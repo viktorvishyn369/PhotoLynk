@@ -195,3 +195,5 @@ server-app/dist/
 *.AppImage
 *.deb
 *.rpm
+server-tray/dist/
+server-tray/node_modules/
