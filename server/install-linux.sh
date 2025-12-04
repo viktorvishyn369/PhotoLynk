@@ -5,6 +5,10 @@
 
 set -e
 
+# Force English locale for consistent command output
+export LC_ALL=C
+export LANG=C
+
 # Colors
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -34,15 +38,27 @@ echo ""
 echo -e "${BLUE}[1/8]${NC} Checking Node.js installation..."
 if ! command -v node &> /dev/null; then
     echo -e "${YELLOW}⚠${NC}  Node.js not found. Installing Node.js 20.x..."
-    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-    apt-get install -y nodejs
+    
+    # Try NodeSource (works globally with fallback)
+    if curl -fsSL https://deb.nodesource.com/setup_20.x | bash - 2>/dev/null; then
+        apt-get install -y nodejs 2>/dev/null || {
+            echo -e "${RED}✗${NC} NodeSource installation failed"
+            echo -e "${YELLOW}⚠${NC}  Trying alternative: snap..."
+            snap install node --classic --channel=20 || {
+                echo -e "${RED}✗${NC} All automatic installations failed"
+                echo -e "${YELLOW}⚠${NC}  Please install Node.js manually from: https://nodejs.org/"
+                echo -e "${YELLOW}⚠${NC}  Or use: sudo snap install node --classic"
+                exit 1
+            }
+        }
+    fi
     echo -e "${GREEN}✓${NC} Node.js installed: $(node -v)"
 else
     NODE_VERSION=$(node -v | cut -d'v' -f2 | cut -d'.' -f1)
     if [ "$NODE_VERSION" -lt 16 ]; then
-        echo -e "${YELLOW}⚠${NC}  Node.js version too old. Updating..."
-        curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-        apt-get install -y nodejs
+        echo -e "${YELLOW}⚠${NC}  Node.js version too old (need 16+). Current: $(node -v)"
+        echo -e "${YELLOW}⚠${NC}  Please update Node.js manually from: https://nodejs.org/"
+        exit 1
     fi
     echo -e "${GREEN}✓${NC} Node.js found: $(node -v)"
 fi

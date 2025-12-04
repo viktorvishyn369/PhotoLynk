@@ -1,9 +1,13 @@
 #!/bin/bash
 
+set -e
+
+# Force English locale for consistent command output
+export LC_ALL=C
+export LANG=C
+
 # PhotoSync Server - Ubuntu Server Installation Script (Command-Line Only)
 # For headless Ubuntu Server environments
-
-set -e
 
 # Colors
 RED='\033[0;31m'
