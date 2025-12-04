@@ -113,11 +113,12 @@ const authenticateToken = (req, res, next) => {
 // File Storage Config
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
-        const userDir = path.join(UPLOAD_DIR, String(req.user.id));
-        if (!fs.existsSync(userDir)) {
-            fs.mkdirSync(userDir, { recursive: true });
+        // Use device UUID for folder name (scalable for future cloud service)
+        const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
+        if (!fs.existsSync(deviceDir)) {
+            fs.mkdirSync(deviceDir, { recursive: true });
         }
-        cb(null, userDir);
+        cb(null, deviceDir);
     },
     filename: (req, file, cb) => {
         // Use original name but sanitize or prepend timestamp to avoid collisions if needed.
@@ -246,11 +247,11 @@ app.get('/api/files', authenticateToken, (req, res) => {
 // Download File
 app.get('/api/files/:filename', authenticateToken, (req, res) => {
     const filename = req.params.filename;
-    const userDir = path.join(UPLOAD_DIR, String(req.user.id));
-    const filePath = path.join(userDir, filename);
+    const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
+    const filePath = path.join(deviceDir, filename);
 
     // Security check: prevent directory traversal
-    if (!filePath.startsWith(userDir)) {
+    if (!filePath.startsWith(deviceDir)) {
         return res.status(403).json({ error: 'Access denied' });
     }
 
