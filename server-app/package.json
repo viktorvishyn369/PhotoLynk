@@ -1,0 +1,47 @@
+{
+  "name": "photosync-server",
+  "version": "1.0.0",
+  "description": "PhotoSync Backup Server Desktop App",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "electron-builder",
+    "build-mac": "electron-builder --mac",
+    "build-win": "electron-builder --win",
+    "build-linux": "electron-builder --linux"
+  },
+  "build": {
+    "appId": "com.photosync.server",
+    "productName": "PhotoSync Server",
+    "files": [
+      "main.js",
+      "preload.js",
+      "index.html",
+      "server.js",
+      "backup.db",
+      "uploads/**/*",
+      "node_modules/**/*"
+    ],
+    "directories": {
+      "output": "dist"
+    },
+    "mac": {
+      "category": "public.app-category.utilities",
+      "icon": "icon.png"
+    },
+    "win": {
+      "target": "nsis",
+      "icon": "icon.png"
+    },
+    "linux": {
+      "target": "AppImage",
+      "icon": "icon.png"
+    }
+  },
+  "dependencies": {
+    "electron": "^28.0.0"
+  },
+  "devDependencies": {
+    "electron-builder": "^24.9.1"
+  }
+}

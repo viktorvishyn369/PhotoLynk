@@ -1,0 +1,44 @@
+{
+  "name": "photosync-server",
+  "version": "1.0.0",
+  "description": "PhotoSync Server - Self-hosted photo backup server with auto-restart and firewall configuration",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "install-linux": "sudo bash install-linux.sh",
+    "install-macos": "bash install-macos.sh",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "photo-backup",
+    "self-hosted",
+    "privacy",
+    "decentralized",
+    "cloud-storage",
+    "mobile-backup"
+  ],
+  "author": "PhotoSync Contributors",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/viktorvishyn369/PhotoSync.git"
+  },
+  "bugs": {
+    "url": "https://github.com/viktorvishyn369/PhotoSync/issues"
+  },
+  "homepage": "https://github.com/viktorvishyn369/PhotoSync#readme",
+  "type": "commonjs",
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.2.1",
+    "helmet": "^8.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "morgan": "^1.10.1",
+    "multer": "^2.0.2",
+    "sqlite3": "^5.1.7",
+    "uuid": "^13.0.0"
+  }
+}
