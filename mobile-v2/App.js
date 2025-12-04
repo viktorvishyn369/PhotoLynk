@@ -39,16 +39,9 @@ export default function App() {
   const getDeviceUUID = async () => {
     let uuid = await SecureStore.getItemAsync('device_uuid');
     if (!uuid) {
-      if (Platform.OS === 'android') {
-        uuid = Application.androidId;
-      } else if (Platform.OS === 'ios') {
-        uuid = await Application.getIosIdForVendorAsync();
-      }
-      
-      // Fallback or if above returns null
-      if (!uuid) {
-        uuid = uuidv4();
-      }
+      // Always generate a proper UUID v4 for consistency
+      // This ensures each email+device combination gets a unique, standard UUID
+      uuid = uuidv4();
       await SecureStore.setItemAsync('device_uuid', uuid);
     }
     return uuid;
@@ -426,7 +419,10 @@ export default function App() {
         style={styles.container}
         behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
         keyboardVerticalOffset={Platform.OS === 'ios' ? 0 : 20}>
-        <ScrollView contentContainerStyle={{flexGrow: 1}}>
+        <ScrollView 
+          contentContainerStyle={{paddingBottom: 20}}
+          showsVerticalScrollIndicator={false}
+          keyboardShouldPersistTaps="handled">
         <View style={styles.authHeader}>
           <Image 
             source={require('./assets/icon.png')} 
@@ -766,33 +762,34 @@ const styles = StyleSheet.create({
   // Auth Screen
   authHeader: {
     alignItems: 'center',
-    marginTop: 80,
-    marginBottom: 60,
+    marginTop: Math.max(40, SCREEN_HEIGHT * 0.08),
+    marginBottom: Math.max(30, SCREEN_HEIGHT * 0.04),
   },
   appIcon: {
-    width: 120,
-    height: 120,
-    borderRadius: 24,
-    marginBottom: 24,
+    width: Math.min(100, SCREEN_WIDTH * 0.25),
+    height: Math.min(100, SCREEN_WIDTH * 0.25),
+    borderRadius: 20,
+    marginBottom: 16,
   },
   title: {
-    fontSize: 36,
+    fontSize: Math.min(32, SCREEN_WIDTH * 0.08),
     fontWeight: 'bold',
     color: '#FFFFFF',
-    marginBottom: 10,
+    marginBottom: 8,
   },
   subtitle: {
-    fontSize: 16,
+    fontSize: 14,
     color: '#AAAAAA',
     textAlign: 'center',
-    paddingHorizontal: 40,
+    paddingHorizontal: 30,
   },
   form: {
     paddingHorizontal: Math.max(20, SCREEN_WIDTH * 0.05),
-    gap: 15,
+    gap: 12,
     maxWidth: 500,
     width: '100%',
     alignSelf: 'center',
+    marginBottom: 20,
   },
   input: {
     backgroundColor: '#1A1A1A',
@@ -824,11 +821,9 @@ const styles = StyleSheet.create({
     fontSize: 16,
   },
   authFooter: {
-    position: 'absolute',
-    bottom: 40,
-    left: 0,
-    right: 0,
     alignItems: 'center',
+    paddingVertical: 20,
+    paddingBottom: 40,
   },
   footerText: {
     color: '#666666',
