@@ -441,6 +441,14 @@ export default function App() {
           console.log(`Downloading: ${file.filename}`);
           
           const downloadPath = FileSystem.cacheDirectory + file.filename;
+          
+          // Delete cached file if it exists to prevent conflicts
+          const cachedFileInfo = await FileSystem.getInfoAsync(downloadPath);
+          if (cachedFileInfo.exists) {
+            await FileSystem.deleteAsync(downloadPath, { idempotent: true });
+            console.log(`Cleared cached file: ${file.filename}`);
+          }
+          
           const downloadRes = await FileSystem.downloadAsync(
             `${getServerUrl()}/api/files/${file.filename}`,
             downloadPath,
@@ -494,6 +502,16 @@ export default function App() {
               }
             }
             console.log(`Saved ${assets.length} files to PhotoSync album`);
+          }
+          
+          // Clean up cache files after saving to gallery
+          for (const item of downloadedUris) {
+            try {
+              await FileSystem.deleteAsync(item.uri, { idempotent: true });
+              console.log(`Cleaned up cache: ${item.filename}`);
+            } catch (err) {
+              console.log(`Could not delete cache file ${item.filename}: ${err.message}`);
+            }
           }
         } catch (galleryError) {
           console.log(`Gallery save error: ${galleryError.message}`);
