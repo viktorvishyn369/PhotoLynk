@@ -184,3 +184,5 @@ ios/build/
 
 # Codeium
 .codeiumignore
+photosync-release.keystore
+*.keystore
