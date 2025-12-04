@@ -2,6 +2,37 @@
 
 Secure, private photo backup system. Your photos, your server, your control.
 
+---
+
+## 🚀 Quick Start
+
+### 1️⃣ Install Server (Choose Your Platform)
+
+#### Desktop (macOS, Windows, Linux) - With GUI Tray
+```bash
+# macOS / Linux
+curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install.sh | bash
+
+# Windows (PowerShell as Admin)
+irm https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install.ps1 | iex
+```
+
+#### Linux Server (Headless) - No GUI
+```bash
+curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install-server.sh | bash
+```
+
+### 2️⃣ Install Mobile App
+- Download APK from [Releases](https://github.com/viktorvishyn369/PhotoSync/releases)
+- Install on Android device
+
+### 3️⃣ Connect & Backup
+- Open PhotoSync app
+- Enter server URL: `http://YOUR_SERVER_IP:3000`
+- Register and start backing up!
+
+---
+
 ## 📱 Mobile App (Android)
 
 Download APK from [Releases](https://github.com/viktorvishyn369/PhotoSync/releases)
@@ -47,25 +78,7 @@ curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/inst
 - No GUI required
 - Service management commands
 
-## 🚀 Quick Start
-
-### 1. Install Server
-Choose your platform and run the install command above.
-
-### 2. Find Your Server IP
-```bash
-# macOS / Linux
-ifconfig | grep "inet " | grep -v 127.0.0.1
-
-# Windows
-ipconfig
-```
-
-### 3. Install Mobile App
-- Download APK from Releases
-- Install on Android device
-- Enter server IP: `http://YOUR_IP:3000`
-- Register and start backing up!
+---
 
 ## 📂 File Storage
 
