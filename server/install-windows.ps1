@@ -7,12 +7,19 @@
 $ErrorActionPreference = "Stop"
 
 Write-Host "╔════════════════════════════════════════════════════╗" -ForegroundColor Blue
-Write-Host "║     PhotoSync Server - Windows Installation       ║" -ForegroundColor Blue
+Write-Host "║  PhotoSync Server (GUI) - Windows Installation    ║" -ForegroundColor Blue
 Write-Host "╚════════════════════════════════════════════════════╝" -ForegroundColor Blue
 Write-Host ""
 
-# Step 1: Check Node.js
-Write-Host "[1/7] Checking Node.js installation..." -ForegroundColor Blue
+# Change to server-app directory
+Set-Location -Path "..\server-app"
+if (-not (Test-Path "package.json")) {
+    Write-Host "Error: server-app directory not found" -ForegroundColor Red
+    exit 1
+}
+
+# Step 1: Check Administrator
+Write-Host "[1/7] Checking administrator privileges..." -ForegroundColor Blue
 try {
     $nodeVersion = node -v
     $versionNumber = [int]($nodeVersion -replace 'v(\d+)\..*', '$1')

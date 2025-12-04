@@ -13,9 +13,12 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 echo -e "${BLUE}╔════════════════════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║     PhotoSync Server - macOS Installation         ║${NC}"
+echo -e "${BLUE}║   PhotoSync Server (GUI) - macOS Installation     ║${NC}"
 echo -e "${BLUE}╚════════════════════════════════════════════════════╝${NC}"
 echo ""
+
+# Change to server-app directory
+cd ../server-app || { echo "Error: server-app directory not found"; exit 1; }
 
 # Step 1: Check Node.js
 echo -e "${BLUE}[1/6]${NC} Checking Node.js installation..."
@@ -94,8 +97,8 @@ cat > "$PLIST_FILE" << EOF
     
     <key>ProgramArguments</key>
     <array>
-        <string>$(which node)</string>
-        <string>$INSTALL_DIR/server.js</string>
+        <string>$(which npm)</string>
+        <string>start</string>
     </array>
     
     <key>WorkingDirectory</key>

@@ -13,16 +13,14 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 echo -e "${BLUE}╔════════════════════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║     PhotoSync Server - Linux Installation         ║${NC}"
-echo -e "${BLUE}╔════════════════════════════════════════════════════╗${NC}"
+echo -e "${BLUE}║  PhotoSync Server (GUI) - Linux Desktop Install   ║${NC}"
+echo -e "${BLUE}╚════════════════════════════════════════════════════╝${NC}"
+echo ""
+echo -e "${YELLOW}Note:${NC} For Ubuntu Server (headless), use install-ubuntu-server.sh instead"
 echo ""
 
-# Check if running as root
-if [ "$EUID" -ne 0 ]; then 
-    echo -e "${RED}❌ Please run as root (use sudo)${NC}"
-    echo "Usage: sudo bash install-linux.sh"
-    exit 1
-fi
+# Change to server-app directory
+cd ../server-app || { echo "Error: server-app directory not found"; exit 1; }
 
 # Get the actual user (not root)
 ACTUAL_USER=${SUDO_USER:-$USER}
