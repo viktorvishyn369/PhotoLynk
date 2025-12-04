@@ -5,7 +5,7 @@ import * as MediaLibrary from 'expo-media-library';
 import * as FileSystem from 'expo-file-system/legacy'; // Fixed: Use legacy import for downloadAsync support
 import * as SecureStore from 'expo-secure-store';
 import * as Application from 'expo-application';
-import { v4 as uuidv4 } from 'uuid';
+import { v4 as uuidv4, v5 as uuidv5 } from 'uuid';
 import axios from 'axios';
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
@@ -28,6 +28,7 @@ export default function App() {
   const [remoteIp, setRemoteIp] = useState('');
   const [token, setToken] = useState(null);
   const [userId, setUserId] = useState(null);
+  const [deviceUuid, setDeviceUuid] = useState(null);
   const [status, setStatus] = useState('Idle');
   const [progress, setProgress] = useState(0);
   const [loading, setLoading] = useState(false);
@@ -36,11 +37,29 @@ export default function App() {
     checkLogin();
   }, []);
 
-  const getDeviceUUID = async () => {
+  const getDeviceUUID = async (userEmail = null, userPassword = null) => {
+    // Get hardware device ID (IMEI equivalent)
+    let hardwareId = '';
+    if (Platform.OS === 'android') {
+      hardwareId = Application.androidId || '';
+    } else if (Platform.OS === 'ios') {
+      hardwareId = await Application.getIosIdForVendorAsync() || '';
+    }
+    
+    // If we have email and password, generate deterministic UUID
+    if (userEmail && userPassword && hardwareId) {
+      // Create deterministic UUID from email+password+hardwareId
+      const namespace = '6ba7b810-9dad-11d1-80b4-00c04fd430c8'; // Standard UUID namespace
+      const combinedString = `${userEmail}:${userPassword}:${hardwareId}`;
+      const uuid = uuidv5(combinedString, namespace);
+      await SecureStore.setItemAsync('device_uuid', uuid);
+      return uuid;
+    }
+    
+    // Otherwise, check if we already have a stored UUID
     let uuid = await SecureStore.getItemAsync('device_uuid');
     if (!uuid) {
-      // Always generate a proper UUID v4 for consistency
-      // This ensures each email+device combination gets a unique, standard UUID
+      // Fallback: generate random UUID if no credentials provided
       uuid = uuidv4();
       await SecureStore.setItemAsync('device_uuid', uuid);
     }
@@ -64,6 +83,10 @@ export default function App() {
     if (savedType) setServerType(savedType);
     if (savedRemoteIp) setRemoteIp(savedRemoteIp);
     
+    // Load device UUID
+    const uuid = await getDeviceUUID();
+    setDeviceUuid(uuid);
+    
     const storedToken = await SecureStore.getItemAsync('auth_token');
     const storedUserId = await SecureStore.getItemAsync('user_id');
     if (storedToken) {
@@ -84,7 +107,9 @@ export default function App() {
         await SecureStore.setItemAsync('remote_ip', remoteIp);
       }
       
-      const deviceId = await getDeviceUUID();
+      // Generate deterministic UUID based on email+password+hardware ID
+      const deviceId = await getDeviceUUID(email, password);
+      setDeviceUuid(deviceId); // Update state with new UUID
       const endpoint = type === 'register' ? '/api/register' : '/api/login';
       const SERVER_URL = getServerUrl();
       
@@ -517,42 +542,42 @@ export default function App() {
           <View style={{width: 60}} />
         </View>
         
-        <ScrollView style={styles.content} contentContainerStyle={styles.contentContainer}>
+        <View style={styles.content}>
           <View style={styles.settingsCard}>
-            <Text style={styles.settingsTitle}>Server Configuration</Text>
-            <Text style={styles.settingsDescription}>Configure your PhotoSync server connection (Port 3000)</Text>
+            <Text style={styles.settingsTitle}>Server</Text>
             
-            <Text style={styles.inputLabel}>Server Type</Text>
             <View style={styles.serverToggle}>
               <TouchableOpacity 
                 style={[styles.toggleBtn, serverType === 'local' && styles.toggleBtnActive]}
                 onPress={() => setServerType('local')}>
                 <Text style={[styles.toggleText, serverType === 'local' && styles.toggleTextActive]}>
-                  Local Network
+                  Local
                 </Text>
               </TouchableOpacity>
               <TouchableOpacity 
                 style={[styles.toggleBtn, serverType === 'remote' && styles.toggleBtnActive]}
                 onPress={() => setServerType('remote')}>
                 <Text style={[styles.toggleText, serverType === 'remote' && styles.toggleTextActive]}>
-                  Remote Server
+                  Remote
                 </Text>
               </TouchableOpacity>
             </View>
             
             {serverType === 'remote' && (
-              <>
-                <Text style={styles.inputLabel}>Remote Server IP/Domain</Text>
-                <TextInput 
-                  style={styles.input} 
-                  placeholder="example.com or 123.456.789.0" 
-                  placeholderTextColor="#888888"
-                  value={remoteIp}
-                  onChangeText={setRemoteIp}
-                  autoCapitalize="none"
-                />
-              </>
+              <TextInput 
+                style={[styles.input, {marginTop: 12}]} 
+                placeholder="IP or domain (e.g., 192.168.1.100)" 
+                placeholderTextColor="#666666"
+                value={remoteIp}
+                onChangeText={setRemoteIp}
+                autoCapitalize="none"
+              />
             )}
+            
+            <View style={styles.serverInfo}>
+              <Text style={styles.serverInfoLabel}>Connected to:</Text>
+              <Text style={styles.serverInfoText}>{getServerUrl()}</Text>
+            </View>
             
             <TouchableOpacity 
               style={styles.btnPrimary} 
@@ -561,127 +586,52 @@ export default function App() {
                 if (serverType === 'remote') {
                   await SecureStore.setItemAsync('remote_ip', remoteIp);
                 }
-                Alert.alert('Saved', `Server set to ${getServerUrl()}`);
+                Alert.alert('Saved', 'Server settings updated');
                 setView('home');
               }}>
-              <Text style={styles.btnText}>Save Settings</Text>
+              <Text style={styles.btnText}>Save Changes</Text>
             </TouchableOpacity>
-            
-            <View style={styles.serverInfo}>
-              <Text style={styles.serverInfoText}>Current: {getServerUrl()}</Text>
-            </View>
           </View>
           
-          {/* Setup Guide */}
           <View style={styles.settingsCard}>
-            <Text style={styles.settingsTitle}>📖 Quick Setup Guide</Text>
-            <Text style={styles.settingsDescription}>Follow these simple steps to get started:</Text>
-            
-            <View style={styles.guideSteps}>
-              <View style={styles.guideStep}>
-                <Text style={styles.stepNumber}>1</Text>
-                <View style={styles.stepContent}>
-                  <Text style={styles.stepTitle}>Download Server</Text>
-                  <Text style={styles.stepText}>Get the PhotoSync server from GitHub</Text>
-                </View>
-              </View>
-              
-              <View style={styles.guideStep}>
-                <Text style={styles.stepNumber}>2</Text>
-                <View style={styles.stepContent}>
-                  <Text style={styles.stepTitle}>Run Server</Text>
-                  <Text style={styles.stepText}>Install and start the server on your computer</Text>
-                </View>
-              </View>
-              
-              <View style={styles.guideStep}>
-                <Text style={styles.stepNumber}>3</Text>
-                <View style={styles.stepContent}>
-                  <Text style={styles.stepTitle}>Configure & Sync</Text>
-                  <Text style={styles.stepText}>Set server IP above, register, and start backing up!</Text>
-                </View>
-              </View>
-            </View>
-          </View>
-          
-          {/* How It Works */}
-          <View style={styles.settingsCard}>
-            <Text style={styles.settingsTitle}>💡 How It Works</Text>
-            <Text style={styles.howItWorksText}>
-              PhotoSync is a self-hosted photo backup solution. Your photos are stored on YOUR server, giving you complete control and privacy.
-              {'\n\n'}
-              • <Text style={styles.boldText}>Backup:</Text> Upload photos/videos to your server
-              {'\n'}
-              • <Text style={styles.boldText}>Restore:</Text> Download files back to your device
-              {'\n'}
-              • <Text style={styles.boldText}>Privacy:</Text> Your data never leaves your control
-              {'\n'}
-              • <Text style={styles.boldText}>Security:</Text> Device-bound authentication
-              {'\n\n'}
-              📁 <Text style={styles.boldText}>Uploaded Files Location:</Text>
-              {'\n'}
-              Your synced photos are stored in:{'\n'}
-              <Text style={styles.boldText}>server/uploads/{userId || '[user_id]'}/</Text>{'\n'}
-              {userId ? `Your User ID: ${userId}` : '(Login to see your user ID)'}
+            <Text style={styles.settingsTitle}>About</Text>
+            <Text style={styles.settingsDescription}>
+              Self-hosted photo backup. Your photos stay on your server.
             </Text>
-          </View>
-          
-          {/* GitHub & Resources */}
-          <View style={styles.settingsCard}>
-            <Text style={styles.settingsTitle}>🔗 Resources</Text>
+            {deviceUuid && (
+              <View style={styles.uuidBox}>
+                <Text style={styles.uuidLabel}>Device ID:</Text>
+                <Text style={styles.uuidText}>{deviceUuid}</Text>
+              </View>
+            )}
             
             <TouchableOpacity 
               style={styles.resourceBtn}
               onPress={() => {
-                // Open GitHub repository
                 const githubUrl = 'https://github.com/viktorvishyn369/PhotoSync';
                 Linking.openURL(githubUrl).catch(err => {
-                  Alert.alert('Error', 'Could not open GitHub link');
-                  console.error('Failed to open URL:', err);
+                  Alert.alert('Error', 'Could not open link');
                 });
               }}>
               <Text style={styles.resourceIcon}>📦</Text>
               <View style={styles.resourceContent}>
-                <Text style={styles.resourceTitle}>GitHub Repository</Text>
-                <Text style={styles.resourceDesc}>Download server app & view source code</Text>
-              </View>
-              <Text style={styles.resourceArrow}>→</Text>
-            </TouchableOpacity>
-            
-            <TouchableOpacity 
-              style={styles.resourceBtn}
-              onPress={() => {
-                Alert.alert(
-                  'Server Requirements',
-                  'To run the PhotoSync server:\n\n' +
-                  '• Node.js 16 or higher\n' +
-                  '• 100MB+ free disk space\n' +
-                  '• Windows, Mac, or Linux\n\n' +
-                  'Download from GitHub and run:\n' +
-                  'npm install && npm start',
-                  [{ text: 'Got it!' }]
-                );
-              }}>
-              <Text style={styles.resourceIcon}>💻</Text>
-              <View style={styles.resourceContent}>
-                <Text style={styles.resourceTitle}>Server Requirements</Text>
-                <Text style={styles.resourceDesc}>What you need to run the server</Text>
+                <Text style={styles.resourceTitle}>GitHub</Text>
+                <Text style={styles.resourceDesc}>Download server & docs</Text>
               </View>
               <Text style={styles.resourceArrow}>→</Text>
             </TouchableOpacity>
             
             <View style={styles.openSourceBadge}>
               <Text style={styles.openSourceText}>
-                ⭐ 100% Open Source • Self-Hosted • Privacy First
+                ⭐ Open Source • Self-Hosted • Privacy First
               </Text>
             </View>
           </View>
           
           <View style={styles.settingsFooter}>
             <Text style={styles.footerVersion}>PhotoSync v1.0.0</Text>
-            <Text style={styles.footerCopyright}>Open Source • Made with ❤️</Text>
           </View>
-        </ScrollView>
+        </View>
       </View>
     );
   }
@@ -1018,7 +968,23 @@ const styles = StyleSheet.create({
   settingsDescription: {
     fontSize: 14,
     color: '#AAAAAA',
-    marginBottom: 24,
+    marginBottom: 16,
+  },
+  uuidBox: {
+    backgroundColor: '#0A0A0A',
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 16,
+  },
+  uuidLabel: {
+    fontSize: 11,
+    color: '#888888',
+    marginBottom: 6,
+  },
+  uuidText: {
+    fontSize: 11,
+    color: '#03DAC6',
+    fontFamily: Platform.OS === 'ios' ? 'Courier' : 'monospace',
   },
   inputLabel: {
     color: '#AAAAAA',
@@ -1033,15 +999,20 @@ const styles = StyleSheet.create({
     fontStyle: 'italic',
   },
   serverInfo: {
-    marginTop: 20,
+    marginTop: 16,
     padding: 12,
     backgroundColor: '#0A0A0A',
     borderRadius: 8,
   },
+  serverInfoLabel: {
+    color: '#888888',
+    fontSize: 11,
+    marginBottom: 4,
+  },
   serverInfoText: {
     color: '#03DAC6',
-    fontSize: 12,
-    textAlign: 'center',
+    fontSize: 13,
+    fontWeight: '500',
   },
   headerButtons: {
     flexDirection: 'row',
