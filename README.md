@@ -34,57 +34,7 @@ curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/inst
 
 ---
 
-## 📱 Mobile App
-
-Available on:
-- **Google Play Store** (Android)
-- **App Store** (iOS)
-- **Solana dApp Store**
-
-**Features:**
-- Automatic photo backup
-- Restore to any device
-- Device-bound security (UUID-based)
-- Works offline after setup
-- No cloud dependencies
-
-## 💻 Server Apps
-
-### Desktop (macOS, Windows, Linux)
-System tray app with GUI controls.
-
-**One-line install:**
-```bash
-# macOS / Linux
-curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install.sh | bash
-
-# Windows (PowerShell as Admin)
-irm https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install.ps1 | iex
-```
-
-**Features:**
-- System tray icon
-- Start/Stop/Restart server
-- Open files location
-- Auto-starts on boot
-
-### Linux Server (Headless)
-For Ubuntu Server, VPS, cloud instances.
-
-**One-line install:**
-```bash
-curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install-server.sh | bash
-```
-
-**Features:**
-- Systemd service (auto-start)
-- Firewall configuration
-- No GUI required
-- Service management commands
-
----
-
-## 📂 File Storage
+##  File Storage
 
 Files are stored in:
 ```
@@ -98,12 +48,6 @@ uploads/
 Each device gets its own UUID folder for complete isolation.
 
 ## 🔧 Server Management
-
-### Desktop (Tray App)
-- Click tray icon
-- Use menu to control server
-
-### Linux Server
 ```bash
 # Check status
 sudo systemctl status photosync
