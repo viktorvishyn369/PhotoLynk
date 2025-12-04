@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "VaultSync",
-    "slug": "vaultsync",
+    "name": "PhotoSync",
+    "slug": "photosync",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
@@ -15,8 +15,8 @@
     "ios": {
       "supportsTablet": true,
       "infoPlist": {
-        "NSPhotoLibraryUsageDescription": "VaultSync needs access to your photos to back them up to your secure private cloud.",
-        "NSPhotoLibraryAddUsageDescription": "VaultSync needs permission to save restored photos to your library."
+        "NSPhotoLibraryUsageDescription": "PhotoSync needs access to your photos to back them up to your secure private cloud.",
+        "NSPhotoLibraryAddUsageDescription": "PhotoSync needs permission to save restored photos to your library."
       }
     },
     "android": {
@@ -32,7 +32,7 @@
         "READ_MEDIA_VIDEO",
         "INTERNET"
       ],
-      "package": "com.vaultsync.app",
+      "package": "com.photosync.app",
       "edgeToEdgeEnabled": true
     },
     "web": {
@@ -43,8 +43,8 @@
       [
         "expo-media-library",
         {
-          "photosPermission": "Allow VaultSync to access your photos.",
-          "savePhotosPermission": "Allow VaultSync to save photos.",
+          "photosPermission": "Allow PhotoSync to access your photos.",
+          "savePhotosPermission": "Allow PhotoSync to save photos.",
           "isAccessMediaLocationEnabled": true
         }
       ]

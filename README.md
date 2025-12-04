@@ -1,6 +1,6 @@
-# VaultSync - Secure Photo Backup
+# PhotoSync - Decentralized Photo Backup
 
-A secure, private photo backup system with a headless Node.js server and a React Native (Expo) mobile app.
+A secure, self-hosted photo backup system with a headless Node.js server and React Native (Expo) mobile apps for Android, iOS, and Solana Mobile.
 
 ## Features
 - **Secure Auth**: Email/Password + Device UUID binding.
