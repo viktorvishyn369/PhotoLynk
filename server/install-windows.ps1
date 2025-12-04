@@ -171,6 +171,10 @@ Write-Host "╔═════════════════════�
 Write-Host "║            Installation Successful! 🎉             ║" -ForegroundColor Green
 Write-Host "╚════════════════════════════════════════════════════╝" -ForegroundColor Green
 Write-Host ""
+Write-Host "📁 Uploaded Photos Location:" -ForegroundColor Blue
+Write-Host "   • Path: $installDir\uploads" -ForegroundColor Green
+Write-Host "   • Open: explorer $installDir\uploads" -ForegroundColor Yellow
+Write-Host ""
 Write-Host "📱 Mobile App Configuration:" -ForegroundColor Blue
 Write-Host ""
 Write-Host "   Local Network:" -ForegroundColor Yellow
