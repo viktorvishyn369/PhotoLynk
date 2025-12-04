@@ -2,6 +2,7 @@
   "name": "photosync-server",
   "version": "1.0.0",
   "description": "PhotoSync Backup Server Desktop App",
+  "author": "PhotoSync",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
@@ -37,11 +38,11 @@
       "target": [
         {
           "target": "dmg",
-          "arch": ["x64", "arm64", "universal"]
+          "arch": ["x64", "arm64"]
         },
         {
           "target": "zip",
-          "arch": ["x64", "arm64", "universal"]
+          "arch": ["x64", "arm64"]
         }
       ],
       "hardenedRuntime": true,
@@ -88,9 +89,9 @@
     }
   },
   "dependencies": {
-    "electron": "^28.0.0"
   },
   "devDependencies": {
+    "electron": "^28.0.0",
     "electron-builder": "^24.9.1"
   }
 }
