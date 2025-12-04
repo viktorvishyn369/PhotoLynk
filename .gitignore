@@ -186,3 +186,7 @@ ios/build/
 .codeiumignore
 photosync-release.keystore
 *.keystore
+server-app/uploads/*
+!server-app/uploads/.gitkeep
+server-app/backup.db
+server-app/backup.db-journal
