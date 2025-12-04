@@ -23,8 +23,9 @@ curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/inst
 ```
 
 ### 2️⃣ Install Mobile App
-- Download APK from [Releases](https://github.com/viktorvishyn369/PhotoSync/releases)
-- Install on Android device
+- Download from **Google Play Store**
+- Or **App Store** (iOS)
+- Also available on **Solana dApp Store**
 
 ### 3️⃣ Connect & Backup
 - Open PhotoSync app
@@ -33,9 +34,12 @@ curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/inst
 
 ---
 
-## 📱 Mobile App (Android)
+## 📱 Mobile App
 
-Download APK from [Releases](https://github.com/viktorvishyn369/PhotoSync/releases)
+Available on:
+- **Google Play Store** (Android)
+- **App Store** (iOS)
+- **Solana dApp Store**
 
 **Features:**
 - Automatic photo backup
