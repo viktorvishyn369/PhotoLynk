@@ -197,3 +197,4 @@ server-app/dist/
 *.rpm
 server-tray/dist/
 server-tray/node_modules/
+*.idsig
