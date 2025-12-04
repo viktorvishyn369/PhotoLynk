@@ -712,7 +712,6 @@ export default function App() {
         <View style={styles.statusCard}>
           <View style={styles.statusHeader}>
             <Text style={styles.statusLabel}>STATUS</Text>
-            {loading && <ActivityIndicator size="small" color="#03DAC6" />}
           </View>
           <Text style={styles.statusText}>{status}</Text>
           {progress > 0 && progress < 1 && (
