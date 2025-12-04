@@ -260,8 +260,8 @@ export default function App() {
   if (view === 'auth') {
     return (
       <View style={styles.container}>
-        <Text style={styles.title}>VaultSync</Text>
-        <Text style={styles.subtitle}>Secure Cloud Backup</Text>
+        <Text style={styles.title}>PhotoSync</Text>
+        <Text style={styles.subtitle}>Your Secure Backup</Text>
         
         <View style={styles.form}>
           <TextInput 
@@ -296,7 +296,7 @@ export default function App() {
   return (
     <View style={styles.container}>
       <View style={styles.header}>
-        <Text style={styles.headerTitle}>My Vault v2</Text>
+        <Text style={styles.headerTitle}>PhotoSync</Text>
         <TouchableOpacity onPress={logout}>
            <Text style={styles.logoutText}>Logout</Text>
         </TouchableOpacity>

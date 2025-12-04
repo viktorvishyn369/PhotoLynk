@@ -172,8 +172,10 @@ Write-Host "║            Installation Successful! 🎉             ║" -Foreg
 Write-Host "╚════════════════════════════════════════════════════╝" -ForegroundColor Green
 Write-Host ""
 Write-Host "📁 Uploaded Photos Location:" -ForegroundColor Blue
-Write-Host "   • Path: $installDir\uploads" -ForegroundColor Green
-Write-Host "   • Open: explorer $installDir\uploads" -ForegroundColor Yellow
+Write-Host "   • Path: $installDir\uploads\[user_id]\" -ForegroundColor Green
+Write-Host "   • Each user gets their own folder by user ID"
+Write-Host "   • Open folder: explorer $installDir\uploads" -ForegroundColor Yellow
+Write-Host "   • List users: dir $installDir\uploads" -ForegroundColor Yellow
 Write-Host ""
 Write-Host "📱 Mobile App Configuration:" -ForegroundColor Blue
 Write-Host ""
