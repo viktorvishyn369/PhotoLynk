@@ -690,9 +690,12 @@ export default function App() {
           <View style={{width: 60}} />
         </View>
         
-        <View style={styles.content}>
+        <ScrollView style={styles.content} contentContainerStyle={styles.contentContainer}>
           <View style={styles.settingsCard}>
             <Text style={styles.settingsTitle}>Server</Text>
+            <Text style={styles.settingsDescription}>
+              Choose where your server is running:
+            </Text>
             
             <View style={styles.serverToggle}>
               <TouchableOpacity 
@@ -709,6 +712,20 @@ export default function App() {
                   Remote
                 </Text>
               </TouchableOpacity>
+            </View>
+            
+            <View style={styles.serverExplanation}>
+              {serverType === 'local' ? (
+                <Text style={styles.serverExplanationText}>
+                  📱 <Text style={styles.boldText}>Local:</Text> Server on same WiFi network{'\n'}
+                  (e.g., your home computer or laptop)
+                </Text>
+              ) : (
+                <Text style={styles.serverExplanationText}>
+                  🌐 <Text style={styles.boldText}>Remote:</Text> Server anywhere on internet{'\n'}
+                  (e.g., cloud server or office computer)
+                </Text>
+              )}
             </View>
             
             {serverType === 'remote' && (
@@ -751,7 +768,19 @@ export default function App() {
               <View style={styles.guideStep}>
                 <Text style={styles.guideStepNumber}>1</Text>
                 <View style={styles.guideStepContent}>
-                  <Text style={styles.guideStepTitle}>Copy the link</Text>
+                  <Text style={styles.guideStepTitle}>Open Terminal/CMD</Text>
+                  <Text style={styles.guideStepDesc}>
+                    • Mac: Press Cmd+Space, type "Terminal"{'\n'}
+                    • Windows: Press Win+R, type "powershell"{'\n'}
+                    • Linux: Press Ctrl+Alt+T
+                  </Text>
+                </View>
+              </View>
+              
+              <View style={styles.guideStep}>
+                <Text style={styles.guideStepNumber}>2</Text>
+                <View style={styles.guideStepContent}>
+                  <Text style={styles.guideStepTitle}>Get the command</Text>
                   <TouchableOpacity 
                     style={styles.copyLinkBtn}
                     onPress={() => {
@@ -763,18 +792,10 @@ export default function App() {
               </View>
               
               <View style={styles.guideStep}>
-                <Text style={styles.guideStepNumber}>2</Text>
-                <View style={styles.guideStepContent}>
-                  <Text style={styles.guideStepTitle}>Choose your device</Text>
-                  <Text style={styles.guideStepDesc}>Desktop (Mac/Windows/Linux) or Server</Text>
-                </View>
-              </View>
-              
-              <View style={styles.guideStep}>
                 <Text style={styles.guideStepNumber}>3</Text>
                 <View style={styles.guideStepContent}>
-                  <Text style={styles.guideStepTitle}>Copy & paste command</Text>
-                  <Text style={styles.guideStepDesc}>Paste in Terminal (Mac/Linux) or PowerShell (Windows)</Text>
+                  <Text style={styles.guideStepTitle}>Copy & paste</Text>
+                  <Text style={styles.guideStepDesc}>Right-click in Terminal/PowerShell to paste</Text>
                 </View>
               </View>
               
@@ -782,23 +803,48 @@ export default function App() {
                 <Text style={styles.guideStepNumber}>4</Text>
                 <View style={styles.guideStepContent}>
                   <Text style={styles.guideStepTitle}>Press Enter</Text>
-                  <Text style={styles.guideStepDesc}>Server will install and start automatically!</Text>
+                  <Text style={styles.guideStepDesc}>Server installs automatically!</Text>
                 </View>
               </View>
             </View>
           </View>
           
+          <View style={styles.settingsFooter}>
+            <Text style={styles.footerVersion}>PhotoSync v1.0.0</Text>
+          </View>
+        </ScrollView>
+      </View>
+    );
+  }
+
+  if (view === 'about') {
+    return (
+      <View style={styles.container}>
+        <View style={styles.header}>
+          <TouchableOpacity onPress={() => setView('home')} style={styles.backBtn}>
+            <Text style={styles.backText}>← Back</Text>
+          </TouchableOpacity>
+          <Text style={styles.headerTitle}>About</Text>
+          <View style={{width: 60}} />
+        </View>
+        
+        <ScrollView style={styles.content} contentContainerStyle={styles.contentContainer}>
           <View style={styles.settingsCard}>
-            <Text style={styles.settingsTitle}>About</Text>
+            <Text style={styles.settingsTitle}>PhotoSync</Text>
             <Text style={styles.settingsDescription}>
               Self-hosted photo backup. Your photos stay on your server.
             </Text>
+            
             {deviceUuid && (
               <View style={styles.uuidBox}>
                 <Text style={styles.uuidLabel}>Device ID:</Text>
                 <Text style={styles.uuidText}>{deviceUuid}</Text>
               </View>
             )}
+          </View>
+          
+          <View style={styles.settingsCard}>
+            <Text style={styles.settingsTitle}>Resources</Text>
             
             <TouchableOpacity 
               style={styles.resourceBtn}
@@ -826,7 +872,7 @@ export default function App() {
           <View style={styles.settingsFooter}>
             <Text style={styles.footerVersion}>PhotoSync v1.0.0</Text>
           </View>
-        </View>
+        </ScrollView>
       </View>
     );
   }
@@ -839,6 +885,9 @@ export default function App() {
           <Text style={styles.headerSubtitle}>Your Secure Backup</Text>
         </View>
         <View style={styles.headerButtons}>
+          <TouchableOpacity onPress={() => setView('about')} style={styles.infoBtn}>
+            <Text style={styles.infoText}>ℹ️</Text>
+          </TouchableOpacity>
           <TouchableOpacity onPress={() => setView('settings')} style={styles.settingsBtn}>
             <Text style={styles.settingsText}>⚙️</Text>
           </TouchableOpacity>
@@ -1116,7 +1165,20 @@ const styles = StyleSheet.create({
   serverToggle: {
     flexDirection: 'row',
     gap: 10,
-    marginBottom: 8,
+    marginTop: 12,
+  },
+  serverExplanation: {
+    marginTop: 12,
+    padding: 12,
+    backgroundColor: '#1A1A1A',
+    borderRadius: 8,
+    borderLeftWidth: 3,
+    borderLeftColor: THEME.primary,
+  },
+  serverExplanationText: {
+    color: '#CCCCCC',
+    fontSize: 13,
+    lineHeight: 20,
   },
   toggleBtn: {
     flex: 1,
@@ -1211,6 +1273,17 @@ const styles = StyleSheet.create({
   headerButtons: {
     flexDirection: 'row',
     gap: 10,
+  },
+  infoBtn: {
+    backgroundColor: '#1A1A1A',
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#333333',
+  },
+  infoText: {
+    fontSize: 18,
   },
   settingsBtn: {
     backgroundColor: '#1A1A1A',
