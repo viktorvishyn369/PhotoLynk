@@ -1,6 +1,6 @@
 import 'react-native-get-random-values';
 import React, { useState, useEffect } from 'react';
-import { StyleSheet, Text, View, TextInput, TouchableOpacity, Alert, ScrollView, ActivityIndicator, Platform, Pressable, Button, Dimensions, SafeAreaView, KeyboardAvoidingView, Linking, Image } from 'react-native';
+import { StyleSheet, Text, View, TextInput, TouchableOpacity, Alert, ScrollView, ActivityIndicator, Platform, Pressable, Button, Dimensions, SafeAreaView, KeyboardAvoidingView, Linking, Image, Clipboard } from 'react-native';
 import * as MediaLibrary from 'expo-media-library';
 import * as FileSystem from 'expo-file-system/legacy'; // Fixed: Use legacy import for downloadAsync support
 import * as SecureStore from 'expo-secure-store';
@@ -836,10 +836,15 @@ export default function App() {
             </Text>
             
             {deviceUuid && (
-              <View style={styles.uuidBox}>
-                <Text style={styles.uuidLabel}>Device ID:</Text>
+              <TouchableOpacity 
+                style={styles.uuidBox}
+                onPress={() => {
+                  Clipboard.setString(deviceUuid);
+                  Alert.alert('Copied!', 'Device ID copied to clipboard');
+                }}>
+                <Text style={styles.uuidLabel}>Device ID (tap to copy):</Text>
                 <Text style={styles.uuidText}>{deviceUuid}</Text>
-              </View>
+              </TouchableOpacity>
             )}
           </View>
           
@@ -886,7 +891,7 @@ export default function App() {
         </View>
         <View style={styles.headerButtons}>
           <TouchableOpacity onPress={() => setView('about')} style={styles.infoBtn}>
-            <Text style={styles.infoText}>ℹ️</Text>
+            <Text style={styles.infoText}>i</Text>
           </TouchableOpacity>
           <TouchableOpacity onPress={() => setView('settings')} style={styles.settingsBtn}>
             <Text style={styles.settingsText}>⚙️</Text>
@@ -1276,14 +1281,18 @@ const styles = StyleSheet.create({
   },
   infoBtn: {
     backgroundColor: '#1A1A1A',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 8,
-    borderWidth: 1,
-    borderColor: '#333333',
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 2,
+    borderColor: '#03DAC6',
   },
   infoText: {
-    fontSize: 18,
+    fontSize: 20,
+    fontWeight: 'bold',
+    color: '#03DAC6',
   },
   settingsBtn: {
     backgroundColor: '#1A1A1A',
