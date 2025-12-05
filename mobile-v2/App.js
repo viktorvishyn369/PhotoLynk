@@ -179,38 +179,38 @@ export default function App() {
     setLoading(true);
 
     try {
-      // 1. Get ALL photos/videos from gallery (excluding PhotoSync folder to prevent backing up synced files)
-      const albums = await MediaLibrary.getAlbumsAsync();
-      console.log('All albums:', albums.map(a => `${a.title} (${a.assetCount})`).join(', '));
+      console.log('\n🔍 ===== BACKUP TRACE START =====');
       
-      const photoSyncAlbum = albums.find(a => a.title === 'PhotoSync');
-      
-      // Get ALL assets from device
+      // 1. Get All Assets
+      setStatus('Loading photos...');
       const allAssets = await MediaLibrary.getAssetsAsync({
+        first: 10000,
         mediaType: ['photo', 'video'],
-        first: 10000, 
-        sortBy: ['creationTime']
       });
       
-      console.log(`Total assets on device: ${allAssets.totalCount}`);
+      console.log(`📱 Total assets on device: ${allAssets.assets.length}`);
       
-      // Exclude files from PhotoSync album (to avoid backing up synced files)
+      // Exclude files already in PhotoSync album to prevent re-uploading restored files
+      const albums = await MediaLibrary.getAlbumsAsync();
+      console.log(`📂 All albums: ${albums.map(a => `${a.title} (${a.assetCount})`).join(', ')}`);
+      
+      const photoSyncAlbum = albums.find(a => a.title === 'PhotoSync');
       let excludedIds = new Set();
+      
       if (photoSyncAlbum) {
-        const photoSyncAssets = await MediaLibrary.getAssetsAsync({
+        const albumAssets = await MediaLibrary.getAssetsAsync({
           album: photoSyncAlbum,
-          first: 10000
+          first: 10000,
         });
-        photoSyncAssets.assets.forEach(a => excludedIds.add(a.id));
-        console.log(`Excluding ${excludedIds.size} files from PhotoSync album`);
+        excludedIds = new Set(albumAssets.assets.map(a => a.id));
+        console.log(`📂 PhotoSync album has ${excludedIds.size} files (will exclude)`);
       }
       
       const assets = {
-        ...allAssets,
         assets: allAssets.assets.filter(a => !excludedIds.has(a.id))
       };
       
-      console.log(`Assets to backup: ${assets.assets.length}`);
+      console.log(`📊 Assets to backup (after excluding PhotoSync): ${assets.assets.length}`);
       setStatus(`Found ${assets.assets.length} photos/videos to check...`);
 
       if (assets.assets.length === 0) {
@@ -226,12 +226,12 @@ export default function App() {
       const SERVER_URL = getServerUrl();
       const serverRes = await axios.get(`${SERVER_URL}/api/files`, config);
       
+      console.log(`\n☁️  Server response: ${serverRes.data.files.length} files`);
+      
       // Create case-insensitive set of server filenames
       const serverFiles = new Set(serverRes.data.files.map(f => f.filename.toLowerCase()));
       
-      console.log(`Server has ${serverFiles.size} files`);
-      console.log('Server files:', Array.from(serverFiles));
-      console.log('Local assets:', assets.assets.map(a => a.filename));
+      console.log(`📊 Server files (unique, lowercase): ${serverFiles.size}`);
 
       // 3. Identify Missing on Server
       const toUpload = [];
@@ -341,6 +341,17 @@ export default function App() {
       }
 
       // Show detailed completion status
+      console.log('\n📊 ===== BACKUP SUMMARY =====');
+      console.log(`Total on device: ${allAssets.assets.length}`);
+      console.log(`PhotoSync excluded: ${excludedIds.size}`);
+      console.log(`To check: ${assets.assets.length}`);
+      console.log(`On server before: ${serverFiles.size}`);
+      console.log(`Marked for upload: ${toUpload.length}`);
+      console.log(`Actually uploaded: ${successCount}`);
+      console.log(`Duplicates skipped: ${duplicateCount}`);
+      console.log(`Failed: ${failedCount}`);
+      console.log('===== END BACKUP TRACE =====\n');
+      
       if (failedCount === 0) {
         setStatus(`Backup Complete! Uploaded ${successCount} file${successCount !== 1 ? 's' : ''}.`);
         Alert.alert('Success', `Successfully backed up ${successCount} file${successCount !== 1 ? 's' : ''}.`);
