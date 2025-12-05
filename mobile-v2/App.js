@@ -40,19 +40,38 @@ export default function App() {
   const getDeviceUUID = async (userEmail = null, userPassword = null) => {
     // Get hardware device ID (IMEI equivalent)
     let hardwareId = '';
-    if (Platform.OS === 'android') {
-      hardwareId = Application.androidId || '';
-    } else if (Platform.OS === 'ios') {
-      hardwareId = await Application.getIosIdForVendorAsync() || '';
+    try {
+      if (Platform.OS === 'android') {
+        hardwareId = Application.androidId || '';
+        console.log('Android ID:', hardwareId);
+      } else if (Platform.OS === 'ios') {
+        console.log('Getting iOS vendor ID...');
+        hardwareId = await Application.getIosIdForVendorAsync() || '';
+        console.log('iOS vendor ID:', hardwareId);
+      }
+    } catch (error) {
+      console.error('Error getting hardware ID:', error);
+      hardwareId = 'fallback-' + Math.random().toString(36).substring(7);
     }
     
     // If we have email and hardware ID, use deterministic UUID
     if (userEmail && hardwareId) {
-      // Create storage key based on email+hardware (without password for security)
-      const storageKey = `device_uuid_${userEmail}_${hardwareId}`;
+      console.log('Creating storage key for:', userEmail);
+      // Create storage key based on email+hardware (hash to avoid length limits)
+      const keyString = `${userEmail}_${hardwareId}`;
+      const storageKey = `uuid_${uuidv5(keyString, '6ba7b810-9dad-11d1-80b4-00c04fd430c8')}`;
+      console.log('Storage key (hashed):', storageKey);
       
       // Check if we already have UUID for this user+device combination
-      let existingUuid = await SecureStore.getItemAsync(storageKey);
+      console.log('Checking for existing UUID...');
+      let existingUuid = null;
+      try {
+        existingUuid = await SecureStore.getItemAsync(storageKey);
+        console.log('Existing UUID:', existingUuid);
+      } catch (error) {
+        console.error('Error reading from SecureStore:', error);
+      }
+      
       if (existingUuid) {
         console.log('Using existing UUID for', userEmail, ':', existingUuid);
         return existingUuid;
@@ -60,12 +79,16 @@ export default function App() {
       
       // Generate new deterministic UUID from email+password+hardwareId
       if (userPassword) {
+        console.log('Generating new UUID with uuidv5...');
         const namespace = '6ba7b810-9dad-11d1-80b4-00c04fd430c8'; // Standard UUID namespace
         const combinedString = `${userEmail}:${userPassword}:${hardwareId}`;
         const uuid = uuidv5(combinedString, namespace);
+        console.log('UUID generated:', uuid);
         
         // Store with user+device specific key
+        console.log('Storing UUID in SecureStore...');
         await SecureStore.setItemAsync(storageKey, uuid);
+        console.log('UUID stored successfully');
         console.log('Generated new deterministic UUID for', userEmail, ':', uuid);
         return uuid;
       }
