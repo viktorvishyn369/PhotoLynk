@@ -52,10 +52,34 @@ For questions about this privacy policy:
 - **Email**: viktor.vishyn.369@gmail.com
 - **GitHub**: https://github.com/viktorvishyn369/PhotoSync
 
+## Disclaimer and Limitation of Liability
+
+**USE AT YOUR OWN RISK**: PhotoSync is provided "AS IS" without warranty of any kind, express or implied. The developers make no guarantees about:
+- Data integrity or reliability
+- Backup completeness or accuracy
+- Server security or availability
+- Protection against data loss
+
+**NO LIABILITY**: In no event shall the developers be liable for:
+- Any data loss, corruption, or deletion
+- Any damages arising from use or inability to use the software
+- Any security breaches or unauthorized access
+- Any server failures or malfunctions
+- Any indirect, incidental, special, or consequential damages
+
+**YOUR RESPONSIBILITY**: You are solely responsible for:
+- Maintaining your own backups
+- Securing your server and network
+- Protecting your data
+- Compliance with applicable laws
+- Any data loss or damage
+
+**NOT A PROFESSIONAL SERVICE**: PhotoSync is a free, open-source project provided as-is. It is not a professional backup service and should not be relied upon as your only backup solution.
+
 ## Open Source
 PhotoSync is open source. You can review the code to verify our privacy practices:
 https://github.com/viktorvishyn369/PhotoSync
 
 ---
 
-**Summary**: Your data, your server, your control. We don't collect, store, or access any of your data.
+**Summary**: Your data, your server, your control. We don't collect, store, or access any of your data. Use at your own risk.

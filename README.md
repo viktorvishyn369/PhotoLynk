@@ -58,6 +58,8 @@ uploads/
 Each device gets its own UUID folder for complete isolation.
 
 ## 🔧 Server Management
+
+**For Headless Linux Servers** (systemd service):
 ```bash
 # Check status
 sudo systemctl status photosync
@@ -74,6 +76,10 @@ sudo systemctl restart photosync
 # View logs
 sudo journalctl -u photosync -f
 ```
+
+**For Desktop (Tray App):**
+- Use the tray icon menu to Start/Stop/Restart
+- Or run manually: `cd ~/PhotoSync/server && node server.js`
 
 ## 🔒 Security
 
@@ -109,13 +115,14 @@ See [PRIVACY_POLICY.md](PRIVACY_POLICY.md)
 ### Can't connect from mobile app
 
 **For Local Server (same WiFi network):**
-1. Find your server's local IP:
+1. **Auto-detected:** The app automatically detects your local server at `192.168.1.222:3000`
+2. If auto-detection doesn't work, find your server's local IP manually:
    - **Mac/Linux:** `ifconfig | grep "inet " | grep -v 127.0.0.1`
    - **Windows:** `ipconfig` (look for IPv4 Address)
-2. Use this IP in app: `http://192.168.1.XXX:3000`
-3. ❌ **Don't use:** `localhost` or `127.0.0.1` (won't work from phone!)
-4. ✅ **Use:** Your actual local IP like `192.168.1.100`
-5. Ensure phone and server on **same WiFi network**
+3. Use this IP in app: `http://192.168.1.XXX:3000`
+4. ❌ **Don't use:** `localhost` or `127.0.0.1` (won't work from phone!)
+5. ✅ **Use:** Your actual local IP like `192.168.1.100`
+6. Ensure phone and server on **same WiFi network**
 
 **For Remote Server (internet/VPS):**
 1. Use your public IP or domain: `http://YOUR_PUBLIC_IP:3000`
