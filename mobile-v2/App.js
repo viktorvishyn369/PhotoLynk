@@ -109,12 +109,13 @@ export default function App() {
 
   const getServerUrl = () => {
     const PORT = '3000';
-    if (serverType === 'local') {
-      // Use local network IP - you can detect this or use a standard one
-      return `http://192.168.1.222:${PORT}`; // Default local IP
-    } else {
-      return `http://${remoteIp}:${PORT}`;
-    }
+    // Always use the host from Settings (remoteIp) for both local and remote,
+    // so there is no hardcoded IP in the app. If not set, fall back to
+    // localhost as a dev placeholder.
+    const host = (remoteIp && remoteIp.trim().length > 0)
+      ? remoteIp.trim()
+      : 'localhost';
+    return `http://${host}:${PORT}`;
   };
 
   const checkLogin = async () => {
@@ -282,6 +283,7 @@ export default function App() {
       setStatus('Checking server files...');
       const config = await getAuthHeaders();
       const SERVER_URL = getServerUrl();
+      console.log('Using server URL for backup:', SERVER_URL);
       const serverRes = await axios.get(`${SERVER_URL}/api/files`, config);
       
       console.log(`\n☁️  Server response: ${serverRes.data.files.length} files`);
@@ -698,7 +700,9 @@ export default function App() {
             )}
             
             <Text style={styles.serverHint}>
-              {serverType === 'local' ? '📡 Using local network (192.168.1.222:3000)' : '🌐 Port 3000 (hardcoded)'}
+              {serverType === 'local'
+                ? '📡 Using local network (http://<your-computer-ip>:3000)'
+                : '🌐 Using custom host on port 3000'}
             </Text>
           </View>
           
@@ -789,7 +793,7 @@ export default function App() {
             {serverType === 'remote' && (
               <TextInput 
                 style={[styles.input, {marginTop: 12}]} 
-                placeholder="IP or domain (e.g., 192.168.1.100)" 
+                placeholder="IP or domain of your server" 
                 placeholderTextColor="#666666"
                 value={remoteIp}
                 onChangeText={setRemoteIp}
