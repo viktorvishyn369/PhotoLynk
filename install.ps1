@@ -10,26 +10,65 @@ Write-Host ""
 Write-Host "[1/5] Checking Node.js..." -ForegroundColor Blue
 if (!(Get-Command node -ErrorAction SilentlyContinue)) {
     Write-Host "⚠  Node.js not found. Installing..." -ForegroundColor Yellow
-    
+
+    # Helper: are we running as Administrator?
+    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
     # Check if winget is available (Windows 10/11)
     if (Get-Command winget -ErrorAction SilentlyContinue) {
+        Write-Host "→ Using winget to install Node.js LTS" -ForegroundColor Blue
         winget install OpenJS.NodeJS.LTS
     }
-    # Check if choco is available
+    # Else, if Chocolatey is already available, use it
     elseif (Get-Command choco -ErrorAction SilentlyContinue) {
+        Write-Host "→ Using Chocolatey to install Node.js LTS" -ForegroundColor Blue
         choco install nodejs-lts -y
     }
-    else {
-        Write-Host "✗ Could not install Node.js automatically (no winget or choco detected)" -ForegroundColor Red
+    # Else, try to install Chocolatey if we are admin
+    elseif ($isAdmin) {
+        Write-Host "→ Chocolatey not found. Installing Chocolatey first..." -ForegroundColor Blue
+        try {
+            Set-ExecutionPolicy Bypass -Scope Process -Force | Out-Null
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+            Write-Host "✓ Chocolatey installed" -ForegroundColor Green
+            # Refresh PATH so choco is available
+            $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+            Write-Host "→ Using Chocolatey to install Node.js LTS" -ForegroundColor Blue
+            choco install nodejs-lts -y
+        } catch {
+            Write-Host "✗ Failed to install Chocolatey automatically" -ForegroundColor Red
+        }
+    }
+    
+    # Final fallback if nothing worked
+    if (!(Get-Command node -ErrorAction SilentlyContinue)) {
+        Write-Host "✗ Could not install Node.js automatically" -ForegroundColor Red
+        if (-not $isAdmin) {
+            Write-Host "This script is not running as Administrator. To let it install Chocolatey + Node.js automatically:" -ForegroundColor Yellow
+            Write-Host "  1) Close this window" -ForegroundColor Yellow
+            Write-Host "  2) Right-click PowerShell and choose 'Run as administrator'" -ForegroundColor Yellow
+            Write-Host "  3) Run the install command again" -ForegroundColor Yellow
+        }
         Write-Host "" 
-        Write-Host "1) Open this link in your browser: https://nodejs.org/" -ForegroundColor Yellow
-        Write-Host "2) Download and install the LTS version of Node.js" -ForegroundColor Yellow
-        Write-Host "3) Close this window, then run this install command again" -ForegroundColor Yellow
+        $nodeUrl = "https://nodejs.org/en/download"
+        Write-Host "Opening Node.js LTS download page in your default browser:" -ForegroundColor Yellow
+        Write-Host "  $nodeUrl" -ForegroundColor Yellow
+        try {
+            Start-Process $nodeUrl
+        } catch {
+            Write-Host "(If the browser did not open, manually visit: $nodeUrl)" -ForegroundColor Yellow
+        }
+        Write-Host "" 
+        Write-Host "In your browser:" -ForegroundColor Yellow
+        Write-Host "  1) Download the Windows LTS installer (.msi)" -ForegroundColor Yellow
+        Write-Host "  2) Run it and complete the setup" -ForegroundColor Yellow
+        Write-Host "  3) Close this window and run this installer command again" -ForegroundColor Yellow
         Write-Host "" 
         Read-Host "Press Enter to close this window"
         exit 1
     }
-    
+
     # Refresh PATH
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
     Write-Host "✓ Node.js installed" -ForegroundColor Green
