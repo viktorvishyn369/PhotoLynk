@@ -198,3 +198,5 @@ server-app/dist/
 server-tray/dist/
 server-tray/node_modules/
 *.idsig
+server/package-lock.json
+server-tray/package-lock.json

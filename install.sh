@@ -87,6 +87,7 @@ echo -e "${GREEN}✓${NC} Downloaded to $INSTALL_DIR"
 echo ""
 echo -e "${BLUE}[3/5]${NC} Installing server dependencies..."
 cd server
+rm -f package-lock.json
 npm install --production
 echo -e "${GREEN}✓${NC} Server dependencies installed"
 
@@ -94,6 +95,7 @@ echo -e "${GREEN}✓${NC} Server dependencies installed"
 echo ""
 echo -e "${BLUE}[4/5]${NC} Installing tray app dependencies..."
 cd ../server-tray
+rm -f package-lock.json
 npm install
 echo -e "${GREEN}✓${NC} Tray app dependencies installed"
 
