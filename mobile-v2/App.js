@@ -817,10 +817,8 @@ export default function App() {
           </View>
           
           <View style={styles.settingsCard}>
-            <Text style={styles.settingsTitle}>📖 Quick Start (on your computer)</Text>
-            <Text style={styles.settingsDescriptionSmall}>
-              Run these commands on your Mac / PC / server. Not on the phone.
-            </Text>
+            <Text style={styles.settingsTitle}>📖 Quick Server Start</Text>
+            <Text style={styles.settingsDescriptionSmall}>(on your computer)</Text>
 
             <Text style={styles.quickStepsTitle}>1. Open Terminal / Command Prompt</Text>
             <Text style={styles.quickStepsText}>
@@ -891,10 +889,6 @@ export default function App() {
         <ScrollView style={styles.content} contentContainerStyle={styles.contentContainer}>
           <View style={styles.settingsCard}>
             <Text style={styles.settingsTitle}>PhotoSync</Text>
-            <Text style={styles.settingsDescription}>
-              Self-hosted photo backup. Your photos stay on your server.
-            </Text>
-            
             {deviceUuid && (
               <TouchableOpacity 
                 style={styles.uuidBox}
