@@ -846,13 +846,13 @@ export default function App() {
 
             <Text style={[styles.quickStepsTitle, { marginTop: 12 }]}>3. Windows Desktop (PowerShell)</Text>
             <Text style={styles.quickStepsText}>
-              Paste this into PowerShell on your computer, then press Enter:
+              Open <Text style={styles.boldText}>PowerShell</Text> (not Command Prompt), paste this line, then press Enter:
             </Text>
             <TouchableOpacity
-              onPress={() => Clipboard.setString('irm https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install.ps1 | iex')}
+              onPress={() => Clipboard.setString('[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-RestMethod https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install.ps1 | Invoke-Expression')}
               style={{ marginTop: 4 }}>
               <Text style={styles.codeLine}>
-                irm https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install.ps1 | iex
+                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-RestMethod https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install.ps1 | Invoke-Expression
               </Text>
               <Text style={styles.codeHint}>Tap to copy</Text>
             </TouchableOpacity>

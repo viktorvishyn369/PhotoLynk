@@ -21,8 +21,9 @@ Secure, private photo backup system. Your photos, your server, your control.
 # macOS / Linux
 curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install.sh | bash
 
-# Windows (PowerShell as Admin)
-irm https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install.ps1 | iex
+# Windows (PowerShell, Windows 10 compatible)
+# Run this inside PowerShell (not Command Prompt):
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-RestMethod https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install.ps1 | Invoke-Expression
 ```
 
 **Tip:** Right-click in Terminal/PowerShell to paste, then press Enter!
