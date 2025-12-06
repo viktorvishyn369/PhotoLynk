@@ -20,9 +20,13 @@ if (!(Get-Command node -ErrorAction SilentlyContinue)) {
         choco install nodejs-lts -y
     }
     else {
-        Write-Host "✗ Could not install Node.js automatically" -ForegroundColor Red
-        Write-Host "Please install Node.js from: https://nodejs.org/" -ForegroundColor Yellow
-        Write-Host "Then run this script again." -ForegroundColor Yellow
+        Write-Host "✗ Could not install Node.js automatically (no winget or choco detected)" -ForegroundColor Red
+        Write-Host "" 
+        Write-Host "1) Open this link in your browser: https://nodejs.org/" -ForegroundColor Yellow
+        Write-Host "2) Download and install the LTS version of Node.js" -ForegroundColor Yellow
+        Write-Host "3) Close this window, then run this install command again" -ForegroundColor Yellow
+        Write-Host "" 
+        Read-Host "Press Enter to close this window"
         exit 1
     }
     
