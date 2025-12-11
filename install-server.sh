@@ -107,7 +107,7 @@ echo ""
 echo -e "${BLUE}[5/6]${NC} Starting PhotoSync service..."
 $SUDO systemctl daemon-reload
 $SUDO systemctl enable photosync
-$SUDO systemctl start photosync
+$SUDO systemctl restart photosync
 echo -e "${GREEN}✓${NC} Service started and enabled"
 
 # Configure firewall
