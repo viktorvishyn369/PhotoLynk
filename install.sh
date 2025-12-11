@@ -172,5 +172,5 @@ echo "Keep this terminal open and connect from your phone using Expo (QR code)."
 echo ""
 
 # Start Expo dev server (foreground so user can see QR code)
-npx expo start --tunnel
+npx expo start
 
