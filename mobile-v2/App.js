@@ -207,6 +207,149 @@ export default function App() {
     }
   };
 
+  const cleanDeviceDuplicates = async () => {
+    setLoading(true);
+    setStatus('Scanning for duplicate photos/videos on this device...');
+
+    try {
+      const permission = await MediaLibrary.requestPermissionsAsync(true);
+      if (permission.status !== 'granted') {
+        Alert.alert('Permission needed', 'We need access to photos to safely scan for duplicates.');
+        setLoading(false);
+        return;
+      }
+
+      const allAssets = await MediaLibrary.getAssetsAsync({
+        first: 10000,
+        mediaType: ['photo', 'video'],
+      });
+
+      if (!allAssets.assets || allAssets.assets.length === 0) {
+        setStatus('No photos or videos found on this device.');
+        Alert.alert('No Media', 'No photos or videos were found on this device.');
+        setLoading(false);
+        return;
+      }
+
+      setStatus(`Analyzing ${allAssets.assets.length} files for duplicates...`);
+
+      const groupsByKey = {};
+
+      for (let i = 0; i < allAssets.assets.length; i++) {
+        const asset = allAssets.assets[i];
+        try {
+          const info = await MediaLibrary.getAssetInfoAsync(asset.id);
+          const filename = (info && info.filename) || asset.filename || 'unknown';
+          const size = info && typeof info.size === 'number' ? info.size : 0;
+          const width = info && typeof info.width === 'number' ? info.width : 0;
+          const height = info && typeof info.height === 'number' ? info.height : 0;
+          const duration = info && typeof info.duration === 'number' ? info.duration : 0;
+          const creationTime = info && info.creationTime ? info.creationTime : asset.creationTime || 0;
+
+          const key = [
+            asset.mediaType || 'unknown',
+            filename.toLowerCase(),
+            `${width}x${height}`,
+            Math.round(duration),
+            size,
+            creationTime ? Math.round(creationTime / 1000) : 0,
+          ].join('|');
+
+          if (!groupsByKey[key]) {
+            groupsByKey[key] = [];
+          }
+          groupsByKey[key].push({ asset, info, filename });
+        } catch (e) {
+          // Skip assets we cannot inspect safely
+          continue;
+        }
+      }
+
+      const duplicateGroups = Object.values(groupsByKey).filter(group => group.length > 1);
+
+      if (duplicateGroups.length === 0) {
+        setStatus('No exact duplicate photos or videos found on this device.');
+        Alert.alert('No Duplicates', 'No exact duplicate photos or videos were found.');
+        setLoading(false);
+        return;
+      }
+
+      let duplicateCount = 0;
+      duplicateGroups.forEach(group => {
+        // We keep one item per group and consider the rest duplicates
+        duplicateCount += (group.length - 1);
+      });
+
+      const summaryMessage = `Found ${duplicateCount} duplicate photo/video item${duplicateCount !== 1 ? 's' : ''} in ${duplicateGroups.length} group${duplicateGroups.length !== 1 ? 's' : ''} on this device.`;
+
+      if (Platform.OS === 'android') {
+        // Safest behavior on Android: report only, no deletion
+        setStatus('Duplicate scan completed (report only on Android).');
+        Alert.alert(
+          'Duplicates Found',
+          summaryMessage + '\n\nOn Android, PhotoSync will not delete files automatically. Please use this information together with your gallery/file manager to clean up duplicates manually.',
+        );
+        setLoading(false);
+        return;
+      }
+
+      // iOS: allow user to move duplicates to Recently Deleted via system Photos
+      Alert.alert(
+        'Clean Duplicates',
+        summaryMessage + '\n\nOn iOS, duplicates will be moved to the system "Recently Deleted" area so they can be recovered for a limited time.',
+        [
+          { text: 'Cancel', style: 'cancel', onPress: () => { setStatus('Duplicate scan cancelled.'); setLoading(false); } },
+          {
+            text: 'Delete Duplicates',
+            style: 'destructive',
+            onPress: async () => {
+              try {
+                setStatus('Deleting duplicate photos/videos (moving to Recently Deleted)...');
+
+                const idsToDelete = [];
+                duplicateGroups.forEach(group => {
+                  // Sort by creationTime so we keep the oldest (index 0)
+                  const sorted = [...group].sort((a, b) => {
+                    const at = a.info && a.info.creationTime ? a.info.creationTime : a.asset.creationTime || 0;
+                    const bt = b.info && b.info.creationTime ? b.info.creationTime : b.asset.creationTime || 0;
+                    return at - bt;
+                  });
+                  for (let i = 1; i < sorted.length; i++) {
+                    idsToDelete.push(sorted[i].asset.id);
+                  }
+                });
+
+                if (idsToDelete.length === 0) {
+                  setStatus('No duplicates selected for deletion.');
+                  setLoading(false);
+                  return;
+                }
+
+                await MediaLibrary.deleteAssetsAsync(idsToDelete);
+                setStatus(`Deleted ${idsToDelete.length} duplicate item${idsToDelete.length !== 1 ? 's' : ''} (moved to Recently Deleted).`);
+                Alert.alert(
+                  'Duplicates Cleaned',
+                  `Deleted ${idsToDelete.length} duplicate item${idsToDelete.length !== 1 ? 's' : ''}. You can still recover them from the Photos app in "Recently Deleted" for a limited time.`,
+                );
+              } catch (deleteError) {
+                console.error('Error deleting duplicates:', deleteError);
+                setStatus('Error while deleting duplicates: ' + (deleteError && deleteError.message ? deleteError.message : 'Unknown error'));
+                Alert.alert('Error', 'Could not delete some duplicates. Please try again or clean manually in the Photos app.');
+              } finally {
+                setLoading(false);
+              }
+            }
+          }
+        ]
+      );
+    } catch (error) {
+      console.error('Duplicate scan error:', error);
+      setStatus('Error during duplicate scan: ' + (error && error.message ? error.message : 'Unknown error'));
+      Alert.alert('Error', 'Could not complete duplicate scan.');
+      setLoading(false);
+    }
+  };
+
   const logout = async () => {
     await SecureStore.deleteItemAsync('auth_token');
     setToken(null);
@@ -1001,11 +1144,22 @@ export default function App() {
             <Text style={styles.cardTitle}>Sync from Cloud</Text>
             <Text style={styles.cardDescription}>Download backed up files to PhotoSync album</Text>
           </TouchableOpacity>
+
+          <TouchableOpacity 
+            onPress={cleanDeviceDuplicates} 
+            disabled={loading}
+            style={[styles.actionCard, styles.cleanupCard, loading && styles.disabledCard]}>
+            <View style={styles.cardIcon}>
+              <Text style={styles.cardIconText}>🧹</Text>
+            </View>
+            <Text style={styles.cardTitle}>Clean Duplicates</Text>
+            <Text style={styles.cardDescription}>Safely find and remove duplicate photos/videos on this device</Text>
+          </TouchableOpacity>
         </View>
       </ScrollView>
     </View>
   );
-}
+  }
 
 const styles = StyleSheet.create({
   container: {
@@ -1178,6 +1332,10 @@ const styles = StyleSheet.create({
   syncCard: {
     backgroundColor: '#0A2A2A',
     borderColor: '#03DAC6',
+  },
+  cleanupCard: {
+    backgroundColor: '#2A240A',
+    borderColor: '#FFB74D',
   },
   disabledCard: {
     opacity: 0.5,

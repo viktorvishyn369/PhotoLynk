@@ -32,6 +32,13 @@ fi
 echo -e "${GREEN}✓${NC} Detected: $PLATFORM"
 echo ""
 
+# Try to load Homebrew into PATH if it is already installed (helps on reruns)
+if [ -x "/opt/homebrew/bin/brew" ]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+elif [ -x "/usr/local/bin/brew" ]; then
+    eval "$(/usr/local/bin/brew shellenv)"
+fi
+
 # Check if Node.js is installed
 echo -e "${BLUE}[1/6]${NC} Checking Node.js..."
 if ! command -v node &> /dev/null; then
@@ -41,10 +48,26 @@ if ! command -v node &> /dev/null; then
         # Install Homebrew if not installed
         if ! command -v brew &> /dev/null; then
             echo -e "${YELLOW}⚠${NC}  Homebrew not found. Installing Homebrew..."
-            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+            if ! /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"; then
+                echo -e "${RED}✗${NC} Homebrew installation failed. Make sure this macOS user is an Administrator, then rerun this installer."
+                exit 1
+            fi
+            if [ -x "/opt/homebrew/bin/brew" ]; then
+                eval "$(/opt/homebrew/bin/brew shellenv)"
+            elif [ -x "/usr/local/bin/brew" ]; then
+                eval "$(/usr/local/bin/brew shellenv)"
+            fi
         fi
         echo -e "${BLUE}→${NC} Using Homebrew to install Node.js"
-        brew install node
+        set +e
+        HOMEBREW_NO_INSTALL_FROM_API=1 brew install node
+        BREW_NODE_EXIT=$?
+        set -e
+        if [ "$BREW_NODE_EXIT" -ne 0 ]; then
+            echo -e "${RED}✗${NC} Could not install Node.js automatically via Homebrew"
+            echo -e "${YELLOW}⚠${NC}  Please install Node.js from: https://nodejs.org/ (LTS recommended), then rerun this script."
+            exit 1
+        fi
     else
         # Linux - try to detect package manager
         if command -v apt-get &> /dev/null; then
