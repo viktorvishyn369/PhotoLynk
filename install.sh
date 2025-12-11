@@ -127,7 +127,7 @@ echo -e "${GREEN}✓${NC} Downloaded to $INSTALL_DIR"
 
 # Install server dependencies
 echo ""
-echo -e "${BLUE}[4/6]${NC} Installing server dependencies..."
+echo -e "${BLUE}[4/7]${NC} Installing server dependencies..."
 cd server
 rm -f package-lock.json
 npm install --production
@@ -135,38 +135,42 @@ echo -e "${GREEN}✓${NC} Server dependencies installed"
 
 # Install tray dependencies
 echo ""
-echo -e "${BLUE}[5/6]${NC} Installing tray app dependencies..."
+echo -e "${BLUE}[5/7]${NC} Installing tray app dependencies..."
 cd ../server-tray
 rm -f package-lock.json
 npm install
 echo -e "${GREEN}✓${NC} Tray app dependencies installed"
 
-# Start the tray app
+# Start the tray app in the background
 echo ""
-echo -e "${BLUE}[6/6]${NC} Starting PhotoSync Server..."
+echo -e "${BLUE}[6/7]${NC} Starting PhotoSync Server tray in background..."
 echo ""
-echo -e "${GREEN}✓${NC} Installation complete!"
-echo ""
-echo -e "${BLUE}═══════════════════════════════════════════════════${NC}"
-echo -e "${GREEN}PhotoSync Server is starting...${NC}"
-echo -e "${BLUE}═══════════════════════════════════════════════════${NC}"
-echo ""
-echo "Look for the PhotoSync icon in your:"
+(npm start &>/dev/null &)
+echo -e "${GREEN}✓${NC} Tray app launched. Look for the PhotoSync icon in your:"
 if [ "$PLATFORM" = "Mac" ]; then
     echo "  • Menu bar (top-right corner)"
 else
     echo "  • System tray"
 fi
+
+# Prepare and start the mobile app (Expo dev server)
 echo ""
-echo "Click the icon to:"
-echo "  • Open files location"
-echo "  • Stop/Start/Restart server"
-echo "  • Quit"
+echo -e "${BLUE}[7/7]${NC} Preparing mobile app and starting Expo dev server..."
+cd ../mobile-v2
+rm -f package-lock.json
+npm install
+echo -e "${GREEN}✓${NC} Mobile app dependencies installed"
+
 echo ""
-echo "Server URL: http://YOUR_LOCAL_IP:3000"
+echo -e "${BLUE}═══════════════════════════════════════════════════${NC}"
+echo -e "${GREEN}All components installed.${NC}"
+echo -e "${BLUE}═══════════════════════════════════════════════════${NC}"
 echo ""
-echo -e "${YELLOW}Note:${NC} Find your local IP with: ifconfig (Mac/Linux) or ipconfig (Windows)"
+echo "The PhotoSync Server tray is running on your computer."
+echo "Now starting the Expo dev server for the mobile app..."
+echo "Keep this terminal open and connect from your phone using Expo (QR code)."
 echo ""
 
-# Start the app
-npm start
+# Start Expo dev server (foreground so user can see QR code)
+npx expo start --tunnel
+
