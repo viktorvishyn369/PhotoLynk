@@ -59,13 +59,24 @@ function patchAppDelegateSwift(contents) {
     }
   );
 
-  // Inject permission prompt trigger + didBecomeActive handler after cachedLaunchOptions assignment (or after bindReactNativeFactory)
+  // Inject permission prompt trigger + didBecomeActive handler after cachedLaunchOptions assignment
   if (!out.includes('searchForServices(ofType: "_http._tcp."')) {
     const anchor = 'cachedLaunchOptions = launchOptions';
     if (out.includes(anchor)) {
       out = out.replace(
         anchor,
-        `${anchor}\n\n    localNetBrowserDelegate = LocalNetworkBrowserDelegate()\n    localNetBrowser = NetServiceBrowser()\n    localNetBrowser?.delegate = localNetBrowserDelegate\n    // Starting a browse triggers the iOS Local Network prompt the first time.\n    localNetBrowser?.searchForServices(ofType: \"_http._tcp.\", inDomain: \"local.\")\n\n    // Start RN once after the app becomes active (after the prompt is dismissed).\n    didBecomeActiveObserver = NotificationCenter.default.addObserver(\n      forName: UIApplication.didBecomeActiveNotification,\n      object: nil,\n      queue: .main\n    ) { [weak self] _ in\n      guard let self = self else { return }\n      self.didBecomeActiveCount += 1\n      if self.didBecomeActiveCount < 2 { return }\n      if self.didStartReactNativeAfterBecomeActive { return }\n      self.didStartReactNativeAfterBecomeActive = true\n\n      self.localNetBrowser?.stop()\n      self.localNetBrowser = nil\n      self.localNetBrowserDelegate = nil\n\n      DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {\n        guard let window = self.window else { return }\n        guard let factory = self.reactNativeFactory else { return }\n        factory.startReactNative(\n          withModuleName: \"main\",\n          in: window,\n          launchOptions: self.cachedLaunchOptions)\n      }\n    }`
+        `${anchor}\n\n    // PhotoSyncLocalNetworkPromptPatch\n    // Show the native splash while waiting, so first launch isn't a black screen.
+    if let window = window {
+      let splashVC: UIViewController? = nil
+      let storyboard = UIStoryboard(name: \"SplashScreen\", bundle: nil)
+      splashVC = storyboard.instantiateInitialViewController()
+      window.rootViewController = splashVC ?? UIViewController()
+      window.makeKeyAndVisible()
+    }
+
+    localNetBrowserDelegate = LocalNetworkBrowserDelegate()\n    localNetBrowser = NetServiceBrowser()\n    localNetBrowser?.delegate = localNetBrowserDelegate\n    // Starting a browse triggers the iOS Local Network prompt the first time.\n    localNetBrowser?.searchForServices(ofType: \"_http._tcp.\", inDomain: \"local.\")\n\n    // Start RN once after the app becomes active (after any system permission prompts).
+    // Do NOT require a 2nd activation: if permission was already granted, we still need to start.
+    didBecomeActiveObserver = NotificationCenter.default.addObserver(\n      forName: UIApplication.didBecomeActiveNotification,\n      object: nil,\n      queue: .main\n    ) { [weak self] _ in\n      guard let self = self else { return }\n      if self.didStartReactNativeAfterBecomeActive { return }\n      self.didStartReactNativeAfterBecomeActive = true\n\n      self.localNetBrowser?.stop()\n      self.localNetBrowser = nil\n      self.localNetBrowserDelegate = nil\n\n      DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {\n        guard let window = self.window else { return }\n        guard let factory = self.reactNativeFactory else { return }\n        factory.startReactNative(\n          withModuleName: \"main\",\n          in: window,\n          launchOptions: self.cachedLaunchOptions)\n      }\n    }`
       );
     }
   }
