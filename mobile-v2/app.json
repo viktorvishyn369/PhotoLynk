@@ -23,6 +23,11 @@
       "infoPlist": {
         "NSPhotoLibraryUsageDescription": "PhotoSync needs access to your photos to back them up to your secure private cloud.",
         "NSPhotoLibraryAddUsageDescription": "PhotoSync needs permission to save restored photos to your library.",
+        "NSLocalNetworkUsageDescription": "PhotoSync needs access to your local network to connect to your PhotoSync server and the development bundler.",
+        "NSBonjourServices": [
+          "_expo._tcp",
+          "_http._tcp"
+        ],
         "ITSAppUsesNonExemptEncryption": false
       }
     },
