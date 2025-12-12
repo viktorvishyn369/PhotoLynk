@@ -32,6 +32,40 @@ fi
 echo -e "${GREEN}✓${NC} Detected: $PLATFORM"
 echo ""
 
+# Headless/non-interactive mode:
+# - Default is non-interactive (best for one-line installers)
+# - Set PHOTOSYNC_INTERACTIVE=1 to enable tray UI and interactive prompts
+# - Set PHOTOSYNC_HEADLESS=1 to force headless behavior
+INTERACTIVE="${PHOTOSYNC_INTERACTIVE:-0}"
+HEADLESS="${PHOTOSYNC_HEADLESS:-0}"
+
+# Non-interactive implies headless on Linux (since tray UI won't work there in headless)
+if [ "$INTERACTIVE" != "1" ] && [ "$PLATFORM" = "Linux" ]; then
+    HEADLESS="1"
+fi
+
+if [ "${PHOTOSYNC_NONINTERACTIVE:-0}" = "1" ]; then
+    HEADLESS="1"
+fi
+
+# On Linux, if no display is available, auto-enable headless
+if [ "$PLATFORM" = "Linux" ] && [ "$HEADLESS" != "1" ]; then
+    if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ]; then
+        HEADLESS="1"
+    fi
+fi
+
+if [ "$HEADLESS" = "1" ]; then
+    echo -e "${YELLOW}⚠${NC}  Headless mode enabled (no tray UI / no Expo auto-start)"
+    echo ""
+fi
+
+# Reduce interactive prompts where possible
+export GIT_TERMINAL_PROMPT=0
+if [ "$PLATFORM" = "Mac" ]; then
+    export NONINTERACTIVE=1
+fi
+
 # Try to load Homebrew into PATH if it is already installed (helps on reruns)
 if [ -x "/opt/homebrew/bin/brew" ]; then
     eval "$(/opt/homebrew/bin/brew shellenv)"
@@ -141,7 +175,7 @@ if [ -d "$INSTALL_DIR" ]; then
     # Discard any local changes (including generated lockfiles) so updates are reliable
     git reset --hard HEAD >/dev/null 2>&1 || true
     git clean -fd >/dev/null 2>&1 || true
-    git pull
+    git pull || true
 else
     git clone https://github.com/viktorvishyn369/PhotoSync.git "$INSTALL_DIR"
     cd "$INSTALL_DIR"
@@ -159,19 +193,33 @@ echo -e "${GREEN}✓${NC} Server dependencies installed"
 echo ""
 echo -e "${BLUE}[5/7]${NC} Installing tray app dependencies..."
 cd ../server-tray
-npm install
-echo -e "${GREEN}✓${NC} Tray app dependencies installed"
+
+if [ "$HEADLESS" = "1" ]; then
+    echo -e "${YELLOW}⚠${NC}  Headless mode: skipping tray app install"
+else
+    npm install
+    echo -e "${GREEN}✓${NC} Tray app dependencies installed"
+fi
 
 # Start the tray app in the background
 echo ""
 echo -e "${BLUE}[6/7]${NC} Starting PhotoSync Server tray in background..."
 echo ""
-(npm start &>/dev/null &)
-echo -e "${GREEN}✓${NC} Tray app launched. Look for the PhotoSync icon in your:"
-if [ "$PLATFORM" = "Mac" ]; then
-    echo "  • Menu bar (top-right corner)"
+
+if [ "$HEADLESS" = "1" ]; then
+    echo -e "${BLUE}→${NC} Starting server in background (headless)"
+    cd ../server
+    (nohup node server.js >/dev/null 2>&1 &)
+    echo -e "${GREEN}✓${NC} Server started"
+    cd ../server-tray
 else
-    echo "  • System tray"
+    (npm start &>/dev/null &)
+    echo -e "${GREEN}✓${NC} Tray app launched. Look for the PhotoSync icon in your:"
+    if [ "$PLATFORM" = "Mac" ]; then
+        echo "  • Menu bar (top-right corner)"
+    else
+        echo "  • System tray"
+    fi
 fi
 
 # Prepare and start the mobile app (Expo dev server)
@@ -191,8 +239,42 @@ echo "Now starting the Expo dev server for the mobile app..."
 echo "Keep this terminal open and connect from your phone using Expo (QR code)."
 echo ""
 
+START_EXPO="${PHOTOSYNC_START_EXPO:-}"
+if [ "$HEADLESS" = "1" ] && [ "$START_EXPO" != "1" ]; then
+    echo -e "${YELLOW}⚠${NC}  Headless mode: skipping Expo dev server auto-start"
+    echo -e "${BLUE}→${NC} To start Expo later: cd $INSTALL_DIR/mobile-v2 && npx expo start --dev-client --clear"
+    exit 0
+fi
+
 # Start Expo dev server (foreground so user can see QR code)
 PORT=8081
+kill_listeners_on_port() {
+    _port="$1"
+    if command -v lsof &> /dev/null; then
+        pids=$(lsof -tiTCP:"$_port" -sTCP:LISTEN 2>/dev/null || true)
+        if [ -n "$pids" ]; then
+            echo -e "${YELLOW}⚠${NC}  Port $_port is in use. Stopping existing process(es): $pids"
+            kill $pids 2>/dev/null || true
+            sleep 1
+            still=$(lsof -tiTCP:"$_port" -sTCP:LISTEN 2>/dev/null || true)
+            if [ -n "$still" ]; then
+                kill -9 $still 2>/dev/null || true
+            fi
+        fi
+    elif command -v fuser &> /dev/null; then
+        pids=$(fuser -n tcp "$_port" 2>/dev/null | tr -s ' ' | sed 's/^ //g' || true)
+        if [ -n "$pids" ]; then
+            echo -e "${YELLOW}⚠${NC}  Port $_port is in use. Stopping existing process(es): $pids"
+            kill $pids 2>/dev/null || true
+            sleep 1
+            fuser -k -n tcp "$_port" 2>/dev/null || true
+        fi
+    fi
+}
+
+kill_listeners_on_port 8081
+kill_listeners_on_port 8082
+
 if command -v lsof &> /dev/null; then
     if lsof -tiTCP:$PORT -sTCP:LISTEN &> /dev/null; then
         PORT=8082

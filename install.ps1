@@ -6,6 +6,34 @@ Write-Host "║           PhotoSync Server - Installer            ║" -Foregrou
 Write-Host "╚════════════════════════════════════════════════════╝" -ForegroundColor Blue
 Write-Host ""
 
+# Headless/non-interactive mode:
+# - Default is non-interactive (best for one-line installers)
+# - Set PHOTOSYNC_INTERACTIVE=1 to allow tray UI and Read-Host pauses
+$interactive = $env:PHOTOSYNC_INTERACTIVE -eq "1"
+$headless = -not $interactive
+if ($headless) {
+    Write-Host "⚠  Headless mode enabled (no tray UI)" -ForegroundColor Yellow
+    Write-Host ""
+}
+
+function Stop-PortListeners {
+    param([int]$Port)
+    try {
+        $conns = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue
+        if ($conns) {
+            $pids = $conns | Select-Object -ExpandProperty OwningProcess -Unique
+            foreach ($pid in $pids) {
+                if ($pid -and $pid -ne 0) {
+                    Write-Host "⚠  Port $Port is in use. Stopping process $pid" -ForegroundColor Yellow
+                    Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+    } catch {
+        # ignore
+    }
+}
+
 # Allow this process to run npm.ps1 and other helper scripts without changing system-wide policy
 try {
     Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction SilentlyContinue
@@ -24,7 +52,7 @@ if (!(Get-Command node -ErrorAction SilentlyContinue)) {
     # Check if winget is available (Windows 10/11)
     if (Get-Command winget -ErrorAction SilentlyContinue) {
         Write-Host "→ Using winget to install Node.js LTS" -ForegroundColor Blue
-        winget install OpenJS.NodeJS.LTS
+        winget install OpenJS.NodeJS.LTS --accept-package-agreements --accept-source-agreements
     }
     # Else, if Chocolatey is already available, use it
     elseif (Get-Command choco -ErrorAction SilentlyContinue) {
@@ -79,7 +107,7 @@ if (!(Get-Command node -ErrorAction SilentlyContinue)) {
         Write-Host "  2) Run it and complete the setup" -ForegroundColor Yellow
         Write-Host "  3) Close this window and run this installer command again" -ForegroundColor Yellow
         Write-Host "" 
-        Read-Host "Press Enter to close this window"
+        if ($interactive) { Read-Host "Press Enter to close this window" }
         exit 1
     }
 
@@ -101,7 +129,7 @@ if (!(Get-Command git -ErrorAction SilentlyContinue)) {
 
     if (Get-Command winget -ErrorAction SilentlyContinue) {
         Write-Host "→ Using winget to install Git" -ForegroundColor Blue
-        winget install Git.Git
+        winget install Git.Git --accept-package-agreements --accept-source-agreements
         $gitInstalled = (Get-Command git -ErrorAction SilentlyContinue) -ne $null
     }
     elseif (Get-Command choco -ErrorAction SilentlyContinue) {
@@ -133,7 +161,7 @@ if (!(Get-Command git -ErrorAction SilentlyContinue)) {
         Write-Host "  2) Accept the defaults to add Git to PATH" -ForegroundColor Yellow
         Write-Host "  3) Close this window and run this installer command again" -ForegroundColor Yellow
         Write-Host "" 
-        Read-Host "Press Enter to close this window"
+        if ($interactive) { Read-Host "Press Enter to close this window" }
         exit 1
     }
     
@@ -161,7 +189,7 @@ if (Test-Path $installDir) {
         Write-Host "   Error: $($_.Exception.Message)" -ForegroundColor Red
         Write-Host "" 
         Write-Host "Please check that this machine can reach https://github.com in a browser and that DNS/network are working, then run this installer again." -ForegroundColor Yellow
-        Read-Host "Press Enter to close this window"
+        if ($interactive) { Read-Host "Press Enter to close this window" }
         exit 1
     }
     Set-Location $installDir
@@ -180,10 +208,19 @@ Write-Host "✓ Server dependencies installed" -ForegroundColor Green
 Write-Host ""
 Write-Host "[5/5] Installing tray app dependencies..." -ForegroundColor Blue
 Set-Location ..\server-tray
-cmd /c "npm install"
-Write-Host "✓ Tray app dependencies installed" -ForegroundColor Green
 
-# Start the tray app
+if ($headless) {
+    Write-Host "⚠  Headless mode: skipping tray app install" -ForegroundColor Yellow
+} else {
+    cmd /c "npm install"
+    Write-Host "✓ Tray app dependencies installed" -ForegroundColor Green
+}
+
+# Free Expo ports (prevents Metro conflicts if user starts Expo later)
+Stop-PortListeners -Port 8081
+Stop-PortListeners -Port 8082
+
+# Start the tray app (or server headless)
 Write-Host ""
 Write-Host "✓ Installation complete!" -ForegroundColor Green
 Write-Host ""
@@ -216,10 +253,17 @@ Write-Host ""
 Write-Host "Note: Find your local IP with: ipconfig" -ForegroundColor Yellow
 Write-Host ""
 
-# Start the app via cmd so execution policy on npm.ps1 is irrelevant
-cmd /c "npm start"
+if ($headless) {
+    Write-Host "→ Starting server headlessly..." -ForegroundColor Blue
+    Start-Process -FilePath "node" -ArgumentList "server.js" -WorkingDirectory "$installDir\server" -WindowStyle Hidden
+    Write-Host "✓ Server started (headless)" -ForegroundColor Green
+    exit 0
+} else {
+    # Start the tray app via cmd so execution policy on npm.ps1 is irrelevant
+    cmd /c "npm start"
 
-# Keep window open so user can read any errors
-Write-Host "" 
-Write-Host "Installation script finished. If you saw any errors above, please screenshot or copy them before closing." -ForegroundColor Yellow
-Read-Host "Press Enter to close this window"
+    # Keep window open so user can read any errors
+    Write-Host "" 
+    Write-Host "Installation script finished. If you saw any errors above, please screenshot or copy them before closing." -ForegroundColor Yellow
+    if ($interactive) { Read-Host "Press Enter to close this window" }
+}
