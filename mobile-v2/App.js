@@ -244,10 +244,19 @@ export default function App() {
         return;
       }
 
-      const allAssets = await MediaLibrary.getAssetsAsync({
-        first: 10000,
-        mediaType: ['photo', 'video'],
-      });
+      // iOS can return 0 assets immediately after the user grants permission.
+      // Retry a few times with a short delay to allow the permission state to propagate.
+      let allAssets = { assets: [] };
+      for (let attempt = 0; attempt < 3; attempt++) {
+        allAssets = await MediaLibrary.getAssetsAsync({
+          first: 10000,
+          mediaType: ['photo', 'video'],
+        });
+        if (allAssets && allAssets.assets && allAssets.assets.length > 0) break;
+        if (attempt < 2) {
+          await new Promise(r => setTimeout(r, 400));
+        }
+      }
 
       if (!allAssets.assets || allAssets.assets.length === 0) {
         setStatus('No photos or videos found on this device.');
