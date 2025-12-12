@@ -119,8 +119,8 @@ export default function App() {
 
     if (serverType === 'remote') {
       const host = normalizeHostInput(remoteHost);
-      // Remote always uses HTTPS.
-      return host ? `https://${host}` : 'https://localhost';
+      // Remote uses HTTPS with the same :3000 port convention as Local.
+      return host ? `https://${host}:${PORT}` : `https://localhost:${PORT}`;
     }
 
     // Local always uses HTTP on :3000 and expects a LAN IP/host.
@@ -1007,7 +1007,7 @@ export default function App() {
                   onChangeText={(t) => setRemoteHost(normalizeHostInput(t))}
                   autoCapitalize="none"
                 />
-                <Text style={styles.inputHint}>Example: myserver.com or 23.198.9.123 (HTTPS is used automatically)</Text>
+                <Text style={styles.inputHint}>Example: myserver.com or 23.198.9.123 (HTTPS + port 3000 is used automatically)</Text>
               </>
             )}
 
@@ -1028,7 +1028,7 @@ export default function App() {
             <Text style={styles.serverHint}>
               {serverType === 'local'
                 ? '📡 Using local network (http://<your-computer-ip>:3000)'
-                : '🌐 Using remote server (https://<domain-or-ip>)'}
+                : '🌐 Using remote server (https://<domain-or-ip>:3000)'}
             </Text>
 
             <TouchableOpacity
