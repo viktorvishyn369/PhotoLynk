@@ -1237,10 +1237,10 @@ export default function App() {
             disabled={loading}
             style={[styles.actionCard, styles.cleanupCard, loading && styles.disabledCard]}>
             <View style={styles.cardIcon}>
-              <Text style={styles.cardIconText}>🧹</Text>
+              <Text style={styles.cardIconText}> </Text>
             </View>
             <Text style={styles.cardTitle}>Clean Duplicates</Text>
-            <Text style={styles.cardDescription}>Safely find and remove duplicate photos/videos on this device</Text>
+            <Text style={styles.cardDescription}>Find and remove duplicate photos/videos on this device</Text>
           </TouchableOpacity>
         </View>
       </ScrollView>
