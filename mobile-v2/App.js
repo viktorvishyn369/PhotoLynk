@@ -387,25 +387,13 @@ export default function App() {
       if (duplicateGroups.length === 0) {
         const noteParts = [];
         noteParts.push(`Hashed ${hashedCount} item${hashedCount !== 1 ? 's' : ''}.`);
-        if (hashSkipped > 0) {
-          noteParts.push(`Note: ${hashSkipped} item${hashSkipped !== 1 ? 's were' : ' was'} skipped because the file content could not be read (iCloud/unsupported URI/permissions).`);
-        }
-        if (skippedPhUri > 0) {
-          noteParts.push(`iOS ph:// assets (often iCloud/Optimize Storage): ${skippedPhUri}`);
-        }
-        if (skippedNoUri > 0) {
-          noteParts.push(`Assets with no URI provided: ${skippedNoUri}`);
-        }
-        if (hashFailed > 0) {
-          noteParts.push(`Hash failures: ${hashFailed}`);
-        }
-        if (inspectFailed > 0) {
-          noteParts.push(`${inspectFailed} item${inspectFailed !== 1 ? 's were' : ' was'} skipped because asset info could not be read.`);
-        }
+        if (hashSkipped > 0) noteParts.push(`Skipped: ${hashSkipped}`);
+        if (hashFailed > 0) noteParts.push(`Hash failures: ${hashFailed}`);
+        if (inspectFailed > 0) noteParts.push(`Asset-info failures: ${inspectFailed}`);
         if (sampleSkipped.length > 0) {
-          noteParts.push('Examples:');
-          sampleSkipped.forEach(s => {
-            noteParts.push(`- ${s.filename} (${s.reason}) ${s.uri ? '[' + s.uri + ']' : ''}`);
+          noteParts.push('Examples (max 3):');
+          sampleSkipped.slice(0, 3).forEach(s => {
+            noteParts.push(`- ${s.filename}${s.reason ? ' — ' + s.reason : ''}`);
           });
         }
         const note = noteParts.length > 0 ? `\n\n${noteParts.join('\n')}` : '';
@@ -423,21 +411,9 @@ export default function App() {
 
       const skippedParts = [];
       skippedParts.push(`Hashed ${hashedCount} item${hashedCount !== 1 ? 's' : ''}.`);
-      if (hashSkipped > 0) {
-        skippedParts.push(`Skipped ${hashSkipped} item${hashSkipped !== 1 ? 's' : ''} (cannot read file bytes: iCloud/unsupported URI/permissions).`);
-      }
-      if (skippedPhUri > 0) {
-        skippedParts.push(`ph:// assets skipped: ${skippedPhUri} (often iCloud/Optimize Storage)`);
-      }
-      if (skippedNoUri > 0) {
-        skippedParts.push(`No-URI assets skipped: ${skippedNoUri}`);
-      }
-      if (hashFailed > 0) {
-        skippedParts.push(`Hash failures: ${hashFailed}`);
-      }
-      if (inspectFailed > 0) {
-        skippedParts.push(`Skipped ${inspectFailed} item${inspectFailed !== 1 ? 's' : ''} (could not read asset info).`);
-      }
+      if (hashSkipped > 0) skippedParts.push(`Skipped: ${hashSkipped}`);
+      if (hashFailed > 0) skippedParts.push(`Hash failures: ${hashFailed}`);
+      if (inspectFailed > 0) skippedParts.push(`Asset-info failures: ${inspectFailed}`);
       const skippedNote = skippedParts.length > 0 ? `\n\n${skippedParts.join('\n')}` : '';
       const summaryMessage = `Found ${duplicateCount} duplicate photo/video item${duplicateCount !== 1 ? 's' : ''} in ${duplicateGroups.length} group${duplicateGroups.length !== 1 ? 's' : ''} on this device.\n\nWe will keep the oldest item in each group and delete the newer duplicates.` + skippedNote;
 
