@@ -533,7 +533,7 @@ export default function App() {
     } catch (error) {
       console.error('Duplicate scan error:', error);
       setStatus('Error during duplicate scan: ' + (error && error.message ? error.message : 'Unknown error'));
-      Alert.alert('Error', 'Could not complete duplicate scan.');
+      Alert.alert('Duplicate Scan Error', (error && error.message) ? error.message : 'Could not complete duplicate scan.');
       setLoading(false);
     }
   };
