@@ -93,6 +93,9 @@ export default function App() {
 
     // Strip query/hash leftovers if any
     cleaned = cleaned.split('?')[0].split('#')[0];
+
+    // Host-only input: drop any :port, app will add ports automatically where needed.
+    cleaned = cleaned.includes(':') ? cleaned.split(':')[0] : cleaned;
     return cleaned;
   };
 
@@ -101,15 +104,13 @@ export default function App() {
 
     if (serverType === 'remote') {
       const host = normalizeHostInput(remoteHost);
-      // Remote always uses HTTPS. Allow optional custom port if user includes it.
+      // Remote always uses HTTPS.
       return host ? `https://${host}` : 'https://localhost';
     }
 
     // Local always uses HTTP on :3000 and expects a LAN IP/host.
     const host = normalizeHostInput(localHost) || 'localhost';
-    // If user accidentally includes a port for local, drop it (we hardcode :3000).
-    const hostOnly = host.includes(':') ? host.split(':')[0] : host;
-    return `http://${hostOnly}:${PORT}`;
+    return `http://${host}:${PORT}`;
   };
 
   const checkLogin = async () => {
@@ -988,10 +989,10 @@ export default function App() {
                   placeholder="Enter remote domain or IP" 
                   placeholderTextColor="#666666"
                   value={remoteHost}
-                  onChangeText={setRemoteHost}
+                  onChangeText={(t) => setRemoteHost(normalizeHostInput(t))}
                   autoCapitalize="none"
                 />
-                <Text style={styles.inputHint}>Example: myserver.com (HTTPS is used automatically)</Text>
+                <Text style={styles.inputHint}>Example: myserver.com or 23.198.9.123 (HTTPS is used automatically)</Text>
               </>
             )}
 
@@ -1002,7 +1003,7 @@ export default function App() {
                   placeholder="Enter local server IP" 
                   placeholderTextColor="#666666"
                   value={localHost}
-                  onChangeText={setLocalHost}
+                  onChangeText={(t) => setLocalHost(normalizeHostInput(t))}
                   autoCapitalize="none"
                 />
                 <Text style={styles.inputHint}>Example: 192.168.1.222 (port 3000 is used automatically)</Text>
@@ -1106,7 +1107,7 @@ export default function App() {
                 placeholder="IP or domain of your server" 
                 placeholderTextColor="#666666"
                 value={remoteHost}
-                onChangeText={setRemoteHost}
+                onChangeText={(t) => setRemoteHost(normalizeHostInput(t))}
                 autoCapitalize="none"
               />
             )}
@@ -1117,7 +1118,7 @@ export default function App() {
                 placeholder="Local server IP" 
                 placeholderTextColor="#666666"
                 value={localHost}
-                onChangeText={setLocalHost}
+                onChangeText={(t) => setLocalHost(normalizeHostInput(t))}
                 autoCapitalize="none"
               />
             )}
