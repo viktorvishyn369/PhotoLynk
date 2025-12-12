@@ -322,7 +322,9 @@ export default function App() {
               setStatus(`Hashing files... ${hashedCount} checked`);
             }
 
-            const key = `${asset.mediaType || 'unknown'}|${hashHex}`;
+            // Group duplicates by exact content (SHA-256) regardless of filename/date.
+            // We intentionally do NOT include filename/creationTime in the grouping key.
+            const key = hashHex;
             if (!hashGroups[key]) hashGroups[key] = [];
             hashGroups[key].push({ asset, info });
           } catch (e) {
@@ -363,7 +365,7 @@ export default function App() {
         skippedParts.push(`Skipped ${inspectSkipped} item${inspectSkipped !== 1 ? 's' : ''} (could not read file size/metadata).`);
       }
       const skippedNote = skippedParts.length > 0 ? `\n\n${skippedParts.join('\n')}` : '';
-      const summaryMessage = `Found ${duplicateCount} duplicate photo/video item${duplicateCount !== 1 ? 's' : ''} in ${duplicateGroups.length} group${duplicateGroups.length !== 1 ? 's' : ''} on this device.` + skippedNote;
+      const summaryMessage = `Found ${duplicateCount} duplicate photo/video item${duplicateCount !== 1 ? 's' : ''} in ${duplicateGroups.length} group${duplicateGroups.length !== 1 ? 's' : ''} on this device.\n\nWe will keep the oldest item in each group and delete the newer duplicates.` + skippedNote;
 
       const confirmDeletion = (platformMessage) => {
         Alert.alert(
@@ -380,7 +382,7 @@ export default function App() {
 
                   const idsToDelete = [];
                   duplicateGroups.forEach(group => {
-                    // Sort by creationTime so we keep the oldest (index 0)
+                    // Sort by creationTime so we keep the oldest (index 0) and delete newer duplicates
                     const sorted = [...group].sort((a, b) => {
                       const at = a.info && a.info.creationTime ? a.info.creationTime : a.asset.creationTime || 0;
                       const bt = b.info && b.info.creationTime ? b.info.creationTime : b.asset.creationTime || 0;
