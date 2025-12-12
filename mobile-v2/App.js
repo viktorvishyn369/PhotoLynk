@@ -1293,7 +1293,7 @@ export default function App() {
           <View style={styles.statusHeader}>
             <Text style={styles.statusLabel}>STATUS</Text>
           </View>
-          <Text style={styles.statusText} numberOfLines={2} ellipsizeMode="tail">{status}</Text>
+          <Text style={styles.statusText} numberOfLines={1} ellipsizeMode="tail">{status}</Text>
           {progress > 0 && progress < 1 && (
             <View style={styles.progressBar}>
               <View style={[styles.progressFill, { width: `${progress * 100}%` }]} />
