@@ -1293,7 +1293,7 @@ export default function App() {
           <View style={styles.statusHeader}>
             <Text style={styles.statusLabel}>STATUS</Text>
           </View>
-          <Text style={styles.statusText}>{status}</Text>
+          <Text style={styles.statusText} numberOfLines={2} ellipsizeMode="tail">{status}</Text>
           {progress > 0 && progress < 1 && (
             <View style={styles.progressBar}>
               <View style={[styles.progressFill, { width: `${progress * 100}%` }]} />
@@ -1488,6 +1488,7 @@ const styles = StyleSheet.create({
   statusText: {
     color: '#FFFFFF',
     fontSize: 16,
+    lineHeight: 20,
   },
   progressBar: {
     height: 4,
