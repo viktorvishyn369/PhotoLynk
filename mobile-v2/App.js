@@ -46,79 +46,32 @@ export default function App() {
     }
   };
 
-  const getDeviceUUID = async (userEmail = null, userPassword = null) => {
-    // Get hardware device ID (IMEI equivalent)
+  const getDeviceUUID = async (userEmail = null) => {
+    // NOTE:
+    // - We cannot access true IMEI in Expo/React Native.
+    // - On iOS we use idForVendor; on Android we use androidId.
+    // - To stay consistent across reinstalls, UUID must be derived, not stored in app storage.
+    if (!userEmail) return null;
+
     let hardwareId = '';
     try {
       if (Platform.OS === 'android') {
         hardwareId = Application.androidId || '';
-        console.log('Android ID:', hardwareId);
       } else if (Platform.OS === 'ios') {
-        console.log('Getting iOS vendor ID...');
-        hardwareId = await Application.getIosIdForVendorAsync() || '';
-        console.log('iOS vendor ID:', hardwareId);
+        hardwareId = (await Application.getIosIdForVendorAsync()) || '';
       }
     } catch (error) {
-      console.error('Error getting hardware ID:', error);
-      hardwareId = 'fallback-' + Math.random().toString(36).substring(7);
+      console.error('Error getting device identifier:', error);
+      hardwareId = '';
     }
-    
-    // If we have email and hardware ID, use deterministic UUID
-    if (userEmail && hardwareId) {
-      console.log('Creating storage key for:', userEmail);
-      // Create storage key based on email+hardware (hash to avoid length limits)
-      const keyString = `${userEmail}_${hardwareId}`;
-      const storageKey = `uuid_${uuidv5(keyString, '6ba7b810-9dad-11d1-80b4-00c04fd430c8')}`;
-      console.log('Storage key (hashed):', storageKey);
-      
-      // Check if we already have UUID for this user+device combination
-      console.log('Checking for existing UUID...');
-      let existingUuid = null;
-      try {
-        existingUuid = await SecureStore.getItemAsync(storageKey);
-        console.log('Existing UUID:', existingUuid);
-      } catch (error) {
-        console.error('Error reading from SecureStore:', error);
-      }
-      
-      if (existingUuid) {
-        console.log('Using existing UUID for', userEmail, ':', existingUuid);
-        return existingUuid;
-      }
-      
-      // Generate new deterministic UUID from email+password+hardwareId
-      if (userPassword) {
-        console.log('Generating new UUID with uuidv5...');
-        const namespace = '6ba7b810-9dad-11d1-80b4-00c04fd430c8'; // Standard UUID namespace
-        const combinedString = `${userEmail}:${userPassword}:${hardwareId}`;
-        const uuid = uuidv5(combinedString, namespace);
-        console.log('UUID generated:', uuid);
-        
-        // Store with user+device specific key
-        console.log('Storing UUID in SecureStore...');
-        await SecureStore.setItemAsync(storageKey, uuid);
-        console.log('UUID stored successfully');
-        console.log('Generated new deterministic UUID for', userEmail, ':', uuid);
-        return uuid;
-      }
 
-      // If we have an email but no stored UUID and no password to deterministically
-      // regenerate it, we MUST NOT create a new random UUID. Doing so would break
-      // the server's token<->device binding and cause 403 errors.
+    if (!hardwareId) {
+      // If we can't get a stable device identifier, we cannot guarantee a stable UUID.
       return null;
     }
-    
-    // Fallback: check generic device_uuid key
-    let existingUuid = await SecureStore.getItemAsync('device_uuid');
-    if (existingUuid) {
-      return existingUuid;
-    }
-    
-    // Last resort: generate random UUID
-    const uuid = uuidv4();
-    await SecureStore.setItemAsync('device_uuid', uuid);
-    console.log('Generated new random UUID:', uuid);
-    return uuid;
+
+    const namespace = '6ba7b810-9dad-11d1-80b4-00c04fd430c8';
+    return uuidv5(`${userEmail}:${hardwareId}`, namespace);
   };
 
   const getServerUrl = () => {
@@ -174,7 +127,7 @@ export default function App() {
     console.log('Email:', email, 'Password:', password ? '***' : 'empty');
     
     if (!email || !password) {
-      Alert.alert('Error', 'Please enter email and password');
+      Alert.alert('Error', 'Please fill in all fields');
       return;
     }
     
@@ -186,24 +139,29 @@ export default function App() {
         await SecureStore.setItemAsync('remote_ip', remoteIp);
       }
       
-      // Generate deterministic UUID based on email+password+hardware ID
-      console.log('Generating UUID...');
-      const deviceId = await getDeviceUUID(email, password);
-      console.log('UUID generated:', deviceId);
-      setDeviceUuid(deviceId); // Update state with new UUID
+      // Device UUID must be stable across reinstalls, so we derive it from email + device identifier
+      // (not from app storage and not from password).
+      const deviceId = await getDeviceUUID(email);
+      if (!deviceId) {
+        Alert.alert('Device ID unavailable', 'Could not read a stable device identifier for this phone. Please try again, or restart the app.');
+        setLoading(false);
+        return;
+      }
+      setDeviceUuid(deviceId);
       const endpoint = type === 'register' ? '/api/register' : '/api/login';
-      const SERVER_URL = getServerUrl();
-      
-      const payload = {
-        email, 
+      const res = await axios.post(getServerUrl() + endpoint, {
+        email,
         password,
-        device_uuid: deviceId,
+        deviceUuid: deviceId,
         device_name: Platform.OS + ' ' + Platform.Version
-      };
+      });
 
-      console.log('Attempting auth:', type, `${SERVER_URL}${endpoint}`, payload);
-
-      const res = await axios.post(`${SERVER_URL}${endpoint}`, payload, { timeout: 5000 });
+      console.log('Attempting auth:', type, `${getServerUrl()}${endpoint}`, {
+        email,
+        password,
+        deviceUuid: deviceId,
+        device_name: Platform.OS + ' ' + Platform.Version
+      });
       console.log('Auth response:', res.status);
 
       if (type === 'login') {
