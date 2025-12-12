@@ -29,6 +29,7 @@ const FORCE_HTTPS_REDIRECT = String(process.env.FORCE_HTTPS_REDIRECT || '').toLo
 const os = require('os');
 const HOME_DIR = os.homedir();
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(HOME_DIR, 'PhotoSync', 'server', 'uploads');
+const CLOUD_DIR = process.env.CLOUD_DIR || path.join(HOME_DIR, 'PhotoSync', 'server', 'cloud');
 
 // Security & Middleware
 app.use(helmet()); // Sets various HTTP headers for security
@@ -81,6 +82,11 @@ if (!fs.existsSync(PHOTOSYNC_DIR)) {
 // Ensure upload directory exists
 if (!fs.existsSync(UPLOAD_DIR)) {
     fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+}
+
+// Ensure cloud directory exists
+if (!fs.existsSync(CLOUD_DIR)) {
+    fs.mkdirSync(CLOUD_DIR, { recursive: true });
 }
 
 // Database Setup
@@ -190,7 +196,28 @@ const storage = multer.diskStorage({
         cb(null, file.originalname); 
     }
 });
+
 const upload = multer({ storage: storage });
+
+// Cloud chunk storage (encrypted blobs): keep server blind
+const cloudStorage = multer.diskStorage({
+    destination: (req, file, cb) => {
+        const userDir = path.join(CLOUD_DIR, 'users', String(req.user.id));
+        const chunksDir = path.join(userDir, 'chunks');
+        if (!fs.existsSync(chunksDir)) {
+            fs.mkdirSync(chunksDir, { recursive: true });
+        }
+        cb(null, chunksDir);
+    },
+    filename: (req, file, cb) => {
+        const requestedId = req.headers['x-chunk-id'];
+        const safeId = typeof requestedId === 'string' && requestedId.match(/^[a-f0-9]{64}$/i)
+            ? requestedId.toLowerCase()
+            : crypto.randomBytes(32).toString('hex');
+        cb(null, safeId);
+    }
+});
+const uploadCloudChunk = multer({ storage: cloudStorage });
 
 // --- ROUTES ---
 
@@ -348,6 +375,109 @@ app.get('/api/files/:filename', authenticateToken, (req, res) => {
     } else {
         res.status(404).json({ error: 'File not found' });
     }
+});
+
+// --- StealthCloud (zero-knowledge) routes ---
+// Server stores encrypted chunks and encrypted manifests only.
+
+// Upload encrypted chunk blob
+app.post('/api/cloud/chunks', authenticateToken, uploadCloudChunk.single('chunk'), (req, res) => {
+    if (!req.file) return res.status(400).json({ error: 'No chunk uploaded' });
+
+    const requestedId = (req.headers['x-chunk-id'] || '').toString().toLowerCase();
+    const storedName = req.file.filename;
+
+    // Optional integrity check: if client provided a sha256 id, verify it
+    if (requestedId && requestedId.match(/^[a-f0-9]{64}$/i)) {
+        try {
+            const buf = fs.readFileSync(req.file.path);
+            const actual = crypto.createHash('sha256').update(buf).digest('hex');
+            if (actual !== requestedId) {
+                fs.unlinkSync(req.file.path);
+                return res.status(400).json({ error: 'Chunk hash mismatch' });
+            }
+
+            // Ensure filename equals requested hash for idempotency
+            if (storedName !== requestedId) {
+                const dir = path.dirname(req.file.path);
+                const target = path.join(dir, requestedId);
+                if (fs.existsSync(target)) {
+                    fs.unlinkSync(req.file.path);
+                } else {
+                    fs.renameSync(req.file.path, target);
+                }
+                return res.json({ chunkId: requestedId, stored: true });
+            }
+        } catch (e) {
+            return res.status(500).json({ error: 'Chunk verification failed' });
+        }
+    }
+
+    res.json({ chunkId: storedName, stored: true });
+});
+
+// Download encrypted chunk blob
+app.get('/api/cloud/chunks/:chunkId', authenticateToken, (req, res) => {
+    const chunkId = (req.params.chunkId || '').toLowerCase();
+    if (!chunkId.match(/^[a-f0-9]{64}$/i)) {
+        return res.status(400).json({ error: 'Invalid chunk id' });
+    }
+    const chunksRoot = path.join(CLOUD_DIR, 'users', String(req.user.id), 'chunks');
+    const chunkPath = path.join(chunksRoot, chunkId);
+    if (!chunkPath.startsWith(chunksRoot)) {
+        return res.status(403).json({ error: 'Access denied' });
+    }
+    if (!fs.existsSync(chunkPath)) {
+        return res.status(404).json({ error: 'Chunk not found' });
+    }
+    res.download(chunkPath);
+});
+
+// Upload encrypted manifest JSON
+app.post('/api/cloud/manifests', authenticateToken, (req, res) => {
+    const { manifestId, encryptedManifest } = req.body || {};
+    if (!manifestId || typeof manifestId !== 'string') return res.status(400).json({ error: 'manifestId required' });
+    if (!encryptedManifest || typeof encryptedManifest !== 'string') return res.status(400).json({ error: 'encryptedManifest required' });
+
+    const safeId = manifestId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
+    if (!safeId) return res.status(400).json({ error: 'Invalid manifestId' });
+
+    const userDir = path.join(CLOUD_DIR, 'users', String(req.user.id));
+    const manifestsDir = path.join(userDir, 'manifests');
+    if (!fs.existsSync(manifestsDir)) fs.mkdirSync(manifestsDir, { recursive: true });
+
+    const manifestPath = path.join(manifestsDir, `${safeId}.json`);
+    const payload = {
+        manifestId: safeId,
+        encryptedManifest,
+        createdAt: new Date().toISOString()
+    };
+    fs.writeFileSync(manifestPath, JSON.stringify(payload));
+    res.json({ manifestId: safeId, stored: true });
+});
+
+// List manifests
+app.get('/api/cloud/manifests', authenticateToken, (req, res) => {
+    const manifestsDir = path.join(CLOUD_DIR, 'users', String(req.user.id), 'manifests');
+    if (!fs.existsSync(manifestsDir)) return res.json({ manifests: [] });
+    const list = fs.readdirSync(manifestsDir)
+        .filter(f => f.endsWith('.json'))
+        .filter(f => !f.startsWith('.'))
+        .map(f => ({ manifestId: f.replace(/\.json$/, '') }));
+    res.json({ manifests: list });
+});
+
+// Download encrypted manifest
+app.get('/api/cloud/manifests/:manifestId', authenticateToken, (req, res) => {
+    const safeId = (req.params.manifestId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
+    if (!safeId) return res.status(400).json({ error: 'Invalid manifest id' });
+    const manifestsRoot = path.join(CLOUD_DIR, 'users', String(req.user.id), 'manifests');
+    const manifestPath = path.join(manifestsRoot, `${safeId}.json`);
+    if (!manifestPath.startsWith(manifestsRoot)) {
+        return res.status(403).json({ error: 'Access denied' });
+    }
+    if (!fs.existsSync(manifestPath)) return res.status(404).json({ error: 'Manifest not found' });
+    res.sendFile(manifestPath);
 });
 
 const startUpdateChecker = () => {

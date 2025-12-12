@@ -7,6 +7,9 @@ import * as SecureStore from 'expo-secure-store';
 import * as Application from 'expo-application';
 import { v4 as uuidv4, v5 as uuidv5 } from 'uuid';
 import axios from 'axios';
+import nacl from 'tweetnacl';
+import naclUtil from 'tweetnacl-util';
+import { sha256 } from 'js-sha256';
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
@@ -26,7 +29,7 @@ export default function App() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
-  const [serverType, setServerType] = useState('local'); // 'local' or 'remote'
+  const [serverType, setServerType] = useState('local'); // 'local' | 'remote' | 'stealthcloud'
   const [localHost, setLocalHost] = useState('');
   const [remoteHost, setRemoteHost] = useState('');
   const [token, setToken] = useState(null);
@@ -46,6 +49,341 @@ export default function App() {
     } catch (error) {
       console.error('Link open error', error);
       Alert.alert('Error', 'Could not open link');
+    }
+  };
+
+  const getStealthCloudMasterKey = async () => {
+    const keyName = 'stealthcloud_master_key_v1';
+    const existing = await SecureStore.getItemAsync(keyName);
+    if (existing) {
+      return naclUtil.decodeBase64(existing);
+    }
+    const key = new Uint8Array(32);
+    global.crypto.getRandomValues(key);
+    await SecureStore.setItemAsync(keyName, naclUtil.encodeBase64(key));
+    return key;
+  };
+
+  const makeChunkNonce = (baseNonce16, chunkIndex) => {
+    const nonce = new Uint8Array(24);
+    nonce.set(baseNonce16, 0);
+    // little-endian uint64 chunkIndex
+    let x = BigInt(chunkIndex);
+    for (let i = 0; i < 8; i++) {
+      nonce[16 + i] = Number(x & 0xffn);
+      x >>= 8n;
+    }
+    return nonce;
+  };
+
+  const normalizeFilePath = (uri) => {
+    if (!uri || typeof uri !== 'string') return null;
+    if (uri.startsWith('file://')) return uri.replace('file://', '');
+    return uri;
+  };
+
+  const stealthCloudUploadEncryptedChunk = async ({ SERVER_URL, config, chunkId, encryptedBytes }) => {
+    const tmpUri = `${FileSystem.cacheDirectory}sc_${chunkId}.bin`;
+    const b64 = naclUtil.encodeBase64(encryptedBytes);
+    await FileSystem.writeAsStringAsync(tmpUri, b64, { encoding: FileSystem.EncodingType.Base64 });
+
+    const formData = new FormData();
+    formData.append('chunk', {
+      uri: tmpUri,
+      name: `${chunkId}.bin`,
+      type: 'application/octet-stream'
+    });
+
+    await axios.post(`${SERVER_URL}/api/cloud/chunks`, formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+        'X-Chunk-Id': chunkId,
+        ...config.headers
+      },
+      timeout: 60000
+    });
+
+    await FileSystem.deleteAsync(tmpUri, { idempotent: true });
+  };
+
+  const stealthCloudBackup = async () => {
+    const { status: permStatus } = await MediaLibrary.requestPermissionsAsync();
+    if (permStatus !== 'granted') {
+      Alert.alert('Permission needed', 'We need access to photos to back them up.');
+      return;
+    }
+
+    setStatus('Scanning local media...');
+    setProgress(0);
+    setLoading(true);
+
+    try {
+      const config = await getAuthHeaders();
+      const SERVER_URL = getServerUrl();
+      const masterKey = await getStealthCloudMasterKey();
+
+      const allAssets = await MediaLibrary.getAssetsAsync({
+        first: 10000,
+        mediaType: ['photo', 'video'],
+      });
+
+      if (!allAssets.assets || allAssets.assets.length === 0) {
+        setStatus('No photos/videos');
+        Alert.alert('No Media', 'No photos or videos were found on this device.');
+        return;
+      }
+
+      // list manifests so we can skip already-backed up items (by asset id)
+      let existingManifests = [];
+      try {
+        const listRes = await axios.get(`${SERVER_URL}/api/cloud/manifests`, config);
+        existingManifests = (listRes.data && listRes.data.manifests) ? listRes.data.manifests : [];
+      } catch (e) {
+        existingManifests = [];
+      }
+      const already = new Set(existingManifests.map(m => m.manifestId));
+
+      const CHUNK_PLAINTEXT_BYTES = 4 * 1024 * 1024;
+      let uploaded = 0;
+      let skipped = 0;
+      let failed = 0;
+
+      for (let i = 0; i < allAssets.assets.length; i++) {
+        const asset = allAssets.assets[i];
+
+        // deterministic manifest id per asset (stable for retries)
+        const manifestId = sha256(`asset:${asset.id}`);
+        if (already.has(manifestId)) {
+          skipped++;
+          continue;
+        }
+
+        setStatus(`Encrypting ${i + 1}/${allAssets.assets.length}`);
+
+        let assetInfo;
+        try {
+          assetInfo = await MediaLibrary.getAssetInfoAsync(asset.id);
+        } catch (e) {
+          failed++;
+          continue;
+        }
+
+        const localUri = assetInfo.localUri || assetInfo.uri;
+        if (!localUri) {
+          failed++;
+          continue;
+        }
+
+        const filePath = normalizeFilePath(localUri);
+        if (!filePath) {
+          failed++;
+          continue;
+        }
+
+        // Generate per-file key and base nonce
+        const fileKey = new Uint8Array(32);
+        global.crypto.getRandomValues(fileKey);
+        const baseNonce16 = new Uint8Array(16);
+        global.crypto.getRandomValues(baseNonce16);
+
+        // Wrap fileKey with masterKey (nacl.secretbox) so it can be stored in manifest safely
+        const wrapNonce = new Uint8Array(24);
+        global.crypto.getRandomValues(wrapNonce);
+        const wrappedKey = nacl.secretbox(fileKey, wrapNonce, masterKey);
+
+        // Stream-read plaintext file, encrypt each chunk independently
+        let chunkIndex = 0;
+        const chunkIds = [];
+        const chunkSizes = [];
+
+        // react-native-blob-util readStream uses base64 chunks
+        let ReactNativeBlobUtil = null;
+        try {
+          const mod = require('react-native-blob-util');
+          ReactNativeBlobUtil = mod && (mod.default || mod);
+        } catch (e) {
+          ReactNativeBlobUtil = null;
+        }
+        if (!ReactNativeBlobUtil || !ReactNativeBlobUtil.fs || typeof ReactNativeBlobUtil.fs.readStream !== 'function') {
+          throw new Error('StealthCloud backup requires a development build (react-native-blob-util).');
+        }
+
+        const stat = await ReactNativeBlobUtil.fs.stat(filePath);
+        const originalSize = stat && stat.size ? Number(stat.size) : null;
+
+        const stream = await ReactNativeBlobUtil.fs.readStream(filePath, 'base64', CHUNK_PLAINTEXT_BYTES);
+
+        await new Promise((resolve, reject) => {
+          stream.open();
+          stream.onData(async (chunkB64) => {
+            stream.pause();
+            try {
+              const plaintext = naclUtil.decodeBase64(chunkB64);
+              const nonce = makeChunkNonce(baseNonce16, chunkIndex);
+              const boxed = nacl.secretbox(plaintext, nonce, fileKey);
+              const chunkId = sha256(naclUtil.encodeBase64(boxed));
+
+              await stealthCloudUploadEncryptedChunk({ SERVER_URL, config, chunkId, encryptedBytes: boxed });
+
+              chunkIds.push(chunkId);
+              chunkSizes.push(plaintext.length);
+              chunkIndex += 1;
+
+              setProgress((i + 1) / allAssets.assets.length);
+              stream.resume();
+            } catch (e) {
+              reject(e);
+            }
+          });
+          stream.onError((e) => reject(e));
+          stream.onEnd(() => resolve());
+        });
+
+        // Build manifest (then encrypt it with masterKey)
+        const manifest = {
+          v: 1,
+          assetId: asset.id,
+          filename: assetInfo.filename || asset.filename || null,
+          mediaType: asset.mediaType || null,
+          originalSize,
+          baseNonce16: naclUtil.encodeBase64(baseNonce16),
+          wrapNonce: naclUtil.encodeBase64(wrapNonce),
+          wrappedFileKey: naclUtil.encodeBase64(wrappedKey),
+          chunkIds,
+          chunkSizes
+        };
+
+        const manifestPlain = naclUtil.decodeUTF8(JSON.stringify(manifest));
+        const manifestNonce = new Uint8Array(24);
+        global.crypto.getRandomValues(manifestNonce);
+        const manifestBox = nacl.secretbox(manifestPlain, manifestNonce, masterKey);
+        const encryptedManifest = JSON.stringify({
+          manifestNonce: naclUtil.encodeBase64(manifestNonce),
+          manifestBox: naclUtil.encodeBase64(manifestBox)
+        });
+
+        await axios.post(`${SERVER_URL}/api/cloud/manifests`, { manifestId, encryptedManifest }, { headers: config.headers, timeout: 30000 });
+        uploaded += 1;
+      }
+
+      setStatus('Backup complete');
+      Alert.alert('StealthCloud Backup', `Uploaded: ${uploaded}\nSkipped: ${skipped}\nFailed: ${failed}`);
+    } catch (e) {
+      console.error('StealthCloud backup error:', e);
+      setStatus('Backup error');
+      Alert.alert('StealthCloud Backup Error', e && e.message ? e.message : 'Unknown error');
+    } finally {
+      setLoading(false);
+      setProgress(0);
+    }
+  };
+
+  const stealthCloudRestore = async () => {
+    setStatus('Requesting permissions...');
+    setLoading(true);
+
+    const permission = await MediaLibrary.requestPermissionsAsync();
+    if (permission.status !== 'granted') {
+      Alert.alert('Permission Required', 'Media library permission is required to sync photos to your gallery.');
+      setLoading(false);
+      return;
+    }
+    if (Platform.OS === 'ios' && permission.accessPrivileges && permission.accessPrivileges !== 'all') {
+      setStatus('Limited photo access. Please allow full access to sync from cloud.');
+      Alert.alert('Limited Photos Access', 'Sync needs Full Access to your Photos library.');
+      setLoading(false);
+      return;
+    }
+
+    try {
+      const config = await getAuthHeaders();
+      const SERVER_URL = getServerUrl();
+      const masterKey = await getStealthCloudMasterKey();
+
+      const listRes = await axios.get(`${SERVER_URL}/api/cloud/manifests`, config);
+      const manifests = (listRes.data && listRes.data.manifests) ? listRes.data.manifests : [];
+      if (manifests.length === 0) {
+        setStatus('No backups');
+        Alert.alert('No Backups', 'No StealthCloud backups found for this account.');
+        return;
+      }
+
+      // Download all manifests and restore; in MVP we restore everything.
+      setStatus('Restoring from StealthCloud...');
+      setProgress(0);
+
+      let restored = 0;
+      for (let i = 0; i < manifests.length; i++) {
+        const mid = manifests[i].manifestId;
+        const manRes = await axios.get(`${SERVER_URL}/api/cloud/manifests/${mid}`, { headers: config.headers, timeout: 30000 });
+        const payload = manRes.data;
+        const parsed = typeof payload === 'string' ? JSON.parse(payload) : payload;
+        const enc = JSON.parse(parsed.encryptedManifest);
+        const manifestNonce = naclUtil.decodeBase64(enc.manifestNonce);
+        const manifestBox = naclUtil.decodeBase64(enc.manifestBox);
+        const manifestPlain = nacl.secretbox.open(manifestBox, manifestNonce, masterKey);
+        if (!manifestPlain) continue;
+
+        const manifest = JSON.parse(naclUtil.encodeUTF8(manifestPlain));
+
+        const wrapNonce = naclUtil.decodeBase64(manifest.wrapNonce);
+        const wrappedFileKey = naclUtil.decodeBase64(manifest.wrappedFileKey);
+        const fileKey = nacl.secretbox.open(wrappedFileKey, wrapNonce, masterKey);
+        if (!fileKey) continue;
+
+        const baseNonce16 = naclUtil.decodeBase64(manifest.baseNonce16);
+
+        // Reconstruct plaintext to a temp file (append per chunk)
+        const filename = manifest.filename || `${mid}.bin`;
+        const outUri = `${FileSystem.cacheDirectory}sc_restore_${filename}`;
+        const outPath = normalizeFilePath(outUri);
+        await FileSystem.deleteAsync(outUri, { idempotent: true });
+        await FileSystem.writeAsStringAsync(outUri, '', { encoding: FileSystem.EncodingType.Base64 });
+
+        let ReactNativeBlobUtil = null;
+        try {
+          const mod = require('react-native-blob-util');
+          ReactNativeBlobUtil = mod && (mod.default || mod);
+        } catch (e) {
+          ReactNativeBlobUtil = null;
+        }
+        if (!ReactNativeBlobUtil || !ReactNativeBlobUtil.fs || typeof ReactNativeBlobUtil.fs.appendFile !== 'function') {
+          throw new Error('StealthCloud restore requires a development build (react-native-blob-util).');
+        }
+
+        for (let c = 0; c < manifest.chunkIds.length; c++) {
+          const chunkId = manifest.chunkIds[c];
+          const tmpChunkPath = `${FileSystem.cacheDirectory}sc_dl_${chunkId}.bin`;
+          await FileSystem.deleteAsync(tmpChunkPath, { idempotent: true });
+          await FileSystem.downloadAsync(`${SERVER_URL}/api/cloud/chunks/${chunkId}`, tmpChunkPath, { headers: config.headers });
+          const chunkB64 = await FileSystem.readAsStringAsync(tmpChunkPath, { encoding: FileSystem.EncodingType.Base64 });
+          await FileSystem.deleteAsync(tmpChunkPath, { idempotent: true });
+
+          const boxed = naclUtil.decodeBase64(chunkB64);
+          const nonce = makeChunkNonce(baseNonce16, c);
+          const plaintext = nacl.secretbox.open(boxed, nonce, fileKey);
+          if (!plaintext) throw new Error('Chunk decrypt failed');
+
+          // append plaintext bytes to file
+          const p64 = naclUtil.encodeBase64(plaintext);
+          await ReactNativeBlobUtil.fs.appendFile(outPath, p64, 'base64');
+        }
+
+        await MediaLibrary.saveToLibraryAsync(outUri);
+        await FileSystem.deleteAsync(outUri, { idempotent: true });
+        restored += 1;
+        setProgress((i + 1) / manifests.length);
+      }
+
+      setStatus('Sync complete');
+      Alert.alert('StealthCloud Sync', `Restored ${restored} file${restored !== 1 ? 's' : ''}.`);
+    } catch (e) {
+      console.error('StealthCloud restore error:', e);
+      setStatus('Sync error');
+      Alert.alert('StealthCloud Sync Error', e && e.message ? e.message : 'Unknown error');
+    } finally {
+      setLoading(false);
+      setProgress(0);
     }
   };
 
@@ -103,6 +441,10 @@ export default function App() {
 
   const getServerUrl = () => {
     const PORT = '3000';
+
+    if (serverType === 'stealthcloud') {
+      return 'https://stealthlynk.io';
+    }
 
     if (serverType === 'remote') {
       const host = normalizeHostInput(remoteHost);
@@ -190,7 +532,7 @@ export default function App() {
       await SecureStore.setItemAsync('server_type', serverType);
       if (serverType === 'remote') {
         await SecureStore.setItemAsync('remote_host', remoteHost);
-      } else {
+      } else if (serverType === 'local') {
         await SecureStore.setItemAsync('local_host', localHost);
       }
       
@@ -569,6 +911,9 @@ export default function App() {
   };
 
   const backupPhotos = async () => {
+    if (serverType === 'stealthcloud') {
+      return stealthCloudBackup();
+    }
     const { status } = await MediaLibrary.requestPermissionsAsync();
     if (status !== 'granted') {
       Alert.alert('Permission needed', 'We need access to photos to back them up.');
@@ -772,6 +1117,9 @@ export default function App() {
   };
 
   const restorePhotos = async () => {
+    if (serverType === 'stealthcloud') {
+      return stealthCloudRestore();
+    }
     setStatus('Requesting permissions...');
     setLoading(true);
     
@@ -1037,6 +1385,13 @@ export default function App() {
                   Remote Server
                 </Text>
               </TouchableOpacity>
+              <TouchableOpacity 
+                style={[styles.toggleBtn, serverType === 'stealthcloud' && styles.toggleBtnActive]}
+                onPress={() => setServerType('stealthcloud')}>
+                <Text style={[styles.toggleText, serverType === 'stealthcloud' && styles.toggleTextActive]}>
+                  StealthCloud
+                </Text>
+              </TouchableOpacity>
             </View>
             
             {serverType === 'remote' && (
@@ -1050,6 +1405,12 @@ export default function App() {
                   autoCapitalize="none"
                 />
                 <Text style={styles.inputHint}>Example: myserver.com or 23.198.9.123 (HTTPS + port 3000 is used automatically)</Text>
+              </>
+            )}
+
+            {serverType === 'stealthcloud' && (
+              <>
+                <Text style={styles.inputHint}>StealthCloud is a zero-knowledge encrypted cloud. The server can store your backups but cannot view them.</Text>
               </>
             )}
 
@@ -1070,7 +1431,9 @@ export default function App() {
             <Text style={styles.serverHint}>
               {serverType === 'local'
                 ? '📡 Using local network (http://<your-computer-ip>:3000)'
-                : '🌐 Using remote server (https://<domain-or-ip>:3000)'}
+                : serverType === 'remote'
+                  ? '🌐 Using remote server (https://<domain-or-ip>:3000)'
+                  : '🕶️ Using StealthCloud (https://stealthlynk.io)'}
             </Text>
 
             <View style={styles.serverInfo}>
@@ -1192,6 +1555,13 @@ export default function App() {
                   Remote
                 </Text>
               </TouchableOpacity>
+              <TouchableOpacity 
+                style={[styles.toggleBtn, serverType === 'stealthcloud' && styles.toggleBtnActive]}
+                onPress={() => setServerType('stealthcloud')}>
+                <Text style={[styles.toggleText, serverType === 'stealthcloud' && styles.toggleTextActive]}>
+                  StealthCloud
+                </Text>
+              </TouchableOpacity>
             </View>
             
             <View style={styles.serverExplanation}>
@@ -1200,10 +1570,15 @@ export default function App() {
                   📱 <Text style={styles.boldText}>Local:</Text> Server on same WiFi network{'\n'}
                   (e.g., your home computer or laptop)
                 </Text>
-              ) : (
+              ) : serverType === 'remote' ? (
                 <Text style={styles.serverExplanationText}>
                   🌐 <Text style={styles.boldText}>Remote:</Text> Server anywhere on internet{'\n'}
                   (e.g., cloud server or office computer — open port 3000 externally)
+                </Text>
+              ) : (
+                <Text style={styles.serverExplanationText}>
+                  🕶️ <Text style={styles.boldText}>StealthCloud:</Text> Zero-knowledge encrypted cloud{'\n'}
+                  (server stores encrypted shards only — cannot view your files)
                 </Text>
               )}
             </View>
@@ -1241,7 +1616,7 @@ export default function App() {
                 await SecureStore.setItemAsync('server_type', serverType);
                 if (serverType === 'remote') {
                   await SecureStore.setItemAsync('remote_host', remoteHost);
-                } else {
+                } else if (serverType === 'local') {
                   await SecureStore.setItemAsync('local_host', localHost);
                 }
                 Alert.alert('Saved', 'Server settings updated');
@@ -1252,7 +1627,7 @@ export default function App() {
           </View>
           
           <View style={styles.settingsCard}>
-            <Text style={styles.settingsTitle}>� Server Setup</Text>
+            <Text style={styles.settingsTitle}>Server Setup</Text>
             <Text style={styles.serverExplanationText}>
               Follow the latest install steps on GitHub.
             </Text>
