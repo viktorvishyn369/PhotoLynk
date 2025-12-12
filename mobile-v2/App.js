@@ -102,6 +102,11 @@ export default function App() {
         console.log('Generated new deterministic UUID for', userEmail, ':', uuid);
         return uuid;
       }
+
+      // If we have an email but no stored UUID and no password to deterministically
+      // regenerate it, we MUST NOT create a new random UUID. Doing so would break
+      // the server's token<->device binding and cause 403 errors.
+      return null;
     }
     
     // Fallback: check generic device_uuid key
@@ -137,13 +142,25 @@ export default function App() {
     
     // Load stored email to get correct UUID
     const storedEmail = await SecureStore.getItemAsync('user_email');
-    
+
+    const storedToken = await SecureStore.getItemAsync('auth_token');
+    const storedUserId = await SecureStore.getItemAsync('user_id');
+
     // Load device UUID (with email if available)
     const uuid = await getDeviceUUID(storedEmail);
     setDeviceUuid(uuid);
-    
-    const storedToken = await SecureStore.getItemAsync('auth_token');
-    const storedUserId = await SecureStore.getItemAsync('user_id');
+
+    // If we have a token but we can't determine the UUID bound to it, force re-login.
+    if (storedToken && storedEmail && !uuid) {
+      await SecureStore.deleteItemAsync('auth_token');
+      await SecureStore.deleteItemAsync('user_id');
+      setToken(null);
+      setUserId(null);
+      setView('auth');
+      Alert.alert('Login required', 'Your device identifier changed. Please login again so the server can re-bind your account to this device.');
+      return;
+    }
+
     if (storedToken) {
       setToken(storedToken);
       if (storedUserId) setUserId(parseInt(storedUserId));
@@ -426,6 +443,9 @@ export default function App() {
     // so that X-Device-UUID matches the device_uuid inside the JWT
     const storedEmail = await SecureStore.getItemAsync('user_email');
     const uuid = await getDeviceUUID(storedEmail);
+    if (!uuid) {
+      throw new Error('Device UUID missing. Please logout and login again.');
+    }
     return {
       headers: {
         'Authorization': `Bearer ${token}`,
