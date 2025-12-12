@@ -72,7 +72,8 @@
           "isAccessMediaLocationEnabled": true
         }
       ],
-      "./plugins/withCleartextTraffic.js"
+      "./plugins/withCleartextTraffic.js",
+      "./plugins/withIosLocalNetworkPrompt.js"
     ],
     "extra": {
       "eas": {
