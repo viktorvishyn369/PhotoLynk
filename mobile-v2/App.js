@@ -291,66 +291,65 @@ export default function App() {
 
       const summaryMessage = `Found ${duplicateCount} duplicate photo/video item${duplicateCount !== 1 ? 's' : ''} in ${duplicateGroups.length} group${duplicateGroups.length !== 1 ? 's' : ''} on this device.`;
 
-      if (Platform.OS === 'android') {
-        // Safest behavior on Android: report only, no deletion
-        setStatus('Duplicate scan completed (report only on Android).');
+      const confirmDeletion = (platformMessage) => {
         Alert.alert(
-          'Duplicates Found',
-          summaryMessage + '\n\nOn Android, PhotoSync will not delete files automatically. Please use this information together with your gallery/file manager to clean up duplicates manually.',
-        );
-        setLoading(false);
-        return;
-      }
+          'Clean Duplicates',
+          summaryMessage + platformMessage,
+          [
+            { text: 'Cancel', style: 'cancel', onPress: () => { setStatus('Duplicate scan cancelled.'); setLoading(false); } },
+            {
+              text: 'Delete Duplicates',
+              style: 'destructive',
+              onPress: async () => {
+                try {
+                  setStatus('Deleting duplicate photos/videos...');
 
-      // iOS: allow user to move duplicates to Recently Deleted via system Photos
-      Alert.alert(
-        'Clean Duplicates',
-        summaryMessage + '\n\nOn iOS, duplicates will be moved to the system "Recently Deleted" area so they can be recovered for a limited time.',
-        [
-          { text: 'Cancel', style: 'cancel', onPress: () => { setStatus('Duplicate scan cancelled.'); setLoading(false); } },
-          {
-            text: 'Delete Duplicates',
-            style: 'destructive',
-            onPress: async () => {
-              try {
-                setStatus('Deleting duplicate photos/videos (moving to Recently Deleted)...');
-
-                const idsToDelete = [];
-                duplicateGroups.forEach(group => {
-                  // Sort by creationTime so we keep the oldest (index 0)
-                  const sorted = [...group].sort((a, b) => {
-                    const at = a.info && a.info.creationTime ? a.info.creationTime : a.asset.creationTime || 0;
-                    const bt = b.info && b.info.creationTime ? b.info.creationTime : b.asset.creationTime || 0;
-                    return at - bt;
+                  const idsToDelete = [];
+                  duplicateGroups.forEach(group => {
+                    // Sort by creationTime so we keep the oldest (index 0)
+                    const sorted = [...group].sort((a, b) => {
+                      const at = a.info && a.info.creationTime ? a.info.creationTime : a.asset.creationTime || 0;
+                      const bt = b.info && b.info.creationTime ? b.info.creationTime : b.asset.creationTime || 0;
+                      return at - bt;
+                    });
+                    for (let i = 1; i < sorted.length; i++) {
+                      idsToDelete.push(sorted[i].asset.id);
+                    }
                   });
-                  for (let i = 1; i < sorted.length; i++) {
-                    idsToDelete.push(sorted[i].asset.id);
+
+                  if (idsToDelete.length === 0) {
+                    setStatus('No duplicates selected for deletion.');
+                    setLoading(false);
+                    return;
                   }
-                });
 
-                if (idsToDelete.length === 0) {
-                  setStatus('No duplicates selected for deletion.');
+                  await MediaLibrary.deleteAssetsAsync(idsToDelete);
+                  const recoveryNote = Platform.OS === 'ios'
+                    ? 'Deleted items were moved to "Recently Deleted" in Photos.'
+                    : 'Deleted items were removed from this device.';
+                  setStatus(`Deleted ${idsToDelete.length} duplicate item${idsToDelete.length !== 1 ? 's' : ''}.`);
+                  Alert.alert(
+                    'Duplicates Cleaned',
+                    `Deleted ${idsToDelete.length} duplicate item${idsToDelete.length !== 1 ? 's' : ''}.\n\n${recoveryNote}`
+                  );
+                } catch (deleteError) {
+                  console.error('Error deleting duplicates:', deleteError);
+                  setStatus('Error while deleting duplicates: ' + (deleteError && deleteError.message ? deleteError.message : 'Unknown error'));
+                  Alert.alert('Error', 'Could not delete some duplicates. Please try again or clean manually in the Photos app.');
+                } finally {
                   setLoading(false);
-                  return;
                 }
-
-                await MediaLibrary.deleteAssetsAsync(idsToDelete);
-                setStatus(`Deleted ${idsToDelete.length} duplicate item${idsToDelete.length !== 1 ? 's' : ''} (moved to Recently Deleted).`);
-                Alert.alert(
-                  'Duplicates Cleaned',
-                  `Deleted ${idsToDelete.length} duplicate item${idsToDelete.length !== 1 ? 's' : ''}. You can still recover them from the Photos app in "Recently Deleted" for a limited time.`,
-                );
-              } catch (deleteError) {
-                console.error('Error deleting duplicates:', deleteError);
-                setStatus('Error while deleting duplicates: ' + (deleteError && deleteError.message ? deleteError.message : 'Unknown error'));
-                Alert.alert('Error', 'Could not delete some duplicates. Please try again or clean manually in the Photos app.');
-              } finally {
-                setLoading(false);
               }
             }
-          }
-        ]
-      );
+          ]
+        );
+      };
+
+      if (Platform.OS === 'android') {
+        confirmDeletion('\n\nOn Android, duplicates will be permanently deleted from device storage. This cannot be undone, so make sure your important photos are backed up first.');
+      } else {
+        confirmDeletion('\n\nOn iOS, duplicates will be moved to the system "Recently Deleted" area so they can be recovered for a limited time.');
+      }
     } catch (error) {
       console.error('Duplicate scan error:', error);
       setStatus('Error during duplicate scan: ' + (error && error.message ? error.message : 'Unknown error'));
@@ -973,92 +972,18 @@ export default function App() {
           </View>
           
           <View style={styles.settingsCard}>
-            <Text style={styles.settingsTitle}>📖 Quick Server Start</Text>
-            <Text style={styles.settingsDescriptionSmall}>(on your computer)</Text>
-
-            <Text style={styles.quickStepsTitle}>1. Open Terminal / Command Prompt</Text>
-            <Text style={styles.quickStepsText}>
-              • Mac: Cmd + Space → type "Terminal" → Enter{'\n'}
-              • Windows: Win + R → type "powershell" → Enter{'\n'}
-              • Linux: Ctrl + Alt + T
+            <Text style={styles.settingsTitle}>� Server Setup</Text>
+            <Text style={styles.settingsDescription}>
+              Follow the latest installation instructions (macOS, Windows, Linux desktop, and Linux server) directly on GitHub so everything stays up-to-date.
             </Text>
-
-            <Text style={[styles.quickStepsTitle, { marginTop: 12 }]}>2. Desktop (macOS / Linux) prerequisites</Text>
-            <Text style={styles.quickStepsText}>Install these first (opens browser):</Text>
-            <View style={styles.linkList}>
-              <TouchableOpacity style={styles.linkButton} onPress={() => openLink('https://nodejs.org/dist/v18.20.8/node-v18.20.8.pkg')}>
-                <Text style={styles.linkButtonText}>Node.js v18.20.8 (macOS Intel)</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.linkButton} onPress={() => openLink('https://nodejs.org/dist/v18.20.8/node-v18.20.8.pkg')}>
-                <Text style={styles.linkButtonText}>Node.js v18.20.8 (macOS Apple Silicon)</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.linkButton} onPress={() => openLink('https://nodejs.org/dist/v18.20.8/node-v18.20.8-linux-x64.tar.xz')}>
-                <Text style={styles.linkButtonText}>Node.js v18.20.8 (Linux desktop x64)</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.linkButton} onPress={() => openLink('https://git-scm.com/downloads')}>
-                <Text style={styles.linkButtonText}>Git</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.linkButton} onPress={() => openLink('https://brew.sh/')}>
-                <Text style={styles.linkButtonText}>Homebrew (macOS only)</Text>
-              </TouchableOpacity>
-            </View>
-            <Text style={[styles.quickStepsTitle, { marginTop: 12 }]}>3. Desktop (macOS / Linux) installer</Text>
-            <Text style={styles.quickStepsText}>After prerequisites finish installing, run this with sudo:</Text>
-            <TouchableOpacity
-              onPress={() => Clipboard.setString('sudo curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install.sh | bash')}
-              style={{ marginTop: 4 }}>
-              <Text style={styles.codeLine}>
-                sudo curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install.sh | bash
-              </Text>
-              <Text style={styles.codeHint}>Tap to copy</Text>
+            <TouchableOpacity 
+              style={styles.setupGuideBtn}
+              onPress={() => openLink('https://github.com/viktorvishyn369/PhotoSync#-quick-start')}>
+              <Text style={styles.setupGuideBtnText}>Open README Instructions</Text>
             </TouchableOpacity>
-
-            <Text style={[styles.quickStepsTitle, { marginTop: 12 }]}>4. Windows Desktop prerequisites</Text>
-            <Text style={styles.quickStepsText}>Install these first:</Text>
-            <View style={styles.linkList}>
-              <TouchableOpacity style={styles.linkButton} onPress={() => openLink('https://nodejs.org/dist/v18.20.8/node-v18.20.8-x64.msi')}>
-                <Text style={styles.linkButtonText}>Node.js v18.20.8 (Windows x64 only)</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.linkButton} onPress={() => openLink('https://gitforwindows.org/')}>
-                <Text style={styles.linkButtonText}>Git for Windows</Text>
-              </TouchableOpacity>
-            </View>
-            <Text style={[styles.quickStepsTitle, { marginTop: 12 }]}>5. Windows Desktop (PowerShell)</Text>
             <Text style={styles.quickStepsText}>
-              Open <Text style={styles.boldText}>PowerShell</Text> as Administrator, paste this line, then press Enter.
-              Works on Windows 10 (initial release) and newer on x64 machines only. If it still asks for Node/Git, install from the links above and rerun.
+              The README includes prerequisite download links, one-line install commands, and troubleshooting steps. We keep that page current so you always get the right instructions for your platform.
             </Text>
-            <TouchableOpacity
-              onPress={() => Clipboard.setString('[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-RestMethod https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install.ps1 | Invoke-Expression')}
-              style={{ marginTop: 4 }}>
-              <Text style={styles.codeLine}>
-                [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-RestMethod https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install.ps1 | Invoke-Expression
-              </Text>
-              <Text style={styles.codeHint}>Tap to copy</Text>
-            </TouchableOpacity>
-
-            <Text style={[styles.quickStepsTitle, { marginTop: 12 }]}>6. Headless Linux server prerequisites</Text>
-            <Text style={styles.quickStepsText}>Install these from your distro or the official sites:</Text>
-            <View style={styles.linkList}>
-              <TouchableOpacity style={styles.linkButton} onPress={() => openLink('https://nodejs.org/en/download/archive/v18.20.8')}>
-                <Text style={styles.linkButtonText}>Node.js v18.20.8 (tarball)</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.linkButton} onPress={() => openLink('https://git-scm.com/download/linux')}>
-                <Text style={styles.linkButtonText}>Git for Linux</Text>
-              </TouchableOpacity>
-            </View>
-            <Text style={[styles.quickStepsTitle, { marginTop: 12 }]}>7. Headless Linux Server (no GUI)</Text>
-            <Text style={styles.quickStepsText}>
-              Paste this into your Linux server shell, then press Enter (use sudo so the service can be installed):
-            </Text>
-            <TouchableOpacity
-              onPress={() => Clipboard.setString('sudo curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install-server.sh | bash')}
-              style={{ marginTop: 4 }}>
-              <Text style={styles.codeLine}>
-                sudo curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install-server.sh | bash
-              </Text>
-              <Text style={styles.codeHint}>Tap to copy</Text>
-            </TouchableOpacity>
           </View>
           
           <View style={styles.settingsFooter}>
@@ -1643,6 +1568,23 @@ const styles = StyleSheet.create({
     color: '#CCCCCC',
     fontSize: 13,
     lineHeight: 22,
+  },
+  linkList: {
+    gap: 8,
+    marginTop: 8,
+  },
+  linkButton: {
+    backgroundColor: '#2A2A2A',
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: '#3A3A3A',
+  },
+  linkButtonText: {
+    color: '#FFFFFF',
+    fontSize: 13,
+    fontWeight: '600',
   },
   codeLine: {
     color: '#FFFFFF',
