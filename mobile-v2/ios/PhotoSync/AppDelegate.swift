@@ -53,7 +53,15 @@ public class AppDelegate: ExpoAppDelegate {
 
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
         guard let window = self.window else { return }
-        guard let factory = self.reactNativeFactory else { return }
+        // Fully recreate the RN factory/delegate so bundle URL resolution happens again.
+        let delegate = ReactNativeDelegate()
+        let factory = ExpoReactNativeFactory(delegate: delegate)
+        delegate.dependencyProvider = RCTAppDependencyProvider()
+
+        self.reactNativeDelegate = delegate
+        self.reactNativeFactory = factory
+        self.bindReactNativeFactory(factory)
+
         factory.startReactNative(
           withModuleName: "main",
           in: window,
