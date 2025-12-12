@@ -244,19 +244,10 @@ export default function App() {
         return;
       }
 
-      // iOS can return 0 assets immediately after the user grants permission.
-      // Retry a few times with a short delay to allow the permission state to propagate.
-      let allAssets = { assets: [] };
-      for (let attempt = 0; attempt < 3; attempt++) {
-        allAssets = await MediaLibrary.getAssetsAsync({
-          first: 10000,
-          mediaType: ['photo', 'video'],
-        });
-        if (allAssets && allAssets.assets && allAssets.assets.length > 0) break;
-        if (attempt < 2) {
-          await new Promise(r => setTimeout(r, 400));
-        }
-      }
+      const allAssets = await MediaLibrary.getAssetsAsync({
+        first: 10000,
+        mediaType: ['photo', 'video'],
+      });
 
       if (!allAssets.assets || allAssets.assets.length === 0) {
         setStatus('No photos or videos found on this device.');
@@ -1456,9 +1447,13 @@ const styles = StyleSheet.create({
     marginBottom: 8,
   },
   cardDescription: {
-    fontSize: 14,
+    fontSize: Platform.select({
+      ios: SCREEN_WIDTH < 380 ? 12 : 13,
+      android: SCREEN_WIDTH < 380 ? 12 : 13,
+      default: SCREEN_WIDTH < 380 ? 12 : 13,
+    }),
     color: '#AAAAAA',
-    lineHeight: 20,
+    lineHeight: SCREEN_WIDTH < 380 ? 17 : 18,
   },
   infoCard: {
     backgroundColor: '#1A1A1A',
