@@ -280,10 +280,23 @@ export default function App() {
 
       const normalizePathForHashing = (uri) => {
         if (!uri || typeof uri !== 'string') return null;
+        let u = uri.trim();
+        // Some iOS file URIs can include a #fragment or ?query (e.g. "...mp4#<token>")
+        // which breaks native hashing. Remove those parts.
+        const hashIdx = u.indexOf('#');
+        if (hashIdx !== -1) u = u.slice(0, hashIdx);
+        const qIdx = u.indexOf('?');
+        if (qIdx !== -1) u = u.slice(0, qIdx);
+        // Decode percent-encoding if present
+        try {
+          u = decodeURI(u);
+        } catch (e) {
+          // ignore
+        }
         // iOS usually provides file:// URIs for local assets.
-        if (uri.startsWith('file://')) return uri.replace('file://', '');
+        if (u.startsWith('file://')) return u.replace('file://', '');
         // Android often uses content://; react-native-blob-util supports hashing URIs.
-        return uri;
+        return u;
       };
 
       for (let i = 0; i < allAssets.assets.length; i++) {
