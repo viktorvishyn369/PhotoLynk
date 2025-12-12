@@ -46,47 +46,40 @@ export default function App() {
     }
   };
 
-  const getDeviceUUID = async (userEmail = null) => {
-    // NOTE:
-    // - We cannot access true IMEI in Expo/React Native.
-    // - On iOS we use idForVendor; on Android we use androidId.
-    // - iOS idForVendor can change after uninstall (if it's the only app from that vendor).
-    //   To stay stable across reinstall, we also persist the UUID in SecureStore (Keychain on iOS).
+  const getDeviceUUID = async (userEmail = null, userPassword = null) => {
+    // UUID policy (per your request):
+    // - Must be stable across reinstalls
+    // - Must depend ONLY on credentials the user types: email + password
+    // - We persist the resulting UUID so the app can use it later for API calls
+    //   without requiring the password again.
     if (!userEmail) return null;
 
-    const persistedKey = `device_uuid_v2:${userEmail.toLowerCase()}`;
+    const normalizedEmail = userEmail.toLowerCase();
+    const persistedKey = `device_uuid_v3:${normalizedEmail}`;
+
+    let persisted = null;
     try {
-      const persisted = await SecureStore.getItemAsync(persistedKey);
-      if (persisted) return persisted;
+      persisted = await SecureStore.getItemAsync(persistedKey);
     } catch (e) {
-      // ignore
+      persisted = null;
     }
 
-    let hardwareId = '';
-    try {
-      if (Platform.OS === 'android') {
-        hardwareId = Application.androidId || '';
-      } else if (Platform.OS === 'ios') {
-        hardwareId = (await Application.getIosIdForVendorAsync()) || '';
-      }
-    } catch (error) {
-      console.error('Error getting device identifier:', error);
-      hardwareId = '';
-    }
+    // If password is not provided (e.g. app start), we can only use the persisted UUID.
+    if (!userPassword) return persisted;
 
-    if (!hardwareId) {
-      // If we can't get a stable device identifier, we cannot guarantee a stable UUID.
-      return null;
-    }
-
+    // If password is provided (login/register), enforce email+password-derived UUID.
     const namespace = '6ba7b810-9dad-11d1-80b4-00c04fd430c8';
-    const uuid = uuidv5(`${userEmail.toLowerCase()}:${hardwareId}`, namespace);
-    try {
-      await SecureStore.setItemAsync(persistedKey, uuid);
-    } catch (e) {
-      // ignore
+    const expected = uuidv5(`${normalizedEmail}:${userPassword}`, namespace);
+
+    if (persisted !== expected) {
+      try {
+        await SecureStore.setItemAsync(persistedKey, expected);
+      } catch (e) {
+        // ignore
+      }
     }
-    return uuid;
+
+    return expected;
   };
 
   const getServerUrl = () => {
@@ -113,7 +106,7 @@ export default function App() {
     const storedToken = await SecureStore.getItemAsync('auth_token');
     const storedUserId = await SecureStore.getItemAsync('user_id');
 
-    // Load device UUID (with email if available)
+    // Load persisted device UUID for this email (cannot regenerate without password)
     const uuid = await getDeviceUUID(storedEmail);
     setDeviceUuid(uuid);
 
@@ -154,11 +147,10 @@ export default function App() {
         await SecureStore.setItemAsync('remote_ip', remoteIp);
       }
       
-      // Device UUID must be stable across reinstalls, so we derive it from email + device identifier
-      // (not from app storage and not from password).
-      const deviceId = await getDeviceUUID(email);
+      // Device UUID is derived from email+password and persisted.
+      const deviceId = await getDeviceUUID(email, password);
       if (!deviceId) {
-        Alert.alert('Device ID unavailable', 'Could not read a stable device identifier for this phone. Please try again, or restart the app.');
+        Alert.alert('Device ID unavailable', 'Could not derive a device ID from your credentials. Please try again.');
         setLoading(false);
         return;
       }
