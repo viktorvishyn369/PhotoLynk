@@ -266,7 +266,8 @@ export default function App() {
         return;
       }
 
-      const permission = await MediaLibrary.requestPermissionsAsync(true);
+      // Request permission to access media library
+      const permission = await MediaLibrary.requestPermissionsAsync();
       if (permission.status !== 'granted') {
         Alert.alert('Permission needed', 'We need access to photos to safely scan for duplicates.');
         setLoading(false);
