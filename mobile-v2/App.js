@@ -3,6 +3,7 @@ import React, { useState, useEffect } from 'react';
 import { StyleSheet, Text, View, TextInput, TouchableOpacity, Alert, ScrollView, ActivityIndicator, Platform, Pressable, Button, Dimensions, SafeAreaView, KeyboardAvoidingView, Linking, Image, Clipboard } from 'react-native';
 import * as MediaLibrary from 'expo-media-library';
 import * as FileSystem from 'expo-file-system/legacy'; // Fixed: Use legacy import for downloadAsync support
+import * as Crypto from 'expo-crypto';
 import * as SecureStore from 'expo-secure-store';
 import * as Application from 'expo-application';
 import { v4 as uuidv4, v5 as uuidv5 } from 'uuid';
@@ -242,43 +243,95 @@ export default function App() {
 
       setStatus(`Analyzing ${allAssets.assets.length} files for duplicates...`);
 
-      const groupsByKey = {};
+      const getUriForHashing = (assetInfo) => {
+        const uri = (assetInfo && (assetInfo.localUri || assetInfo.uri)) || null;
+        if (!uri) return null;
+        // iOS can return ph:// which isn't directly readable by FileSystem
+        if (typeof uri === 'string' && uri.startsWith('ph://')) return null;
+        return uri;
+      };
+
+      const sizeGroups = {};
+      let inspectSkipped = 0;
 
       for (let i = 0; i < allAssets.assets.length; i++) {
         const asset = allAssets.assets[i];
         try {
           const info = await MediaLibrary.getAssetInfoAsync(asset.id);
-          const filename = (info && info.filename) || asset.filename || 'unknown';
           const size = info && typeof info.size === 'number' ? info.size : 0;
-          const width = info && typeof info.width === 'number' ? info.width : 0;
-          const height = info && typeof info.height === 'number' ? info.height : 0;
-          const duration = info && typeof info.duration === 'number' ? info.duration : 0;
-          const creationTime = info && info.creationTime ? info.creationTime : asset.creationTime || 0;
-
-          const key = [
-            asset.mediaType || 'unknown',
-            filename.toLowerCase(),
-            `${width}x${height}`,
-            Math.round(duration),
-            size,
-            creationTime ? Math.round(creationTime / 1000) : 0,
-          ].join('|');
-
-          if (!groupsByKey[key]) {
-            groupsByKey[key] = [];
+          if (!size || size <= 0) {
+            inspectSkipped++;
+            continue;
           }
-          groupsByKey[key].push({ asset, info, filename });
+          if (!sizeGroups[size]) sizeGroups[size] = [];
+          sizeGroups[size].push({ asset, info });
         } catch (e) {
-          // Skip assets we cannot inspect safely
+          inspectSkipped++;
           continue;
         }
       }
 
-      const duplicateGroups = Object.values(groupsByKey).filter(group => group.length > 1);
-
-      if (duplicateGroups.length === 0) {
+      const candidateGroups = Object.values(sizeGroups).filter(group => group.length > 1);
+      if (candidateGroups.length === 0) {
         setStatus('No exact duplicate photos or videos found on this device.');
         Alert.alert('No Duplicates', 'No exact duplicate photos or videos were found.');
+        setLoading(false);
+        return;
+      }
+
+      const hashGroups = {};
+      let hashedCount = 0;
+      let hashSkipped = 0;
+
+      for (let g = 0; g < candidateGroups.length; g++) {
+        const group = candidateGroups[g];
+        for (let j = 0; j < group.length; j++) {
+          const { asset, info } = group[j];
+
+          const uri = getUriForHashing(info);
+          if (!uri) {
+            hashSkipped++;
+            continue;
+          }
+
+          try {
+            // Read as base64 and hash that canonical representation.
+            // This still uniquely identifies the underlying bytes, without relying on atob/Buffer.
+            const base64 = await FileSystem.readAsStringAsync(uri, { encoding: FileSystem.EncodingType.Base64 });
+            const hashHex = await Crypto.digestStringAsync(
+              Crypto.CryptoDigestAlgorithm.SHA256,
+              base64,
+              { encoding: Crypto.CryptoEncoding.HEX }
+            );
+
+            hashedCount++;
+            if (hashedCount % 10 === 0) {
+              setStatus(`Hashing files... ${hashedCount} checked`);
+            }
+
+            const key = `${asset.mediaType || 'unknown'}|${hashHex}`;
+            if (!hashGroups[key]) hashGroups[key] = [];
+            hashGroups[key].push({ asset, info });
+          } catch (e) {
+            hashSkipped++;
+            continue;
+          }
+        }
+      }
+
+      const duplicateGroups = Object.values(hashGroups).filter(group => group.length > 1);
+
+      if (duplicateGroups.length === 0) {
+        const noteParts = [];
+        if (hashSkipped > 0) {
+          noteParts.push(`Note: ${hashSkipped} item${hashSkipped !== 1 ? 's were' : ' was'} skipped because the file content could not be read (iCloud/unsupported URI/permissions).`);
+        }
+        if (inspectSkipped > 0) {
+          noteParts.push(`${inspectSkipped} item${inspectSkipped !== 1 ? 's were' : ' was'} skipped because file size/metadata could not be read.`);
+        }
+        const note = noteParts.length > 0 ? `\n\n${noteParts.join('\n')}` : '';
+        setStatus('No exact duplicate photos or videos found on this device.');
+        Alert.alert('No Duplicates', 'No exact duplicate photos or videos were found.' + note);
         setLoading(false);
         return;
       }
@@ -289,7 +342,15 @@ export default function App() {
         duplicateCount += (group.length - 1);
       });
 
-      const summaryMessage = `Found ${duplicateCount} duplicate photo/video item${duplicateCount !== 1 ? 's' : ''} in ${duplicateGroups.length} group${duplicateGroups.length !== 1 ? 's' : ''} on this device.`;
+      const skippedParts = [];
+      if (hashSkipped > 0) {
+        skippedParts.push(`Skipped ${hashSkipped} item${hashSkipped !== 1 ? 's' : ''} (cannot read file bytes: iCloud/unsupported URI/permissions).`);
+      }
+      if (inspectSkipped > 0) {
+        skippedParts.push(`Skipped ${inspectSkipped} item${inspectSkipped !== 1 ? 's' : ''} (could not read file size/metadata).`);
+      }
+      const skippedNote = skippedParts.length > 0 ? `\n\n${skippedParts.join('\n')}` : '';
+      const summaryMessage = `Found ${duplicateCount} duplicate photo/video item${duplicateCount !== 1 ? 's' : ''} in ${duplicateGroups.length} group${duplicateGroups.length !== 1 ? 's' : ''} on this device.` + skippedNote;
 
       const confirmDeletion = (platformMessage) => {
         Alert.alert(
