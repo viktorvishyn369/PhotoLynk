@@ -12,6 +12,7 @@ public class AppDelegate: ExpoAppDelegate {
 #if DEBUG
   private var didAutoReloadAfterBecomeActive = false
   private var didBecomeActiveObserver: NSObjectProtocol?
+  private var cachedLaunchOptions: [UIApplication.LaunchOptionsKey: Any]?
 #endif
 
   public override func application(
@@ -35,6 +36,8 @@ public class AppDelegate: ExpoAppDelegate {
 #endif
 
 #if DEBUG
+    cachedLaunchOptions = launchOptions
+
     // Workaround: On first launch, iOS may show the Local Network permission prompt before
     // the dev bundle URL is available, leading to a red screen: "No script URL provided".
     // When the app becomes active after the prompt, trigger a single RN reload so Metro
@@ -49,7 +52,12 @@ public class AppDelegate: ExpoAppDelegate {
       self.didAutoReloadAfterBecomeActive = true
 
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-        RCTReloadCommand.triggerReloadCommandListeners("Auto-reload after didBecomeActive")
+        guard let window = self.window else { return }
+        guard let factory = self.reactNativeFactory else { return }
+        factory.startReactNative(
+          withModuleName: "main",
+          in: window,
+          launchOptions: self.cachedLaunchOptions)
       }
     }
 #endif
