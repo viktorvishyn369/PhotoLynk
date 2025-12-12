@@ -1,3 +1,4 @@
+import Foundation
 import Expo
 import React
 import ReactAppDependencyProvider
@@ -13,6 +14,9 @@ public class AppDelegate: ExpoAppDelegate {
   private var didStartReactNativeAfterBecomeActive = false
   private var didBecomeActiveObserver: NSObjectProtocol?
   private var cachedLaunchOptions: [UIApplication.LaunchOptionsKey: Any]?
+  private var localNetBrowser: NetServiceBrowser?
+  private var localNetBrowserDelegate: LocalNetworkBrowserDelegate?
+  private var didBecomeActiveCount = 0
 #endif
 
   public override func application(
@@ -45,6 +49,12 @@ public class AppDelegate: ExpoAppDelegate {
 #if DEBUG
     cachedLaunchOptions = launchOptions
 
+    localNetBrowserDelegate = LocalNetworkBrowserDelegate()
+    localNetBrowser = NetServiceBrowser()
+    localNetBrowser?.delegate = localNetBrowserDelegate
+    // Starting a browse triggers the iOS Local Network prompt the first time.
+    localNetBrowser?.searchForServices(ofType: "_http._tcp.", inDomain: "local.")
+
     // Start RN once after the app becomes active (after any system permission prompts).
     didBecomeActiveObserver = NotificationCenter.default.addObserver(
       forName: UIApplication.didBecomeActiveNotification,
@@ -52,8 +62,16 @@ public class AppDelegate: ExpoAppDelegate {
       queue: .main
     ) { [weak self] _ in
       guard let self = self else { return }
+      self.didBecomeActiveCount += 1
+      // 1st activation happens immediately on launch; iOS may show the permission prompt after.
+      // Start RN only on the 2nd activation (after the prompt is dismissed).
+      if self.didBecomeActiveCount < 2 { return }
       if self.didStartReactNativeAfterBecomeActive { return }
       self.didStartReactNativeAfterBecomeActive = true
+
+      self.localNetBrowser?.stop()
+      self.localNetBrowser = nil
+      self.localNetBrowserDelegate = nil
 
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
         guard let window = self.window else { return }
@@ -113,3 +131,8 @@ class ReactNativeDelegate: ExpoReactNativeFactoryDelegate {
 #endif
   }
 }
+
+#if DEBUG
+private final class LocalNetworkBrowserDelegate: NSObject, NetServiceBrowserDelegate {
+}
+#endif
