@@ -154,6 +154,8 @@ export default function App() {
         setLoading(false);
         return;
       }
+      // Keep a generic copy for runtime usage (some flows need UUID before per-email lookup is ready)
+      await SecureStore.setItemAsync('device_uuid', deviceId);
       setDeviceUuid(deviceId);
       const endpoint = type === 'register' ? '/api/register' : '/api/login';
       const res = await axios.post(getServerUrl() + endpoint, {
@@ -461,7 +463,13 @@ export default function App() {
     // Always use the same user+device UUID that was used at login
     // so that X-Device-UUID matches the device_uuid inside the JWT
     const storedEmail = await SecureStore.getItemAsync('user_email');
-    const uuid = await getDeviceUUID(storedEmail);
+    let uuid = deviceUuid;
+    if (!uuid) {
+      uuid = await getDeviceUUID(storedEmail);
+    }
+    if (!uuid) {
+      uuid = await SecureStore.getItemAsync('device_uuid');
+    }
     if (!uuid) {
       throw new Error('Device UUID missing. Please logout and login again.');
     }
