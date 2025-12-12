@@ -1214,7 +1214,7 @@ export default function App() {
               <Text style={styles.cardIconText}>☁️</Text>
             </View>
             <Text style={styles.cardTitle}>Backup Photos</Text>
-            <Text style={styles.cardDescription}>Upload your photos & videos to secure cloud storage</Text>
+            <Text style={styles.cardDescription}>Upload your photos/videos to secure cloud storage</Text>
           </TouchableOpacity>
 
           <TouchableOpacity 
