@@ -130,6 +130,11 @@ export default function App() {
     // Load stored email to get correct UUID
     const storedEmail = await SecureStore.getItemAsync('user_email');
 
+    // Prefill last used email for convenience (password is intentionally not persisted)
+    if (storedEmail && !email) {
+      setEmail(storedEmail);
+    }
+
     const storedToken = await SecureStore.getItemAsync('auth_token');
     const storedUserId = await SecureStore.getItemAsync('user_id');
 
@@ -1065,6 +1070,8 @@ export default function App() {
             onChangeText={setEmail}
             autoCapitalize="none"
             keyboardType="email-address"
+            autoComplete="email"
+            textContentType="username"
           />
           <TextInput 
             style={styles.input} 
@@ -1073,6 +1080,8 @@ export default function App() {
             value={password}
             onChangeText={setPassword}
             secureTextEntry
+            autoComplete="password"
+            textContentType="password"
           />
           
           <TouchableOpacity style={styles.btnPrimary} onPress={() => handleAuth('login')} disabled={loading}>
