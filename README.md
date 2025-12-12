@@ -136,6 +136,43 @@ The server will:
 - **Isolated storage**: Each device has separate folder
 - **No cloud**: Everything runs locally on your network
 
+### Remote access over HTTPS (recommended)
+
+If you use PhotoSync over the public internet, **do not use plain HTTP**.
+
+Mobile app (Remote Server):
+
+- Enter a **full base URL**.
+  - Examples:
+    - `https://photosync.example.com` (Cloudflare / reverse proxy)
+    - `https://1.2.3.4:3443` (native HTTPS)
+
+Two supported HTTPS setups:
+
+1) **Cloudflare Tunnel / Reverse Proxy (recommended)**
+   - Keep the PhotoSync server running on HTTP locally (default `:3000`).
+   - Put Cloudflare Tunnel or a reverse proxy (Caddy/Nginx) in front to provide HTTPS.
+   - Your phone connects to the HTTPS URL (usually port 443).
+
+2) **Native HTTPS in PhotoSync server (advanced)**
+   - Enable HTTPS directly in `server/server.js` with environment variables:
+     - `ENABLE_HTTPS=true`
+     - `HTTPS_PORT=3443` (or `443`)
+     - `TLS_KEY_PATH=/path/to/privkey.pem`
+     - `TLS_CERT_PATH=/path/to/fullchain.pem`
+     - Optional: `FORCE_HTTPS_REDIRECT=true` (redirects HTTP `:3000` to HTTPS)
+
+Brute-force protection (basic rate limiting):
+
+- Auth endpoints are rate limited (in-memory) with env:
+  - `AUTH_RATE_LIMIT_WINDOW_MS` (default 15 minutes)
+  - `AUTH_RATE_LIMIT_MAX` (default 25)
+
+Important:
+
+- **Set a strong `JWT_SECRET`** for any remote deployment.
+- If you run multiple server instances behind a load balancer, the in-memory rate limit is per-instance.
+
 ### Device UUID generation (mobile)
 
 The mobile app generates the device UUID as:
@@ -211,9 +248,9 @@ See [PRIVACY_POLICY.md](PRIVACY_POLICY.md)
 6. Ensure phone and server on **same WiFi network**
 
 **For Remote Server (internet/VPS):**
-1. Use your public IP or domain: `http://YOUR_PUBLIC_IP:3000`
-2. Make sure port 3000 is open in firewall
-3. If using domain: `http://yourdomain.com:3000`
+1. Prefer HTTPS via Cloudflare Tunnel / reverse proxy.
+2. In the app (Remote Server), enter a full URL like `https://yourdomain.com`
+3. If you must use direct server access, use native HTTPS (see “Remote access over HTTPS”).
 
 **Common issues:**
 - Server not running? Check tray icon or terminal
