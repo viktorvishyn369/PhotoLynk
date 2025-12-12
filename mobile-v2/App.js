@@ -275,6 +275,10 @@ export default function App() {
       let inspectFailed = 0;
       let hashSkipped = 0;
       let hashSkippedLarge = 0;
+      let skippedPhUri = 0;
+      let skippedNoUri = 0;
+      let hashFailed = 0;
+      const sampleSkipped = [];
 
       const normalizePathForHashing = (uri) => {
         if (!uri || typeof uri !== 'string') return null;
@@ -294,9 +298,31 @@ export default function App() {
           continue;
         }
 
+        const rawUri = (info && (info.localUri || info.uri)) || null;
+        if (!rawUri) {
+          hashSkipped++;
+          skippedNoUri++;
+          if (sampleSkipped.length < 5) {
+            sampleSkipped.push({ filename: info && info.filename ? info.filename : asset.filename, reason: 'missing uri', uri: '' });
+          }
+          continue;
+        }
+
+        if (typeof rawUri === 'string' && rawUri.startsWith('ph://')) {
+          hashSkipped++;
+          skippedPhUri++;
+          if (sampleSkipped.length < 5) {
+            sampleSkipped.push({ filename: info && info.filename ? info.filename : asset.filename, reason: 'ph:// (iCloud/Photos)', uri: rawUri });
+          }
+          continue;
+        }
+
         const uri = getUriForHashing(info);
         if (!uri) {
           hashSkipped++;
+          if (sampleSkipped.length < 5) {
+            sampleSkipped.push({ filename: info && info.filename ? info.filename : asset.filename, reason: 'unreadable uri', uri: String(rawUri) });
+          }
           continue;
         }
 
@@ -319,6 +345,10 @@ export default function App() {
           hashGroups[key].push({ asset, info });
         } catch (e) {
           hashSkipped++;
+          hashFailed++;
+          if (sampleSkipped.length < 5) {
+            sampleSkipped.push({ filename: info && info.filename ? info.filename : asset.filename, reason: 'hash failed', uri: String(rawUri) });
+          }
           continue;
         }
       }
@@ -331,8 +361,23 @@ export default function App() {
         if (hashSkipped > 0) {
           noteParts.push(`Note: ${hashSkipped} item${hashSkipped !== 1 ? 's were' : ' was'} skipped because the file content could not be read (iCloud/unsupported URI/permissions).`);
         }
+        if (skippedPhUri > 0) {
+          noteParts.push(`iOS ph:// assets (often iCloud/Optimize Storage): ${skippedPhUri}`);
+        }
+        if (skippedNoUri > 0) {
+          noteParts.push(`Assets with no URI provided: ${skippedNoUri}`);
+        }
+        if (hashFailed > 0) {
+          noteParts.push(`Hash failures: ${hashFailed}`);
+        }
         if (inspectFailed > 0) {
           noteParts.push(`${inspectFailed} item${inspectFailed !== 1 ? 's were' : ' was'} skipped because asset info could not be read.`);
+        }
+        if (sampleSkipped.length > 0) {
+          noteParts.push('Examples:');
+          sampleSkipped.forEach(s => {
+            noteParts.push(`- ${s.filename} (${s.reason}) ${s.uri ? '[' + s.uri + ']' : ''}`);
+          });
         }
         const note = noteParts.length > 0 ? `\n\n${noteParts.join('\n')}` : '';
         setStatus('No exact duplicate photos or videos found on this device.');
@@ -351,6 +396,15 @@ export default function App() {
       skippedParts.push(`Hashed ${hashedCount} item${hashedCount !== 1 ? 's' : ''}.`);
       if (hashSkipped > 0) {
         skippedParts.push(`Skipped ${hashSkipped} item${hashSkipped !== 1 ? 's' : ''} (cannot read file bytes: iCloud/unsupported URI/permissions).`);
+      }
+      if (skippedPhUri > 0) {
+        skippedParts.push(`ph:// assets skipped: ${skippedPhUri} (often iCloud/Optimize Storage)`);
+      }
+      if (skippedNoUri > 0) {
+        skippedParts.push(`No-URI assets skipped: ${skippedNoUri}`);
+      }
+      if (hashFailed > 0) {
+        skippedParts.push(`Hash failures: ${hashFailed}`);
       }
       if (inspectFailed > 0) {
         skippedParts.push(`Skipped ${inspectFailed} item${inspectFailed !== 1 ? 's' : ''} (could not read asset info).`);
