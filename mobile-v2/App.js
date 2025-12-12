@@ -288,10 +288,16 @@ export default function App() {
         return;
       }
 
-      const allAssets = await MediaLibrary.getAssetsAsync({
-        first: 10000,
-        mediaType: ['photo', 'video'],
-      });
+      let allAssets = null;
+      for (let attempt = 0; attempt < 5; attempt++) {
+        allAssets = await MediaLibrary.getAssetsAsync({
+          first: 10000,
+          mediaType: ['photo', 'video'],
+        });
+
+        if (allAssets && allAssets.assets && allAssets.assets.length > 0) break;
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
 
       if (!allAssets.assets || allAssets.assets.length === 0) {
         setStatus('No photos or videos found on this device.');
