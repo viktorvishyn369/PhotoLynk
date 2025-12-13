@@ -290,6 +290,9 @@ const cloudStorage = multer.diskStorage({
 });
 const uploadCloudChunk = multer({ storage: cloudStorage });
 
+// Raw encrypted chunk uploads (application/octet-stream)
+const rawCloudChunk = express.raw({ type: '*/*', limit: '250mb' });
+
 // --- ROUTES ---
 
 // Root: Secure by default (no info leaked)
@@ -453,14 +456,49 @@ app.get('/api/files/:filename', authenticateToken, (req, res) => {
 // Server stores encrypted chunks and encrypted manifests only.
 
 // Upload encrypted chunk blob
-app.post('/api/cloud/chunks', authenticateToken, uploadCloudChunk.single('chunk'), (req, res) => {
+app.post('/api/cloud/chunks', authenticateToken, (req, res, next) => {
+    const ct = (req.headers['content-type'] || '').toString().toLowerCase();
+    if (ct.startsWith('application/octet-stream') || ct === 'application/octetstream') {
+        return rawCloudChunk(req, res, next);
+    }
+    return uploadCloudChunk.single('chunk')(req, res, next);
+}, (req, res) => {
     const clientBuild = (req.headers['x-client-build'] || '').toString();
     if (clientBuild) {
         console.log(`[SC] /chunks client=${clientBuild} user=${req.user.id}`);
     }
-    if (!req.file) return res.status(400).json({ error: 'No chunk uploaded' });
-
     const requestedId = (req.headers['x-chunk-id'] || '').toString().toLowerCase();
+
+    // If raw upload (no multipart), store from req.body
+    if (!req.file) {
+        if (!req.body || !Buffer.isBuffer(req.body) || req.body.length === 0) {
+            return res.status(400).json({ error: 'No chunk uploaded' });
+        }
+
+        if (!requestedId || !requestedId.match(/^[a-f0-9]{64}$/i)) {
+            return res.status(400).json({ error: 'Missing or invalid X-Chunk-Id' });
+        }
+
+        const { chunksDir } = ensureStealthCloudUserDirs(req.user);
+        const target = path.join(chunksDir, requestedId);
+        if (!target.startsWith(chunksDir)) {
+            return res.status(403).json({ error: 'Access denied' });
+        }
+
+        try {
+            const actual = crypto.createHash('sha256').update(req.body).digest('hex');
+            if (actual !== requestedId) {
+                return res.status(400).json({ error: 'Chunk hash mismatch' });
+            }
+            if (!fs.existsSync(target)) {
+                fs.writeFileSync(target, req.body);
+            }
+            return res.json({ chunkId: requestedId, stored: true });
+        } catch (e) {
+            return res.status(500).json({ error: 'Chunk verification failed' });
+        }
+    }
+
     const storedName = req.file.filename;
 
     // Optional integrity check: if client provided a sha256 id, verify it
