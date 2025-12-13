@@ -234,7 +234,7 @@ export default function App() {
 
         let assetInfo;
         try {
-          assetInfo = await MediaLibrary.getAssetInfoAsync(asset.id);
+          assetInfo = await MediaLibrary.getAssetInfoAsync(asset.id, { shouldDownloadFromNetwork: true });
         } catch (e) {
           failed++;
           continue;
