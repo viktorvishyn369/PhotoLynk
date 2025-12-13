@@ -88,6 +88,31 @@ export default function App() {
     return s;
   };
 
+  const resolveReadableFilePath = async ({ assetId, assetInfo }) => {
+    const localUri = (assetInfo && (assetInfo.localUri || assetInfo.uri)) || null;
+    if (!localUri) {
+      throw new Error('Missing localUri');
+    }
+
+    // Fast-path: real file paths
+    if (localUri.startsWith('file://') || localUri.startsWith('/')) {
+      const p = normalizeFilePath(localUri);
+      if (!p) throw new Error('Invalid file path');
+      return { filePath: p, tmpCopied: false };
+    }
+
+    // Fallback: content:// (Android) or ph:// (iOS) style URIs
+    const ext = (assetInfo && (assetInfo.filename || '').includes('.'))
+      ? `.${assetInfo.filename.split('.').pop()}`
+      : '';
+    const tmpUri = `${FileSystem.cacheDirectory}sc_src_${assetId}${ext}`;
+    await FileSystem.deleteAsync(tmpUri, { idempotent: true });
+    await FileSystem.copyAsync({ from: localUri, to: tmpUri });
+    const p = normalizeFilePath(tmpUri);
+    if (!p) throw new Error('Failed to stage asset');
+    return { filePath: p, tmpCopied: true, tmpUri };
+  };
+
   const stealthCloudUploadEncryptedChunk = async ({ SERVER_URL, config, chunkId, encryptedBytes }) => {
     const tmpUri = `${FileSystem.cacheDirectory}sc_${chunkId}.bin`;
     const b64 = naclUtil.encodeBase64(encryptedBytes);
@@ -191,6 +216,8 @@ export default function App() {
       for (let i = 0; i < allAssets.assets.length; i++) {
         const asset = allAssets.assets[i];
 
+        try {
+
         // deterministic manifest id per asset (stable for retries)
         const manifestId = sha256(`asset:${asset.id}`);
         if (already.has(manifestId)) {
@@ -208,17 +235,7 @@ export default function App() {
           continue;
         }
 
-        const localUri = assetInfo.localUri || assetInfo.uri;
-        if (!localUri) {
-          failed++;
-          continue;
-        }
-
-        const filePath = normalizeFilePath(localUri);
-        if (!filePath) {
-          failed++;
-          continue;
-        }
+        const { filePath, tmpCopied, tmpUri } = await resolveReadableFilePath({ assetId: asset.id, assetInfo });
 
         // Generate per-file key and base nonce
         const fileKey = new Uint8Array(32);
@@ -325,6 +342,16 @@ export default function App() {
           { headers: config.headers, timeout: 30000 }
         );
         uploaded += 1;
+
+        if (tmpCopied && tmpUri) {
+          await FileSystem.deleteAsync(tmpUri, { idempotent: true });
+        }
+
+        } catch (e) {
+          failed += 1;
+          console.warn('StealthCloud asset failed:', asset && asset.id ? asset.id : 'unknown', e && e.message ? e.message : String(e));
+          continue;
+        }
       }
 
       setStatus('Backup complete');
