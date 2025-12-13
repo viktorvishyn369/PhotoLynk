@@ -341,75 +341,98 @@ export default function App() {
         const chunkIds = [];
         const chunkSizes = [];
 
-        // react-native-blob-util readStream uses base64 chunks
-        let ReactNativeBlobUtil = null;
-        try {
-          const mod = require('react-native-blob-util');
-          ReactNativeBlobUtil = mod && (mod.default || mod);
-        } catch (e) {
-          ReactNativeBlobUtil = null;
-        }
-        if (!ReactNativeBlobUtil || !ReactNativeBlobUtil.fs || typeof ReactNativeBlobUtil.fs.readStream !== 'function') {
-          throw new Error('StealthCloud backup requires a development build (react-native-blob-util).');
-        }
+        let originalSize = null;
 
-        const stat = await ReactNativeBlobUtil.fs.stat(filePath);
-        const originalSize = stat && stat.size ? Number(stat.size) : null;
+        if (Platform.OS === 'ios') {
+          const fileUri = filePath.startsWith('/') ? `file://${filePath}` : (filePath || tmpUri);
+          const fileB64 = await FileSystem.readAsStringAsync(fileUri, { encoding: FileSystem.EncodingType.Base64 });
+          const effectiveBytes = CHUNK_PLAINTEXT_BYTES - (CHUNK_PLAINTEXT_BYTES % 3);
+          const chunkB64Len = (effectiveBytes / 3) * 4;
+          for (let offset = 0; offset < fileB64.length; offset += chunkB64Len) {
+            const nextB64 = fileB64.slice(offset, offset + chunkB64Len);
+            const plaintext = naclUtil.decodeBase64(nextB64);
+            const nonce = makeChunkNonce(baseNonce16, chunkIndex);
+            const boxed = nacl.secretbox(plaintext, nonce, fileKey);
+            const chunkId = sha256.create().update(boxed).hex();
+            setStatus(`Uploading ${i + 1}/${allAssets.assets.length}`);
+            await stealthCloudUploadEncryptedChunk({ SERVER_URL, config, chunkId, encryptedBytes: boxed });
+            chunkIds.push(chunkId);
+            chunkSizes.push(plaintext.length);
+            chunkIndex += 1;
+            setProgress((i + 1) / allAssets.assets.length);
+          }
+          originalSize = Math.floor((fileB64.length * 3) / 4);
+        } else {
+          // react-native-blob-util readStream uses base64 chunks
+          let ReactNativeBlobUtil = null;
+          try {
+            const mod = require('react-native-blob-util');
+            ReactNativeBlobUtil = mod && (mod.default || mod);
+          } catch (e) {
+            ReactNativeBlobUtil = null;
+          }
+          if (!ReactNativeBlobUtil || !ReactNativeBlobUtil.fs || typeof ReactNativeBlobUtil.fs.readStream !== 'function') {
+            throw new Error('StealthCloud backup requires a development build (react-native-blob-util).');
+          }
 
-        const stream = await ReactNativeBlobUtil.fs.readStream(filePath, 'base64', CHUNK_PLAINTEXT_BYTES);
+          const stat = await ReactNativeBlobUtil.fs.stat(filePath);
+          originalSize = stat && stat.size ? Number(stat.size) : null;
 
-        await new Promise((resolve, reject) => {
-          const queue = [];
-          let draining = false;
-          let ended = false;
+          const stream = await ReactNativeBlobUtil.fs.readStream(filePath, 'base64', CHUNK_PLAINTEXT_BYTES);
 
-          stream.open();
+          await new Promise((resolve, reject) => {
+            const queue = [];
+            let draining = false;
+            let ended = false;
 
-          stream.onData((chunkB64) => {
-            queue.push(chunkB64);
+            stream.open();
 
-            if (draining) return;
-            draining = true;
+            stream.onData((chunkB64) => {
+              queue.push(chunkB64);
 
-            (async () => {
-              try {
-                while (queue.length) {
-                  const nextB64 = queue.shift();
-                  const plaintext = naclUtil.decodeBase64(nextB64);
-                  const nonce = makeChunkNonce(baseNonce16, chunkIndex);
-                  const boxed = nacl.secretbox(plaintext, nonce, fileKey);
-                  const chunkId = sha256.create().update(boxed).hex();
+              if (draining) return;
+              draining = true;
 
-                  setStatus(`Uploading ${i + 1}/${allAssets.assets.length}`);
-                  await stealthCloudUploadEncryptedChunk({ SERVER_URL, config, chunkId, encryptedBytes: boxed });
+              (async () => {
+                try {
+                  while (queue.length) {
+                    const nextB64 = queue.shift();
+                    const plaintext = naclUtil.decodeBase64(nextB64);
+                    const nonce = makeChunkNonce(baseNonce16, chunkIndex);
+                    const boxed = nacl.secretbox(plaintext, nonce, fileKey);
+                    const chunkId = sha256.create().update(boxed).hex();
 
-                  chunkIds.push(chunkId);
-                  chunkSizes.push(plaintext.length);
-                  chunkIndex += 1;
+                    setStatus(`Uploading ${i + 1}/${allAssets.assets.length}`);
+                    await stealthCloudUploadEncryptedChunk({ SERVER_URL, config, chunkId, encryptedBytes: boxed });
 
-                  setProgress((i + 1) / allAssets.assets.length);
+                    chunkIds.push(chunkId);
+                    chunkSizes.push(plaintext.length);
+                    chunkIndex += 1;
+
+                    setProgress((i + 1) / allAssets.assets.length);
+                  }
+                } catch (e) {
+                  reject(e);
+                  return;
+                } finally {
+                  draining = false;
                 }
-              } catch (e) {
-                reject(e);
-                return;
-              } finally {
-                draining = false;
-              }
 
-              if (ended && queue.length === 0) {
+                if (ended && queue.length === 0) {
+                  resolve();
+                }
+              })();
+            });
+
+            stream.onError((e) => reject(e));
+            stream.onEnd(() => {
+              ended = true;
+              if (!draining && queue.length === 0) {
                 resolve();
               }
-            })();
+            });
           });
-
-          stream.onError((e) => reject(e));
-          stream.onEnd(() => {
-            ended = true;
-            if (!draining && queue.length === 0) {
-              resolve();
-            }
-          });
-        });
+        }
 
         if (!chunkIds.length) {
           throw new Error('StealthCloud backup read 0 bytes (no chunks).');
