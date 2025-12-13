@@ -143,6 +143,7 @@ export default function App() {
   const backgroundWarnEligibleRef = useRef(false);
   const wasBackgroundedDuringWorkRef = useRef(false);
   const loadingRef = useRef(false);
+  const backgroundedAtMsRef = useRef(0);
 
   const setLoadingSafe = (value) => {
     loadingRef.current = value;
@@ -186,17 +187,28 @@ export default function App() {
   useEffect(() => {
     const sub = AppState.addEventListener('change', (nextState) => {
       if (backgroundWarnEligibleRef.current && loadingRef.current && nextState === 'background') {
+        backgroundedAtMsRef.current = Date.now();
         wasBackgroundedDuringWorkRef.current = true;
-        setWasBackgroundedDuringWork(true);
+        setWasBackgroundedDuringWorkSafe(true);
         return;
       }
 
       if (nextState === 'active' && wasBackgroundedDuringWorkRef.current) {
+        const backgroundForMs = backgroundedAtMsRef.current ? (Date.now() - backgroundedAtMsRef.current) : 0;
+        backgroundedAtMsRef.current = 0;
+
         // Clear refs immediately so multiple rapid 'active' events can't re-trigger the alert.
         wasBackgroundedDuringWorkRef.current = false;
         backgroundWarnEligibleRef.current = false;
-        setWasBackgroundedDuringWork(false);
-        setBackgroundWarnEligible(false);
+        setWasBackgroundedDuringWorkSafe(false);
+        setBackgroundWarnEligibleSafe(false);
+
+        // Android can emit short background->active blips during permission prompts/system UI.
+        // Ignore very short transitions to avoid spamming the user.
+        if (Platform.OS === 'android' && backgroundForMs > 0 && backgroundForMs < 1500) {
+          return;
+        }
+
         Alert.alert('Backup paused', 'The app was backgrounded during an operation. Keep the app open during backup/sync for best reliability.');
       }
     });
