@@ -37,6 +37,9 @@ app.use(cors());
 app.use(morgan('common')); // Logging
 app.use(express.json());
 
+// Prevent stale caching (e.g., 304 Not Modified) for API responses like StealthCloud manifest listing
+app.set('etag', false);
+
 // Basic brute-force protection for auth endpoints (in-memory)
 const createRateLimiter = ({ windowMs, max }) => {
     const hits = new Map();
@@ -453,22 +456,31 @@ app.post('/api/cloud/manifests', authenticateToken, (req, res) => {
         createdAt: new Date().toISOString()
     };
     fs.writeFileSync(manifestPath, JSON.stringify(payload));
-    res.json({ manifestId: safeId, stored: true });
+
+    res.json({ ok: true, manifestId: safeId });
 });
 
 // List manifests
 app.get('/api/cloud/manifests', authenticateToken, (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('ETag', '');
     const manifestsDir = path.join(CLOUD_DIR, 'users', String(req.user.id), 'manifests');
     if (!fs.existsSync(manifestsDir)) return res.json({ manifests: [] });
     const list = fs.readdirSync(manifestsDir)
         .filter(f => f.endsWith('.json'))
-        .filter(f => !f.startsWith('.'))
+        .filter(f => !f.startsWith('.')) // Skip hidden files like .DS_Store
         .map(f => ({ manifestId: f.replace(/\.json$/, '') }));
     res.json({ manifests: list });
 });
 
 // Download encrypted manifest
 app.get('/api/cloud/manifests/:manifestId', authenticateToken, (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    res.setHeader('ETag', '');
     const safeId = (req.params.manifestId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
     if (!safeId) return res.status(400).json({ error: 'Invalid manifest id' });
     const manifestsRoot = path.join(CLOUD_DIR, 'users', String(req.user.id), 'manifests');
