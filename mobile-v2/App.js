@@ -143,7 +143,7 @@ export default function App() {
     if (ReactNativeBlobUtil && ReactNativeBlobUtil.fetch && ReactNativeBlobUtil.wrap) {
       const filePath = tmpUri.startsWith('file://') ? tmpUri.replace('file://', '') : tmpUri;
       try {
-        await ReactNativeBlobUtil.fetch('POST', url, headers, [
+        const resp = await ReactNativeBlobUtil.fetch('POST', url, headers, [
           {
             name: 'chunk',
             filename: `${chunkId}.bin`,
@@ -151,6 +151,20 @@ export default function App() {
             data: ReactNativeBlobUtil.wrap(filePath)
           }
         ]);
+
+        // blob-util fetch may not throw on HTTP errors; check status explicitly
+        const status = typeof resp?.info === 'function' ? resp.info().status : undefined;
+        if (typeof status === 'number' && status >= 300) {
+          let body = '';
+          try {
+            body = typeof resp?.text === 'function' ? await resp.text() : '';
+          } catch (e) {
+            body = '';
+          }
+          throw new Error(`Chunk upload failed: HTTP ${status}${body ? ` ${body}` : ''}`);
+        }
+
+        await FileSystem.deleteAsync(tmpUri, { idempotent: true });
         return;
       } catch (e) {
         console.warn('StealthCloud chunk upload failed (blob-util), falling back to axios:', e?.message || String(e));
@@ -170,6 +184,7 @@ export default function App() {
         headers,
         timeout: 60000
       });
+      await FileSystem.deleteAsync(tmpUri, { idempotent: true });
     } catch (e) {
       console.warn('StealthCloud chunk upload failed (axios):', e?.message || String(e));
       throw e;
