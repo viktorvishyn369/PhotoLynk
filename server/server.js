@@ -210,6 +210,10 @@ const authenticateToken = (req, res, next) => {
 };
 
 const getStealthCloudUserKey = (user) => {
+    const deviceKey = (user && (user.device_uuid || user.deviceUuid)) ? String(user.device_uuid || user.deviceUuid) : '';
+    const safeDevice = deviceKey.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
+    if (safeDevice) return safeDevice;
+
     const key = (user && (user.user_uuid || user.userUuid)) ? String(user.user_uuid || user.userUuid) : '';
     // UUID safe-ish folder: keep only [a-zA-Z0-9_-]
     const safe = key.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
@@ -225,9 +229,20 @@ const ensureStealthCloudUserDirs = (user) => {
     if (!fs.existsSync(manifestsDir)) fs.mkdirSync(manifestsDir, { recursive: true });
 
     // Backward-compat migration: if old numeric folder exists and new doesn't have data, move it once
-    if (user && user.id && String(user.id) !== key) {
-        const oldDir = path.join(CLOUD_DIR, 'users', String(user.id));
-        if (fs.existsSync(oldDir)) {
+    const oldKeys = [];
+    if (user && (user.user_uuid || user.userUuid)) {
+        const oldUserUuid = String(user.user_uuid || user.userUuid).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
+        if (oldUserUuid) oldKeys.push(oldUserUuid);
+    }
+    if (user && user.id) {
+        oldKeys.push(String(user.id));
+    }
+    oldKeys
+        .filter((v, i, a) => v && a.indexOf(v) === i)
+        .filter(k => k !== key)
+        .forEach(oldKey => {
+            const oldDir = path.join(CLOUD_DIR, 'users', oldKey);
+            if (!fs.existsSync(oldDir)) return;
             const oldChunks = path.join(oldDir, 'chunks');
             const oldManifests = path.join(oldDir, 'manifests');
             try {
@@ -248,8 +263,7 @@ const ensureStealthCloudUserDirs = (user) => {
             } catch (e) {
                 // ignore migration errors
             }
-        }
-    }
+        });
 
     return { userDir, chunksDir, manifestsDir };
 };
