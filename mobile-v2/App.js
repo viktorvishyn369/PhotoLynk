@@ -1,10 +1,11 @@
 import 'react-native-get-random-values';
 import React, { useState, useEffect } from 'react';
-import { StyleSheet, Text, View, TextInput, TouchableOpacity, Alert, ScrollView, ActivityIndicator, Platform, Pressable, Button, Dimensions, SafeAreaView, KeyboardAvoidingView, Linking, Image, Clipboard, NativeModules } from 'react-native';
+import { StyleSheet, Text, View, TextInput, TouchableOpacity, Alert, ScrollView, ActivityIndicator, Platform, Pressable, Button, Dimensions, SafeAreaView, KeyboardAvoidingView, Linking, Image, Clipboard, NativeModules, AppState } from 'react-native';
 import * as MediaLibrary from 'expo-media-library';
 import * as FileSystem from 'expo-file-system/legacy'; // Fixed: Use legacy import for downloadAsync support
 import * as SecureStore from 'expo-secure-store';
 import * as Application from 'expo-application';
+import * as KeepAwake from 'expo-keep-awake';
 import { v4 as uuidv4, v5 as uuidv5 } from 'uuid';
 import axios from 'axios';
 import nacl from 'tweetnacl';
@@ -40,10 +41,39 @@ export default function App() {
   const [status, setStatus] = useState('Idle');
   const [progress, setProgress] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [wasBackgroundedDuringWork, setWasBackgroundedDuringWork] = useState(false);
 
   useEffect(() => {
     checkLogin();
   }, []);
+
+  useEffect(() => {
+    if (loading) {
+      KeepAwake.activateKeepAwakeAsync('photosync-work');
+      return;
+    }
+    KeepAwake.deactivateKeepAwake('photosync-work');
+  }, [loading]);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (nextState) => {
+      if (loading && nextState !== 'active') {
+        setWasBackgroundedDuringWork(true);
+      }
+      if (!loading && nextState === 'active' && wasBackgroundedDuringWork) {
+        setWasBackgroundedDuringWork(false);
+      }
+    });
+    return () => {
+      sub.remove();
+    };
+  }, [loading, wasBackgroundedDuringWork]);
+
+  useEffect(() => {
+    if (wasBackgroundedDuringWork && !loading) {
+      Alert.alert('Backup paused', 'The app was backgrounded during an operation. Keep the app open during backup/sync for best reliability.');
+    }
+  }, [wasBackgroundedDuringWork, loading]);
 
   const openLink = async (url) => {
     try {
