@@ -73,7 +73,7 @@ If you installed PhotoSync **with the desktop tray app**, it will automatically 
 In the tray menu you will see:
 
 - `Local IP (click to copy)`
-- One or more IP addresses (example: `192.168.1.123`)
+- One or more IP addresses (example: `<LAN_IP>`)
 
 Then:
 
@@ -81,7 +81,7 @@ Then:
 2. Click the IP address you want (it copies to clipboard).
 3. In the mobile app, paste it as a full URL:
    - `http://<copied-ip>:3000`
-   - Example: `http://192.168.1.123:3000`
+   - Example: `http://<LAN_IP>:3000`
 
 If you don't see any IPs listed, make sure:
 
@@ -95,7 +95,7 @@ If you don't see any IPs listed, make sure:
 - **Windows:** Settings → Network & Internet → Wi‑Fi/Ethernet → properties → **IPv4 address**
 - **Linux:** Settings → Network → select your connection → **IPv4** (or run `ip a`)
 
-Use that IP like: `http://192.168.1.123:3000`
+Use that IP like: `http://<LAN_IP>:3000`
 
 P.S. **With the same credentials (email + password), your backed up photos/videos can be restored on any phone** (login with the same credentials and run Restore/Sync).
 
@@ -204,7 +204,7 @@ Mobile app (Remote Server):
 - Enter a **full base URL**.
   - Examples:
     - `https://photosync.example.com` (Cloudflare / reverse proxy)
-    - `https://1.2.3.4:3443` (native HTTPS)
+    - `https://<public-ip>:3443` (native HTTPS)
 
 Two supported HTTPS setups:
 
@@ -300,7 +300,7 @@ See [PRIVACY_POLICY.md](PRIVACY_POLICY.md)
 1. If you are using the **Desktop Tray app**, open the tray menu and click the IP under `Local IP (click to copy)` (it copies the IP only).
 2. In the mobile app, use it as a full URL:
    - `http://<ip>:3000`
-   - Example: `http://192.168.1.100:3000`
+   - Example: `http://<LAN_IP>:3000`
 3. If you are not using the tray app (or it shows no IP), find your server IP manually:
    - **macOS:** System Settings → Network → your connection → **IP Address**
    - **Windows:** `ipconfig` → **IPv4 Address**
