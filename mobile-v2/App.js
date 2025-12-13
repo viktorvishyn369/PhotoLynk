@@ -144,6 +144,21 @@ export default function App() {
   const wasBackgroundedDuringWorkRef = useRef(false);
   const loadingRef = useRef(false);
 
+  const setLoadingSafe = (value) => {
+    loadingRef.current = value;
+    setLoading(value);
+  };
+
+  const setBackgroundWarnEligibleSafe = (value) => {
+    backgroundWarnEligibleRef.current = value;
+    setBackgroundWarnEligible(value);
+  };
+
+  const setWasBackgroundedDuringWorkSafe = (value) => {
+    wasBackgroundedDuringWorkRef.current = value;
+    setWasBackgroundedDuringWork(value);
+  };
+
   useEffect(() => {
     checkLogin();
   }, []);
@@ -422,9 +437,9 @@ export default function App() {
 
     setStatus('Scanning local media...');
     setProgress(0);
-    setLoading(true);
-    setBackgroundWarnEligible(true);
-    setWasBackgroundedDuringWork(false);
+    setLoadingSafe(true);
+    setBackgroundWarnEligibleSafe(true);
+    setWasBackgroundedDuringWorkSafe(false);
 
     try {
       const config = await getAuthHeaders();
@@ -699,35 +714,35 @@ export default function App() {
       setStatus('Backup error');
       Alert.alert('StealthCloud Backup Error', e && e.message ? e.message : 'Unknown error');
     } finally {
-      setLoading(false);
-      setBackgroundWarnEligible(false);
+      setLoadingSafe(false);
+      setBackgroundWarnEligibleSafe(false);
       setProgress(0);
     }
   };
 
   const stealthCloudRestore = async () => {
     setStatus('Requesting permissions...');
-    setLoading(true);
+    setLoadingSafe(true);
 
     const permission = await MediaLibrary.requestPermissionsAsync();
     if (permission.status !== 'granted') {
       Alert.alert('Permission Required', 'Media library permission is required to sync photos to your gallery.');
-      setLoading(false);
-      setBackgroundWarnEligible(false);
-      setWasBackgroundedDuringWork(false);
+      setLoadingSafe(false);
+      setBackgroundWarnEligibleSafe(false);
+      setWasBackgroundedDuringWorkSafe(false);
       return;
     }
     if (Platform.OS === 'ios' && permission.accessPrivileges && permission.accessPrivileges !== 'all') {
       setStatus('Limited photo access. Please allow full access to sync from cloud.');
       Alert.alert('Limited Photos Access', 'Sync needs Full Access to your Photos library.');
-      setLoading(false);
-      setBackgroundWarnEligible(false);
-      setWasBackgroundedDuringWork(false);
+      setLoadingSafe(false);
+      setBackgroundWarnEligibleSafe(false);
+      setWasBackgroundedDuringWorkSafe(false);
       return;
     }
 
-    setBackgroundWarnEligible(true);
-    setWasBackgroundedDuringWork(false);
+    setBackgroundWarnEligibleSafe(true);
+    setWasBackgroundedDuringWorkSafe(false);
 
     try {
       const config = await getAuthHeaders();
@@ -828,8 +843,8 @@ export default function App() {
       setStatus('Sync error');
       Alert.alert('StealthCloud Sync Error', e && e.message ? e.message : 'Unknown error');
     } finally {
-      setLoading(false);
-      setBackgroundWarnEligible(false);
+      setLoadingSafe(false);
+      setBackgroundWarnEligibleSafe(false);
       setProgress(0);
     }
   };
@@ -881,8 +896,9 @@ export default function App() {
     // Strip query/hash leftovers if any
     cleaned = cleaned.split('?')[0].split('#')[0];
 
-    // Host-only input: drop any :port, app will add ports automatically where needed.
-    cleaned = cleaned.includes(':') ? cleaned.split(':')[0] : cleaned;
+    // If user typed a port (e.g. 192.168.1.10:3000), strip it since the app appends :3000 automatically.
+    cleaned = cleaned.replace(/:\d+$/, '');
+
     return cleaned;
   };
 
@@ -1046,7 +1062,9 @@ export default function App() {
   };
 
   const cleanDeviceDuplicates = async () => {
-    setLoading(true);
+    setBackgroundWarnEligibleSafe(false);
+    setWasBackgroundedDuringWorkSafe(false);
+    setLoadingSafe(true);
     setStatus('Scanning for duplicate photos/videos on this device...');
 
     try {
@@ -1061,7 +1079,7 @@ export default function App() {
       if (!blobModulePresent) {
         setStatus('Duplicate scan requires a development build (not Expo Go).');
         Alert.alert('Development Build Required', 'Clean Duplicates uses native file analysis for reliability. Please install a development build (expo run:ios/android) and try again.');
-        setLoading(false);
+        setLoadingSafe(false);
         return;
       }
 
@@ -1076,7 +1094,7 @@ export default function App() {
       if (!ReactNativeBlobUtil || !ReactNativeBlobUtil.fs || typeof ReactNativeBlobUtil.fs.hash !== 'function') {
         setStatus('Duplicate scan requires a development build (not Expo Go).');
         Alert.alert('Development Build Required', 'Clean Duplicates uses native file analysis for reliability. Please install a development build (expo run:ios/android) and try again.');
-        setLoading(false);
+        setLoadingSafe(false);
         return;
       }
 
@@ -1084,7 +1102,7 @@ export default function App() {
       const permission = await MediaLibrary.requestPermissionsAsync();
       if (permission.status !== 'granted') {
         Alert.alert('Permission needed', 'We need access to photos to safely scan for duplicates.');
-        setLoading(false);
+        setLoadingSafe(false);
         return;
       }
 
@@ -1100,7 +1118,7 @@ export default function App() {
           'Limited Photos Access',
           'Clean Duplicates needs Full Access to your Photos library to scan for duplicates.\n\nGo to Settings → PhotoSync → Photos → Full Access.'
         );
-        setLoading(false);
+        setLoadingSafe(false);
         return;
       }
 
@@ -1118,7 +1136,7 @@ export default function App() {
       if (!allAssets.assets || allAssets.assets.length === 0) {
         setStatus('No photos or videos found on this device.');
         Alert.alert('No Media', 'No photos or videos were found on this device.');
-        setLoading(false);
+        setLoadingSafe(false);
         return;
       }
 
@@ -1246,13 +1264,14 @@ export default function App() {
         const note = noteParts.length > 0 ? `\n\n${noteParts.join('\n')}` : '';
         setStatus('No duplicates');
         Alert.alert('No Duplicates', 'No exact duplicate photos or videos were found.' + note);
-        setLoading(false);
+        setLoadingSafe(false);
+        setBackgroundWarnEligibleSafe(false);
+        setWasBackgroundedDuringWorkSafe(false);
         return;
       }
 
       let duplicateCount = 0;
       duplicateGroups.forEach(group => {
-        // We keep one item per group and consider the rest duplicates
         duplicateCount += (group.length - 1);
       });
 
@@ -1269,7 +1288,7 @@ export default function App() {
           'Clean Duplicates',
           summaryMessage + platformMessage,
           [
-            { text: 'Cancel', style: 'cancel', onPress: () => { setStatus('Duplicate scan cancelled.'); setLoading(false); } },
+            { text: 'Cancel', style: 'cancel', onPress: () => { setStatus('Duplicate scan cancelled.'); setLoadingSafe(false); } },
             {
               text: 'Delete Duplicates',
               style: 'destructive',
@@ -1292,7 +1311,7 @@ export default function App() {
 
                   if (idsToDelete.length === 0) {
                     setStatus('Nothing to delete');
-                    setLoading(false);
+                    setLoadingSafe(false);
                     return;
                   }
 
@@ -1310,7 +1329,7 @@ export default function App() {
                   setStatus('Error while deleting duplicates: ' + (deleteError && deleteError.message ? deleteError.message : 'Unknown error'));
                   Alert.alert('Error', 'Could not delete some duplicates. Please try again or clean manually in the Photos app.');
                 } finally {
-                  setLoading(false);
+                  setLoadingSafe(false);
                 }
               }
             }
@@ -1327,7 +1346,7 @@ export default function App() {
       console.error('Duplicate scan error:', error);
       setStatus('Error during duplicate scan: ' + (error && error.message ? error.message : 'Unknown error'));
       Alert.alert('Duplicate Scan Error', (error && error.message) ? error.message : 'Could not complete duplicate scan.');
-      setLoading(false);
+      setLoadingSafe(false);
     }
   };
 
@@ -1372,9 +1391,9 @@ export default function App() {
 
     setStatus('Scanning local media...');
     setProgress(0); // Reset progress
-    setLoading(true);
-    setBackgroundWarnEligible(true);
-    setWasBackgroundedDuringWork(false);
+    setLoadingSafe(true);
+    setBackgroundWarnEligibleSafe(true);
+    setWasBackgroundedDuringWorkSafe(false);
 
     try {
       console.log('\n🔍 ===== BACKUP TRACE START =====');
@@ -1469,7 +1488,9 @@ export default function App() {
       if (checkedCount === 0) {
         setStatus('No photos found to backup.');
         Alert.alert('No Photos', 'No photos or videos found on device.');
-        setLoading(false);
+        setLoadingSafe(false);
+        setBackgroundWarnEligibleSafe(false);
+        setWasBackgroundedDuringWorkSafe(false);
         return;
       }
 
@@ -1487,7 +1508,9 @@ export default function App() {
       if (toUpload.length === 0) {
         setStatus(`All ${checkedCount} files already backed up.`);
         Alert.alert('Up to Date', `All ${checkedCount} photos/videos are already on the server.`);
-        setLoading(false);
+        setLoadingSafe(false);
+        setBackgroundWarnEligibleSafe(false);
+        setWasBackgroundedDuringWorkSafe(false);
         return;
       }
 
@@ -1579,8 +1602,8 @@ export default function App() {
       setStatus('Error during backup: ' + error.message);
       setProgress(0); // Reset progress on error
     } finally {
-      setLoading(false);
-      setBackgroundWarnEligible(false);
+      setLoadingSafe(false);
+      setBackgroundWarnEligibleSafe(false);
     }
   };
 
@@ -1589,16 +1612,16 @@ export default function App() {
       return stealthCloudRestore();
     }
     setStatus('Requesting permissions...');
-    setLoading(true);
+    setLoadingSafe(true);
     
     // Request full media library permission (read is required to check what already exists locally,
     // and write is required to save restored items)
     const permission = await MediaLibrary.requestPermissionsAsync();
     if (permission.status !== 'granted') {
       Alert.alert('Permission Required', 'Media library permission is required to sync photos to your gallery.');
-      setLoading(false);
-      setBackgroundWarnEligible(false);
-      setWasBackgroundedDuringWork(false);
+      setLoadingSafe(false);
+      setBackgroundWarnEligibleSafe(false);
+      setWasBackgroundedDuringWorkSafe(false);
       return;
     }
 
@@ -1609,14 +1632,14 @@ export default function App() {
         'Limited Photos Access',
         'Sync from Cloud needs Full Access to your Photos library to check what already exists and save new items.\n\nGo to Settings → PhotoSync → Photos → Full Access.'
       );
-      setLoading(false);
-      setBackgroundWarnEligible(false);
-      setWasBackgroundedDuringWork(false);
+      setLoadingSafe(false);
+      setBackgroundWarnEligibleSafe(false);
+      setWasBackgroundedDuringWorkSafe(false);
       return;
     }
 
-    setBackgroundWarnEligible(true);
-    setWasBackgroundedDuringWork(false);
+    setBackgroundWarnEligibleSafe(true);
+    setWasBackgroundedDuringWorkSafe(false);
     
     console.log('\n⬇️  ===== RESTORE TRACE START =====');
     
@@ -1640,7 +1663,9 @@ export default function App() {
       if (serverFiles.length === 0) {
         setStatus('No files on server to download.');
         Alert.alert('No Files', 'There are no files on the server to download.');
-        setLoading(false);
+        setLoadingSafe(false);
+        setBackgroundWarnEligibleSafe(false);
+        setWasBackgroundedDuringWorkSafe(false);
         return;
       }
       
@@ -1662,7 +1687,9 @@ export default function App() {
       if (toDownload.length === 0) {
         setStatus(`All ${serverFiles.length} files already synced.`);
         Alert.alert('Up to Date', `All ${serverFiles.length} server files are already on your device.`);
-        setLoading(false);
+        setLoadingSafe(false);
+        setBackgroundWarnEligibleSafe(false);
+        setWasBackgroundedDuringWorkSafe(false);
         return;
       }
 
@@ -2239,7 +2266,8 @@ export default function App() {
       </ScrollView>
     </View>
   );
-  }
+
+}
 
 const styles = StyleSheet.create({
   container: {
