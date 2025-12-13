@@ -80,8 +80,12 @@ export default function App() {
 
   const normalizeFilePath = (uri) => {
     if (!uri || typeof uri !== 'string') return null;
-    if (uri.startsWith('file://')) return uri.replace('file://', '');
-    return uri;
+    let s = uri;
+    if (s.startsWith('file://')) s = s.replace('file://', '');
+    // iOS can append a "#..." fragment or "?..." query to local file paths; strip them for filesystem access
+    s = s.split('#')[0];
+    s = s.split('?')[0];
+    return s;
   };
 
   const stealthCloudUploadEncryptedChunk = async ({ SERVER_URL, config, chunkId, encryptedBytes }) => {
