@@ -248,30 +248,47 @@ export default function App() {
         const stream = await ReactNativeBlobUtil.fs.readStream(filePath, 'base64', CHUNK_PLAINTEXT_BYTES);
 
         await new Promise((resolve, reject) => {
+          let processing = Promise.resolve();
+
           stream.open();
-          stream.onData(async (chunkB64) => {
+
+          stream.onData((chunkB64) => {
+            // Some stream implementations can emit multiple events before pause takes effect.
+            // Queue processing to guarantee sequential uploads.
             stream.pause();
-            try {
-              const plaintext = naclUtil.decodeBase64(chunkB64);
-              const nonce = makeChunkNonce(baseNonce16, chunkIndex);
-              const boxed = nacl.secretbox(plaintext, nonce, fileKey);
-              const chunkId = sha256(naclUtil.encodeBase64(boxed));
+            processing = processing
+              .then(async () => {
+                const plaintext = naclUtil.decodeBase64(chunkB64);
+                const nonce = makeChunkNonce(baseNonce16, chunkIndex);
+                const boxed = nacl.secretbox(plaintext, nonce, fileKey);
+                const chunkId = sha256(naclUtil.encodeBase64(boxed));
 
-              await stealthCloudUploadEncryptedChunk({ SERVER_URL, config, chunkId, encryptedBytes: boxed });
+                setStatus(`Uploading ${i + 1}/${allAssets.assets.length}`);
+                await stealthCloudUploadEncryptedChunk({ SERVER_URL, config, chunkId, encryptedBytes: boxed });
 
-              chunkIds.push(chunkId);
-              chunkSizes.push(plaintext.length);
-              chunkIndex += 1;
+                chunkIds.push(chunkId);
+                chunkSizes.push(plaintext.length);
+                chunkIndex += 1;
 
-              setProgress((i + 1) / allAssets.assets.length);
-              stream.resume();
-            } catch (e) {
-              reject(e);
-            }
+                setProgress((i + 1) / allAssets.assets.length);
+              })
+              .then(() => {
+                stream.resume();
+              })
+              .catch((e) => {
+                reject(e);
+              });
           });
+
           stream.onError((e) => reject(e));
-          stream.onEnd(() => resolve());
+          stream.onEnd(() => {
+            processing.then(resolve).catch(reject);
+          });
         });
+
+        if (!chunkIds.length) {
+          throw new Error('StealthCloud backup read 0 bytes (no chunks).');
+        }
 
         // Build manifest (then encrypt it with masterKey)
         const manifest = {
