@@ -26,6 +26,20 @@ const THEME = {
   error: '#CF6679'
 };
 
+const MB = 1024 * 1024;
+
+const chooseStealthCloudChunkBytes = ({ platform, originalSize }) => {
+  // Keep requests reasonably sized while avoiding memory spikes.
+  // - Android: 4MB works well with blob-util streaming.
+  // - iOS: default smaller chunks; allow 4MB for very large files to reduce overhead.
+  const size = typeof originalSize === 'number' ? originalSize : null;
+  if (platform === 'ios') {
+    if (size !== null && size >= 256 * MB) return 4 * MB;
+    return 2 * MB;
+  }
+  return 4 * MB;
+};
+
 export default function App() {
   const [view, setView] = useState('loading'); // loading, auth, home, settings
   const [authMode, setAuthMode] = useState('login'); // login, register
@@ -335,7 +349,6 @@ export default function App() {
       }
       const already = new Set(existingManifests.map(m => m.manifestId));
 
-      const CHUNK_PLAINTEXT_BYTES = 4 * 1024 * 1024;
       let uploaded = 0;
       let skipped = 0;
       let failed = 0;
@@ -383,6 +396,7 @@ export default function App() {
         const chunkSizes = [];
 
         let originalSize = null;
+        let chunkPlainBytes = null;
 
         if (Platform.OS === 'ios') {
           const fileUri = filePath.startsWith('/') ? `file://${filePath}` : (filePath || tmpUri);
@@ -393,7 +407,10 @@ export default function App() {
             originalSize = null;
           }
 
-          const effectiveBytes = CHUNK_PLAINTEXT_BYTES - (CHUNK_PLAINTEXT_BYTES % 3);
+          chunkPlainBytes = chooseStealthCloudChunkBytes({ platform: 'ios', originalSize });
+
+          const effectiveBytes = chunkPlainBytes - (chunkPlainBytes % 3);
+
           let position = 0;
           while (true) {
             let nextB64 = '';
@@ -445,7 +462,9 @@ export default function App() {
           const stat = await ReactNativeBlobUtil.fs.stat(filePath);
           originalSize = stat && stat.size ? Number(stat.size) : null;
 
-          const stream = await ReactNativeBlobUtil.fs.readStream(filePath, 'base64', CHUNK_PLAINTEXT_BYTES);
+          chunkPlainBytes = chooseStealthCloudChunkBytes({ platform: 'android', originalSize });
+
+          const stream = await ReactNativeBlobUtil.fs.readStream(filePath, 'base64', chunkPlainBytes);
 
           await new Promise((resolve, reject) => {
             const queue = [];
