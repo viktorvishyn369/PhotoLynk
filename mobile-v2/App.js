@@ -328,16 +328,10 @@ export default function App() {
       const SERVER_URL = getServerUrl();
       const masterKey = await getStealthCloudMasterKey();
 
-      const allAssets = await MediaLibrary.getAssetsAsync({
-        first: 10000,
-        mediaType: ['photo', 'video'],
-      });
-
-      if (!allAssets.assets || allAssets.assets.length === 0) {
-        setStatus('No photos/videos');
-        Alert.alert('No Media', 'No photos or videos were found on this device.');
-        return;
-      }
+      const PAGE_SIZE = 250;
+      let after = null;
+      let totalCount = null;
+      let processedIndex = 0;
 
       // list manifests so we can skip already-backed up items (by asset id)
       let existingManifests = [];
@@ -353,8 +347,29 @@ export default function App() {
       let skipped = 0;
       let failed = 0;
 
-      for (let i = 0; i < allAssets.assets.length; i++) {
-        const asset = allAssets.assets[i];
+      while (true) {
+        const page = await MediaLibrary.getAssetsAsync({
+          first: PAGE_SIZE,
+          after: after || undefined,
+          mediaType: ['photo', 'video'],
+        });
+
+        if (totalCount === null && page && typeof page.totalCount === 'number') {
+          totalCount = page.totalCount;
+        }
+
+        const assets = page && Array.isArray(page.assets) ? page.assets : [];
+        if (assets.length === 0) {
+          if (processedIndex === 0) {
+            setStatus('No photos/videos');
+            Alert.alert('No Media', 'No photos or videos were found on this device.');
+          }
+          break;
+        }
+
+        for (let j = 0; j < assets.length; j++) {
+          const asset = assets[j];
+          processedIndex += 1;
 
         try {
 
@@ -365,7 +380,7 @@ export default function App() {
           continue;
         }
 
-        setStatus(`Encrypting ${i + 1}/${allAssets.assets.length}`);
+        setStatus(`Encrypting ${processedIndex}/${totalCount || '?'}`);
 
         let assetInfo;
         try {
@@ -434,13 +449,13 @@ export default function App() {
             const nonce = makeChunkNonce(baseNonce16, chunkIndex);
             const boxed = nacl.secretbox(plaintext, nonce, fileKey);
             const chunkId = sha256.create().update(boxed).hex();
-            setStatus(`Uploading ${i + 1}/${allAssets.assets.length}`);
+            setStatus(`Uploading ${processedIndex}/${totalCount || '?'}`);
             await stealthCloudUploadEncryptedChunk({ SERVER_URL, config, chunkId, encryptedBytes: boxed });
             chunkIds.push(chunkId);
             chunkSizes.push(plaintext.length);
             chunkIndex += 1;
             position += plaintext.length;
-            setProgress((i + 1) / allAssets.assets.length);
+            if (totalCount) setProgress(processedIndex / totalCount);
 
             if (plaintext.length < effectiveBytes) {
               break;
@@ -488,14 +503,14 @@ export default function App() {
                     const boxed = nacl.secretbox(plaintext, nonce, fileKey);
                     const chunkId = sha256.create().update(boxed).hex();
 
-                    setStatus(`Uploading ${i + 1}/${allAssets.assets.length}`);
+                    setStatus(`Uploading ${processedIndex}/${totalCount || '?'}`);
                     await stealthCloudUploadEncryptedChunk({ SERVER_URL, config, chunkId, encryptedBytes: boxed });
 
                     chunkIds.push(chunkId);
                     chunkSizes.push(plaintext.length);
                     chunkIndex += 1;
 
-                    setProgress((i + 1) / allAssets.assets.length);
+                    if (totalCount) setProgress(processedIndex / totalCount);
                   }
                 } catch (e) {
                   reject(e);
@@ -562,6 +577,12 @@ export default function App() {
           failed += 1;
           console.warn('StealthCloud asset failed:', asset && asset.id ? asset.id : 'unknown', e && e.message ? e.message : String(e));
           continue;
+        }
+        }
+
+        after = page && page.endCursor ? page.endCursor : null;
+        if (!page || page.hasNextPage !== true) {
+          break;
         }
       }
 
