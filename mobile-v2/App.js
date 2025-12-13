@@ -142,6 +142,7 @@ export default function App() {
 
   const backgroundWarnEligibleRef = useRef(false);
   const wasBackgroundedDuringWorkRef = useRef(false);
+  const loadingRef = useRef(false);
 
   useEffect(() => {
     checkLogin();
@@ -156,6 +157,10 @@ export default function App() {
   }, [wasBackgroundedDuringWork]);
 
   useEffect(() => {
+    loadingRef.current = loading;
+  }, [loading]);
+
+  useEffect(() => {
     if (loading) {
       KeepAwake.activateKeepAwakeAsync('photosync-work');
       return;
@@ -165,13 +170,18 @@ export default function App() {
 
   useEffect(() => {
     const sub = AppState.addEventListener('change', (nextState) => {
-      if (backgroundWarnEligibleRef.current && nextState === 'background') {
+      if (backgroundWarnEligibleRef.current && loadingRef.current && nextState === 'background') {
+        wasBackgroundedDuringWorkRef.current = true;
         setWasBackgroundedDuringWork(true);
         return;
       }
 
-      if (backgroundWarnEligibleRef.current && nextState === 'active' && wasBackgroundedDuringWorkRef.current) {
+      if (nextState === 'active' && wasBackgroundedDuringWorkRef.current) {
+        // Clear refs immediately so multiple rapid 'active' events can't re-trigger the alert.
+        wasBackgroundedDuringWorkRef.current = false;
+        backgroundWarnEligibleRef.current = false;
         setWasBackgroundedDuringWork(false);
+        setBackgroundWarnEligible(false);
         Alert.alert('Backup paused', 'The app was backgrounded during an operation. Keep the app open during backup/sync for best reliability.');
       }
     });
@@ -691,7 +701,6 @@ export default function App() {
     } finally {
       setLoading(false);
       setBackgroundWarnEligible(false);
-      setWasBackgroundedDuringWork(false);
       setProgress(0);
     }
   };
@@ -817,6 +826,7 @@ export default function App() {
       Alert.alert('StealthCloud Sync Error', e && e.message ? e.message : 'Unknown error');
     } finally {
       setLoading(false);
+      setBackgroundWarnEligible(false);
       setProgress(0);
     }
   };
@@ -1567,6 +1577,7 @@ export default function App() {
       setProgress(0); // Reset progress on error
     } finally {
       setLoading(false);
+      setBackgroundWarnEligible(false);
     }
   };
 
@@ -1770,6 +1781,7 @@ export default function App() {
       Alert.alert('Restore Error', error.message);
     } finally {
       setLoading(false);
+      setBackgroundWarnEligible(false);
     }
   };
 
