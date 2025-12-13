@@ -118,6 +118,16 @@ export default function App() {
     return { filePath: p, tmpCopied: true, tmpUri };
   };
 
+  const sanitizeHeaders = (headers) => {
+    const out = {};
+    const src = headers && typeof headers === 'object' ? headers : {};
+    for (const [k, v] of Object.entries(src)) {
+      if (v === undefined || v === null) continue;
+      out[k] = String(v);
+    }
+    return out;
+  };
+
   const stealthCloudUploadEncryptedChunk = async ({ SERVER_URL, config, chunkId, encryptedBytes }) => {
     const tmpUri = `${FileSystem.cacheDirectory}sc_${chunkId}.bin`;
     const b64 = naclUtil.encodeBase64(encryptedBytes);
@@ -135,10 +145,10 @@ export default function App() {
     }
 
     const url = `${SERVER_URL}/api/cloud/chunks`;
-    const headers = {
+    const headers = sanitizeHeaders({
       'X-Chunk-Id': chunkId,
       ...(config && config.headers ? config.headers : {})
-    };
+    });
 
     if (ReactNativeBlobUtil && ReactNativeBlobUtil.fetch && ReactNativeBlobUtil.wrap) {
       const filePath = tmpUri.startsWith('file://') ? tmpUri.replace('file://', '') : tmpUri;
@@ -249,7 +259,9 @@ export default function App() {
 
         let assetInfo;
         try {
-          assetInfo = await MediaLibrary.getAssetInfoAsync(asset.id, { shouldDownloadFromNetwork: true });
+          assetInfo = Platform.OS === 'android'
+            ? await MediaLibrary.getAssetInfoAsync(asset.id, { shouldDownloadFromNetwork: true })
+            : await MediaLibrary.getAssetInfoAsync(asset.id);
         } catch (e) {
           failed++;
           continue;
