@@ -156,22 +156,20 @@ export default function App() {
 
     const url = `${SERVER_URL}/api/cloud/chunks`;
     // IMPORTANT: do not send Content-Type from auth headers; multipart must set its own boundary
-    const headers = stripContentType(sanitizeHeaders({
+    const baseHeaders = sanitizeHeaders({
       'X-Chunk-Id': chunkId,
       ...(config && config.headers ? config.headers : {})
-    }));
+    });
 
     if (ReactNativeBlobUtil && ReactNativeBlobUtil.fetch && ReactNativeBlobUtil.wrap) {
       const filePath = tmpUri.startsWith('file://') ? tmpUri.replace('file://', '') : tmpUri;
       try {
-        const resp = await ReactNativeBlobUtil.fetch('POST', url, headers, [
-          {
-            name: 'chunk',
-            filename: `${chunkId}.bin`,
-            type: 'application/octet-stream',
-            data: ReactNativeBlobUtil.wrap(filePath)
-          }
-        ]);
+        // Prefer raw octet-stream upload (more reliable than multipart on some RN builds)
+        const rawHeaders = {
+          ...stripContentType(baseHeaders),
+          'Content-Type': 'application/octet-stream'
+        };
+        const resp = await ReactNativeBlobUtil.fetch('POST', url, rawHeaders, ReactNativeBlobUtil.wrap(filePath));
 
         // blob-util fetch may not throw on HTTP errors; check status explicitly
         const status = typeof resp?.info === 'function' ? resp.info().status : undefined;
@@ -188,7 +186,34 @@ export default function App() {
         await FileSystem.deleteAsync(tmpUri, { idempotent: true });
         return;
       } catch (e) {
-        console.warn('StealthCloud chunk upload failed (blob-util), falling back to axios:', e?.message || String(e));
+        console.warn('StealthCloud chunk upload failed (blob-util raw), trying multipart/axios:', e?.message || String(e));
+
+        // Try multipart as fallback (older server / strict proxies)
+        try {
+          const mpHeaders = stripContentType(baseHeaders);
+          const resp2 = await ReactNativeBlobUtil.fetch('POST', url, mpHeaders, [
+            {
+              name: 'chunk',
+              filename: `${chunkId}.bin`,
+              type: 'application/octet-stream',
+              data: ReactNativeBlobUtil.wrap(filePath)
+            }
+          ]);
+          const status2 = typeof resp2?.info === 'function' ? resp2.info().status : undefined;
+          if (typeof status2 === 'number' && status2 >= 300) {
+            let body2 = '';
+            try {
+              body2 = typeof resp2?.text === 'function' ? await resp2.text() : '';
+            } catch (e2) {
+              body2 = '';
+            }
+            throw new Error(`Chunk upload failed (multipart): HTTP ${status2}${body2 ? ` ${body2}` : ''}`);
+          }
+          await FileSystem.deleteAsync(tmpUri, { idempotent: true });
+          return;
+        } catch (e2) {
+          console.warn('StealthCloud chunk upload failed (blob-util multipart), falling back to axios:', e2?.message || String(e2));
+        }
       }
     }
 
@@ -202,7 +227,7 @@ export default function App() {
 
     try {
       await axios.post(url, formData, {
-        headers,
+        headers: stripContentType(baseHeaders),
         timeout: 60000
       });
       await FileSystem.deleteAsync(tmpUri, { idempotent: true });
