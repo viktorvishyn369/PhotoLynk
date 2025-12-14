@@ -321,6 +321,10 @@ app.get('/', (req, res) => {
     res.status(403).send('Access Forbidden');
 });
 
+app.get('/health', (req, res) => {
+    res.status(200).json({ ok: true });
+});
+
 // Register User
 app.post('/api/register', authRateLimiter, async (req, res) => {
     const { email, password } = req.body;
