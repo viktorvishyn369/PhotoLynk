@@ -16,11 +16,21 @@ jobs:
         uses: actions/setup-node@v3
         with:
           node-version: '20'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       
       - name: Install dependencies
         run: |
           cd server-tray
           npm install
+
+      - name: Rebuild native modules for Electron
+        run: |
+          cd server-tray
+          npm run rebuild-native
       
       - name: Build macOS apps
         run: |
@@ -44,11 +54,21 @@ jobs:
         uses: actions/setup-node@v3
         with:
           node-version: '20'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       
       - name: Install dependencies
         run: |
           cd server-tray
           npm install
+
+      - name: Rebuild native modules for Electron
+        run: |
+          cd server-tray
+          npm run rebuild-native
       
       - name: Build Windows apps
         run: |
@@ -71,11 +91,21 @@ jobs:
         uses: actions/setup-node@v3
         with:
           node-version: '20'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       
       - name: Install dependencies
         run: |
           cd server-tray
           npm install
+
+      - name: Rebuild native modules for Electron
+        run: |
+          cd server-tray
+          npm run rebuild-native
       
       - name: Build Linux apps
         run: |
