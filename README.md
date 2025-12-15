@@ -18,8 +18,8 @@ Secure, private photo backup system. Your photos, your server, your control.
 
 4. On your phone, open the PhotoSync mobile app and go to Settings:
    - Select **Local** connection
-   - Paste the IP you copied (use the full URL format):
-     - `http://<your-ip>:3000`
+   - Paste the IP you copied (digits only):
+     - Example: `192.168.1.222`
 
 Done. Start backing up your photos/videos.
 
@@ -57,7 +57,7 @@ If you prefer installing from source (advanced), you can use the provided script
 ### Local backup (LAN)
 
 - You run **PhotoSync Server** on your computer.
-- Your phone connects over your home network to `http://<server-ip>:3000`.
+- Your phone connects over your home network to the server (port `3000`).
 - Photos/videos are uploaded to the server and stored on disk under your account folder.
 
 ### StealthCloud backup
@@ -202,9 +202,8 @@ See [PRIVACY_POLICY.md](PRIVACY_POLICY.md)
 
 **For Local Server (same WiFi network):**
 1. If you are using the **Desktop Tray app**, open the tray menu and select **Local IP Addresses**, then click an address to copy it.
-2. In the mobile app, use it as a full URL:
-   - `http://<ip>:3000`
-   - Example: `http://<LAN_IP>:3000`
+2. In the mobile app (Local), paste the IP address (digits only):
+   - Example: `192.168.1.222`
 3. If you are not using the tray app (or it shows no IP), find your server IP manually:
    - **macOS:** System Settings → Network → your connection → **IP Address**
    - **Windows:** `ipconfig` → **IPv4 Address**
