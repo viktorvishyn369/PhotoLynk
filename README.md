@@ -18,7 +18,7 @@ Back up photos/videos to your own server or StealthCloud, and restore on any pho
 
 4. On your phone, open the PhotoSync mobile app and go to Settings:
    - Select **Local** connection
-   - Paste the IP you copied (digits only):
+   - Paste the IP address you copied (IP only — no http(s)://, no port, no domain):
      - Example: `192.168.1.222`
 
 Done. Start backing up your photos/videos.
@@ -199,7 +199,7 @@ Remote works like Local mode, but your server runs on a remote machine (VPS/home
 
 - Install PhotoSync Server on the remote machine (headless is recommended).
 - Enable HTTPS (TLS) on the remote server so traffic is encrypted end-to-end.
-- In the mobile app (Remote), enter the server public IP only (digits only). The app will use HTTPS for the connection.
+- In the mobile app (Remote), enter the server public IP address only (IP only — no http(s)://, no port, no domain). The app will use HTTPS for the connection.
 
 ---
 
@@ -250,7 +250,7 @@ See [PRIVACY_POLICY.md](PRIVACY_POLICY.md)
 
 **For Local Server (same WiFi network):**
 1. If you are using the **Desktop Tray app**, open the tray menu and select **Local IP Addresses**, then click an address to copy it.
-2. In the mobile app (Local), paste the IP address (digits only):
+2. In the mobile app (Local), paste the IP address only (no http(s)://, no port, no domain):
    - Example: `192.168.1.222`
 3. If you are not using the tray app (or it shows no IP), find your server IP manually:
    - **macOS:** System Settings → Network → your connection → **IP Address**
@@ -262,7 +262,7 @@ See [PRIVACY_POLICY.md](PRIVACY_POLICY.md)
 **For Remote Server (internet/VPS):**
 1. Install PhotoSync Server on your remote machine (VPS/home server).
 2. Enable HTTPS (TLS) for PhotoSync Server on the remote machine (install a certificate and open the HTTPS port).
-3. In the app (Remote), enter the public IP address (digits only):
+3. In the app (Remote), enter the public IP address only (no http(s)://, no port, no domain):
    - Example: `203.0.113.10`
 
 **Common issues:**
