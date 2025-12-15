@@ -172,8 +172,8 @@ How it works:
 
 Limitations:
 
-- In **Expo Go**, native file hashing is not available, so Clean Duplicates requires a **development build**.
-- Some iOS assets may not be readable (e.g. iCloud “Optimize Storage” / `ph://` URIs), so they can be skipped.
+- Clean Duplicates works in the installed app (development builds and production builds). It is not supported in **Expo Go** because it relies on native file hashing.
+- On iOS, items that are not available as a local file (for example when iCloud Photos is enabled with “Optimize iPhone Storage”) may be skipped during analysis. For best results, download originals to the device and grant Photos “Full Access”.
 
 Deletion behavior:
 
