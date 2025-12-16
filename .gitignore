@@ -118,6 +118,15 @@ server/backup.db-journal
 # Business-only scripts (not for public repo)
 install-server-PhotoSync.sh
 
+# StealthLynk private (do not push)
+mobile-v2/
+SERVER SETUP/
+server/generate-capacity-json.js
+server/sweep-expired-users.js
+server/reconcile-cloud-usage.js
+server/photosync-*.service
+server/photosync-*.timer
+
 # Mobile specific
 mobile/android/app/build/
 mobile/android/.gradle/
@@ -202,7 +211,7 @@ server-tray/dist/
 server-tray/node_modules/
 *.idsig
 server/package-lock.json
-server-tray/package-lock.json
+!server-tray/package-lock.json
 !server-tray/build/
 !server-tray/build/entitlements.mac.plist
 !server-tray/build/entitlements.mac.inherit.plist
