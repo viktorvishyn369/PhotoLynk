@@ -35,9 +35,22 @@ const resolveDataDir = () => {
     return path.join(HOME_DIR, 'PhotoSync', 'server');
 };
 
+const normalizeTierGb = (value) => {
+    const n = Number(value);
+    if (!Number.isFinite(n)) return null;
+    if (n === 100 || n === 200 || n === 400 || n === 1000) return n;
+    return null;
+};
+
 const DATA_DIR = resolveDataDir();
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(DATA_DIR, 'uploads');
 const CLOUD_DIR = process.env.CLOUD_DIR || path.join(DATA_DIR, 'cloud');
+const CAPACITY_JSON_PATH = process.env.CAPACITY_JSON_PATH || path.join(DATA_DIR, 'capacity', 'photosync-capacity.json');
+
+const SUBSCRIPTION_GRACE_DAYS = Number.parseInt(process.env.SUBSCRIPTION_GRACE_DAYS || '10', 10);
+const REVENUECAT_WEBHOOK_SECRET = process.env.REVENUECAT_WEBHOOK_SECRET || '';
+const USER_QUOTA_MARGIN_BYTES = Number.parseInt(process.env.USER_QUOTA_MARGIN_BYTES || String(50 * 1024 * 1024), 10);
+const ENABLE_CLOUD_UPLOAD_LOCK = String(process.env.ENABLE_CLOUD_UPLOAD_LOCK || 'true').toLowerCase() !== 'false';
 
 // Security & Middleware
 app.use(helmet()); // Sets various HTTP headers for security
@@ -106,6 +119,137 @@ const db = new sqlite3.Database(DB_PATH, (err) => {
     else console.log(`Connected to SQLite database at ${DB_PATH}`);
 });
 
+// SQLite concurrency tuning for single-server deployments.
+// WAL reduces write contention; busy_timeout avoids transient SQLITE_BUSY under load.
+db.serialize(() => {
+    db.run(`PRAGMA journal_mode=WAL`);
+    db.run(`PRAGMA synchronous=NORMAL`);
+    db.run(`PRAGMA busy_timeout=5000`);
+});
+
+const dbGetAsync = (sql, params) => new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => {
+        if (err) return reject(err);
+        resolve(row || null);
+    });
+});
+
+const dbRunAsync = (sql, params) => new Promise((resolve, reject) => {
+    db.run(sql, params, function (err) {
+        if (err) return reject(err);
+        resolve(this);
+    });
+});
+
+const dbAllAsync = (sql, params) => new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => {
+        if (err) return reject(err);
+        resolve(Array.isArray(rows) ? rows : []);
+    });
+});
+
+const ensurePlanRow = async (userId) => {
+    const existing = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [userId]);
+    if (existing) return existing;
+    const now = Date.now();
+    await dbRunAsync(
+        `INSERT INTO user_plans (user_id, status, updated_at) VALUES (?, ?, ?)
+         ON CONFLICT(user_id) DO UPDATE SET updated_at=excluded.updated_at`,
+        [userId, 'none', now]
+    );
+    return await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [userId]);
+};
+
+const resolveSubscriptionState = async (userId) => {
+    const now = Date.now();
+    const row = await ensurePlanRow(userId);
+    if (!row) return { allowed: false, status: 'none' };
+
+    const expiresAt = typeof row.expires_at === 'number' ? row.expires_at : (row.expires_at ? Number(row.expires_at) : null);
+    const graceUntil = typeof row.grace_until === 'number' ? row.grace_until : (row.grace_until ? Number(row.grace_until) : null);
+    const deletedAt = typeof row.deleted_at === 'number' ? row.deleted_at : (row.deleted_at ? Number(row.deleted_at) : null);
+
+    if (deletedAt && deletedAt > 0) {
+        return {
+            allowed: false,
+            status: 'deleted',
+            expiresAt: expiresAt || null,
+            graceUntil: graceUntil || null,
+            deletedAt,
+            planGb: row.plan_gb || null,
+        };
+    }
+
+    if (expiresAt && expiresAt > 0 && expiresAt <= now) {
+        const graceMs = Math.max(0, SUBSCRIPTION_GRACE_DAYS) * 24 * 60 * 60 * 1000;
+        const gu = graceUntil && graceUntil > 0 ? graceUntil : (expiresAt + graceMs);
+        if (!graceUntil || graceUntil <= 0) {
+            const updatedAt = Date.now();
+            await dbRunAsync(
+                `UPDATE user_plans SET status = ?, grace_until = ?, updated_at = ? WHERE user_id = ?`,
+                ['grace', gu, updatedAt, userId]
+            );
+        }
+        return {
+            allowed: false,
+            status: 'grace',
+            expiresAt,
+            graceUntil: gu,
+            planGb: row.plan_gb || null,
+        };
+    }
+
+    if (row.status === 'active') {
+        return {
+            allowed: true,
+            status: 'active',
+            expiresAt: expiresAt || null,
+            graceUntil: graceUntil || null,
+            planGb: row.plan_gb || null,
+        };
+    }
+
+    return {
+        allowed: false,
+        status: row.status || 'none',
+        expiresAt: expiresAt || null,
+        graceUntil: graceUntil || null,
+        planGb: row.plan_gb || null,
+    };
+};
+
+const requireActiveSubscription = async (req, res, next) => {
+    try {
+        const st = await resolveSubscriptionState(req.user.id);
+        if (st.allowed) return next();
+
+        if (st.status === 'grace') {
+            return res.status(402).json({
+                error: 'Subscription expired',
+                code: 'SUBSCRIPTION_EXPIRED',
+                expiresAt: st.expiresAt,
+                graceUntil: st.graceUntil,
+                deleteInDays: SUBSCRIPTION_GRACE_DAYS,
+            });
+        }
+
+        if (st.status === 'deleted') {
+            return res.status(410).json({
+                error: 'Data deleted',
+                code: 'SUBSCRIPTION_DATA_DELETED',
+                deletedAt: st.deletedAt,
+            });
+        }
+
+        return res.status(402).json({
+            error: 'Subscription required',
+            code: 'SUBSCRIPTION_REQUIRED',
+        });
+    } catch (e) {
+        return res.status(500).json({ error: 'Subscription check failed' });
+    }
+};
+
 db.serialize(() => {
     // Users table
     db.run(`CREATE TABLE IF NOT EXISTS users (
@@ -114,6 +258,33 @@ db.serialize(() => {
         email TEXT UNIQUE,
         password TEXT
     )`);
+
+    // Subscription/tier state (for StealthCloud / RevenueCat). Kept separate from auth rows.
+    db.run(`CREATE TABLE IF NOT EXISTS user_plans (
+        user_id INTEGER PRIMARY KEY,
+        plan_gb INTEGER,
+        rc_app_user_id TEXT,
+        rc_product_id TEXT,
+        rc_entitlement TEXT,
+        status TEXT,
+        expires_at INTEGER,
+        grace_until INTEGER,
+        deleted_at INTEGER,
+        updated_at INTEGER,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )`);
+
+    // Migrate existing DBs: add missing columns to user_plans
+    db.all(`PRAGMA table_info(user_plans)`, [], (err, cols) => {
+        if (err) return;
+        const names = Array.isArray(cols) ? cols.map(c => c && c.name).filter(Boolean) : [];
+        if (!names.includes('grace_until')) {
+            db.run(`ALTER TABLE user_plans ADD COLUMN grace_until INTEGER`, [], () => {});
+        }
+        if (!names.includes('deleted_at')) {
+            db.run(`ALTER TABLE user_plans ADD COLUMN deleted_at INTEGER`, [], () => {});
+        }
+    });
 
     // Migrate existing DBs: add user_uuid column if missing, and populate it
     db.all(`PRAGMA table_info(users)`, [], (err, cols) => {
@@ -163,6 +334,15 @@ db.serialize(() => {
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(user_id, filename),
         UNIQUE(user_id, file_hash)
+    )`);
+
+    db.run(`CREATE TABLE IF NOT EXISTS cloud_chunks (
+        user_id INTEGER,
+        chunk_id TEXT,
+        size INTEGER,
+        created_at INTEGER,
+        PRIMARY KEY(user_id, chunk_id),
+        FOREIGN KEY(user_id) REFERENCES users(id)
     )`);
     
     // Clean up database on startup - remove entries for files that don't exist
@@ -325,10 +505,158 @@ app.get('/health', (req, res) => {
     res.status(200).json({ ok: true });
 });
 
+const readCapacityJson = () => {
+    try {
+        if (!fs.existsSync(CAPACITY_JSON_PATH)) return null;
+        const raw = fs.readFileSync(CAPACITY_JSON_PATH, 'utf8');
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch (e) {
+        return null;
+    }
+};
+
+const getUserPlanGb = async (userId) => {
+    const row = await ensurePlanRow(userId);
+    const planGb = row && row.plan_gb !== null && row.plan_gb !== undefined ? Number(row.plan_gb) : null;
+    return Number.isFinite(planGb) ? planGb : null;
+};
+
+const getUserUsedBytes = async (userId) => {
+    const row = await dbGetAsync(
+        `SELECT COALESCE(SUM(size), 0) AS usedBytes FROM cloud_chunks WHERE user_id = ?`,
+        [userId]
+    );
+    const used = row && row.usedBytes !== undefined && row.usedBytes !== null ? Number(row.usedBytes) : 0;
+    return Number.isFinite(used) ? used : 0;
+};
+
+const getUserQuotaBytes = async (userId) => {
+    const planGb = await getUserPlanGb(userId);
+    if (!planGb) return 0;
+    const GB = 1000 * 1000 * 1000;
+    return Math.floor(planGb * GB);
+};
+
+const getServerFreeBytes = () => {
+    const payload = readCapacityJson();
+    const free = payload && typeof payload.freeBytes === 'number' ? payload.freeBytes : null;
+    return typeof free === 'number' && Number.isFinite(free) ? free : null;
+};
+
+const enforceUserQuotaForIncomingBytes = async ({ userId, incomingBytes }) => {
+    const quotaBytes = await getUserQuotaBytes(userId);
+    const usedBytes = await getUserUsedBytes(userId);
+    const inc = typeof incomingBytes === 'number' && Number.isFinite(incomingBytes) ? incomingBytes : 0;
+    const allowed = quotaBytes <= 0 ? true : (usedBytes + inc + USER_QUOTA_MARGIN_BYTES) <= quotaBytes;
+    return {
+        allowed,
+        quotaBytes,
+        usedBytes,
+        remainingBytes: Math.max(0, quotaBytes - usedBytes),
+        marginBytes: USER_QUOTA_MARGIN_BYTES,
+    };
+};
+
+// Concurrency hardening:
+// - Without this lock, two parallel chunk uploads for the same user can both pass the quota check
+//   before either inserts into cloud_chunks, letting the user exceed their tier.
+// - This is an in-memory mutex (single-node). If you run multiple Node processes behind a load balancer,
+//   you should replace this with a distributed lock or an atomic quota reservation table.
+const cloudUploadLocks = new Map();
+
+const acquireCloudUploadLock = async (userId) => {
+    const key = String(userId);
+    const prev = cloudUploadLocks.get(key) || Promise.resolve();
+    let releaseNext;
+    const gate = new Promise((resolve) => {
+        releaseNext = resolve;
+    });
+    const chain = prev.then(() => gate);
+    cloudUploadLocks.set(key, chain);
+    await prev;
+
+    let released = false;
+    return () => {
+        if (released) return;
+        released = true;
+        try {
+            releaseNext();
+        } catch (e) {
+            // ignore
+        }
+        setTimeout(() => {
+            if (cloudUploadLocks.get(key) === chain) {
+                cloudUploadLocks.delete(key);
+            }
+        }, 0);
+    };
+};
+
+const lockStealthCloudUploadForUser = async (req, res, next) => {
+    try {
+        if (!ENABLE_CLOUD_UPLOAD_LOCK) return next();
+        if (!req.user || !req.user.id) return next();
+        const release = await acquireCloudUploadLock(req.user.id);
+        let done = false;
+        const cleanup = () => {
+            if (done) return;
+            done = true;
+            release();
+        };
+        res.on('finish', cleanup);
+        res.on('close', cleanup);
+        req.on('aborted', cleanup);
+        return next();
+    } catch (e) {
+        return next(e);
+    }
+};
+
+// Capacity endpoint (recommended for proxies that only forward /api/*)
+app.get('/api/capacity', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const payload = readCapacityJson();
+    if (!payload) return res.status(404).json({ error: 'Capacity not available' });
+    return res.json(payload);
+});
+
+// Public well-known capacity JSON (mobile app can call this directly)
+app.get('/.well-known/photosync-capacity.json', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const payload = readCapacityJson();
+    if (!payload) return res.status(404).json({ error: 'Capacity not available' });
+    return res.json(payload);
+});
+
+app.get('/api/cloud/usage', authenticateToken, async (req, res) => {
+    try {
+        const planGb = await getUserPlanGb(req.user.id);
+        const quotaBytes = await getUserQuotaBytes(req.user.id);
+        const usedBytes = await getUserUsedBytes(req.user.id);
+        const subscription = await resolveSubscriptionState(req.user.id);
+        const serverFreeBytes = getServerFreeBytes();
+
+        return res.json({
+            planGb,
+            quotaBytes,
+            usedBytes,
+            remainingBytes: Math.max(0, quotaBytes - usedBytes),
+            marginBytes: USER_QUOTA_MARGIN_BYTES,
+            subscription,
+            serverFreeBytes,
+        });
+    } catch (e) {
+        return res.status(500).json({ error: 'Usage unavailable' });
+    }
+});
+
 // Register User
 app.post('/api/register', authRateLimiter, async (req, res) => {
-    const { email, password } = req.body;
+    const { email, password, plan_gb } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
+
+    const normalizedPlanGb = normalizeTierGb(plan_gb);
 
     try {
         const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
@@ -338,10 +666,21 @@ app.post('/api/register', authRateLimiter, async (req, res) => {
                 if (err.message.includes('UNIQUE constraint failed')) return res.status(409).json({ error: 'Email already exists' });
                 return res.status(500).json({ error: err.message });
             }
+
+            const newUserId = this.lastID;
+            if (normalizedPlanGb) {
+                const now = Date.now();
+                db.run(
+                    `INSERT INTO user_plans (user_id, plan_gb, status, updated_at) VALUES (?, ?, ?, ?)
+                     ON CONFLICT(user_id) DO UPDATE SET plan_gb=excluded.plan_gb, status=excluded.status, updated_at=excluded.updated_at`,
+                    [newUserId, normalizedPlanGb, 'selected', now]
+                );
+            }
+
             res.status(201).json({ message: 'User registered successfully' });
         });
-    } catch (e) {
-        res.status(500).json({ error: 'Server error' });
+    } catch (error) {
+        res.status(500).json({ error: error.message });
     }
 });
 
@@ -362,6 +701,13 @@ app.post('/api/login', authRateLimiter, (req, res) => {
             [user.id, device_uuid, device_name || 'Unknown Device'], 
             (devErr) => {
                 if (devErr) console.error('Device reg error:', devErr);
+
+                const now = Date.now();
+                db.run(
+                    `INSERT INTO user_plans (user_id, rc_app_user_id, status, updated_at) VALUES (?, ?, ?, ?)
+                     ON CONFLICT(user_id) DO UPDATE SET rc_app_user_id=excluded.rc_app_user_id, updated_at=excluded.updated_at`,
+                    [user.id, String(device_uuid), 'none', now]
+                );
                 
                 // Generate Token BOUND to this device
                 const token = jwt.sign({ id: user.id, user_uuid: user.user_uuid, email: user.email, device_uuid: device_uuid }, JWT_SECRET, { expiresIn: '30d' });
@@ -369,6 +715,85 @@ app.post('/api/login', authRateLimiter, (req, res) => {
             }
         );
     });
+});
+
+app.get('/api/subscription/status', authenticateToken, async (req, res) => {
+    try {
+        const st = await resolveSubscriptionState(req.user.id);
+        return res.json(st);
+    } catch (e) {
+        return res.status(500).json({ error: 'Failed to resolve subscription status' });
+    }
+});
+
+app.post('/api/revenuecat/webhook', async (req, res) => {
+    try {
+        if (REVENUECAT_WEBHOOK_SECRET) {
+            const auth = (req.headers['authorization'] || '').toString();
+            if (auth !== `Bearer ${REVENUECAT_WEBHOOK_SECRET}`) {
+                return res.status(401).json({ error: 'Unauthorized' });
+            }
+        }
+
+        const event = req.body || {};
+        const appUserId = event && (event.app_user_id || event.appUserId) ? String(event.app_user_id || event.appUserId) : '';
+        if (!appUserId) return res.status(400).json({ error: 'Missing app_user_id' });
+
+        const expiresAtMs = event && (event.expiration_at_ms || event.expirationAtMs) ? Number(event.expiration_at_ms || event.expirationAtMs) : null;
+        const productId = event && (event.product_id || event.productId) ? String(event.product_id || event.productId) : null;
+        const entitlementId = event && (event.entitlement_id || event.entitlementId) ? String(event.entitlement_id || event.entitlementId) : null;
+        const tierGb = normalizeTierGb(event && (event.plan_gb || event.planGb || event.tier_gb || event.tierGb));
+
+        db.get(
+            `SELECT up.user_id AS user_id
+               FROM user_plans up
+              WHERE up.rc_app_user_id = ?
+              LIMIT 1`,
+            [appUserId],
+            async (err, row) => {
+                if (err) return res.status(500).json({ error: 'Database error' });
+                if (!row || !row.user_id) return res.status(404).json({ error: 'User not found' });
+
+                const now = Date.now();
+                const expiresMs = Number.isFinite(expiresAtMs) ? expiresAtMs : null;
+                const isActive = expiresMs && expiresMs > now;
+
+                if (isActive) {
+                    await dbRunAsync(
+                        `UPDATE user_plans
+                            SET status = ?,
+                                expires_at = ?,
+                                grace_until = NULL,
+                                deleted_at = NULL,
+                                rc_product_id = ?,
+                                rc_entitlement = ?,
+                                plan_gb = COALESCE(?, plan_gb),
+                                updated_at = ?
+                          WHERE user_id = ?`,
+                        ['active', expiresMs, productId, entitlementId, tierGb, now, row.user_id]
+                    );
+                    return res.json({ ok: true });
+                }
+
+                const graceMs = Math.max(0, SUBSCRIPTION_GRACE_DAYS) * 24 * 60 * 60 * 1000;
+                const graceUntil = (expiresMs && expiresMs > 0) ? (expiresMs + graceMs) : (now + graceMs);
+                await dbRunAsync(
+                    `UPDATE user_plans
+                        SET status = ?,
+                            expires_at = COALESCE(?, expires_at),
+                            grace_until = COALESCE(grace_until, ?),
+                            rc_product_id = ?,
+                            rc_entitlement = ?,
+                            updated_at = ?
+                      WHERE user_id = ?`,
+                    ['grace', expiresMs, graceUntil, productId, entitlementId, now, row.user_id]
+                );
+                return res.json({ ok: true });
+            }
+        );
+    } catch (e) {
+        return res.status(500).json({ error: 'Webhook failed' });
+    }
 });
 
 // Upload File
@@ -481,13 +906,13 @@ app.get('/api/files/:filename', authenticateToken, (req, res) => {
 // Server stores encrypted chunks and encrypted manifests only.
 
 // Upload encrypted chunk blob
-app.post('/api/cloud/chunks', authenticateToken, (req, res, next) => {
+app.post('/api/cloud/chunks', authenticateToken, requireActiveSubscription, lockStealthCloudUploadForUser, (req, res, next) => {
     const ct = (req.headers['content-type'] || '').toString().toLowerCase();
     if (ct.startsWith('application/octet-stream') || ct === 'application/octetstream') {
         return rawCloudChunk(req, res, next);
     }
     return uploadCloudChunk.single('chunk')(req, res, next);
-}, (req, res) => {
+}, async (req, res) => {
     const clientBuild = (req.headers['x-client-build'] || '').toString();
     if (clientBuild) {
         console.log(`[SC] /chunks client=${clientBuild} user=${req.user.id}`);
@@ -510,14 +935,31 @@ app.post('/api/cloud/chunks', authenticateToken, (req, res, next) => {
             return res.status(403).json({ error: 'Access denied' });
         }
 
+        if (fs.existsSync(target)) {
+            return res.json({ chunkId: requestedId, stored: true });
+        }
+
+        const quotaCheck = await enforceUserQuotaForIncomingBytes({ userId: req.user.id, incomingBytes: req.body.length });
+        if (!quotaCheck.allowed) {
+            return res.status(413).json({
+                error: 'Storage limit reached',
+                code: 'QUOTA_EXCEEDED',
+                usedBytes: quotaCheck.usedBytes,
+                quotaBytes: quotaCheck.quotaBytes,
+                remainingBytes: quotaCheck.remainingBytes,
+            });
+        }
+
         try {
             const actual = crypto.createHash('sha256').update(req.body).digest('hex');
             if (actual !== requestedId) {
                 return res.status(400).json({ error: 'Chunk hash mismatch' });
             }
-            if (!fs.existsSync(target)) {
-                fs.writeFileSync(target, req.body);
-            }
+            fs.writeFileSync(target, req.body);
+            db.run(
+                `INSERT OR IGNORE INTO cloud_chunks (user_id, chunk_id, size, created_at) VALUES (?, ?, ?, ?)`,
+                [req.user.id, requestedId, req.body.length, Date.now()]
+            );
             return res.json({ chunkId: requestedId, stored: true });
         } catch (e) {
             return res.status(500).json({ error: 'Chunk verification failed' });
@@ -525,6 +967,37 @@ app.post('/api/cloud/chunks', authenticateToken, (req, res, next) => {
     }
 
     const storedName = req.file.filename;
+    const tmpPath = req.file.path;
+    const tmpSize = (() => {
+        try {
+            const st = fs.statSync(tmpPath);
+            return st && typeof st.size === 'number' ? Number(st.size) : 0;
+        } catch (e) {
+            return 0;
+        }
+    })();
+
+    // If we already have this chunk, don't count it again.
+    if (requestedId && requestedId.match(/^[a-f0-9]{64}$/i)) {
+        const { chunksDir } = ensureStealthCloudUserDirs(req.user);
+        const existing = path.join(chunksDir, requestedId);
+        if (fs.existsSync(existing)) {
+            try { fs.unlinkSync(tmpPath); } catch (e) {}
+            return res.json({ chunkId: requestedId, stored: true });
+        }
+    }
+
+    const quotaCheckMultipart = await enforceUserQuotaForIncomingBytes({ userId: req.user.id, incomingBytes: tmpSize });
+    if (!quotaCheckMultipart.allowed) {
+        try { fs.unlinkSync(tmpPath); } catch (e) {}
+        return res.status(413).json({
+            error: 'Storage limit reached',
+            code: 'QUOTA_EXCEEDED',
+            usedBytes: quotaCheckMultipart.usedBytes,
+            quotaBytes: quotaCheckMultipart.quotaBytes,
+            remainingBytes: quotaCheckMultipart.remainingBytes,
+        });
+    }
 
     // Optional integrity check: if client provided a sha256 id, verify it
     if (requestedId && requestedId.match(/^[a-f0-9]{64}$/i)) {
@@ -545,6 +1018,18 @@ app.post('/api/cloud/chunks', authenticateToken, (req, res, next) => {
                 } else {
                     fs.renameSync(req.file.path, target);
                 }
+                const finalPath = fs.existsSync(target) ? target : req.file.path;
+                let finalSize = tmpSize;
+                try {
+                    const st = fs.statSync(finalPath);
+                    finalSize = st && typeof st.size === 'number' ? Number(st.size) : finalSize;
+                } catch (e) {
+                    finalSize = finalSize;
+                }
+                db.run(
+                    `INSERT OR IGNORE INTO cloud_chunks (user_id, chunk_id, size, created_at) VALUES (?, ?, ?, ?)`,
+                    [req.user.id, requestedId, finalSize, Date.now()]
+                );
                 return res.json({ chunkId: requestedId, stored: true });
             }
         } catch (e) {
@@ -552,11 +1037,15 @@ app.post('/api/cloud/chunks', authenticateToken, (req, res, next) => {
         }
     }
 
+    db.run(
+        `INSERT OR IGNORE INTO cloud_chunks (user_id, chunk_id, size, created_at) VALUES (?, ?, ?, ?)`,
+        [req.user.id, storedName, tmpSize, Date.now()]
+    );
     res.json({ chunkId: storedName, stored: true });
 });
 
 // Download encrypted chunk blob
-app.get('/api/cloud/chunks/:chunkId', authenticateToken, (req, res) => {
+app.get('/api/cloud/chunks/:chunkId', authenticateToken, requireActiveSubscription, (req, res) => {
     const chunkId = (req.params.chunkId || '').toLowerCase();
     if (!chunkId.match(/^[a-f0-9]{64}$/i)) {
         return res.status(400).json({ error: 'Invalid chunk id' });
@@ -573,7 +1062,7 @@ app.get('/api/cloud/chunks/:chunkId', authenticateToken, (req, res) => {
 });
 
 // Upload encrypted manifest JSON
-app.post('/api/cloud/manifests', authenticateToken, (req, res) => {
+app.post('/api/cloud/manifests', authenticateToken, requireActiveSubscription, (req, res) => {
     const { manifestId, encryptedManifest, chunkCount } = req.body || {};
     const clientBuild = (req.headers['x-client-build'] || '').toString();
     if (clientBuild) {
@@ -603,7 +1092,7 @@ app.post('/api/cloud/manifests', authenticateToken, (req, res) => {
 });
 
 // List manifests
-app.get('/api/cloud/manifests', authenticateToken, (req, res) => {
+app.get('/api/cloud/manifests', authenticateToken, requireActiveSubscription, (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
@@ -618,7 +1107,7 @@ app.get('/api/cloud/manifests', authenticateToken, (req, res) => {
 });
 
 // Download encrypted manifest
-app.get('/api/cloud/manifests/:manifestId', authenticateToken, (req, res) => {
+app.get('/api/cloud/manifests/:manifestId', authenticateToken, requireActiveSubscription, (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
