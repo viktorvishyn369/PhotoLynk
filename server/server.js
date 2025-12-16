@@ -48,6 +48,7 @@ const CLOUD_DIR = process.env.CLOUD_DIR || path.join(DATA_DIR, 'cloud');
 const CAPACITY_JSON_PATH = process.env.CAPACITY_JSON_PATH || path.join(DATA_DIR, 'capacity', 'photosync-capacity.json');
 
 const SUBSCRIPTION_GRACE_DAYS = Number.parseInt(process.env.SUBSCRIPTION_GRACE_DAYS || '10', 10);
+const TRIAL_DAYS = Number.parseInt(process.env.TRIAL_DAYS || '7', 10);
 const REVENUECAT_WEBHOOK_SECRET = process.env.REVENUECAT_WEBHOOK_SECRET || '';
 const USER_QUOTA_MARGIN_BYTES = Number.parseInt(process.env.USER_QUOTA_MARGIN_BYTES || String(50 * 1024 * 1024), 10);
 const ENABLE_CLOUD_UPLOAD_LOCK = String(process.env.ENABLE_CLOUD_UPLOAD_LOCK || 'true').toLowerCase() !== 'false';
@@ -152,10 +153,12 @@ const ensurePlanRow = async (userId) => {
     const existing = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [userId]);
     if (existing) return existing;
     const now = Date.now();
+    const trialMs = Math.max(0, TRIAL_DAYS) * 24 * 60 * 60 * 1000;
+    const trialUntil = trialMs > 0 ? (now + trialMs) : null;
     await dbRunAsync(
-        `INSERT INTO user_plans (user_id, status, updated_at) VALUES (?, ?, ?)
+        `INSERT INTO user_plans (user_id, status, trial_until, updated_at) VALUES (?, ?, ?, ?)
          ON CONFLICT(user_id) DO UPDATE SET updated_at=excluded.updated_at`,
-        [userId, 'none', now]
+        [userId, trialUntil ? 'trial' : 'none', trialUntil, now]
     );
     return await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [userId]);
 };
@@ -168,6 +171,7 @@ const resolveSubscriptionState = async (userId) => {
     const expiresAt = typeof row.expires_at === 'number' ? row.expires_at : (row.expires_at ? Number(row.expires_at) : null);
     const graceUntil = typeof row.grace_until === 'number' ? row.grace_until : (row.grace_until ? Number(row.grace_until) : null);
     const deletedAt = typeof row.deleted_at === 'number' ? row.deleted_at : (row.deleted_at ? Number(row.deleted_at) : null);
+    const trialUntil = typeof row.trial_until === 'number' ? row.trial_until : (row.trial_until ? Number(row.trial_until) : null);
 
     if (deletedAt && deletedAt > 0) {
         return {
@@ -176,6 +180,17 @@ const resolveSubscriptionState = async (userId) => {
             expiresAt: expiresAt || null,
             graceUntil: graceUntil || null,
             deletedAt,
+            planGb: row.plan_gb || null,
+        };
+    }
+
+    if (trialUntil && trialUntil > now) {
+        return {
+            allowed: true,
+            status: 'trial',
+            trialUntil,
+            expiresAt: expiresAt || null,
+            graceUntil: graceUntil || null,
             planGb: row.plan_gb || null,
         };
     }
@@ -190,9 +205,10 @@ const resolveSubscriptionState = async (userId) => {
                 ['grace', gu, updatedAt, userId]
             );
         }
+        const allowedInGrace = gu && gu > 0 ? now <= gu : false;
         return {
-            allowed: false,
-            status: 'grace',
+            allowed: allowedInGrace,
+            status: allowedInGrace ? 'grace' : 'grace_expired',
             expiresAt,
             graceUntil: gu,
             planGb: row.plan_gb || null,
@@ -212,10 +228,29 @@ const resolveSubscriptionState = async (userId) => {
     return {
         allowed: false,
         status: row.status || 'none',
+        trialUntil: trialUntil || null,
         expiresAt: expiresAt || null,
         graceUntil: graceUntil || null,
         planGb: row.plan_gb || null,
     };
+};
+
+// Allow read-only access to StealthCloud data even without an active subscription.
+// We only block access after the data has been deleted server-side.
+const blockDeletedSubscription = async (req, res, next) => {
+    try {
+        const st = await resolveSubscriptionState(req.user.id);
+        if (st.status === 'deleted') {
+            return res.status(410).json({
+                error: 'Data deleted',
+                code: 'SUBSCRIPTION_DATA_DELETED',
+                deletedAt: st.deletedAt,
+            });
+        }
+        return next();
+    } catch (e) {
+        return res.status(500).json({ error: 'Subscription check failed' });
+    }
 };
 
 const requireActiveSubscription = async (req, res, next) => {
@@ -223,7 +258,7 @@ const requireActiveSubscription = async (req, res, next) => {
         const st = await resolveSubscriptionState(req.user.id);
         if (st.allowed) return next();
 
-        if (st.status === 'grace') {
+        if (st.status === 'grace' || st.status === 'grace_expired') {
             return res.status(402).json({
                 error: 'Subscription expired',
                 code: 'SUBSCRIPTION_EXPIRED',
@@ -269,6 +304,7 @@ db.serialize(() => {
         status TEXT,
         expires_at INTEGER,
         grace_until INTEGER,
+        trial_until INTEGER,
         deleted_at INTEGER,
         updated_at INTEGER,
         FOREIGN KEY(user_id) REFERENCES users(id)
@@ -280,6 +316,9 @@ db.serialize(() => {
         const names = Array.isArray(cols) ? cols.map(c => c && c.name).filter(Boolean) : [];
         if (!names.includes('grace_until')) {
             db.run(`ALTER TABLE user_plans ADD COLUMN grace_until INTEGER`, [], () => {});
+        }
+        if (!names.includes('trial_until')) {
+            db.run(`ALTER TABLE user_plans ADD COLUMN trial_until INTEGER`, [], () => {});
         }
         if (!names.includes('deleted_at')) {
             db.run(`ALTER TABLE user_plans ADD COLUMN deleted_at INTEGER`, [], () => {});
@@ -668,14 +707,15 @@ app.post('/api/register', authRateLimiter, async (req, res) => {
             }
 
             const newUserId = this.lastID;
-            if (normalizedPlanGb) {
-                const now = Date.now();
-                db.run(
-                    `INSERT INTO user_plans (user_id, plan_gb, status, updated_at) VALUES (?, ?, ?, ?)
-                     ON CONFLICT(user_id) DO UPDATE SET plan_gb=excluded.plan_gb, status=excluded.status, updated_at=excluded.updated_at`,
-                    [newUserId, normalizedPlanGb, 'selected', now]
-                );
-            }
+            const now = Date.now();
+            const trialMs = Math.max(0, TRIAL_DAYS) * 24 * 60 * 60 * 1000;
+            const trialUntil = trialMs > 0 ? (now + trialMs) : null;
+            const initialStatus = trialUntil ? 'trial' : 'none';
+            db.run(
+                `INSERT INTO user_plans (user_id, plan_gb, status, trial_until, updated_at) VALUES (?, ?, ?, ?, ?)
+                 ON CONFLICT(user_id) DO UPDATE SET plan_gb=COALESCE(excluded.plan_gb, plan_gb), status=excluded.status, trial_until=excluded.trial_until, updated_at=excluded.updated_at`,
+                [newUserId, normalizedPlanGb, initialStatus, trialUntil, now]
+            );
 
             res.status(201).json({ message: 'User registered successfully' });
         });
@@ -699,14 +739,18 @@ app.post('/api/login', authRateLimiter, (req, res) => {
         // Register/Update Device
         db.run(`INSERT OR IGNORE INTO devices (user_id, device_uuid, device_name) VALUES (?, ?, ?)`, 
             [user.id, device_uuid, device_name || 'Unknown Device'], 
-            (devErr) => {
+            async (devErr) => {
                 if (devErr) console.error('Device reg error:', devErr);
 
                 const now = Date.now();
+                try {
+                    await ensurePlanRow(user.id);
+                } catch (e) {
+                    // ignore
+                }
                 db.run(
-                    `INSERT INTO user_plans (user_id, rc_app_user_id, status, updated_at) VALUES (?, ?, ?, ?)
-                     ON CONFLICT(user_id) DO UPDATE SET rc_app_user_id=excluded.rc_app_user_id, updated_at=excluded.updated_at`,
-                    [user.id, String(device_uuid), 'none', now]
+                    `UPDATE user_plans SET rc_app_user_id = ?, updated_at = ? WHERE user_id = ?`,
+                    [String(device_uuid), now, user.id]
                 );
                 
                 // Generate Token BOUND to this device
@@ -1085,7 +1129,7 @@ app.post('/api/cloud/chunks', authenticateToken, requireActiveSubscription, lock
 });
 
 // Download encrypted chunk blob
-app.get('/api/cloud/chunks/:chunkId', authenticateToken, requireActiveSubscription, (req, res) => {
+app.get('/api/cloud/chunks/:chunkId', authenticateToken, blockDeletedSubscription, (req, res) => {
     const chunkId = (req.params.chunkId || '').toLowerCase();
     if (!chunkId.match(/^[a-f0-9]{64}$/i)) {
         return res.status(400).json({ error: 'Invalid chunk id' });
@@ -1132,7 +1176,7 @@ app.post('/api/cloud/manifests', authenticateToken, requireActiveSubscription, (
 });
 
 // List manifests
-app.get('/api/cloud/manifests', authenticateToken, requireActiveSubscription, (req, res) => {
+app.get('/api/cloud/manifests', authenticateToken, blockDeletedSubscription, (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
@@ -1147,7 +1191,7 @@ app.get('/api/cloud/manifests', authenticateToken, requireActiveSubscription, (r
 });
 
 // Download encrypted manifest
-app.get('/api/cloud/manifests/:manifestId', authenticateToken, requireActiveSubscription, (req, res) => {
+app.get('/api/cloud/manifests/:manifestId', authenticateToken, blockDeletedSubscription, (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
