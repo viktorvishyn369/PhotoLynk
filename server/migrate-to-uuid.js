@@ -11,8 +11,21 @@ const sqlite3 = require('sqlite3').verbose();
 const fs = require('fs');
 const path = require('path');
 
-const DB_PATH = './backup.db';
-const UPLOAD_DIR = './uploads';
+const DEFAULT_LINUX_MEDIA_DIR = '/data/media';
+const DEFAULT_LINUX_DB_DIR = '/data/db';
+
+const isExistingDir = (p) => {
+    try {
+        return fs.existsSync(p) && fs.statSync(p).isDirectory();
+    } catch (e) {
+        return false;
+    }
+};
+
+const DB_PATH =
+    process.env.DB_PATH || (isExistingDir(DEFAULT_LINUX_DB_DIR) ? path.join(DEFAULT_LINUX_DB_DIR, 'backup.db') : path.join(__dirname, 'backup.db'));
+const UPLOAD_DIR =
+    process.env.UPLOAD_DIR || (isExistingDir(DEFAULT_LINUX_MEDIA_DIR) ? DEFAULT_LINUX_MEDIA_DIR : path.join(__dirname, 'uploads'));
 
 console.log('🔄 Starting migration from user_id folders to device_uuid folders...\n');
 

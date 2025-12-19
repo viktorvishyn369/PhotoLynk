@@ -4,7 +4,7 @@ const path = require('path');
 const { execSync } = require('child_process');
 
 const CURRENT_VERSION = '1.0.0';
-const GITHUB_REPO = 'viktorvishyn369/PhotoSync';
+const GITHUB_REPO = 'viktorvishyn369/PhotoLynk';
 const UPDATE_CHECK_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
 
 class Updater {
@@ -22,7 +22,7 @@ class Updater {
         path: `/repos/${GITHUB_REPO}/releases/latest`,
         method: 'GET',
         headers: {
-          'User-Agent': 'PhotoSync-Server'
+          'User-Agent': 'PhotoLynk-Server'
         }
       };
 

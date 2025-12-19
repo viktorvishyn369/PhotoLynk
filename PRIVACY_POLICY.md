@@ -1,12 +1,12 @@
-# PhotoSync Privacy Policy
+# PhotoLynk Privacy Policy
 
 **Last Updated**: December 4, 2024
 
 ## Overview
-PhotoSync is a self-hosted photo backup application. We do not collect, store, or share any personal data on external servers.
+PhotoLynk is a self-hosted photo backup application. We do not collect, store, or share any personal data on external servers.
 
 ## Data Collection
-PhotoSync collects and stores the following data **only on YOUR server**:
+PhotoLynk collects and stores the following data **only on YOUR server**:
 
 - **Photos and Videos**: Stored on the server you control
 - **Email Address**: Used for authentication, stored locally on your server
@@ -23,7 +23,7 @@ All data is stored on the server YOU control. We (the app developers) have **no 
 - **No Analytics**: We do not collect usage statistics or analytics
 
 ## Third-Party Services
-PhotoSync does **not** use any third-party services, analytics, or tracking tools. Your data stays on your server.
+PhotoLynk does **not** use any third-party services, analytics, or tracking tools. Your data stays on your server.
 
 ## Data Sharing
 We do not share any data with third parties because we do not have access to your data. All data remains on your self-hosted server.
@@ -42,7 +42,7 @@ You have complete control over your data:
 - No data stored on external servers
 
 ## Children's Privacy
-PhotoSync does not knowingly collect data from children under 13. Since all data is self-hosted, parents have full control over what data is stored.
+PhotoLynk does not knowingly collect data from children under 13. Since all data is self-hosted, parents have full control over what data is stored.
 
 ## Changes to This Policy
 We may update this privacy policy from time to time. Updates will be posted on our GitHub repository.
@@ -50,11 +50,11 @@ We may update this privacy policy from time to time. Updates will be posted on o
 ## Contact
 For questions about this privacy policy:
 - **Email**: viktor.vishyn.369@gmail.com
-- **GitHub**: https://github.com/viktorvishyn369/PhotoSync
+- **GitHub**: https://github.com/viktorvishyn369/PhotoLynk
 
 ## Disclaimer and Limitation of Liability
 
-**USE AT YOUR OWN RISK**: PhotoSync is provided "AS IS" without warranty of any kind, express or implied. The developers make no guarantees about:
+**USE AT YOUR OWN RISK**: PhotoLynk is provided "AS IS" without warranty of any kind, express or implied. The developers make no guarantees about:
 - Data integrity or reliability
 - Backup completeness or accuracy
 - Server security or availability
@@ -74,11 +74,11 @@ For questions about this privacy policy:
 - Compliance with applicable laws
 - Any data loss or damage
 
-**NOT A PROFESSIONAL SERVICE**: PhotoSync is a free, open-source project provided as-is. It is not a professional backup service and should not be relied upon as your only backup solution.
+**NOT A PROFESSIONAL SERVICE**: PhotoLynk is a free, open-source project provided as-is. It is not a professional backup service and should not be relied upon as your only backup solution.
 
 ## Open Source
-PhotoSync is open source. You can review the code to verify our privacy practices:
-https://github.com/viktorvishyn369/PhotoSync
+PhotoLynk is open source. You can review the code to verify our privacy practices:
+https://github.com/viktorvishyn369/PhotoLynk
 
 ---
 

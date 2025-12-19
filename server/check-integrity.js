@@ -3,13 +3,39 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-// Use same path logic as server.js
 const HOME_DIR = os.homedir();
-const PHOTOSYNC_DIR = path.join(HOME_DIR, 'PhotoSync', 'server');
-const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(PHOTOSYNC_DIR, 'uploads');
-const DB_PATH = process.env.DB_PATH || path.join(PHOTOSYNC_DIR, 'backup.db');
+const DEFAULT_LINUX_MEDIA_DIR = '/data/media';
+const DEFAULT_LINUX_DB_DIR = '/data/db';
 
-console.log('\n🔍 ===== PHOTOSYNC INTEGRITY CHECK =====\n');
+const isExistingDir = (p) => {
+  try {
+    return fs.existsSync(p) && fs.statSync(p).isDirectory();
+  } catch (e) {
+    return false;
+  }
+};
+
+const resolveBaseDir = () => {
+  if (process.env.PHOTOSYNC_DATA_DIR) return process.env.PHOTOSYNC_DATA_DIR;
+  if (process.env.UPLOAD_DIR) return path.dirname(process.env.UPLOAD_DIR);
+  if (isExistingDir(DEFAULT_LINUX_MEDIA_DIR) || isExistingDir(DEFAULT_LINUX_DB_DIR)) return '/data';
+  const photolynkDir = path.join(HOME_DIR, 'PhotoLynk', 'server');
+  const photosyncDir = path.join(HOME_DIR, 'PhotoSync', 'server');
+  try {
+    if (fs.existsSync(photolynkDir)) return photolynkDir;
+    if (fs.existsSync(photosyncDir)) return photosyncDir;
+  } catch (e) {
+  }
+  return photolynkDir;
+};
+
+const BASE_DIR = resolveBaseDir();
+const UPLOAD_DIR =
+  process.env.UPLOAD_DIR || (isExistingDir(DEFAULT_LINUX_MEDIA_DIR) ? DEFAULT_LINUX_MEDIA_DIR : path.join(BASE_DIR, 'uploads'));
+const DB_PATH =
+  process.env.DB_PATH || (isExistingDir(DEFAULT_LINUX_DB_DIR) ? path.join(DEFAULT_LINUX_DB_DIR, 'backup.db') : path.join(BASE_DIR, 'backup.db'));
+
+console.log('\n🔍 ===== PHOTOLYNK INTEGRITY CHECK =====\n');
 console.log(`📁 Upload directory: ${UPLOAD_DIR}`);
 console.log(`💾 Database: ${DB_PATH}`);
 console.log(`🏠 Home directory: ${HOME_DIR}`);

@@ -1,7 +1,7 @@
 {
   "name": "photosync-server",
   "version": "1.0.1",
-  "description": "PhotoSync Server - Self-hosted photo backup server with auto-restart and firewall configuration",
+  "description": "PhotoLynk Server - Self-hosted photo backup server with auto-restart and firewall configuration",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -20,16 +20,16 @@
     "cloud-storage",
     "mobile-backup"
   ],
-  "author": "PhotoSync Contributors",
+  "author": "PhotoLynk Contributors",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/viktorvishyn369/PhotoSync.git"
+    "url": "https://github.com/viktorvishyn369/PhotoLynk.git"
   },
   "bugs": {
-    "url": "https://github.com/viktorvishyn369/PhotoSync/issues"
+    "url": "https://github.com/viktorvishyn369/PhotoLynk/issues"
   },
-  "homepage": "https://github.com/viktorvishyn369/PhotoSync#readme",
+  "homepage": "https://github.com/viktorvishyn369/PhotoLynk#readme",
   "type": "commonjs",
   "dependencies": {
     "bcrypt": "^6.0.0",

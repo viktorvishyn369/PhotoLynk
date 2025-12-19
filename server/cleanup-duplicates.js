@@ -1,7 +1,10 @@
 const sqlite3 = require('sqlite3').verbose();
+const fs = require('fs');
 const path = require('path');
 
-const DB_PATH = path.join(__dirname, 'backup.db');
+const DEFAULT_LINUX_DB_DIR = '/data/db';
+const DB_PATH =
+  process.env.DB_PATH || (fs.existsSync(DEFAULT_LINUX_DB_DIR) ? path.join(DEFAULT_LINUX_DB_DIR, 'backup.db') : path.join(__dirname, 'backup.db'));
 const db = new sqlite3.Database(DB_PATH);
 
 console.log('🔍 Checking for duplicate filenames in database...\n');

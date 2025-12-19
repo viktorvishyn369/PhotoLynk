@@ -1,4 +1,4 @@
-# PhotoSync — Self‑Hosted. Encrypted Cloud. iOS ↔ Android.
+# PhotoLynk — Self‑Hosted. Encrypted Cloud. iOS ↔ Android.
 
 Back up photos/videos to your own server or StealthCloud, and restore on any phone with the same credentials.
 
@@ -8,15 +8,15 @@ Back up photos/videos to your own server or StealthCloud, and restore on any pho
 
 ### Option A: Local Backup (Home Wi‑Fi / LAN)
 
-1. Download the **PhotoSync Server** app for your platform from **GitHub Releases**:
-   - https://github.com/viktorvishyn369/PhotoSync/releases
+1. Download the **PhotoLynk Server** app for your platform from **GitHub Releases**:
+   - https://github.com/viktorvishyn369/PhotoLynk/releases
 
 2. Install it and run it.
    - It runs in your system tray / menu bar.
 
 3. Open the tray dropdown menu, find **Local IP Addresses**, and click your IP to copy it.
 
-4. On your phone, open the PhotoSync mobile app and go to Settings:
+4. On your phone, open the PhotoLynk mobile app and go to Settings:
    - Select **Local** connection
    - Paste the IP address you copied (IP only — no http(s)://, no port, no domain):
      - Example: `192.168.1.222`
@@ -27,7 +27,7 @@ Done. Start backing up your photos/videos.
 
 Remote works like Local mode, but your server runs on a remote machine (VPS/home server) and the app connects over HTTPS.
 
-1. Install and run PhotoSync Server on your remote machine.
+1. Install and run PhotoLynk Server on your remote machine.
 2. Configure HTTPS (TLS) on the server.
 3. Ensure the server is reachable from the internet on port `3000` with TLS enabled.
 4. In the mobile app Settings:
@@ -41,7 +41,7 @@ Note: the mobile app automatically connects as `https://<host>:3000` for Remote,
 
 If you choose **StealthCloud**, you do not need to download/install the server app.
 
-1. Install the PhotoSync mobile app.
+1. Install the PhotoLynk mobile app.
 2. Select **StealthCloud** inside the app.
 3. Start backing up.
 
@@ -53,15 +53,15 @@ If you prefer installing from source (advanced), you can use the provided script
 
 - Desktop (macOS/Linux):
   ```bash
-  sudo curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install.sh | bash
+  sudo curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoLynk/main/install.sh | bash
   ```
 - Windows (PowerShell as Administrator):
   ```powershell
-  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-RestMethod https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install.ps1 | Invoke-Expression
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-RestMethod https://raw.githubusercontent.com/viktorvishyn369/PhotoLynk/main/install.ps1 | Invoke-Expression
   ```
 - Linux server (headless):
   ```bash
-  sudo curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install-server.sh | bash
+  sudo curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoLynk/main/install-server.sh | bash
   ```
 
 ---
@@ -70,7 +70,7 @@ If you prefer installing from source (advanced), you can use the provided script
 
 ### Local backup (LAN)
 
-- You run **PhotoSync Server** on your computer.
+- You run **PhotoLynk Server** on your computer.
 - Your phone connects over your home network to the server (port `3000`).
 - Photos/videos are uploaded to the server and stored on disk under your account folder.
 
@@ -131,8 +131,8 @@ Prerequisites:
 Clone the repo:
 
 ```bash
-git clone https://github.com/viktorvishyn369/PhotoSync.git
-cd PhotoSync
+git clone https://github.com/viktorvishyn369/PhotoLynk.git
+cd PhotoLynk
 ```
 
 Run as a desktop tray app (includes server):
@@ -163,17 +163,17 @@ Optional configuration (environment variables):
 
 ## Auto-Updates
 
-PhotoSync automatically checks for updates every 24 hours.
+PhotoLynk automatically checks for updates every 24 hours.
 
 **Check for updates manually:**
 ```bash
-cd ~/PhotoSync/server
+cd ~/PhotoLynk/server
 npm run check-update
 ```
 
 **Install update:**
 ```bash
-cd ~/PhotoSync/server
+cd ~/PhotoLynk/server
 npm run update
 ```
 
@@ -211,7 +211,7 @@ This means StealthCloud stores encrypted data and is designed so that it cannot 
 
 Remote works like Local mode, but your server runs on a remote machine (VPS/home server) instead of your personal computer.
 
-- Install PhotoSync Server on the remote machine (headless is recommended).
+- Install PhotoLynk Server on the remote machine (headless is recommended).
 - Enable HTTPS (TLS) on the remote server so traffic is encrypted end-to-end.
 - In the mobile app (Remote), enter the server public host only (IP address or domain name only — no http(s)://, no port, no path).
 - The app connects as `https://<host>:3000` for Remote.
@@ -255,7 +255,7 @@ Deletion behavior:
 
 See [PRIVACY_POLICY.md](PRIVACY_POLICY.md)
 
-- PhotoSync does not sell your personal data.
+- PhotoLynk does not sell your personal data.
 - Local mode stores your library on your own machine.
 - StealthCloud (if enabled) stores encrypted backup data.
 
@@ -275,8 +275,8 @@ See [PRIVACY_POLICY.md](PRIVACY_POLICY.md)
 5. Ensure the phone and computer are on the same Wi‑Fi network.
 
 **For Remote Server (internet/VPS):**
-1. Install PhotoSync Server on your remote machine (VPS/home server).
-2. Enable HTTPS (TLS) for PhotoSync Server on the remote machine (install a certificate and open the HTTPS port).
+1. Install PhotoLynk Server on your remote machine (VPS/home server).
+2. Enable HTTPS (TLS) for PhotoLynk Server on the remote machine (install a certificate and open the HTTPS port).
 3. In the app (Remote), enter the public host only (IP address or domain name only — no http(s)://, no port, no path):
    - Example: `203.0.113.10`
 
@@ -303,13 +303,13 @@ taskkill /PID <PID> /F
 ## What Gets Installed
 
 ### Desktop Install
-- PhotoSync repository → `~/PhotoSync`
+- PhotoLynk repository → `~/PhotoLynk`
 - Server dependencies
 - Tray app dependencies
 - System tray application
 
 ### Linux Server Install
-- PhotoSync repository → `/opt/photosync`
+- PhotoLynk repository → `/opt/photolynk`
 - Server dependencies
 - Systemd service
 - Firewall rules
@@ -318,14 +318,14 @@ taskkill /PID <PID> /F
 
 ```bash
 # Desktop
-cd ~/PhotoSync
+cd ~/PhotoLynk
 git pull
 cd server-tray
 npm install
 npm start
 
 # Linux Server
-cd /opt/photosync
+cd /opt/photolynk
 sudo git pull
 cd server
 sudo npm install
@@ -343,8 +343,8 @@ sudo systemctl restart photosync
 
 ### Manual Installation
 ```bash
-git clone https://github.com/viktorvishyn369/PhotoSync.git
-cd PhotoSync
+git clone https://github.com/viktorvishyn369/PhotoLynk.git
+cd PhotoLynk
 
 # For desktop with tray
 cd server-tray
@@ -367,4 +367,4 @@ Issues and pull requests welcome!
 
 ---
 
-**PhotoSync** - Your photos, your server, your privacy.
+**PhotoLynk** - Your photos, your server, your privacy.

@@ -29,10 +29,90 @@ const FORCE_HTTPS_REDIRECT = String(process.env.FORCE_HTTPS_REDIRECT || '').toLo
 const os = require('os');
 const HOME_DIR = os.homedir();
 
+const DEFAULT_LINUX_MEDIA_DIR = '/data/media';
+const DEFAULT_LINUX_DB_DIR = '/data/db';
+
+const isExistingDir = (p) => {
+    try {
+        return fs.existsSync(p) && fs.statSync(p).isDirectory();
+    } catch (e) {
+        return false;
+    }
+};
+
+const reserveStealthCloudIncomingBytes = async ({ userId, incomingBytes }) => {
+    const inc = typeof incomingBytes === 'number' && Number.isFinite(incomingBytes) ? Math.max(0, incomingBytes) : 0;
+    if (inc <= 0) {
+        return {
+            allowed: true,
+            quotaBytes: await getUserQuotaBytes(userId),
+            usedBytes: await getUserUsedBytes(userId),
+            reservedBytes: Number(cloudUploadReservedBytes.get(String(userId)) || 0) || 0,
+            remainingBytes: 0,
+            marginBytes: USER_QUOTA_MARGIN_BYTES,
+            release: () => {},
+        };
+    }
+
+    const releaseLock = await acquireCloudUploadLock(userId);
+    try {
+        const quotaBytes = await getUserQuotaBytes(userId);
+        const usedBytes = await getUserUsedBytes(userId);
+        const key = String(userId);
+        const reservedBytes = Number(cloudUploadReservedBytes.get(key) || 0) || 0;
+        const allowed = quotaBytes <= 0 ? true : (usedBytes + reservedBytes + inc + USER_QUOTA_MARGIN_BYTES) <= quotaBytes;
+        const remaining = quotaBytes <= 0 ? 0 : Math.max(0, quotaBytes - (usedBytes + reservedBytes));
+
+        if (!allowed) {
+            return {
+                allowed: false,
+                quotaBytes,
+                usedBytes,
+                reservedBytes,
+                remainingBytes: remaining,
+                marginBytes: USER_QUOTA_MARGIN_BYTES,
+                release: () => {},
+            };
+        }
+
+        cloudUploadReservedBytes.set(key, reservedBytes + inc);
+        let released = false;
+        const releaseReservation = () => {
+            if (released) return;
+            released = true;
+            const cur = Number(cloudUploadReservedBytes.get(key) || 0) || 0;
+            const next = Math.max(0, cur - inc);
+            if (next <= 0) cloudUploadReservedBytes.delete(key);
+            else cloudUploadReservedBytes.set(key, next);
+        };
+
+        return {
+            allowed: true,
+            quotaBytes,
+            usedBytes,
+            reservedBytes: reservedBytes + inc,
+            remainingBytes: remaining,
+            marginBytes: USER_QUOTA_MARGIN_BYTES,
+            release: releaseReservation,
+        };
+    } finally {
+        releaseLock();
+    }
+};
+
 const resolveDataDir = () => {
     if (process.env.PHOTOSYNC_DATA_DIR) return process.env.PHOTOSYNC_DATA_DIR;
-    if (process.env.DB_PATH) return path.dirname(process.env.DB_PATH);
-    return path.join(HOME_DIR, 'PhotoSync', 'server');
+    if (process.env.UPLOAD_DIR) return path.dirname(process.env.UPLOAD_DIR);
+    if (isExistingDir(DEFAULT_LINUX_MEDIA_DIR) || isExistingDir(DEFAULT_LINUX_DB_DIR)) return '/data';
+    const photolynkDir = path.join(HOME_DIR, 'PhotoLynk', 'server');
+    const photosyncDir = path.join(HOME_DIR, 'PhotoSync', 'server');
+    try {
+        if (fs.existsSync(photolynkDir)) return photolynkDir;
+        if (fs.existsSync(photosyncDir)) return photosyncDir;
+    } catch (e) {
+        // ignore
+    }
+    return photolynkDir;
 };
 
 const normalizeTierGb = (value) => {
@@ -43,11 +123,15 @@ const normalizeTierGb = (value) => {
 };
 
 const DATA_DIR = resolveDataDir();
-const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(DATA_DIR, 'uploads');
-const CLOUD_DIR = process.env.CLOUD_DIR || path.join(DATA_DIR, 'cloud');
-const CAPACITY_JSON_PATH = process.env.CAPACITY_JSON_PATH || path.join(DATA_DIR, 'capacity', 'photosync-capacity.json');
+const UPLOAD_DIR =
+    process.env.UPLOAD_DIR || (isExistingDir(DEFAULT_LINUX_MEDIA_DIR) ? DEFAULT_LINUX_MEDIA_DIR : path.join(DATA_DIR, 'uploads'));
+const DB_PATH =
+    process.env.DB_PATH || (isExistingDir(DEFAULT_LINUX_DB_DIR) ? path.join(DEFAULT_LINUX_DB_DIR, 'backup.db') : path.join(DATA_DIR, 'backup.db'));
+const AUX_ROOT = process.env.PHOTOSYNC_DATA_DIR || path.dirname(UPLOAD_DIR);
+const CLOUD_DIR = process.env.CLOUD_DIR || path.join(AUX_ROOT, 'cloud');
+const CAPACITY_JSON_PATH = process.env.CAPACITY_JSON_PATH || path.join(AUX_ROOT, 'capacity', 'photosync-capacity.json');
 
-const SUBSCRIPTION_GRACE_DAYS = Number.parseInt(process.env.SUBSCRIPTION_GRACE_DAYS || '10', 10);
+const SUBSCRIPTION_GRACE_DAYS = Number.parseInt(process.env.SUBSCRIPTION_GRACE_DAYS || '3', 10);
 const TRIAL_DAYS = Number.parseInt(process.env.TRIAL_DAYS || '7', 10);
 const REVENUECAT_WEBHOOK_SECRET = process.env.REVENUECAT_WEBHOOK_SECRET || '';
 const USER_QUOTA_MARGIN_BYTES = Number.parseInt(process.env.USER_QUOTA_MARGIN_BYTES || String(50 * 1024 * 1024), 10);
@@ -113,8 +197,17 @@ if (!fs.existsSync(CLOUD_DIR)) {
     fs.mkdirSync(CLOUD_DIR, { recursive: true });
 }
 
+const capacityDir = path.dirname(CAPACITY_JSON_PATH);
+if (!fs.existsSync(capacityDir)) {
+    fs.mkdirSync(capacityDir, { recursive: true });
+}
+
+const dbDir = path.dirname(DB_PATH);
+if (!fs.existsSync(dbDir)) {
+    fs.mkdirSync(dbDir, { recursive: true });
+}
+
 // Database Setup
-const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, 'backup.db');
 const db = new sqlite3.Database(DB_PATH, (err) => {
     if (err) console.error('DB Error:', err.message);
     else console.log(`Connected to SQLite database at ${DB_PATH}`);
@@ -153,12 +246,10 @@ const ensurePlanRow = async (userId) => {
     const existing = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [userId]);
     if (existing) return existing;
     const now = Date.now();
-    const trialMs = Math.max(0, TRIAL_DAYS) * 24 * 60 * 60 * 1000;
-    const trialUntil = trialMs > 0 ? (now + trialMs) : null;
     await dbRunAsync(
         `INSERT INTO user_plans (user_id, status, trial_until, updated_at) VALUES (?, ?, ?, ?)
          ON CONFLICT(user_id) DO UPDATE SET updated_at=excluded.updated_at`,
-        [userId, trialUntil ? 'trial' : 'none', trialUntil, now]
+        [userId, 'none', null, now]
     );
     return await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [userId]);
 };
@@ -188,6 +279,26 @@ const resolveSubscriptionState = async (userId) => {
         return {
             allowed: true,
             status: 'trial',
+            trialUntil,
+            expiresAt: expiresAt || null,
+            graceUntil: graceUntil || null,
+            planGb: row.plan_gb || null,
+        };
+    }
+
+    if (row.status === 'trial' && trialUntil && trialUntil > 0 && trialUntil <= now) {
+        try {
+            const updatedAt = Date.now();
+            await dbRunAsync(
+                `UPDATE user_plans SET status = ?, updated_at = ? WHERE user_id = ?`,
+                ['trial_expired', updatedAt, userId]
+            );
+        } catch (e) {
+            // ignore
+        }
+        return {
+            allowed: false,
+            status: 'trial_expired',
             trialUntil,
             expiresAt: expiresAt || null,
             graceUntil: graceUntil || null,
@@ -265,6 +376,56 @@ const requireActiveSubscription = async (req, res, next) => {
                 expiresAt: st.expiresAt,
                 graceUntil: st.graceUntil,
                 deleteInDays: SUBSCRIPTION_GRACE_DAYS,
+            });
+        }
+
+        if (st.status === 'trial_expired') {
+            return res.status(402).json({
+                error: 'Trial expired',
+                code: 'TRIAL_EXPIRED',
+                trialUntil: st.trialUntil,
+            });
+        }
+
+        if (st.status === 'deleted') {
+            return res.status(410).json({
+                error: 'Data deleted',
+                code: 'SUBSCRIPTION_DATA_DELETED',
+                deletedAt: st.deletedAt,
+            });
+        }
+
+        return res.status(402).json({
+            error: 'Subscription required',
+            code: 'SUBSCRIPTION_REQUIRED',
+        });
+    } catch (e) {
+        return res.status(500).json({ error: 'Subscription check failed' });
+    }
+};
+
+// Uploads are more restrictive than read-only sync.
+// Policy: active + trial can upload; grace/trial_expired can only sync/restore.
+const requireUploadSubscription = async (req, res, next) => {
+    try {
+        const st = await resolveSubscriptionState(req.user.id);
+        if (st.status === 'active' || st.status === 'trial') return next();
+
+        if (st.status === 'grace' || st.status === 'grace_expired') {
+            return res.status(402).json({
+                error: 'Subscription expired (sync-only)',
+                code: 'SUBSCRIPTION_EXPIRED_SYNC_ONLY',
+                expiresAt: st.expiresAt,
+                graceUntil: st.graceUntil,
+                deleteInDays: SUBSCRIPTION_GRACE_DAYS,
+            });
+        }
+
+        if (st.status === 'trial_expired') {
+            return res.status(402).json({
+                error: 'Trial expired (sync-only)',
+                code: 'TRIAL_EXPIRED_SYNC_ONLY',
+                trialUntil: st.trialUntil,
             });
         }
 
@@ -574,7 +735,8 @@ const getUserQuotaBytes = async (userId) => {
     const planGb = await getUserPlanGb(userId);
     if (!planGb) return 0;
     const GB = 1000 * 1000 * 1000;
-    return Math.floor(planGb * GB);
+    const planBytes = Math.floor(planGb * GB);
+    return planBytes + USER_QUOTA_MARGIN_BYTES;
 };
 
 const getServerFreeBytes = () => {
@@ -584,7 +746,10 @@ const getServerFreeBytes = () => {
 };
 
 const enforceUserQuotaForIncomingBytes = async ({ userId, incomingBytes }) => {
-    const quotaBytes = await getUserQuotaBytes(userId);
+    const planGb = await getUserPlanGb(userId);
+    const GB = 1000 * 1000 * 1000;
+    const planBytes = planGb ? Math.floor(Number(planGb) * GB) : 0;
+    const quotaBytes = planBytes ? (planBytes + USER_QUOTA_MARGIN_BYTES) : 0;
     const usedBytes = await getUserUsedBytes(userId);
     const inc = typeof incomingBytes === 'number' && Number.isFinite(incomingBytes) ? incomingBytes : 0;
     const allowed = quotaBytes <= 0 ? true : (usedBytes + inc + USER_QUOTA_MARGIN_BYTES) <= quotaBytes;
@@ -592,7 +757,7 @@ const enforceUserQuotaForIncomingBytes = async ({ userId, incomingBytes }) => {
         allowed,
         quotaBytes,
         usedBytes,
-        remainingBytes: Math.max(0, quotaBytes - usedBytes),
+        remainingBytes: Math.max(0, planBytes - usedBytes),
         marginBytes: USER_QUOTA_MARGIN_BYTES,
     };
 };
@@ -603,6 +768,7 @@ const enforceUserQuotaForIncomingBytes = async ({ userId, incomingBytes }) => {
 // - This is an in-memory mutex (single-node). If you run multiple Node processes behind a load balancer,
 //   you should replace this with a distributed lock or an atomic quota reservation table.
 const cloudUploadLocks = new Map();
+const cloudUploadReservedBytes = new Map();
 
 const acquireCloudUploadLock = async (userId) => {
     const key = String(userId);
@@ -661,6 +827,13 @@ app.get('/api/capacity', (req, res) => {
 });
 
 // Public well-known capacity JSON (mobile app can call this directly)
+app.get('/.well-known/photolynk-capacity.json', (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const payload = readCapacityJson();
+    if (!payload) return res.status(404).json({ error: 'Capacity not available' });
+    return res.json(payload);
+});
+
 app.get('/.well-known/photosync-capacity.json', (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     const payload = readCapacityJson();
@@ -671,7 +844,9 @@ app.get('/.well-known/photosync-capacity.json', (req, res) => {
 app.get('/api/cloud/usage', authenticateToken, async (req, res) => {
     try {
         const planGb = await getUserPlanGb(req.user.id);
-        const quotaBytes = await getUserQuotaBytes(req.user.id);
+        const GB = 1000 * 1000 * 1000;
+        const planBytes = planGb ? Math.floor(Number(planGb) * GB) : 0;
+        const quotaBytes = planBytes ? (planBytes + USER_QUOTA_MARGIN_BYTES) : 0;
         const usedBytes = await getUserUsedBytes(req.user.id);
         const subscription = await resolveSubscriptionState(req.user.id);
         const serverFreeBytes = getServerFreeBytes();
@@ -680,7 +855,7 @@ app.get('/api/cloud/usage', authenticateToken, async (req, res) => {
             planGb,
             quotaBytes,
             usedBytes,
-            remainingBytes: Math.max(0, quotaBytes - usedBytes),
+            remainingBytes: Math.max(0, planBytes - usedBytes),
             marginBytes: USER_QUOTA_MARGIN_BYTES,
             subscription,
             serverFreeBytes,
@@ -709,7 +884,7 @@ app.post('/api/register', authRateLimiter, async (req, res) => {
             const newUserId = this.lastID;
             const now = Date.now();
             const trialMs = Math.max(0, TRIAL_DAYS) * 24 * 60 * 60 * 1000;
-            const trialUntil = trialMs > 0 ? (now + trialMs) : null;
+            const trialUntil = (normalizedPlanGb && trialMs > 0) ? (now + trialMs) : null;
             const initialStatus = trialUntil ? 'trial' : 'none';
             db.run(
                 `INSERT INTO user_plans (user_id, plan_gb, status, trial_until, updated_at) VALUES (?, ?, ?, ?, ?)
@@ -889,6 +1064,108 @@ app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => 
     );
 });
 
+// Raw Upload File (no multipart)
+app.post('/api/upload/raw', authenticateToken, (req, res) => {
+    const originalname = (req.headers['x-filename'] || req.headers['x-file-name'] || '').toString();
+    if (!originalname) return res.status(400).json({ error: 'Missing x-filename header' });
+
+    const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
+    try { fs.mkdirSync(deviceDir, { recursive: true }); } catch (e) {}
+
+    const safeName = path.basename(originalname);
+    const tmpName = `${Date.now()}_${Math.random().toString(16).slice(2)}_${safeName}.uploading`;
+    const tmpPath = path.join(deviceDir, tmpName);
+    const finalPath = path.join(deviceDir, safeName);
+
+    const hasher = crypto.createHash('sha256');
+    let writtenBytes = 0;
+
+    const out = fs.createWriteStream(tmpPath);
+    const cleanupTmp = () => {
+        try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
+    };
+
+    req.on('aborted', () => {
+        try { out.destroy(); } catch (e) {}
+        cleanupTmp();
+    });
+
+    req.on('error', (e) => {
+        try { out.destroy(); } catch (e2) {}
+        cleanupTmp();
+    });
+
+    out.on('error', (e) => {
+        cleanupTmp();
+        return res.status(500).json({ error: 'Failed to write upload' });
+    });
+
+    req.on('data', (chunk) => {
+        try {
+            writtenBytes += chunk.length;
+            hasher.update(chunk);
+        } catch (e) {
+            // ignore
+        }
+    });
+
+    out.on('finish', () => {
+        const fileHash = hasher.digest('hex');
+        const mimetype = (req.headers['content-type'] || 'application/octet-stream').toString();
+        const size = writtenBytes;
+
+        db.get(
+            `SELECT filename, file_hash FROM files WHERE user_id = ? AND (file_hash = ? OR filename = ?)`,
+            [req.user.id, fileHash, safeName],
+            (err, row) => {
+                if (err) {
+                    cleanupTmp();
+                    return res.status(500).json({ error: 'Database error' });
+                }
+
+                if (row) {
+                    const existingFilePath = path.join(deviceDir, row.filename);
+                    if (fs.existsSync(existingFilePath)) {
+                        cleanupTmp();
+                        console.log(`Duplicate raw upload detected: ${safeName} (matches ${row.filename})`);
+                        return res.json({ message: 'File already exists (duplicate)', filename: row.filename, duplicate: true });
+                    }
+                    console.log(`File ${row.filename} in DB but missing from disk - cleaning up DB`);
+                    db.run(`DELETE FROM files WHERE user_id = ? AND (file_hash = ? OR filename = ?)`, [req.user.id, fileHash, safeName]);
+                }
+
+                try {
+                    if (fs.existsSync(finalPath)) {
+                        fs.unlinkSync(finalPath);
+                    }
+                } catch (e) {}
+
+                try {
+                    fs.renameSync(tmpPath, finalPath);
+                } catch (e) {
+                    cleanupTmp();
+                    return res.status(500).json({ error: 'Failed to finalize upload' });
+                }
+
+                db.run(
+                    `INSERT OR REPLACE INTO files (user_id, filename, original_name, mime_type, size, file_hash) VALUES (?, ?, ?, ?, ?, ?)`,
+                    [req.user.id, safeName, safeName, mimetype, size, fileHash],
+                    (err2) => {
+                        if (err2) {
+                            console.error('Metadata save error:', err2);
+                            try { fs.unlinkSync(finalPath); } catch (e) {}
+                            return res.status(500).json({ error: 'Failed to save file metadata' });
+                        }
+                        return res.json({ message: 'File uploaded', filename: safeName });
+                    }
+                );
+            }
+        );
+    });
+
+    req.pipe(out);
+});
+
 // List Files (for Sync)
 app.get('/api/files', authenticateToken, (req, res) => {
     // Read files from device UUID folder
@@ -925,6 +1202,46 @@ app.get('/api/files', authenticateToken, (req, res) => {
     } catch (error) {
         console.error('[LIST FILES] Error reading files:', error);
         res.status(500).json({ error: 'Error reading files' });
+    }
+});
+
+// Purge classic uploads (non-StealthCloud) for this device
+app.post('/api/files/purge', authenticateToken, async (req, res) => {
+    try {
+        const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
+
+        const countFiles = (dir) => {
+            try {
+                if (!fs.existsSync(dir)) return 0;
+                return fs.readdirSync(dir)
+                    .filter(f => f && !f.startsWith('.'))
+                    .filter(f => {
+                        try { return fs.statSync(path.join(dir, f)).isFile(); } catch (e) { return false; }
+                    }).length;
+            } catch (e) {
+                return 0;
+            }
+        };
+
+        const filesBefore = countFiles(deviceDir);
+
+        try { fs.rmSync(deviceDir, { recursive: true, force: true }); } catch (e) {}
+        try { fs.mkdirSync(deviceDir, { recursive: true }); } catch (e) {}
+
+        try {
+            await dbRunAsync(`DELETE FROM files WHERE user_id = ?`, [req.user.id]);
+        } catch (e) {
+            return res.status(500).json({ error: 'Failed to clear file index' });
+        }
+
+        return res.json({
+            ok: true,
+            deleted: {
+                files: filesBefore,
+            }
+        });
+    } catch (e) {
+        return res.status(500).json({ error: 'Purge failed' });
     }
 });
 
@@ -990,7 +1307,7 @@ app.post('/api/cloud/purge', authenticateToken, async (req, res) => {
 });
 
 // Upload encrypted chunk blob
-app.post('/api/cloud/chunks', authenticateToken, requireActiveSubscription, lockStealthCloudUploadForUser, (req, res, next) => {
+app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req, res, next) => {
     const ct = (req.headers['content-type'] || '').toString().toLowerCase();
     if (ct.startsWith('application/octet-stream') || ct === 'application/octetstream') {
         return rawCloudChunk(req, res, next);
@@ -1023,14 +1340,14 @@ app.post('/api/cloud/chunks', authenticateToken, requireActiveSubscription, lock
             return res.json({ chunkId: requestedId, stored: true });
         }
 
-        const quotaCheck = await enforceUserQuotaForIncomingBytes({ userId: req.user.id, incomingBytes: req.body.length });
-        if (!quotaCheck.allowed) {
+        const reservation = await reserveStealthCloudIncomingBytes({ userId: req.user.id, incomingBytes: req.body.length });
+        if (!reservation.allowed) {
             return res.status(413).json({
                 error: 'Storage limit reached',
                 code: 'QUOTA_EXCEEDED',
-                usedBytes: quotaCheck.usedBytes,
-                quotaBytes: quotaCheck.quotaBytes,
-                remainingBytes: quotaCheck.remainingBytes,
+                usedBytes: reservation.usedBytes,
+                quotaBytes: reservation.quotaBytes,
+                remainingBytes: reservation.remainingBytes,
             });
         }
 
@@ -1047,6 +1364,8 @@ app.post('/api/cloud/chunks', authenticateToken, requireActiveSubscription, lock
             return res.json({ chunkId: requestedId, stored: true });
         } catch (e) {
             return res.status(500).json({ error: 'Chunk verification failed' });
+        } finally {
+            try { reservation.release(); } catch (e) {}
         }
     }
 
@@ -1071,15 +1390,15 @@ app.post('/api/cloud/chunks', authenticateToken, requireActiveSubscription, lock
         }
     }
 
-    const quotaCheckMultipart = await enforceUserQuotaForIncomingBytes({ userId: req.user.id, incomingBytes: tmpSize });
-    if (!quotaCheckMultipart.allowed) {
+    const reservationMultipart = await reserveStealthCloudIncomingBytes({ userId: req.user.id, incomingBytes: tmpSize });
+    if (!reservationMultipart.allowed) {
         try { fs.unlinkSync(tmpPath); } catch (e) {}
         return res.status(413).json({
             error: 'Storage limit reached',
             code: 'QUOTA_EXCEEDED',
-            usedBytes: quotaCheckMultipart.usedBytes,
-            quotaBytes: quotaCheckMultipart.quotaBytes,
-            remainingBytes: quotaCheckMultipart.remainingBytes,
+            usedBytes: reservationMultipart.usedBytes,
+            quotaBytes: reservationMultipart.quotaBytes,
+            remainingBytes: reservationMultipart.remainingBytes,
         });
     }
 
@@ -1118,6 +1437,8 @@ app.post('/api/cloud/chunks', authenticateToken, requireActiveSubscription, lock
             }
         } catch (e) {
             return res.status(500).json({ error: 'Chunk verification failed' });
+        } finally {
+            try { reservationMultipart.release(); } catch (e) {}
         }
     }
 
@@ -1125,7 +1446,11 @@ app.post('/api/cloud/chunks', authenticateToken, requireActiveSubscription, lock
         `INSERT OR IGNORE INTO cloud_chunks (user_id, chunk_id, size, created_at) VALUES (?, ?, ?, ?)`,
         [req.user.id, storedName, tmpSize, Date.now()]
     );
-    res.json({ chunkId: storedName, stored: true });
+    try {
+        res.json({ chunkId: storedName, stored: true });
+    } finally {
+        try { reservationMultipart.release(); } catch (e) {}
+    }
 });
 
 // Download encrypted chunk blob
@@ -1146,7 +1471,7 @@ app.get('/api/cloud/chunks/:chunkId', authenticateToken, blockDeletedSubscriptio
 });
 
 // Upload encrypted manifest JSON
-app.post('/api/cloud/manifests', authenticateToken, requireActiveSubscription, (req, res) => {
+app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (req, res) => {
     const { manifestId, encryptedManifest, chunkCount } = req.body || {};
     const clientBuild = (req.headers['x-client-build'] || '').toString();
     if (clientBuild) {

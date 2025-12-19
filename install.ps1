@@ -1,8 +1,8 @@
-# PhotoSync Server - One-Line Installer for Windows
-# Usage: irm https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install.ps1 | iex
+# PhotoLynk Server - One-Line Installer for Windows
+# Usage: irm https://raw.githubusercontent.com/viktorvishyn369/PhotoLynk/main/install.ps1 | iex
 
 Write-Host "╔════════════════════════════════════════════════════╗" -ForegroundColor Blue
-Write-Host "║           PhotoSync Server - Installer            ║" -ForegroundColor Blue
+Write-Host "║           PhotoLynk Server - Installer            ║" -ForegroundColor Blue
 Write-Host "╚════════════════════════════════════════════════════╝" -ForegroundColor Blue
 Write-Host ""
 
@@ -174,16 +174,23 @@ if (!(Get-Command git -ErrorAction SilentlyContinue)) {
 
 # Clone repository
 Write-Host ""
-Write-Host "[3/5] Downloading PhotoSync..." -ForegroundColor Blue
-$installDir = "$env:USERPROFILE\PhotoSync"
+Write-Host "[3/5] Downloading PhotoLynk..." -ForegroundColor Blue
+
+$defaultInstallDir = "$env:USERPROFILE\PhotoLynk"
+$legacyInstallDir = "$env:USERPROFILE\PhotoSync"
+$installDir = $defaultInstallDir
+if ((Test-Path $legacyInstallDir) -and -not (Test-Path $defaultInstallDir)) {
+    $installDir = $legacyInstallDir
+}
 
 if (Test-Path $installDir) {
-    Write-Host "⚠  PhotoSync directory exists, updating..." -ForegroundColor Yellow
+    Write-Host "⚠  Existing directory exists, updating..." -ForegroundColor Yellow
     Set-Location $installDir
+    try { git remote set-url origin https://github.com/viktorvishyn369/PhotoLynk.git | Out-Null } catch { }
     git pull
 } else {
     try {
-        git clone https://github.com/viktorvishyn369/PhotoSync.git $installDir
+        git clone https://github.com/viktorvishyn369/PhotoLynk.git $installDir
     } catch {
         Write-Host "✗ Failed to clone repository from GitHub" -ForegroundColor Red
         Write-Host "   Error: $($_.Exception.Message)" -ForegroundColor Red
@@ -225,10 +232,10 @@ Write-Host ""
 Write-Host "✓ Installation complete!" -ForegroundColor Green
 Write-Host ""
 Write-Host "═══════════════════════════════════════════════════" -ForegroundColor Blue
-Write-Host "PhotoSync Server is starting..." -ForegroundColor Green
+Write-Host "PhotoLynk Server is starting..." -ForegroundColor Green
 Write-Host "═══════════════════════════════════════════════════" -ForegroundColor Blue
 Write-Host ""
-Write-Host "Look for the PhotoSync icon in your system tray (bottom-right)"
+Write-Host "Look for the PhotoLynk icon in your system tray (bottom-right)"
 Write-Host ""
 Write-Host "Click the icon to:"
 Write-Host "  • Open files location"

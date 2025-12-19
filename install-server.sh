@@ -1,7 +1,7 @@
 #!/bin/bash
-# PhotoSync Server - Headless Server Installer for Linux
+# PhotoLynk Server - Headless Server Installer for Linux
 # For servers without GUI (Ubuntu Server, VPS, cloud instances)
-# Usage: curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install-server.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoLynk/main/install-server.sh | bash
 
 set -e
 
@@ -13,7 +13,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 echo -e "${BLUE}╔════════════════════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║      PhotoSync Server - Headless Installer        ║${NC}"
+echo -e "${BLUE}║      PhotoLynk Server - Headless Installer        ║${NC}"
 echo -e "${BLUE}║           For Linux Servers (No GUI)               ║${NC}"
 echo -e "${BLUE}╚════════════════════════════════════════════════════╝${NC}"
 echo ""
@@ -83,15 +83,39 @@ fi
 
 # Clone repository
 echo ""
-echo -e "${BLUE}[3/7]${NC} Downloading PhotoSync..."
-INSTALL_DIR="/opt/photosync"
+echo -e "${BLUE}[3/7]${NC} Downloading PhotoLynk..."
+
+DEFAULT_INSTALL_DIR="/opt/photolynk"
+LEGACY_INSTALL_DIR="/opt/photosync"
+INSTALL_DIR="$DEFAULT_INSTALL_DIR"
+if [ -d "$LEGACY_INSTALL_DIR" ] && [ ! -d "$DEFAULT_INSTALL_DIR" ]; then
+    INSTALL_DIR="$LEGACY_INSTALL_DIR"
+fi
+
+SERVICE_NAME="photolynk"
+if [ "$INSTALL_DIR" = "$LEGACY_INSTALL_DIR" ]; then
+    SERVICE_NAME="photosync"
+fi
 
 if [ -d "$INSTALL_DIR" ]; then
-    echo -e "${YELLOW}⚠${NC}  PhotoSync directory exists, updating..."
+    echo -e "${YELLOW}⚠${NC}  Existing install directory exists, updating..."
     cd "$INSTALL_DIR"
-    $SUDO git pull
+    REPO_URL="https://github.com/viktorvishyn369/PhotoLynk.git"
+    if [ -n "${PHOTOLYNK_GITHUB_TOKEN:-}" ]; then
+        REPO_URL="https://x-access-token:${PHOTOLYNK_GITHUB_TOKEN}@github.com/viktorvishyn369/PhotoLynk.git"
+    elif [ -n "${GITHUB_TOKEN:-}" ]; then
+        REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/viktorvishyn369/PhotoLynk.git"
+    fi
+    $SUDO git remote set-url origin "$REPO_URL" >/dev/null 2>&1 || true
+    GIT_TERMINAL_PROMPT=0 $SUDO git pull
 else
-    $SUDO git clone https://github.com/viktorvishyn369/PhotoSync.git "$INSTALL_DIR"
+    REPO_URL="https://github.com/viktorvishyn369/PhotoLynk.git"
+    if [ -n "${PHOTOLYNK_GITHUB_TOKEN:-}" ]; then
+        REPO_URL="https://x-access-token:${PHOTOLYNK_GITHUB_TOKEN}@github.com/viktorvishyn369/PhotoLynk.git"
+    elif [ -n "${GITHUB_TOKEN:-}" ]; then
+        REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/viktorvishyn369/PhotoLynk.git"
+    fi
+    GIT_TERMINAL_PROMPT=0 $SUDO git clone "$REPO_URL" "$INSTALL_DIR"
     cd "$INSTALL_DIR"
 fi
 echo -e "${GREEN}✓${NC} Downloaded to $INSTALL_DIR"
@@ -107,23 +131,35 @@ echo -e "${GREEN}✓${NC} Server dependencies installed"
 echo ""
 echo -e "${BLUE}[5/7]${NC} Creating systemd service..."
 
-$SUDO tee /etc/systemd/system/photosync.service > /dev/null <<EOF
+UPLOAD_DIR="$INSTALL_DIR/server/uploads"
+DB_PATH="$INSTALL_DIR/server/backup.db"
+if [ -d "/data/media" ]; then
+    UPLOAD_DIR="/data/media"
+fi
+if [ -d "/data/db" ]; then
+    DB_PATH="/data/db/backup.db"
+fi
+
+$SUDO mkdir -p "$UPLOAD_DIR" "$(dirname "$DB_PATH")"
+$SUDO chown -R "$SERVICE_USER":"$SERVICE_USER" "$UPLOAD_DIR" "$(dirname "$DB_PATH")" 2>/dev/null || true
+
+$SUDO tee /etc/systemd/system/${SERVICE_NAME}.service > /dev/null <<EOF
 [Unit]
-Description=PhotoSync Server
+Description=PhotoLynk Server
 After=network.target
 
 [Service]
 Type=simple
 User=$SERVICE_USER
 WorkingDirectory=$INSTALL_DIR/server
-Environment="UPLOAD_DIR=$INSTALL_DIR/server/uploads"
-Environment="DB_PATH=$INSTALL_DIR/server/backup.db"
+Environment="UPLOAD_DIR=$UPLOAD_DIR"
+Environment="DB_PATH=$DB_PATH"
 ExecStart=$(which node) server.js
 Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=photosync
+SyslogIdentifier=${SERVICE_NAME}
 
 [Install]
 WantedBy=multi-user.target
@@ -133,10 +169,10 @@ echo -e "${GREEN}✓${NC} Systemd service created"
 
 # Enable and start service
 echo ""
-echo -e "${BLUE}[6/7]${NC} Starting PhotoSync service..."
+echo -e "${BLUE}[6/7]${NC} Starting PhotoLynk service..."
 $SUDO systemctl daemon-reload
-$SUDO systemctl enable photosync
-$SUDO systemctl restart photosync
+$SUDO systemctl enable "$SERVICE_NAME"
+$SUDO systemctl restart "$SERVICE_NAME"
 echo -e "${GREEN}✓${NC} Service started and enabled"
 
 # Configure firewall
@@ -159,7 +195,7 @@ SERVER_IP=$(hostname -I | awk '{print $1}')
 # Display success message
 echo ""
 echo -e "${GREEN}═══════════════════════════════════════════════════${NC}"
-echo -e "${GREEN}✓ PhotoSync Server installed and running!${NC}"
+echo -e "${GREEN}✓ PhotoLynk Server installed and running!${NC}"
 echo -e "${GREEN}═══════════════════════════════════════════════════${NC}"
 echo ""
 echo -e "${BLUE}Server Information:${NC}"
@@ -173,14 +209,14 @@ echo -e "  • Structure: ${YELLOW}uploads/{device-uuid}/${NC}"
 echo -e "  • Each device gets its own folder"
 echo ""
 echo -e "${BLUE}Service Management:${NC}"
-echo -e "  • Status:  ${YELLOW}sudo systemctl status photosync${NC}"
-echo -e "  • Stop:    ${YELLOW}sudo systemctl stop photosync${NC}"
-echo -e "  • Start:   ${YELLOW}sudo systemctl start photosync${NC}"
-echo -e "  • Restart: ${YELLOW}sudo systemctl restart photosync${NC}"
-echo -e "  • Logs:    ${YELLOW}sudo journalctl -u photosync -f${NC}"
+echo -e "  • Status:  ${YELLOW}sudo systemctl status ${SERVICE_NAME}${NC}"
+echo -e "  • Stop:    ${YELLOW}sudo systemctl stop ${SERVICE_NAME}${NC}"
+echo -e "  • Start:   ${YELLOW}sudo systemctl start ${SERVICE_NAME}${NC}"
+echo -e "  • Restart: ${YELLOW}sudo systemctl restart ${SERVICE_NAME}${NC}"
+echo -e "  • Logs:    ${YELLOW}sudo journalctl -u ${SERVICE_NAME} -f${NC}"
 echo ""
 echo -e "${BLUE}Mobile App Setup:${NC}"
-echo -e "  1. Download PhotoSync APK from GitHub Releases"
+echo -e "  1. Download PhotoLynk APK from GitHub Releases"
 echo -e "  2. Install on your Android device"
 echo -e "  3. Enter server URL: ${YELLOW}http://${SERVER_IP}:3000${NC}"
 echo -e "  4. Register and start backing up!"

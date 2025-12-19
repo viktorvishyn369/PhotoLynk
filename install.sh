@@ -1,6 +1,6 @@
 #!/bin/bash
-# PhotoSync Server - One-Line Installer for macOS and Linux
-# Usage: curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoSync/main/install.sh | bash
+# PhotoLynk Server - One-Line Installer for macOS and Linux
+# Usage: curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoLynk/main/install.sh | bash
 
 set -e
 
@@ -12,7 +12,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 echo -e "${BLUE}╔════════════════════════════════════════════════════╗${NC}"
-echo -e "${BLUE}║           PhotoSync Server - Installer            ║${NC}"
+echo -e "${BLUE}║           PhotoLynk Server - Installer            ║${NC}"
 echo -e "${BLUE}╚════════════════════════════════════════════════════╝${NC}"
 echo ""
 
@@ -166,18 +166,25 @@ fi
 
 # Clone repository
 echo ""
-echo -e "${BLUE}[3/6]${NC} Downloading PhotoSync..."
-INSTALL_DIR="$HOME/PhotoSync"
+echo -e "${BLUE}[3/6]${NC} Downloading PhotoLynk..."
+
+DEFAULT_INSTALL_DIR="$HOME/PhotoLynk"
+LEGACY_INSTALL_DIR="$HOME/PhotoSync"
+INSTALL_DIR="$DEFAULT_INSTALL_DIR"
+if [ -d "$LEGACY_INSTALL_DIR" ] && [ ! -d "$DEFAULT_INSTALL_DIR" ]; then
+    INSTALL_DIR="$LEGACY_INSTALL_DIR"
+fi
 
 if [ -d "$INSTALL_DIR" ]; then
-    echo -e "${YELLOW}⚠${NC}  PhotoSync directory exists, resetting and updating..."
+    echo -e "${YELLOW}⚠${NC}  Existing install directory found, resetting and updating..."
     cd "$INSTALL_DIR"
+    git remote set-url origin https://github.com/viktorvishyn369/PhotoLynk.git >/dev/null 2>&1 || true
     # Discard any local changes (including generated lockfiles) so updates are reliable
     git reset --hard HEAD >/dev/null 2>&1 || true
     git clean -fd >/dev/null 2>&1 || true
     git pull || true
 else
-    git clone https://github.com/viktorvishyn369/PhotoSync.git "$INSTALL_DIR"
+    git clone https://github.com/viktorvishyn369/PhotoLynk.git "$INSTALL_DIR"
     cd "$INSTALL_DIR"
 fi
 echo -e "${GREEN}✓${NC} Downloaded to $INSTALL_DIR"
@@ -203,7 +210,7 @@ fi
 
 # Start the tray app in the background
 echo ""
-echo -e "${BLUE}[6/7]${NC} Starting PhotoSync Server tray in background..."
+echo -e "${BLUE}[6/7]${NC} Starting PhotoLynk Server tray in background..."
 echo ""
 
 if [ "$HEADLESS" = "1" ]; then
@@ -214,7 +221,7 @@ if [ "$HEADLESS" = "1" ]; then
     cd ../server-tray
 else
     (npm start &>/dev/null &)
-    echo -e "${GREEN}✓${NC} Tray app launched. Look for the PhotoSync icon in your:"
+    echo -e "${GREEN}✓${NC} Tray app launched. Look for the PhotoLynk icon in your:"
     if [ "$PLATFORM" = "Mac" ]; then
         echo "  • Menu bar (top-right corner)"
     else
@@ -234,7 +241,7 @@ echo -e "${BLUE}═════════════════════�
 echo -e "${GREEN}All components installed.${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════${NC}"
 echo ""
-echo "The PhotoSync Server tray is running on your computer."
+echo "The PhotoLynk Server tray is running on your computer."
 echo "Now starting the Expo dev server for the mobile app..."
 echo "Keep this terminal open and connect from your phone using Expo (QR code)."
 echo ""
