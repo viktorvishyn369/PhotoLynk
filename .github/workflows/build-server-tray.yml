@@ -63,6 +63,7 @@ jobs:
           path: |
             server-tray/dist/*.dmg
             server-tray/dist/*.zip
+          if-no-files-found: warn
 
   build-macos-arm64:
     runs-on: macos-14
@@ -120,6 +121,7 @@ jobs:
           path: |
             server-tray/dist/*.dmg
             server-tray/dist/*.zip
+          if-no-files-found: warn
 
   build-windows:
     runs-on: windows-2022
@@ -157,6 +159,7 @@ jobs:
           name: windows-builds
           path: |
             server-tray/dist/*.exe
+          if-no-files-found: warn
 
   build-linux:
     runs-on: ubuntu-latest
@@ -196,6 +199,7 @@ jobs:
             server-tray/dist/*.AppImage
             server-tray/dist/*.deb
             server-tray/dist/*.rpm
+          if-no-files-found: warn
 
   create-release:
     needs: [build-macos-x64, build-macos-arm64, build-windows, build-linux]
