@@ -88,14 +88,8 @@ echo -e "${BLUE}[3/7]${NC} Downloading PhotoLynk..."
 DEFAULT_INSTALL_DIR="/opt/photolynk"
 LEGACY_INSTALL_DIR="/opt/photosync"
 INSTALL_DIR="$DEFAULT_INSTALL_DIR"
-if [ -d "$LEGACY_INSTALL_DIR" ] && [ ! -d "$DEFAULT_INSTALL_DIR" ]; then
-    INSTALL_DIR="$LEGACY_INSTALL_DIR"
-fi
 
 SERVICE_NAME="photolynk"
-if [ "$INSTALL_DIR" = "$LEGACY_INSTALL_DIR" ]; then
-    SERVICE_NAME="photosync"
-fi
 
 if [ -d "$INSTALL_DIR" ]; then
     echo -e "${YELLOW}⚠${NC}  Existing install directory exists, updating..."
