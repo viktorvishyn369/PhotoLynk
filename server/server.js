@@ -125,9 +125,20 @@ const normalizeTierGb = (value) => {
 const inferTierGbFromProductId = (productId) => {
     if (!productId) return null;
     const pid = String(productId);
-    if (pid === 'stealthcloud_1tb_monthly') return 1000;
-    const m = pid.match(/^stealthcloud_(\d+)(gb|tb)_monthly$/i);
-    if (!m) return null;
+    const pidLower = pid.toLowerCase();
+    if (pidLower === 'stealthcloud_1tb_monthly' || pidLower === 'stealthcloud.1tb.monthly') return 1000;
+
+    const m = pid.match(/(?:^|[._])stealthcloud[._](\d+)(gb|tb)[._]monthly$/i);
+    if (!m) {
+        const legacy = pid.match(/^stealthcloud_(\d+)(gb|tb)_monthly$/i);
+        if (!legacy) return null;
+
+        const qtyLegacy = Number(legacy[1]);
+        const unitLegacy = String(legacy[2]).toLowerCase();
+        if (!Number.isFinite(qtyLegacy) || qtyLegacy <= 0) return null;
+        if (unitLegacy === 'tb') return qtyLegacy * 1000;
+        return qtyLegacy;
+    }
     const qty = Number(m[1]);
     const unit = String(m[2]).toLowerCase();
     if (!Number.isFinite(qty) || qty <= 0) return null;
