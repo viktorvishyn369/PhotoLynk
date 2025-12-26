@@ -171,7 +171,7 @@ echo -e "${GREEN}✓${NC} Service started and enabled"
 
 # Configure firewall
 echo ""
-echo -e "${BLUE}[7/7]${NC} Configuring firewall..."
+echo -e "${BLUE}[7/8]${NC} Configuring firewall..."
 if command -v ufw &> /dev/null; then
     $SUDO ufw allow 3000/tcp
     echo -e "${GREEN}✓${NC} UFW: Port 3000 opened"
@@ -183,8 +183,84 @@ else
     echo -e "${YELLOW}⚠${NC}  No firewall detected, skipping"
 fi
 
+# Optional HTTPS setup with Nginx + Certbot
+echo ""
+echo -e "${BLUE}[8/8]${NC} Optional: Set up HTTPS (Nginx + Certbot)"
+read -p "Do you want to configure HTTPS with your domain now? (y/N): " ENABLE_HTTPS
+ENABLE_HTTPS=${ENABLE_HTTPS,,}
+PROXY_DOMAIN=""
+if [[ "$ENABLE_HTTPS" == "y" || "$ENABLE_HTTPS" == "yes" ]]; then
+    read -p "Enter your domain (e.g., remote.example.com): " PROXY_DOMAIN
+    if [ -z "$PROXY_DOMAIN" ]; then
+        echo -e "${YELLOW}⚠${NC} No domain provided. Skipping HTTPS setup."
+    else
+        read -p "Enter email for Certbot/Let's Encrypt (required): " CERTBOT_EMAIL
+        if [ -z "$CERTBOT_EMAIL" ]; then
+            echo -e "${YELLOW}⚠${NC} No email provided. Skipping HTTPS setup."
+        else
+            echo -e "${BLUE}Installing Nginx and Certbot...${NC}"
+            if command -v apt-get &> /dev/null; then
+                $SUDO apt-get update -y
+                $SUDO apt-get install -y nginx certbot python3-certbot-nginx
+            else
+                echo -e "${YELLOW}⚠${NC} Non-apt system detected. Please install nginx + certbot manually."
+                PROXY_DOMAIN=""
+            fi
+            if [ -n "$PROXY_DOMAIN" ]; then
+                echo -e "${YELLOW}About to create/overwrite Nginx site: /etc/nginx/sites-available/photolynk${NC}"
+                read -p "Proceed with writing Nginx config for $PROXY_DOMAIN? (y/N): " CONFIRM_NGINX
+                CONFIRM_NGINX=${CONFIRM_NGINX,,}
+                if [[ "$CONFIRM_NGINX" == "y" || "$CONFIRM_NGINX" == "yes" ]]; then
+                    echo -e "${BLUE}Configuring Nginx reverse proxy for $PROXY_DOMAIN ...${NC}"
+                    $SUDO tee /etc/nginx/sites-available/photolynk > /dev/null <<EOF
+server {
+  listen 80;
+  server_name $PROXY_DOMAIN;
+  client_max_body_size 2000M;
+
+  location / {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
+  }
+}
+EOF
+                    $SUDO ln -sf /etc/nginx/sites-available/photolynk /etc/nginx/sites-enabled/photolynk
+                    $SUDO nginx -t
+                    $SUDO systemctl reload nginx
+                else
+                    echo -e "${YELLOW}⚠${NC} Skipping Nginx config write. HTTPS setup aborted."
+                    PROXY_DOMAIN=""
+                fi
+                if [ -n "$PROXY_DOMAIN" ]; then
+                    echo -e "${YELLOW}About to request TLS certificate for $PROXY_DOMAIN with email $CERTBOT_EMAIL${NC}"
+                    read -p "Proceed with Certbot now? (y/N): " CONFIRM_CERTBOT
+                    CONFIRM_CERTBOT=${CONFIRM_CERTBOT,,}
+                    if [[ "$CONFIRM_CERTBOT" == "y" || "$CONFIRM_CERTBOT" == "yes" ]]; then
+                        echo -e "${BLUE}Running Certbot for $PROXY_DOMAIN ...${NC}"
+                        $SUDO certbot --nginx -d "$PROXY_DOMAIN" -m "$CERTBOT_EMAIL" --agree-tos --non-interactive || true
+                        echo -e "${GREEN}✓${NC} HTTPS setup attempt completed. If Certbot failed, check DNS (A record to this server) and re-run later."
+                    else
+                        echo -e "${YELLOW}⚠${NC} Certbot skipped. HTTPS not enabled."
+                        PROXY_DOMAIN=""
+                    fi
+                fi
+            fi
+        fi
+    fi
+fi
+
 # Get server IP
 SERVER_IP=$(hostname -I | awk '{print $1}')
+
+# Determine the best URL to display
+if [ -n "$PROXY_DOMAIN" ]; then
+    SERVER_URL="https://$PROXY_DOMAIN"
+else
+    SERVER_URL="http://${SERVER_IP}:3000"
+fi
 
 # Display success message
 echo ""
@@ -194,7 +270,7 @@ echo -e "${GREEN}═════════════════════
 echo ""
 echo -e "${BLUE}Server Information:${NC}"
 echo -e "  • Status: ${GREEN}Running${NC}"
-echo -e "  • URL: ${YELLOW}http://${SERVER_IP}:3000${NC}"
+echo -e "  • URL: ${YELLOW}${SERVER_URL}${NC}"
 echo -e "  • Port: ${YELLOW}3000${NC}"
 echo ""
 echo -e "${BLUE}File Storage:${NC}"
