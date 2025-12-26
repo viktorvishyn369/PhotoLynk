@@ -122,6 +122,19 @@ const normalizeTierGb = (value) => {
     return null;
 };
 
+const inferTierGbFromProductId = (productId) => {
+    if (!productId) return null;
+    const pid = String(productId);
+    if (pid === 'stealthcloud_1tb_monthly') return 1000;
+    const m = pid.match(/^stealthcloud_(\d+)(gb|tb)_monthly$/i);
+    if (!m) return null;
+    const qty = Number(m[1]);
+    const unit = String(m[2]).toLowerCase();
+    if (!Number.isFinite(qty) || qty <= 0) return null;
+    if (unit === 'tb') return qty * 1000;
+    return qty;
+};
+
 const DATA_DIR = resolveDataDir();
 const UPLOAD_DIR =
     process.env.UPLOAD_DIR || (isExistingDir(DEFAULT_LINUX_MEDIA_DIR) ? DEFAULT_LINUX_MEDIA_DIR : path.join(DATA_DIR, 'uploads'));
@@ -971,7 +984,8 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
         const expiresAtMs = event && (event.expiration_at_ms || event.expirationAtMs) ? Number(event.expiration_at_ms || event.expirationAtMs) : null;
         const productId = event && (event.product_id || event.productId) ? String(event.product_id || event.productId) : null;
         const entitlementId = event && (event.entitlement_id || event.entitlementId) ? String(event.entitlement_id || event.entitlementId) : null;
-        const tierGb = normalizeTierGb(event && (event.plan_gb || event.planGb || event.tier_gb || event.tierGb));
+        const tierGbFromEvent = normalizeTierGb(event && (event.plan_gb || event.planGb || event.tier_gb || event.tierGb));
+        const tierGb = tierGbFromEvent || normalizeTierGb(inferTierGbFromProductId(productId));
 
         db.get(
             `SELECT up.user_id AS user_id
