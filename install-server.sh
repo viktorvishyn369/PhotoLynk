@@ -360,7 +360,7 @@ if [ -z "$PROXY_DOMAIN" ]; then
     echo -e "  ${YELLOW}6. Enter in PhotoLynk apps (no http:// or https:// prefix):${NC}"
     echo -e "     ┌────────────────────────────────────────────────────┐"
     echo -e "     │ For IP address:    ${SERVER_IP}          Port: 3000│"
-    echo -e "     │ For domain:        YOUR_DOMAIN           Port: any │"
+    echo -e "     │ For domain:        YOUR_DOMAIN           Port: 443 │"
     echo -e "     └────────────────────────────────────────────────────┘"
     echo -e "     The app auto-detects: IP → HTTP:3000, Domain → HTTPS:443"
     echo ""
