@@ -80,6 +80,24 @@ If you prefer installing from source (advanced), you can use the provided script
 - Files are encrypted on-device and uploaded as encrypted chunks.
 - The cloud stores encrypted data only.
 
+## Backup Speed Modes
+
+PhotoLynk offers two backup speed modes to balance performance and device health:
+
+### Normal Mode (Default)
+- **Slower, gentler backup** — processes files with small delays between uploads
+- Reduces CPU/battery usage and device heat
+- Ideal for large backups running in the background
+- Recommended for overnight or extended backup sessions
+
+### Fast Mode
+- **Maximum speed** — uploads files as fast as your connection allows
+- Higher CPU and battery usage
+- May cause device to warm up during extended use
+- Best for quick backups when plugged in or on Wi-Fi with time constraints
+
+**Toggle Fast Mode** in the app's Settings screen. The mode affects both manual and automatic backups.
+
 ## File Storage
 
 Files are stored in:
