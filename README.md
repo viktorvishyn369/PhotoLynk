@@ -14,11 +14,11 @@ Back up photos/videos to your own server or StealthCloud, and restore on any pho
 2. Install it and run it.
    - It runs in your system tray / menu bar.
 
-3. Open the tray dropdown menu, find **Local IP Addresses**, and click your IP to copy it.
+3. Open the tray dropdown menu → **Local Server** → **Pair Mobile Device (QR)** to show a QR code with your IP.
 
-4. On your phone, open the PhotoLynk mobile app and go to Settings:
+4. On your phone, open the PhotoLynk mobile app:
    - Select **Local** connection
-   - Paste the IP address you copied (IP only — no http(s)://, no port, no domain):
+   - Scan the QR code, or manually enter the IP (IP only — no http(s)://, no port):
      - Example: `192.168.1.222`
 
 Done. Start backing up your photos/videos.
@@ -264,7 +264,7 @@ See [PRIVACY_POLICY.md](PRIVACY_POLICY.md)
 ### Can't connect from mobile app
 
 **For Local Server (same WiFi network):**
-1. If you are using the **Desktop Tray app**, open the tray menu and select **Local IP Addresses**, then click an address to copy it.
+1. If you are using the **Desktop Tray app**, open the tray menu → **Local Server** → **Pair Mobile Device (QR)** to show a QR code, or select **Local IP Addresses** to copy an IP.
 2. In the mobile app (Local), paste the IP address only (no http(s)://, no port, no domain):
    - Example: `192.168.1.222`
 3. If you are not using the tray app (or it shows no IP), find your server IP manually:
