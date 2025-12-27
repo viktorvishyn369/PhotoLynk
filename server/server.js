@@ -477,8 +477,18 @@ db.serialize(() => {
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_uuid TEXT,
         email TEXT UNIQUE,
-        password TEXT
+        password TEXT,
+        hardware_device_id TEXT
     )`);
+
+    // Migrate existing DBs: add hardware_device_id column if missing
+    db.all(`PRAGMA table_info(users)`, [], (err, cols) => {
+        if (err) return;
+        const names = Array.isArray(cols) ? cols.map(c => c && c.name).filter(Boolean) : [];
+        if (!names.includes('hardware_device_id')) {
+            db.run(`ALTER TABLE users ADD COLUMN hardware_device_id TEXT`, [], () => {});
+        }
+    });
 
     // Subscription/tier state (for StealthCloud / RevenueCat). Kept separate from auth rows.
     db.run(`CREATE TABLE IF NOT EXISTS user_plans (
@@ -901,16 +911,17 @@ app.get('/api/cloud/usage', authenticateToken, async (req, res) => {
 
 // Register User
 app.post('/api/register', authRateLimiter, async (req, res) => {
-    const { email, password, plan_gb } = req.body;
+    const { email, password, plan_gb, hardware_device_id } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
     const normalizedEmail = String(email).toLowerCase().trim();
+    const hwDeviceId = hardware_device_id ? String(hardware_device_id).trim() : null;
 
     const normalizedPlanGb = normalizeTierGb(plan_gb);
 
     try {
         const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
         const u = (crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex'));
-        db.run(`INSERT INTO users (user_uuid, email, password) VALUES (?, ?, ?)`, [u, normalizedEmail, hashedPassword], function(err) {
+        db.run(`INSERT INTO users (user_uuid, email, password, hardware_device_id) VALUES (?, ?, ?, ?)`, [u, normalizedEmail, hashedPassword, hwDeviceId], function(err) {
             if (err) {
                 if (err.message.includes('UNIQUE constraint failed')) return res.status(409).json({ error: 'Email already exists' });
                 return res.status(500).json({ error: err.message });
@@ -969,6 +980,57 @@ app.post('/api/login', authRateLimiter, (req, res) => {
                 res.json({ token, userId: user.id });
             }
         );
+    });
+});
+
+// Device-bound Password Reset
+// Allows password reset if the hardware_device_id matches the one stored during account creation
+// This survives app reinstalls because it uses a persistent hardware identifier
+app.post('/api/reset-password-device', authRateLimiter, async (req, res) => {
+    const { email, hardware_device_id, newPassword } = req.body;
+    if (!email || !hardware_device_id || !newPassword) {
+        return res.status(400).json({ error: 'Email, device ID, and new password are required' });
+    }
+    if (newPassword.length < 6) {
+        return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    const normalizedEmail = String(email).toLowerCase().trim();
+    const hwDeviceId = String(hardware_device_id).trim();
+
+    // Find user by email and check hardware_device_id
+    db.get(`SELECT id, email, hardware_device_id FROM users WHERE email = ?`, [normalizedEmail], async (err, user) => {
+        if (err) return res.status(500).json({ error: 'Database error' });
+        if (!user) return res.status(404).json({ error: 'Account not found' });
+
+        // Check if hardware_device_id was stored during registration
+        if (!user.hardware_device_id) {
+            return res.status(403).json({ 
+                error: 'Password reset is not available for this account. The account was created before device-bound reset was enabled.',
+                hint: 'no_hardware_id_stored'
+            });
+        }
+
+        // Compare hardware device IDs
+        if (user.hardware_device_id !== hwDeviceId) {
+            return res.status(403).json({ 
+                error: 'Password reset is only allowed from the device that created this account',
+                hint: 'device_mismatch'
+            });
+        }
+
+        // Device matches - allow password reset
+        try {
+            const hashedPassword = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
+            db.run(`UPDATE users SET password = ? WHERE id = ?`, [hashedPassword, user.id], function(updateErr) {
+                if (updateErr) return res.status(500).json({ error: 'Failed to update password' });
+
+                console.log(`[PASSWORD RESET] Password updated for ${normalizedEmail} via hardware device-bound reset`);
+                res.json({ message: 'Password has been reset successfully' });
+            });
+        } catch (error) {
+            res.status(500).json({ error: error.message });
+        }
     });
 });
 
