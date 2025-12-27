@@ -1655,6 +1655,14 @@ app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (
     const { manifestsDir } = ensureStealthCloudUserDirs(req.user);
 
     const manifestPath = path.join(manifestsDir, `${safeId}.json`);
+    
+    // Cross-device deduplication: if manifest already exists, skip (don't overwrite)
+    // This allows iOS and Android to upload the same file with the same stable manifestId
+    if (fs.existsSync(manifestPath)) {
+        console.log(`[SC] Manifest ${safeId} already exists for user ${req.user.id}, skipping (cross-device dedupe)`);
+        return res.json({ ok: true, manifestId: safeId, skipped: true });
+    }
+    
     const payload = {
         manifestId: safeId,
         encryptedManifest,
