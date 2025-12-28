@@ -1637,7 +1637,7 @@ app.get('/api/cloud/chunks/:chunkId', authenticateToken, blockDeletedSubscriptio
 
 // Upload encrypted manifest JSON
 app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (req, res) => {
-    const { manifestId, encryptedManifest, chunkCount, fileHash } = req.body || {};
+    const { manifestId, encryptedManifest, chunkCount } = req.body || {};
     const clientBuild = (req.headers['x-client-build'] || '').toString();
     if (clientBuild) {
         console.log(`[SC] /manifests client=${clientBuild} user=${req.user.id} chunkCount=${typeof chunkCount === 'number' ? chunkCount : 'na'}`);
@@ -1666,8 +1666,7 @@ app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (
     const payload = {
         manifestId: safeId,
         encryptedManifest,
-        createdAt: new Date().toISOString(),
-        fileHash: typeof fileHash === 'string' && fileHash.length > 0 ? fileHash : undefined,
+        createdAt: new Date().toISOString()
     };
     fs.writeFileSync(manifestPath, JSON.stringify(payload));
 
