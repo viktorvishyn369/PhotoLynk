@@ -1658,9 +1658,10 @@ app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (
     
     // Cross-device deduplication: if manifest already exists, skip (don't overwrite)
     // This allows iOS and Android to upload the same file with the same stable manifestId
+    // Client-side handles all hash-based deduplication (exact file hash and perceptual hash)
     if (fs.existsSync(manifestPath)) {
-        console.log(`[SC] Manifest ${safeId} already exists for user ${req.user.id}, skipping (cross-device dedupe)`);
-        return res.json({ ok: true, manifestId: safeId, skipped: true });
+        console.log(`[SC] Manifest ${safeId} already exists for user ${req.user.id}, skipping (cross-device dedupe by manifestId)`);
+        return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'manifestId' });
     }
     
     const payload = {
