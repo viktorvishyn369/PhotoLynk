@@ -126,6 +126,7 @@ server/sweep-expired-users.js
 server/reconcile-cloud-usage.js
 server/photosync-*.service
 server/photosync-*.timer
+server/tiering-sync.js
 
 # Mobile specific
 mobile/android/app/build/

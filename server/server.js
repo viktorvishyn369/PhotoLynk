@@ -155,6 +155,12 @@ const AUX_ROOT = process.env.PHOTOSYNC_DATA_DIR || path.dirname(UPLOAD_DIR);
 const CLOUD_DIR = process.env.CLOUD_DIR || path.join(AUX_ROOT, 'cloud');
 const CAPACITY_JSON_PATH = process.env.CAPACITY_JSON_PATH || path.join(AUX_ROOT, 'capacity', 'photosync-capacity.json');
 
+// Tiered Storage Configuration
+const ARCHIVE_DIR = process.env.ARCHIVE_DIR || null;
+const TIERING_ENABLED = process.env.TIERING_ENABLED === 'true' && ARCHIVE_DIR !== null;
+const TIERING_AGE_DAYS = Number.parseInt(process.env.TIERING_AGE_DAYS || '30', 10);
+const TIERING_SIZE_THRESHOLD_MB = Number.parseInt(process.env.TIERING_SIZE_THRESHOLD_MB || '10', 10);
+
 const SUBSCRIPTION_GRACE_DAYS = Number.parseInt(process.env.SUBSCRIPTION_GRACE_DAYS || '3', 10);
 const TRIAL_DAYS = Number.parseInt(process.env.TRIAL_DAYS || '7', 10);
 const REVENUECAT_WEBHOOK_SECRET = process.env.REVENUECAT_WEBHOOK_SECRET || '';
@@ -1618,7 +1624,7 @@ app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req
     }
 });
 
-// Download encrypted chunk blob
+// Download encrypted chunk blob (with tiered storage fallback)
 app.get('/api/cloud/chunks/:chunkId', authenticateToken, blockDeletedSubscription, (req, res) => {
     const chunkId = (req.params.chunkId || '').toLowerCase();
     if (!chunkId.match(/^[a-f0-9]{64}$/i)) {
@@ -1629,10 +1635,31 @@ app.get('/api/cloud/chunks/:chunkId', authenticateToken, blockDeletedSubscriptio
     if (!chunkPath.startsWith(chunksRoot)) {
         return res.status(403).json({ error: 'Access denied' });
     }
-    if (!fs.existsSync(chunkPath)) {
-        return res.status(404).json({ error: 'Chunk not found' });
+    
+    // Check hot tier (NVMe)
+    if (fs.existsSync(chunkPath)) {
+        return res.download(chunkPath);
     }
-    res.download(chunkPath);
+    
+    // Tiered storage: check cold tier (HDD) if enabled
+    if (TIERING_ENABLED && ARCHIVE_DIR) {
+        const userKey = getStealthCloudUserKey(req.user);
+        const archiveChunksDir = path.join(ARCHIVE_DIR, 'users', userKey, 'chunks');
+        const archiveChunkPath = path.join(archiveChunksDir, chunkId);
+        
+        if (archiveChunkPath.startsWith(archiveChunksDir) && fs.existsSync(archiveChunkPath)) {
+            // Copy back to hot tier for future access (cache warming)
+            try {
+                fs.copyFileSync(archiveChunkPath, chunkPath);
+                console.log(`[Tiering] Restored chunk ${chunkId} from archive to hot tier`);
+            } catch (e) {
+                console.warn(`[Tiering] Failed to copy chunk to hot tier: ${e.message}`);
+            }
+            return res.download(archiveChunkPath);
+        }
+    }
+    
+    return res.status(404).json({ error: 'Chunk not found' });
 });
 
 // Upload encrypted manifest JSON
