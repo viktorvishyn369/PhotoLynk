@@ -156,45 +156,88 @@ const CLOUD_DIR = process.env.CLOUD_DIR || path.join(AUX_ROOT, 'cloud');
 const CAPACITY_JSON_PATH = process.env.CAPACITY_JSON_PATH || path.join(AUX_ROOT, 'capacity', 'photosync-capacity.json');
 
 // Tiered Storage Configuration
+// NVMe = hot cache (fast), HDD = permanent storage (slow but large)
+// Strategy: Keep recent files on NVMe, async copy to HDD, evict from NVMe when space needed
 const ARCHIVE_DIR = process.env.ARCHIVE_DIR || null;
 const TIERING_ENABLED = process.env.TIERING_ENABLED === 'true' && ARCHIVE_DIR !== null;
-const TIERING_AGE_DAYS = Number.parseInt(process.env.TIERING_AGE_DAYS || '30', 10);
-const TIERING_SIZE_THRESHOLD_MB = Number.parseInt(process.env.TIERING_SIZE_THRESHOLD_MB || '10', 10);
+const NVME_MAX_USAGE_GB = Number.parseInt(process.env.NVME_MAX_USAGE_GB || '800', 10); // Leave ~100GB free on 1TB NVMe
+const NVME_EVICT_TARGET_GB = Number.parseInt(process.env.NVME_EVICT_TARGET_GB || '600', 10); // Evict down to this
 
-// Real-time tiering: copy chunk to HDD SYNCHRONOUSLY, then delete from NVMe
-// This ensures NVMe doesn't fill up with concurrent uploads from many users
-const copyChunkToArchiveSync = (userKey, chunkId, sourcePath) => {
-    if (!TIERING_ENABLED || !ARCHIVE_DIR) return true;
-    try {
-        const archiveChunksDir = path.join(ARCHIVE_DIR, 'users', userKey, 'chunks');
-        const archivePath = path.join(archiveChunksDir, chunkId);
-        if (fs.existsSync(archivePath)) {
-            // Already archived, delete from NVMe
-            try { fs.unlinkSync(sourcePath); } catch (e) {}
-            return true;
+// Async copy chunk to HDD (doesn't block response - phone gets instant speed)
+const copyChunkToArchiveAsync = (userKey, chunkId, sourcePath) => {
+    if (!TIERING_ENABLED || !ARCHIVE_DIR) return;
+    setImmediate(() => {
+        try {
+            const archiveChunksDir = path.join(ARCHIVE_DIR, 'users', userKey, 'chunks');
+            const archivePath = path.join(archiveChunksDir, chunkId);
+            if (fs.existsSync(archivePath)) return; // Already archived
+            if (!fs.existsSync(archiveChunksDir)) fs.mkdirSync(archiveChunksDir, { recursive: true });
+            fs.copyFileSync(sourcePath, archivePath);
+            console.log(`[Tiering] Chunk ${chunkId} copied to HDD (async)`);
+        } catch (e) {
+            console.warn(`[Tiering] Async HDD copy failed: ${e.message}`);
         }
-        if (!fs.existsSync(archiveChunksDir)) fs.mkdirSync(archiveChunksDir, { recursive: true });
-        fs.copyFileSync(sourcePath, archivePath);
-        // Delete from NVMe immediately after successful copy to HDD
-        fs.unlinkSync(sourcePath);
-        console.log(`[Tiering] Chunk ${chunkId} -> HDD (NVMe freed)`);
-        return true;
-    } catch (e) {
-        console.warn(`[Tiering] Failed to archive chunk: ${e.message}`);
-        return false;
-    }
+    });
 };
 
-// Delete chunk from NVMe cache (sync)
-const deleteChunkFromCacheSync = (chunkPath) => {
-    if (!TIERING_ENABLED) return;
-    try {
-        if (fs.existsSync(chunkPath)) {
-            fs.unlinkSync(chunkPath);
+// Check NVMe usage and evict old chunks if needed (runs periodically)
+let lastEvictionCheck = 0;
+const EVICTION_CHECK_INTERVAL_MS = 60000; // Check every 60 seconds max
+const checkAndEvictNvmeCache = () => {
+    if (!TIERING_ENABLED || !ARCHIVE_DIR) return;
+    const now = Date.now();
+    if (now - lastEvictionCheck < EVICTION_CHECK_INTERVAL_MS) return;
+    lastEvictionCheck = now;
+    
+    setImmediate(() => {
+        try {
+            const { execSync } = require('child_process');
+            const dfOutput = execSync(`df -BG ${CLOUD_DIR} | tail -1`).toString();
+            const usedMatch = dfOutput.match(/(\d+)G/);
+            if (!usedMatch) return;
+            const usedGB = parseInt(usedMatch[1], 10);
+            
+            if (usedGB < NVME_MAX_USAGE_GB) return; // Still have space
+            
+            console.log(`[Tiering] NVMe usage ${usedGB}GB > ${NVME_MAX_USAGE_GB}GB, starting eviction...`);
+            
+            // Find oldest chunks on NVMe that are also on HDD (safe to delete)
+            const usersDir = path.join(CLOUD_DIR, 'users');
+            if (!fs.existsSync(usersDir)) return;
+            
+            const chunks = [];
+            for (const userDir of fs.readdirSync(usersDir)) {
+                const chunksDir = path.join(usersDir, userDir, 'chunks');
+                if (!fs.existsSync(chunksDir)) continue;
+                for (const chunkId of fs.readdirSync(chunksDir)) {
+                    const chunkPath = path.join(chunksDir, chunkId);
+                    const archivePath = path.join(ARCHIVE_DIR, 'users', userDir, 'chunks', chunkId);
+                    // Only evict if safely backed up to HDD
+                    if (fs.existsSync(archivePath)) {
+                        const stat = fs.statSync(chunkPath);
+                        chunks.push({ path: chunkPath, mtime: stat.mtimeMs, size: stat.size });
+                    }
+                }
+            }
+            
+            // Sort by oldest first
+            chunks.sort((a, b) => a.mtime - b.mtime);
+            
+            // Evict until we're under target
+            let freedBytes = 0;
+            const targetFreeBytes = (usedGB - NVME_EVICT_TARGET_GB) * 1024 * 1024 * 1024;
+            for (const chunk of chunks) {
+                if (freedBytes >= targetFreeBytes) break;
+                try {
+                    fs.unlinkSync(chunk.path);
+                    freedBytes += chunk.size;
+                } catch (e) {}
+            }
+            console.log(`[Tiering] Evicted ${(freedBytes / (1024*1024*1024)).toFixed(2)}GB from NVMe cache`);
+        } catch (e) {
+            console.warn(`[Tiering] Eviction check failed: ${e.message}`);
         }
-    } catch (e) {
-        // Ignore - file may already be deleted
-    }
+    });
 };
 
 const SUBSCRIPTION_GRACE_DAYS = Number.parseInt(process.env.SUBSCRIPTION_GRACE_DAYS || '3', 10);
@@ -1568,8 +1611,9 @@ app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req
                 `INSERT OR IGNORE INTO cloud_chunks (user_id, chunk_id, size, created_at) VALUES (?, ?, ?, ?)`,
                 [req.user.id, requestedId, req.body.length, Date.now()]
             );
-            // Real-time tiering: copy to HDD synchronously, then free NVMe
-            copyChunkToArchiveSync(getStealthCloudUserKey(req.user), requestedId, target);
+            // Async copy to HDD (doesn't block - phone gets instant NVMe speed)
+            copyChunkToArchiveAsync(getStealthCloudUserKey(req.user), requestedId, target);
+            checkAndEvictNvmeCache(); // Check if eviction needed
             return res.json({ chunkId: requestedId, stored: true });
         } catch (e) {
             return res.status(500).json({ error: 'Chunk verification failed' });
@@ -1642,8 +1686,9 @@ app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req
                     `INSERT OR IGNORE INTO cloud_chunks (user_id, chunk_id, size, created_at) VALUES (?, ?, ?, ?)`,
                     [req.user.id, requestedId, finalSize, Date.now()]
                 );
-                // Real-time tiering: copy to HDD synchronously, then free NVMe
-                copyChunkToArchiveSync(getStealthCloudUserKey(req.user), requestedId, finalPath);
+                // Async copy to HDD (doesn't block - phone gets instant NVMe speed)
+                copyChunkToArchiveAsync(getStealthCloudUserKey(req.user), requestedId, finalPath);
+                checkAndEvictNvmeCache();
                 return res.json({ chunkId: requestedId, stored: true });
             }
         } catch (e) {
@@ -1657,8 +1702,9 @@ app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req
         `INSERT OR IGNORE INTO cloud_chunks (user_id, chunk_id, size, created_at) VALUES (?, ?, ?, ?)`,
         [req.user.id, storedName, tmpSize, Date.now()]
     );
-    // Real-time tiering: copy to HDD synchronously, then free NVMe
-    copyChunkToArchiveSync(getStealthCloudUserKey(req.user), storedName, tmpPath);
+    // Async copy to HDD (doesn't block - phone gets instant NVMe speed)
+    copyChunkToArchiveAsync(getStealthCloudUserKey(req.user), storedName, tmpPath);
+    checkAndEvictNvmeCache();
     try {
         res.json({ chunkId: storedName, stored: true });
     } finally {
@@ -1678,35 +1724,19 @@ app.get('/api/cloud/chunks/:chunkId', authenticateToken, blockDeletedSubscriptio
         return res.status(403).json({ error: 'Access denied' });
     }
     
-    // Check hot tier (NVMe) - serve from cache if exists
+    // Check hot tier (NVMe) - serve instantly if cached (recently uploaded)
     if (fs.existsSync(chunkPath)) {
-        res.download(chunkPath, () => {
-            // Delete from NVMe cache after download completes
-            deleteChunkFromCacheSync(chunkPath);
-        });
-        return;
+        return res.download(chunkPath); // Keep in cache for potential re-downloads
     }
     
-    // Tiered storage: check cold tier (HDD) if enabled
+    // Tiered storage: serve directly from HDD (no point copying to NVMe for one-time download)
     if (TIERING_ENABLED && ARCHIVE_DIR) {
         const userKey = getStealthCloudUserKey(req.user);
         const archiveChunksDir = path.join(ARCHIVE_DIR, 'users', userKey, 'chunks');
         const archiveChunkPath = path.join(archiveChunksDir, chunkId);
         
         if (archiveChunkPath.startsWith(archiveChunksDir) && fs.existsSync(archiveChunkPath)) {
-            // Copy to NVMe for fast serving
-            try {
-                fs.copyFileSync(archiveChunkPath, chunkPath);
-                console.log(`[Tiering] Chunk ${chunkId} HDD -> NVMe for download`);
-            } catch (e) {
-                // Serve directly from HDD if copy fails
-                return res.download(archiveChunkPath);
-            }
-            // Serve from NVMe, then delete from cache
-            res.download(chunkPath, () => {
-                deleteChunkFromCacheSync(chunkPath);
-            });
-            return;
+            return res.download(archiveChunkPath); // Serve directly from HDD
         }
     }
     
