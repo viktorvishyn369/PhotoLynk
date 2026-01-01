@@ -25,7 +25,7 @@ Done. Start backing up your photos/videos.
 
 ### Option B: Remote Backup (VPS / Internet)
 
-Remote works like Local mode, but your server runs on a remote machine (VPS/home server) and the app connects over HTTPS.
+Remote works like Local mode, but your server runs on a remote machine (VPS) and the app connects over HTTPS.
 
 1. Install and run PhotoLynk Server on your remote machine.
 2. Configure HTTPS (TLS) on the server (recommended: domain + reverse proxy such as Nginx/Certbot/Cloudflare).
@@ -84,19 +84,19 @@ If you prefer installing from source (advanced), you can use the provided script
 
 PhotoLynk offers two backup speed modes to balance performance and device health:
 
-### Normal Mode (Default)
+### Slow Mode (Default)
 - **Slower, gentler backup** — processes files with small delays between uploads
 - Reduces CPU/battery usage and device heat
-- Ideal for large backups running in the background
+- Ideal for large backups
 - Recommended for overnight or extended backup sessions
 
 ### Fast Mode
-- **Maximum speed** — uploads files as fast as your connection allows
+- **Maximum speed** — uploads files as fast as your connection or StealthCloud server load allows
 - Higher CPU and battery usage
 - May cause device to warm up during extended use
 - Best for quick backups when plugged in or on Wi-Fi with time constraints
 
-**Toggle Fast Mode** in the app's Settings screen. The mode affects both manual and automatic backups.
+**Toggle Fast Mode** in the app's Settings screen. The mode affects Backups and Syncs.
 
 ## File Storage
 
@@ -109,7 +109,7 @@ uploads/
       └── ...
 ```
 
-Each set of credentials (email + password) maps to a deterministic UUID folder, so storage is isolated per account.
+Each set of credentials (email + password) maps to a deterministic UUID folder, so storage is isolated per account. Extra device bond is created.
 
 ## Server Management
 
@@ -300,7 +300,7 @@ We provide a transparent security audit for StealthCloud backup mode. You can:
 
 1. **Read the audit report:** [`security/SECURITY_AUDIT_REPORT.md`](security/SECURITY_AUDIT_REPORT.md)
 2. **Review the audit script:** [`security/security-audit.sh`](security/security-audit.sh)
-3. **Run the audit yourself:** 
+3. **Run the audit yourself:**
    ```bash
    cd security && ./security-audit.sh
    ```
@@ -335,7 +335,7 @@ Limitations:
 Deletion behavior:
 
 - **iOS**: deleted items go to **Photos → Recently Deleted**.
-- **Android**: deleted items are removed from the device (behavior depends on OEM/OS).
+- **Android**: deleted items go to **Photos → Trash** or are removed from the device (behavior depends on OEM/OS).
 
 ## Requirements
 
