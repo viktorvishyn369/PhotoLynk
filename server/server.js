@@ -1727,6 +1727,63 @@ app.get('/api/cloud/manifests/:manifestId', authenticateToken, blockDeletedSubsc
     res.sendFile(manifestPath);
 });
 
+// DELETE /api/account - Delete user account and all associated data (GDPR compliance)
+app.delete('/api/account', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const userEmail = req.user.email || '';
+        const userKey = getStealthCloudUserKey(req.user);
+        
+        console.log(`[Account Deletion] Starting deletion for user ${userId} (${userEmail})`);
+        
+        // Get user directories
+        const userDir = path.join(CLOUD_DIR, 'users', userKey);
+        const chunksDir = CHUNKS_DIR 
+            ? path.join(CHUNKS_DIR, 'users', userKey)
+            : path.join(userDir, 'chunks');
+        const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid || '');
+        
+        // Delete all user files (chunks, manifests, classic uploads)
+        const dirsToDelete = [chunksDir, userDir, deviceDir].filter(d => d && d.length > 10);
+        for (const dir of dirsToDelete) {
+            try {
+                if (fs.existsSync(dir)) {
+                    fs.rmSync(dir, { recursive: true, force: true });
+                    console.log(`[Account Deletion] Deleted directory: ${dir}`);
+                }
+            } catch (e) {
+                console.error(`[Account Deletion] Error deleting ${dir}:`, e.message);
+            }
+        }
+        
+        // Delete user from database
+        await new Promise((resolve, reject) => {
+            db.run('DELETE FROM user_plans WHERE user_id = ?', [userId], (err) => {
+                if (err) console.error('[Account Deletion] Error deleting user_plans:', err.message);
+                resolve();
+            });
+        });
+        
+        await new Promise((resolve, reject) => {
+            db.run('DELETE FROM users WHERE id = ?', [userId], (err) => {
+                if (err) {
+                    console.error('[Account Deletion] Error deleting user:', err.message);
+                    reject(err);
+                } else {
+                    console.log(`[Account Deletion] User ${userId} deleted from database`);
+                    resolve();
+                }
+            });
+        });
+        
+        console.log(`[Account Deletion] Successfully deleted account for user ${userId}`);
+        res.json({ success: true, message: 'Account and all associated data deleted successfully' });
+    } catch (error) {
+        console.error('[Account Deletion] Error:', error);
+        res.status(500).json({ error: 'Failed to delete account. Please contact support.' });
+    }
+});
+
 const startUpdateChecker = () => {
     updater.startAutoCheck((result) => {
         if (result.available) {
