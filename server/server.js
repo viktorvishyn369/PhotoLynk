@@ -1157,8 +1157,15 @@ app.post('/api/solana/verify-payment', async (req, res) => {
     }
     
     try {
-        // Find user by UUID
-        const user = await dbGetAsync(`SELECT id, email FROM users WHERE user_uuid = ?`, [userUuid]);
+        // Find user by UUID (try user_uuid first, then device_uuid)
+        let user = await dbGetAsync(`SELECT id, email FROM users WHERE user_uuid = ?`, [userUuid]);
+        if (!user) {
+            // Try finding by device_uuid in devices table
+            const device = await dbGetAsync(`SELECT user_id FROM devices WHERE device_uuid = ?`, [userUuid]);
+            if (device) {
+                user = await dbGetAsync(`SELECT id, email FROM users WHERE id = ?`, [device.user_id]);
+            }
+        }
         if (!user) {
             return res.status(404).json({ error: 'User not found' });
         }
