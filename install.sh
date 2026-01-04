@@ -34,17 +34,17 @@ echo ""
 
 # Headless/non-interactive mode:
 # - Default is non-interactive (best for one-line installers)
-# - Set PHOTOSYNC_INTERACTIVE=1 to enable tray UI and interactive prompts
-# - Set PHOTOSYNC_HEADLESS=1 to force headless behavior
-INTERACTIVE="${PHOTOSYNC_INTERACTIVE:-0}"
-HEADLESS="${PHOTOSYNC_HEADLESS:-0}"
+# - Set PHOTOLYNK_INTERACTIVE=1 to enable tray UI and interactive prompts
+# - Set PHOTOLYNK_HEADLESS=1 to force headless behavior
+INTERACTIVE="${PHOTOLYNK_INTERACTIVE:-${PHOTOSYNC_INTERACTIVE:-0}}"
+HEADLESS="${PHOTOLYNK_HEADLESS:-${PHOTOSYNC_HEADLESS:-0}}"
 
 # Non-interactive implies headless on Linux (since tray UI won't work there in headless)
 if [ "$INTERACTIVE" != "1" ] && [ "$PLATFORM" = "Linux" ]; then
     HEADLESS="1"
 fi
 
-if [ "${PHOTOSYNC_NONINTERACTIVE:-0}" = "1" ]; then
+if [ "${PHOTOLYNK_NONINTERACTIVE:-${PHOTOSYNC_NONINTERACTIVE:-0}}" = "1" ]; then
     HEADLESS="1"
 fi
 
@@ -169,11 +169,7 @@ echo ""
 echo -e "${BLUE}[3/6]${NC} Downloading PhotoLynk..."
 
 DEFAULT_INSTALL_DIR="$HOME/PhotoLynk"
-LEGACY_INSTALL_DIR="$HOME/PhotoSync"
 INSTALL_DIR="$DEFAULT_INSTALL_DIR"
-if [ -d "$LEGACY_INSTALL_DIR" ] && [ ! -d "$DEFAULT_INSTALL_DIR" ]; then
-    INSTALL_DIR="$LEGACY_INSTALL_DIR"
-fi
 
 if [ -d "$INSTALL_DIR" ]; then
     echo -e "${YELLOW}⚠${NC}  Existing install directory found, resetting and updating..."
@@ -232,6 +228,13 @@ fi
 # Prepare and start the mobile app (Expo dev server)
 echo ""
 echo -e "${BLUE}[7/7]${NC} Preparing mobile app and starting Expo dev server..."
+
+if [ ! -d "../mobile-v2" ]; then
+    echo -e "${YELLOW}⚠${NC}  mobile-v2 folder not found (expected at $(pwd)/../mobile-v2). Skipping mobile install/start."
+    echo -e "${YELLOW}→${NC}  To install mobile manually: cd $INSTALL_DIR && git pull && cd mobile-v2 && npm install"
+    exit 0
+fi
+
 cd ../mobile-v2
 npm install
 echo -e "${GREEN}✓${NC} Mobile app dependencies installed"
@@ -246,7 +249,7 @@ echo "Now starting the Expo dev server for the mobile app..."
 echo "Keep this terminal open and connect from your phone using Expo (QR code)."
 echo ""
 
-START_EXPO="${PHOTOSYNC_START_EXPO:-}"
+START_EXPO="${PHOTOLYNK_START_EXPO:-${PHOTOSYNC_START_EXPO:-}}"
 if [ "$HEADLESS" = "1" ] && [ "$START_EXPO" != "1" ]; then
     echo -e "${YELLOW}⚠${NC}  Headless mode: skipping Expo dev server auto-start"
     echo -e "${BLUE}→${NC} To start Expo later: cd $INSTALL_DIR/mobile-v2 && npx expo start --dev-client --clear"
