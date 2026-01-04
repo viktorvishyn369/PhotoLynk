@@ -214,6 +214,8 @@ jobs:
         run: |
           cd server-tray
           npm install
+          # Ensure sharp has linux-x64 binaries
+          npm install --os=linux --cpu=x64 sharp
 
       - name: Rebuild native modules for Electron
         run: |
