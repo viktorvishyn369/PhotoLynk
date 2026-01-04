@@ -1139,10 +1139,24 @@ const PLAN_DURATION_MS = {
 
 // Verify Solana payment transaction
 app.post('/api/solana/verify-payment', async (req, res) => {
-    const { txSignature, userUuid, tierGb, duration, solAmount, paymentWallet } = req.body;
+    const { txSignature, tierGb, duration, solAmount, paymentWallet } = req.body;
     
-    if (!txSignature || !userUuid || !tierGb) {
-        return res.status(400).json({ error: 'Missing required fields: txSignature, userUuid, tierGb' });
+    // Extract user from JWT token in Authorization header
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ error: 'Authorization token required' });
+    }
+    
+    const token = authHeader.substring(7);
+    let decoded;
+    try {
+        decoded = jwt.verify(token, JWT_SECRET);
+    } catch (e) {
+        return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+    
+    if (!txSignature || !tierGb) {
+        return res.status(400).json({ error: 'Missing required fields: txSignature, tierGb' });
     }
     
     // Validate payment wallet matches
@@ -1157,15 +1171,8 @@ app.post('/api/solana/verify-payment', async (req, res) => {
     }
     
     try {
-        // Find user by UUID (try user_uuid first, then device_uuid)
-        let user = await dbGetAsync(`SELECT id, email FROM users WHERE user_uuid = ?`, [userUuid]);
-        if (!user) {
-            // Try finding by device_uuid in devices table
-            const device = await dbGetAsync(`SELECT user_id FROM devices WHERE device_uuid = ?`, [userUuid]);
-            if (device) {
-                user = await dbGetAsync(`SELECT id, email FROM users WHERE id = ?`, [device.user_id]);
-            }
-        }
+        // Find user by ID from JWT token
+        const user = await dbGetAsync(`SELECT id, email FROM users WHERE id = ?`, [decoded.id]);
         if (!user) {
             return res.status(404).json({ error: 'User not found' });
         }
