@@ -1236,6 +1236,7 @@ app.post('/api/solana/verify-payment', async (req, res) => {
 
 // Helper function to verify Solana transaction
 async function verifySolanaTransaction(txSignature, expectedSolAmount) {
+    console.log('[Solana] Verifying transaction:', txSignature, 'expected amount:', expectedSolAmount);
     try {
         const axios = require('axios');
         
@@ -1254,8 +1255,9 @@ async function verifySolanaTransaction(txSignature, expectedSolAmount) {
         });
         
         const tx = response.data?.result;
+        console.log('[Solana] Transaction lookup result:', tx ? 'found' : 'not found');
         if (!tx) {
-            return { success: false, error: 'Transaction not found' };
+            return { success: false, error: 'Transaction not found on blockchain yet - please wait and retry' };
         }
         
         // Check if transaction was successful
@@ -1286,6 +1288,8 @@ async function verifySolanaTransaction(txSignature, expectedSolAmount) {
         }
         
         if (!paymentReceived) {
+            console.log('[Solana] Payment wallet not found in tx. Looking for:', SOLANA_PAYMENT_WALLET);
+            console.log('[Solana] Account keys in tx:', accountKeys.map(k => k?.pubkey || k));
             return { success: false, error: 'No payment to our wallet found in transaction' };
         }
         
