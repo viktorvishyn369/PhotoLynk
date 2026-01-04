@@ -1121,6 +1121,196 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
     }
 });
 
+// ============================================================================
+// SOLANA BLOCKCHAIN PAYMENT VERIFICATION
+// ============================================================================
+// Verifies SOL payments on Solana blockchain and activates subscriptions
+// Payment wallet: 8uaqEooTysK7mtb5gLKMD1MJbsKVPoahEXVMAESwptMg
+
+const SOLANA_PAYMENT_WALLET = 'HttTZkUG8xn5A1uJPjRDJqqufdwvHmNQroEGmST8iimU';
+const SOLANA_RPC_ENDPOINT = process.env.SOLANA_RPC_ENDPOINT || 'https://api.mainnet-beta.solana.com';
+const LAMPORTS_PER_SOL = 1000000000;
+
+// Plan durations in milliseconds
+const PLAN_DURATION_MS = {
+    monthly: 30 * 24 * 60 * 60 * 1000,
+    yearly: 365 * 24 * 60 * 60 * 1000,
+};
+
+// Verify Solana payment transaction
+app.post('/api/solana/verify-payment', async (req, res) => {
+    const { txSignature, userUuid, tierGb, duration, solAmount, paymentWallet } = req.body;
+    
+    if (!txSignature || !userUuid || !tierGb) {
+        return res.status(400).json({ error: 'Missing required fields: txSignature, userUuid, tierGb' });
+    }
+    
+    // Validate payment wallet matches
+    if (paymentWallet && paymentWallet !== SOLANA_PAYMENT_WALLET) {
+        return res.status(400).json({ error: 'Invalid payment wallet' });
+    }
+    
+    // Normalize tier
+    const normalizedTier = normalizeTierGb(tierGb);
+    if (!normalizedTier) {
+        return res.status(400).json({ error: 'Invalid tier' });
+    }
+    
+    try {
+        // Find user by UUID
+        const user = await dbGetAsync(`SELECT id, email FROM users WHERE user_uuid = ?`, [userUuid]);
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+        
+        // Verify transaction on Solana blockchain
+        const txVerification = await verifySolanaTransaction(txSignature, solAmount);
+        if (!txVerification.success) {
+            return res.status(400).json({ error: txVerification.error || 'Transaction verification failed' });
+        }
+        
+        // Check if this transaction was already processed
+        const existingTx = await dbGetAsync(
+            `SELECT * FROM solana_payments WHERE tx_signature = ?`,
+            [txSignature]
+        );
+        if (existingTx) {
+            return res.status(409).json({ error: 'Transaction already processed', existingPayment: existingTx });
+        }
+        
+        // Calculate subscription expiry
+        const now = Date.now();
+        const durationMs = PLAN_DURATION_MS[duration] || PLAN_DURATION_MS.monthly;
+        const expiresAt = now + durationMs;
+        
+        // Record the payment
+        await dbRunAsync(
+            `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, tier_gb, duration, created_at, verified_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [user.id, txSignature, solAmount || 0, normalizedTier, duration || 'monthly', now, now]
+        );
+        
+        // Activate subscription
+        await dbRunAsync(
+            `INSERT INTO user_plans (user_id, plan_gb, status, expires_at, updated_at)
+             VALUES (?, ?, 'active', ?, ?)
+             ON CONFLICT(user_id) DO UPDATE SET
+                plan_gb = excluded.plan_gb,
+                status = 'active',
+                expires_at = excluded.expires_at,
+                grace_until = NULL,
+                updated_at = excluded.updated_at`,
+            [user.id, normalizedTier, expiresAt, now]
+        );
+        
+        console.log(`[Solana] Payment verified: ${txSignature} - User ${user.email} - ${normalizedTier}GB ${duration}`);
+        
+        return res.json({
+            success: true,
+            message: 'Payment verified and subscription activated',
+            subscription: {
+                tierGb: normalizedTier,
+                status: 'active',
+                expiresAt: new Date(expiresAt).toISOString(),
+            },
+        });
+    } catch (e) {
+        console.error('[Solana] Payment verification error:', e);
+        return res.status(500).json({ error: 'Payment verification failed' });
+    }
+});
+
+// Helper function to verify Solana transaction
+async function verifySolanaTransaction(txSignature, expectedSolAmount) {
+    try {
+        const axios = require('axios');
+        
+        // Fetch transaction from Solana RPC
+        const response = await axios.post(SOLANA_RPC_ENDPOINT, {
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'getTransaction',
+            params: [
+                txSignature,
+                { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }
+            ],
+        }, {
+            timeout: 30000,
+            headers: { 'Content-Type': 'application/json' },
+        });
+        
+        const tx = response.data?.result;
+        if (!tx) {
+            return { success: false, error: 'Transaction not found' };
+        }
+        
+        // Check if transaction was successful
+        if (tx.meta?.err) {
+            return { success: false, error: 'Transaction failed on chain' };
+        }
+        
+        // Verify the transaction includes a transfer to our payment wallet
+        const accountKeys = tx.transaction?.message?.accountKeys || [];
+        const postBalances = tx.meta?.postBalances || [];
+        const preBalances = tx.meta?.preBalances || [];
+        
+        let paymentReceived = false;
+        let receivedAmount = 0;
+        
+        for (let i = 0; i < accountKeys.length; i++) {
+            const pubkey = accountKeys[i]?.pubkey || accountKeys[i];
+            if (pubkey === SOLANA_PAYMENT_WALLET) {
+                const preBalance = preBalances[i] || 0;
+                const postBalance = postBalances[i] || 0;
+                receivedAmount = (postBalance - preBalance) / LAMPORTS_PER_SOL;
+                
+                if (receivedAmount > 0) {
+                    paymentReceived = true;
+                    break;
+                }
+            }
+        }
+        
+        if (!paymentReceived) {
+            return { success: false, error: 'No payment to our wallet found in transaction' };
+        }
+        
+        // Optionally verify amount (with 5% tolerance for price fluctuations)
+        if (expectedSolAmount && expectedSolAmount > 0) {
+            const tolerance = expectedSolAmount * 0.05;
+            if (receivedAmount < expectedSolAmount - tolerance) {
+                return { 
+                    success: false, 
+                    error: `Insufficient payment: expected ${expectedSolAmount} SOL, received ${receivedAmount} SOL` 
+                };
+            }
+        }
+        
+        return { 
+            success: true, 
+            receivedAmount,
+            blockTime: tx.blockTime,
+            slot: tx.slot,
+        };
+    } catch (e) {
+        console.error('[Solana] RPC error:', e.message);
+        return { success: false, error: 'Failed to verify transaction on blockchain' };
+    }
+}
+
+// Create solana_payments table if not exists
+db.run(`CREATE TABLE IF NOT EXISTS solana_payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    tx_signature TEXT UNIQUE NOT NULL,
+    sol_amount REAL,
+    tier_gb INTEGER,
+    duration TEXT DEFAULT 'monthly',
+    created_at INTEGER,
+    verified_at INTEGER,
+    FOREIGN KEY(user_id) REFERENCES users(id)
+)`);
+
 // Upload File
 app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
