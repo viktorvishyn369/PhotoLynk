@@ -1282,53 +1282,47 @@ async function verifySolanaTransaction(txSignature, expectedSolAmount) {
         return { success: false, error: 'Transaction not found after retries - may still be propagating' };
     }
         
-        // Check if transaction was successful
-        if (tx.meta?.err) {
+        // Check if transaction explicitly failed (only if meta exists)
+        if (tx.meta && tx.meta.err) {
             return { success: false, error: 'Transaction failed on chain' };
         }
         
-        // Verify the transaction includes a transfer to our payment wallet
-        const accountKeys = tx.transaction?.message?.accountKeys || [];
-        const postBalances = tx.meta?.postBalances || [];
-        const preBalances = tx.meta?.preBalances || [];
+        // Parse transfer instructions to find sender, receiver, and amount
+        const instructions = tx.transaction?.message?.instructions || [];
+        let sender = null;
+        let receiver = null;
+        let transferAmount = 0;
         
-        let paymentReceived = false;
-        let receivedAmount = 0;
-        
-        for (let i = 0; i < accountKeys.length; i++) {
-            const pubkey = accountKeys[i]?.pubkey || accountKeys[i];
-            if (pubkey === SOLANA_PAYMENT_WALLET) {
-                const preBalance = preBalances[i] || 0;
-                const postBalance = postBalances[i] || 0;
-                receivedAmount = (postBalance - preBalance) / LAMPORTS_PER_SOL;
-                
-                if (receivedAmount > 0) {
-                    paymentReceived = true;
-                    break;
-                }
+        for (const ix of instructions) {
+            // Look for System Program transfer instruction
+            if (ix.program === 'system' && ix.parsed?.type === 'transfer') {
+                sender = ix.parsed.info.source;
+                receiver = ix.parsed.info.destination;
+                transferAmount = ix.parsed.info.lamports / LAMPORTS_PER_SOL;
+                console.log(`[Solana] Transfer found: ${sender} -> ${receiver}, amount: ${transferAmount} SOL`);
+                break;
             }
         }
         
-        if (!paymentReceived) {
-            console.log('[Solana] Payment wallet not found in tx. Looking for:', SOLANA_PAYMENT_WALLET);
-            console.log('[Solana] Account keys in tx:', accountKeys.map(k => k?.pubkey || k));
-            return { success: false, error: 'No payment to our wallet found in transaction' };
+        if (!sender || !receiver || transferAmount <= 0) {
+            console.log('[Solana] No valid transfer instruction found in transaction');
+            console.log('[Solana] Instructions:', JSON.stringify(instructions, null, 2));
+            return { success: false, error: 'No valid transfer found in transaction' };
         }
         
-        // Optionally verify amount (with 5% tolerance for price fluctuations)
-        if (expectedSolAmount && expectedSolAmount > 0) {
-            const tolerance = expectedSolAmount * 0.05;
-            if (receivedAmount < expectedSolAmount - tolerance) {
-                return { 
-                    success: false, 
-                    error: `Insufficient payment: expected ${expectedSolAmount} SOL, received ${receivedAmount} SOL` 
-                };
-            }
+        // Verify the payment is TO our wallet
+        if (receiver !== SOLANA_PAYMENT_WALLET) {
+            console.log(`[Solana] Payment not to our wallet. Expected: ${SOLANA_PAYMENT_WALLET}, Got: ${receiver}`);
+            return { success: false, error: 'Payment not sent to correct wallet' };
         }
+        
+        console.log(`[Solana] Valid payment: ${transferAmount} SOL from ${sender} to ${receiver}`);
         
     return { 
         success: true, 
-        receivedAmount,
+        receivedAmount: transferAmount,
+        sender,
+        receiver,
         blockTime: tx.blockTime,
         slot: tx.slot,
     };
