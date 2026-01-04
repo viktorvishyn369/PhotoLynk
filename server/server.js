@@ -1237,28 +1237,50 @@ app.post('/api/solana/verify-payment', async (req, res) => {
 // Helper function to verify Solana transaction
 async function verifySolanaTransaction(txSignature, expectedSolAmount) {
     console.log('[Solana] Verifying transaction:', txSignature, 'expected amount:', expectedSolAmount);
-    try {
-        const axios = require('axios');
-        
-        // Fetch transaction from Solana RPC
-        const response = await axios.post(SOLANA_RPC_ENDPOINT, {
-            jsonrpc: '2.0',
-            id: 1,
-            method: 'getTransaction',
-            params: [
-                txSignature,
-                { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0 }
-            ],
-        }, {
-            timeout: 30000,
-            headers: { 'Content-Type': 'application/json' },
-        });
-        
-        const tx = response.data?.result;
-        console.log('[Solana] Transaction lookup result:', tx ? 'found' : 'not found');
-        if (!tx) {
-            return { success: false, error: 'Transaction not found on blockchain yet - please wait and retry' };
+    const axios = require('axios');
+    
+    // Retry up to 5 times with 2 second intervals to allow tx to propagate
+    const maxRetries = 5;
+    const retryDelay = 2000;
+    let tx = null;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            console.log(`[Solana] Attempt ${attempt}/${maxRetries} to fetch transaction`);
+            const response = await axios.post(SOLANA_RPC_ENDPOINT, {
+                jsonrpc: '2.0',
+                id: 1,
+                method: 'getTransaction',
+                params: [
+                    txSignature,
+                    { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0, commitment: 'confirmed' }
+                ],
+            }, {
+                timeout: 30000,
+                headers: { 'Content-Type': 'application/json' },
+            });
+            
+            tx = response.data?.result;
+            if (tx) {
+                console.log('[Solana] Transaction found on attempt', attempt);
+                break;
+            }
+            
+            if (attempt < maxRetries) {
+                console.log(`[Solana] Transaction not found yet, waiting ${retryDelay}ms...`);
+                await new Promise(resolve => setTimeout(resolve, retryDelay));
+            }
+        } catch (e) {
+            console.error(`[Solana] RPC error on attempt ${attempt}:`, e.message);
+            if (attempt < maxRetries) {
+                await new Promise(resolve => setTimeout(resolve, retryDelay));
+            }
         }
+    }
+    
+    if (!tx) {
+        return { success: false, error: 'Transaction not found after retries - may still be propagating' };
+    }
         
         // Check if transaction was successful
         if (tx.meta?.err) {
@@ -1304,16 +1326,12 @@ async function verifySolanaTransaction(txSignature, expectedSolAmount) {
             }
         }
         
-        return { 
-            success: true, 
-            receivedAmount,
-            blockTime: tx.blockTime,
-            slot: tx.slot,
-        };
-    } catch (e) {
-        console.error('[Solana] RPC error:', e.message);
-        return { success: false, error: 'Failed to verify transaction on blockchain' };
-    }
+    return { 
+        success: true, 
+        receivedAmount,
+        blockTime: tx.blockTime,
+        slot: tx.slot,
+    };
 }
 
 // Create solana_payments table if not exists
