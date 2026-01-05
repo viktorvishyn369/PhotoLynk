@@ -1621,9 +1621,31 @@ app.post('/api/solana/verify-payment', async (req, res) => {
         }
         
         // Calculate subscription expiry
+        // If user has existing active subscription, add new term to existing expiration (early renewal)
+        // Otherwise start from now
         const now = Date.now();
         const durationMs = PLAN_DURATION_MS[duration] || PLAN_DURATION_MS.monthly;
-        const expiresAt = now + durationMs;
+        
+        // Get current plan to check existing expiration
+        const currentPlan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [user.id]);
+        let baseTime = now;
+        
+        // If user has active subscription with future expiration, extend from that date
+        if (currentPlan) {
+            const currentExpires = currentPlan.expires_at;
+            const currentTrial = currentPlan.trial_until;
+            
+            // Check if expires_at is in the future
+            if (currentExpires && currentExpires > now) {
+                baseTime = currentExpires;
+            }
+            // Or if trial_until is in the future (user paying during trial)
+            else if (currentTrial && currentTrial > now) {
+                baseTime = currentTrial;
+            }
+        }
+        
+        const expiresAt = baseTime + durationMs;
         
         // Record the payment
         await dbRunAsync(
