@@ -1,6 +1,6 @@
 # PhotoLynk — Self‑Hosted. Encrypted Cloud. iOS ↔ Android ↔ Solana.
 
-**A project by [StealthLynk LLC](https://stealthlynk.io)** — Building secure, privacy-respecting infrastructure for real-world digital systems.
+**A project by <a href="https://stealthlynk.io" target="_blank">StealthLynk LLC</a>** — Building secure, privacy-respecting infrastructure for real-world digital systems.
 
 Back up photos/videos to your own server or StealthCloud, and restore on any phone with the same credentials.
 
