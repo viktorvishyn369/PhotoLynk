@@ -301,66 +301,62 @@ app.get('/admin', adminAuth, (req, res) => {
     const html = adminLayout(`
       <div class="card">
         <h3>Lookup user</h3>
-        <form id="lookup-form" action="javascript:void(0)" onsubmit="return false;">
-          <label>Email</label>
-          <input type="email" name="email" placeholder="user@example.com" />
-          <label>User UUID</label>
-          <input type="text" name="userUuid" placeholder="67ec8dd3-...." />
-          <label>Device UUID</label>
-          <input type="text" name="deviceUuid" placeholder="d27b8441-...." />
-          <div class="flex">
-            <button type="submit">Lookup</button>
-            <span id="lookup-status" class="muted"></span>
-          </div>
-        </form>
+        <label>Email</label>
+        <input type="text" id="lookup-email" placeholder="user@example.com" />
+        <label>User UUID</label>
+        <input type="text" id="lookup-userUuid" placeholder="67ec8dd3-...." />
+        <label>Device UUID</label>
+        <input type="text" id="lookup-deviceUuid" placeholder="d27b8441-...." />
+        <div class="flex">
+          <button type="button" onclick="doLookup()">Lookup</button>
+          <span id="lookup-status" class="muted"></span>
+        </div>
       </div>
 
       <div class="card">
         <h3>Update plan</h3>
-        <form id="update-form" action="javascript:void(0)" onsubmit="return false;">
-          <div class="row">
-            <div>
-              <label>User ID (required)</label>
-              <input type="number" name="userId" placeholder="numeric user_id" required />
-            </div>
-            <div>
-              <label>Plan GB (100, 200, 400, 1000)</label>
-              <input type="number" name="planGb" placeholder="100" />
-            </div>
+        <div class="row">
+          <div>
+            <label>User ID (required)</label>
+            <input type="text" id="update-userId" placeholder="numeric user_id" />
           </div>
-          <div class="row">
-            <div>
-              <label>Expires At (ms epoch)</label>
-              <input type="number" name="expiresAt" placeholder="e.g., Date.now() + 30*86400*1000" />
-            </div>
-            <div>
-              <label>Grace Until (ms epoch)</label>
-              <input type="number" name="graceUntil" placeholder="optional" />
-            </div>
+          <div>
+            <label>Plan GB (100, 200, 400, 1000)</label>
+            <input type="text" id="update-planGb" placeholder="100" />
           </div>
-          <div class="row">
-            <div>
-              <label>Trial Until (ms epoch)</label>
-              <input type="number" name="trialUntil" placeholder="optional" />
-            </div>
-            <div>
-              <label>Status</label>
-              <select name="status">
-                <option value="">(leave unchanged)</option>
-                <option value="active">active</option>
-                <option value="trial">trial</option>
-                <option value="grace">grace</option>
-                <option value="expired">expired</option>
-                <option value="deleted">deleted</option>
-                <option value="none">none</option>
-              </select>
-            </div>
+        </div>
+        <div class="row">
+          <div>
+            <label>Expires At (ms epoch)</label>
+            <input type="text" id="update-expiresAt" placeholder="e.g., Date.now() + 30*86400*1000" />
           </div>
-          <div class="flex">
-            <button type="submit">Update plan</button>
-            <span id="update-status" class="muted"></span>
+          <div>
+            <label>Grace Until (ms epoch)</label>
+            <input type="text" id="update-graceUntil" placeholder="optional" />
           </div>
-        </form>
+        </div>
+        <div class="row">
+          <div>
+            <label>Trial Until (ms epoch)</label>
+            <input type="text" id="update-trialUntil" placeholder="optional" />
+          </div>
+          <div>
+            <label>Status</label>
+            <select id="update-status">
+              <option value="">(leave unchanged)</option>
+              <option value="active">active</option>
+              <option value="trial">trial</option>
+              <option value="grace">grace</option>
+              <option value="expired">expired</option>
+              <option value="deleted">deleted</option>
+              <option value="none">none</option>
+            </select>
+          </div>
+        </div>
+        <div class="flex">
+          <button type="button" onclick="doUpdate()">Update plan</button>
+          <span id="update-status-msg" class="muted"></span>
+        </div>
       </div>
 
       <div class="card">
@@ -369,52 +365,63 @@ app.get('/admin', adminAuth, (req, res) => {
       </div>
 
       <script>
-        const resultsEl = document.getElementById('results');
-        const lookupStatus = document.getElementById('lookup-status');
-        const updateStatus = document.getElementById('update-status');
+        var resultsEl = document.getElementById('results');
+        var lookupStatusEl = document.getElementById('lookup-status');
+        var updateStatusEl = document.getElementById('update-status-msg');
 
-        const formatJson = (obj) => JSON.stringify(obj, null, 2);
+        function formatJson(obj) { return JSON.stringify(obj, null, 2); }
 
-        const handleFetch = async (url, options, statusEl) => {
-          statusEl.textContent = 'Working...';
+        async function doLookup() {
+          lookupStatusEl.textContent = 'Working...';
           try {
-            const res = await fetch(url, options);
-            const text = await res.text();
-            let data;
+            var email = document.getElementById('lookup-email').value.trim();
+            var userUuid = document.getElementById('lookup-userUuid').value.trim();
+            var deviceUuid = document.getElementById('lookup-deviceUuid').value.trim();
+            var params = new URLSearchParams({ email: email, userUuid: userUuid, deviceUuid: deviceUuid });
+            var res = await fetch('/admin/api/user?' + params.toString(), { method: 'GET' });
+            var text = await res.text();
+            var data;
             try { data = JSON.parse(text); } catch (e) { data = text; }
-            resultsEl.textContent = formatJson({ status: res.status, data });
-            statusEl.textContent = res.ok ? 'OK' : 'Error';
+            resultsEl.textContent = formatJson({ status: res.status, data: data });
+            lookupStatusEl.textContent = res.ok ? 'OK' : 'Error';
           } catch (e) {
             resultsEl.textContent = formatJson({ error: e.message });
-            statusEl.textContent = 'Error';
+            lookupStatusEl.textContent = 'Error';
           }
-        };
+        }
 
-        document.getElementById('lookup-form').addEventListener('submit', async (e) => {
-          e.preventDefault();
-          const email = e.target.email.value.trim();
-          const userUuid = e.target.userUuid.value.trim();
-          const deviceUuid = e.target.deviceUuid.value.trim();
-          const params = new URLSearchParams({ email, userUuid, deviceUuid });
-          await handleFetch('/admin/api/user?' + params.toString(), { method: 'GET' }, lookupStatus);
-        });
-
-        document.getElementById('update-form').addEventListener('submit', async (e) => {
-          e.preventDefault();
-          const payload = {
-            userId: Number(e.target.userId.value),
-            planGb: e.target.planGb.value ? Number(e.target.planGb.value) : null,
-            expiresAt: e.target.expiresAt.value ? Number(e.target.expiresAt.value) : null,
-            graceUntil: e.target.graceUntil.value ? Number(e.target.graceUntil.value) : null,
-            trialUntil: e.target.trialUntil.value ? Number(e.target.trialUntil.value) : null,
-            status: e.target.status.value || null,
-          };
-          await handleFetch('/admin/api/user/plan', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-          }, updateStatus);
-        });
+        async function doUpdate() {
+          updateStatusEl.textContent = 'Working...';
+          try {
+            var userId = document.getElementById('update-userId').value.trim();
+            var planGb = document.getElementById('update-planGb').value.trim();
+            var expiresAt = document.getElementById('update-expiresAt').value.trim();
+            var graceUntil = document.getElementById('update-graceUntil').value.trim();
+            var trialUntil = document.getElementById('update-trialUntil').value.trim();
+            var status = document.getElementById('update-status').value;
+            var payload = {
+              userId: userId ? Number(userId) : null,
+              planGb: planGb ? Number(planGb) : null,
+              expiresAt: expiresAt ? Number(expiresAt) : null,
+              graceUntil: graceUntil ? Number(graceUntil) : null,
+              trialUntil: trialUntil ? Number(trialUntil) : null,
+              status: status || null
+            };
+            var res = await fetch('/admin/api/user/plan', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify(payload)
+            });
+            var text = await res.text();
+            var data;
+            try { data = JSON.parse(text); } catch (e) { data = text; }
+            resultsEl.textContent = formatJson({ status: res.status, data: data });
+            updateStatusEl.textContent = res.ok ? 'OK' : 'Error';
+          } catch (e) {
+            resultsEl.textContent = formatJson({ error: e.message });
+            updateStatusEl.textContent = 'Error';
+          }
+        }
       </script>
     `);
     res.send(html);
