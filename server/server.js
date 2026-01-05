@@ -185,6 +185,9 @@ app.use(cors());
 app.use(morgan('common')); // Logging
 app.use(express.json());
 
+// Serve static files from public directory (company website assets)
+app.use('/images', express.static(path.join(__dirname, 'public', 'images')));
+
 // Basic IP allowlist helper
 const isIpAllowed = (ip) => {
     if (!ADMIN_IP_ALLOWLIST.length) return true;
@@ -1172,8 +1175,12 @@ const rawCloudChunk = express.raw({ type: '*/*', limit: '250mb' });
 
 // --- ROUTES ---
 
-// Root: Secure by default (no info leaked)
+// Root: Serve company visit card page
 app.get('/', (req, res) => {
+    const publicIndexPath = path.join(__dirname, 'public', 'index.html');
+    if (fs.existsSync(publicIndexPath)) {
+        return res.sendFile(publicIndexPath);
+    }
     res.status(403).send('Access Forbidden');
 });
 
