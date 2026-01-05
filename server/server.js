@@ -12,6 +12,8 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const crypto = require('crypto');
 const updater = require('./updater');
+let sharp;
+try { sharp = require('sharp'); } catch (e) { sharp = null; }
 
 require('dotenv').config();
 
@@ -161,6 +163,10 @@ const TRIAL_DAYS = Number.parseInt(process.env.TRIAL_DAYS || '7', 10);
 const REVENUECAT_WEBHOOK_SECRET = process.env.REVENUECAT_WEBHOOK_SECRET || '';
 const USER_QUOTA_MARGIN_BYTES = Number.parseInt(process.env.USER_QUOTA_MARGIN_BYTES || String(50 * 1024 * 1024), 10);
 const ENABLE_CLOUD_UPLOAD_LOCK = String(process.env.ENABLE_CLOUD_UPLOAD_LOCK || 'true').toLowerCase() !== 'false';
+const ADMIN_USER = process.env.ADMIN_USER || '';
+const ADMIN_PASSWORD_BCRYPT = process.env.ADMIN_PASSWORD_BCRYPT || '';
+const ADMIN_IP_ALLOWLIST = (process.env.ADMIN_IP_ALLOWLIST || '').split(',').map(s => s.trim()).filter(Boolean);
+const ADMIN_HTML_TITLE = 'StealthCloud Admin';
 
 // Security & Middleware
 app.use(helmet()); // Sets various HTTP headers for security
@@ -168,6 +174,369 @@ app.use(cors());
 app.use(morgan('common')); // Logging
 app.use(express.json());
 
+// Basic IP allowlist helper
+const isIpAllowed = (ip) => {
+    if (!ADMIN_IP_ALLOWLIST.length) return true;
+    const clean = (ip || '').replace('::ffff:', '');
+    return ADMIN_IP_ALLOWLIST.includes(clean);
+};
+
+// Admin auth middleware (Basic Auth + bcrypt + optional IP allowlist)
+const adminAuth = async (req, res, next) => {
+    try {
+        if (!ADMIN_USER || !ADMIN_PASSWORD_BCRYPT) {
+            return res.status(403).send('Admin access not configured');
+        }
+        if (!isIpAllowed(req.ip)) {
+            return res.status(403).send('IP not allowed');
+        }
+        const header = req.headers['authorization'] || '';
+        if (!header.startsWith('Basic ')) return res.status(401).set('WWW-Authenticate', 'Basic').send('Auth required');
+        const decoded = Buffer.from(header.split(' ')[1] || '', 'base64').toString('utf8');
+        const [user, ...rest] = decoded.split(':');
+        const pass = rest.join(':');
+        if (user !== ADMIN_USER) return res.status(401).send('Invalid credentials');
+        const ok = await bcrypt.compare(pass, ADMIN_PASSWORD_BCRYPT);
+        if (!ok) return res.status(401).send('Invalid credentials');
+        next();
+    } catch (e) {
+        return res.status(401).send('Unauthorized');
+    }
+};
+
+// Admin HTML helper
+const adminLayout = (contentHtml) => `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${ADMIN_HTML_TITLE}</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #0b1021;
+      --panel: #121a30;
+      --accent: #4fd1c5;
+      --muted: #8fa3c3;
+      --text: #e6ecff;
+      --danger: #f87171;
+    }
+    body {
+      margin: 0;
+      font-family: 'Inter', system-ui, -apple-system, sans-serif;
+      background: radial-gradient(120% 120% at 20% 20%, rgba(79,209,197,0.08), transparent 50%),
+                  radial-gradient(100% 100% at 80% 0%, rgba(79,209,197,0.06), transparent 45%),
+                  var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+    }
+    .wrap {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+    }
+    h1 { margin: 0 0 12px; letter-spacing: 0.3px; }
+    .card {
+      background: linear-gradient(145deg, rgba(18,26,48,0.95), rgba(18,26,48,0.75));
+      border: 1px solid rgba(79,209,197,0.16);
+      box-shadow: 0 20px 60px rgba(0,0,0,0.35);
+      border-radius: 14px;
+      padding: 18px 20px;
+      margin-top: 16px;
+    }
+    label { display: block; font-weight: 600; margin: 10px 0 6px; color: var(--muted); }
+    input, select, button, textarea {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(255,255,255,0.04);
+      color: var(--text);
+      font-size: 15px;
+      outline: none;
+      transition: border 0.15s ease, transform 0.1s ease;
+    }
+    input:focus, select:focus, textarea:focus { border-color: var(--accent); }
+    button {
+      cursor: pointer;
+      font-weight: 700;
+      background: linear-gradient(135deg, #4fd1c5, #3fb3a9);
+      border: none;
+      color: #0b1021;
+      margin-top: 12px;
+    }
+    button:hover { transform: translateY(-1px); }
+    button:active { transform: translateY(0); }
+    .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+    pre {
+      background: rgba(0,0,0,0.35);
+      border: 1px solid rgba(255,255,255,0.08);
+      border-radius: 12px;
+      padding: 12px;
+      overflow: auto;
+      color: #e6ecff;
+      font-size: 13px;
+    }
+    .danger { color: var(--danger); }
+    .muted { color: var(--muted); }
+    .flex { display: flex; gap: 12px; align-items: center; }
+    .flex button { width: auto; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>${ADMIN_HTML_TITLE}</h1>
+    <p class="muted">Search users, view/update plan, expires_at, grace_until, trial_until, and inspect payments.</p>
+    ${contentHtml}
+  </div>
+</body>
+</html>`;
+
+// Admin page (Basic Auth + IP allowlist + no cache)
+app.get('/admin', adminAuth, (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+    const html = adminLayout(`
+      <div class="card">
+        <h3>Lookup user</h3>
+        <form id="lookup-form">
+          <label>Email</label>
+          <input type="email" name="email" placeholder="user@example.com" />
+          <label>User UUID</label>
+          <input type="text" name="userUuid" placeholder="67ec8dd3-...." />
+          <label>Device UUID</label>
+          <input type="text" name="deviceUuid" placeholder="d27b8441-...." />
+          <div class="flex">
+            <button type="submit">Lookup</button>
+            <span id="lookup-status" class="muted"></span>
+          </div>
+        </form>
+      </div>
+
+      <div class="card">
+        <h3>Update plan</h3>
+        <form id="update-form">
+          <div class="row">
+            <div>
+              <label>User ID (required)</label>
+              <input type="number" name="userId" placeholder="numeric user_id" required />
+            </div>
+            <div>
+              <label>Plan GB (100, 200, 400, 1000)</label>
+              <input type="number" name="planGb" placeholder="100" />
+            </div>
+          </div>
+          <div class="row">
+            <div>
+              <label>Expires At (ms epoch)</label>
+              <input type="number" name="expiresAt" placeholder="e.g., Date.now() + 30*86400*1000" />
+            </div>
+            <div>
+              <label>Grace Until (ms epoch)</label>
+              <input type="number" name="graceUntil" placeholder="optional" />
+            </div>
+          </div>
+          <div class="row">
+            <div>
+              <label>Trial Until (ms epoch)</label>
+              <input type="number" name="trialUntil" placeholder="optional" />
+            </div>
+            <div>
+              <label>Status</label>
+              <select name="status">
+                <option value="">(leave unchanged)</option>
+                <option value="active">active</option>
+                <option value="trial">trial</option>
+                <option value="grace">grace</option>
+                <option value="expired">expired</option>
+                <option value="deleted">deleted</option>
+                <option value="none">none</option>
+              </select>
+            </div>
+          </div>
+          <div class="flex">
+            <button type="submit">Update plan</button>
+            <span id="update-status" class="muted"></span>
+          </div>
+        </form>
+      </div>
+
+      <div class="card">
+        <h3>Results</h3>
+        <pre id="results">Waiting…</pre>
+      </div>
+
+      <script>
+        const resultsEl = document.getElementById('results');
+        const lookupStatus = document.getElementById('lookup-status');
+        const updateStatus = document.getElementById('update-status');
+
+        const formatJson = (obj) => JSON.stringify(obj, null, 2);
+
+        const handleFetch = async (url, options, statusEl) => {
+          statusEl.textContent = 'Working...';
+          try {
+            const res = await fetch(url, options);
+            const text = await res.text();
+            let data;
+            try { data = JSON.parse(text); } catch (e) { data = text; }
+            resultsEl.textContent = formatJson({ status: res.status, data });
+            statusEl.textContent = res.ok ? 'OK' : 'Error';
+          } catch (e) {
+            resultsEl.textContent = formatJson({ error: e.message });
+            statusEl.textContent = 'Error';
+          }
+        };
+
+        document.getElementById('lookup-form').addEventListener('submit', async (e) => {
+          e.preventDefault();
+          const email = e.target.email.value.trim();
+          const userUuid = e.target.userUuid.value.trim();
+          const deviceUuid = e.target.deviceUuid.value.trim();
+          const params = new URLSearchParams({ email, userUuid, deviceUuid });
+          await handleFetch('/admin/api/user?' + params.toString(), { method: 'GET' }, lookupStatus);
+        });
+
+        document.getElementById('update-form').addEventListener('submit', async (e) => {
+          e.preventDefault();
+          const payload = {
+            userId: Number(e.target.userId.value),
+            planGb: e.target.planGb.value ? Number(e.target.planGb.value) : null,
+            expiresAt: e.target.expiresAt.value ? Number(e.target.expiresAt.value) : null,
+            graceUntil: e.target.graceUntil.value ? Number(e.target.graceUntil.value) : null,
+            trialUntil: e.target.trialUntil.value ? Number(e.target.trialUntil.value) : null,
+            status: e.target.status.value || null,
+          };
+          await handleFetch('/admin/api/user/plan', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          }, updateStatus);
+        });
+      </script>
+    `);
+    res.send(html);
+});
+
+// Admin API: lookup user (email | userUuid | deviceUuid)
+app.get('/admin/api/user', adminAuth, async (req, res) => {
+    try {
+        const email = (req.query.email || '').toString().trim().toLowerCase();
+        const userUuid = (req.query.userUuid || req.query.user_uuid || '').toString().trim();
+        const deviceUuid = (req.query.deviceUuid || req.query.device_uuid || '').toString().trim();
+        if (!email && !userUuid && !deviceUuid) {
+            return res.status(400).json({ error: 'email, userUuid, or deviceUuid required' });
+        }
+
+        let user = null;
+        if (email) {
+            user = await dbGetAsync(`SELECT * FROM users WHERE lower(email) = ?`, [email]);
+        }
+        if (!user && userUuid) {
+            user = await dbGetAsync(`SELECT * FROM users WHERE user_uuid = ?`, [userUuid]);
+        }
+        if (!user && deviceUuid) {
+            user = await dbGetAsync(
+                `SELECT u.* FROM users u
+                  JOIN devices d ON u.id = d.user_id
+                 WHERE d.device_uuid = ?
+                 LIMIT 1`,
+                [deviceUuid]
+            );
+        }
+
+        if (!user) return res.status(404).json({ error: 'User not found' });
+
+        const plan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [user.id]);
+        const payments = await dbAllAsync(
+            `SELECT * FROM solana_payments WHERE user_id = ? ORDER BY created_at DESC LIMIT 50`,
+            [user.id]
+        );
+
+        return res.json({ user, plan, payments });
+    } catch (e) {
+        console.error('[Admin] lookup error', e);
+        return res.status(500).json({ error: 'Server error' });
+    }
+});
+
+// Admin API: update plan fields
+app.post('/admin/api/user/plan', adminAuth, async (req, res) => {
+    try {
+        const {
+            userId,
+            planGb,
+            expiresAt,
+            graceUntil,
+            trialUntil,
+            status,
+        } = req.body || {};
+
+        const uid = Number(userId);
+        if (!Number.isFinite(uid) || uid <= 0) return res.status(400).json({ error: 'userId required' });
+
+        const user = await dbGetAsync(`SELECT * FROM users WHERE id = ?`, [uid]);
+        if (!user) return res.status(404).json({ error: 'User not found' });
+
+        await ensurePlanRow(uid);
+
+        const updates = [];
+        const params = [];
+        const now = Date.now();
+
+        if (planGb !== undefined && planGb !== null && planGb !== '') {
+            const normalized = normalizeTierGb(planGb);
+            if (!normalized) return res.status(400).json({ error: 'Invalid planGb' });
+            updates.push('plan_gb = ?');
+            params.push(normalized);
+        }
+        const numericOrNull = (v) => {
+            if (v === undefined || v === null || v === '') return null;
+            const n = Number(v);
+            return Number.isFinite(n) ? n : null;
+        };
+        const exp = numericOrNull(expiresAt);
+        if (expiresAt !== undefined) {
+            if (exp === null) return res.status(400).json({ error: 'Invalid expiresAt' });
+            updates.push('expires_at = ?');
+            params.push(exp);
+        }
+        const gu = numericOrNull(graceUntil);
+        if (graceUntil !== undefined) {
+            if (gu === null) return res.status(400).json({ error: 'Invalid graceUntil' });
+            updates.push('grace_until = ?');
+            params.push(gu);
+        }
+        const tu = numericOrNull(trialUntil);
+        if (trialUntil !== undefined) {
+            if (tu === null) return res.status(400).json({ error: 'Invalid trialUntil' });
+            updates.push('trial_until = ?');
+            params.push(tu);
+        }
+        if (status !== undefined && status !== null && status !== '') {
+            const allowed = new Set(['active', 'trial', 'grace', 'expired', 'deleted', 'none']);
+            if (!allowed.has(String(status))) return res.status(400).json({ error: 'Invalid status' });
+            updates.push('status = ?');
+            params.push(String(status));
+        }
+
+        if (!updates.length) return res.status(400).json({ error: 'No updates provided' });
+
+        updates.push('updated_at = ?');
+        params.push(now, uid);
+
+        const sql = `UPDATE user_plans SET ${updates.join(', ')} WHERE user_id = ?`;
+        await dbRunAsync(sql, params);
+
+        const plan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [uid]);
+        return res.json({ ok: true, plan });
+    } catch (e) {
+        console.error('[Admin] plan update error', e);
+        return res.status(500).json({ error: 'Server error' });
+    }
+});
 // Prevent stale caching (e.g., 304 Not Modified) for API responses like StealthCloud manifest listing
 app.set('etag', false);
 
@@ -1580,6 +1949,48 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
     } catch (e) {
         return res.status(500).json({ error: 'Purge failed' });
     }
+});
+
+// Thumbnail endpoint - returns resized image (150px)
+app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
+    const filename = req.params.filename;
+    const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
+    const filePath = path.join(deviceDir, filename);
+
+    // Security check: prevent directory traversal
+    if (!filePath.startsWith(deviceDir)) {
+        return res.status(403).json({ error: 'Access denied' });
+    }
+
+    if (!fs.existsSync(filePath)) {
+        return res.status(404).json({ error: 'File not found' });
+    }
+
+    const ext = (filename || '').split('.').pop()?.toLowerCase() || '';
+    const isImage = ['jpg', 'jpeg', 'png', 'heic', 'heif', 'webp', 'gif', 'bmp', 'tiff'].includes(ext);
+    
+    if (!isImage) {
+        return res.status(400).json({ error: 'Not an image file' });
+    }
+
+    // If sharp is available, generate thumbnail
+    if (sharp) {
+        try {
+            const thumbBuffer = await sharp(filePath)
+                .resize(150, 150, { fit: 'cover', position: 'center' })
+                .jpeg({ quality: 70 })
+                .toBuffer();
+            res.set('Content-Type', 'image/jpeg');
+            res.set('Cache-Control', 'public, max-age=86400');
+            return res.send(thumbBuffer);
+        } catch (e) {
+            console.log('Thumbnail generation failed:', e.message);
+            // Fall through to serve original
+        }
+    }
+
+    // Fallback: serve original file
+    res.download(filePath);
 });
 
 // Download File
