@@ -301,7 +301,7 @@ app.get('/admin', adminAuth, (req, res) => {
     const html = adminLayout(`
       <div class="card">
         <h3>Lookup user</h3>
-        <form id="lookup-form">
+        <form id="lookup-form" action="javascript:void(0)" onsubmit="return false;">
           <label>Email</label>
           <input type="email" name="email" placeholder="user@example.com" />
           <label>User UUID</label>
@@ -317,7 +317,7 @@ app.get('/admin', adminAuth, (req, res) => {
 
       <div class="card">
         <h3>Update plan</h3>
-        <form id="update-form">
+        <form id="update-form" action="javascript:void(0)" onsubmit="return false;">
           <div class="row">
             <div>
               <label>User ID (required)</label>
