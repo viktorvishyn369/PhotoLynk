@@ -169,7 +169,18 @@ const ADMIN_IP_ALLOWLIST = (process.env.ADMIN_IP_ALLOWLIST || '').split(',').map
 const ADMIN_HTML_TITLE = 'StealthCloud Admin';
 
 // Security & Middleware
-app.use(helmet()); // Sets various HTTP headers for security
+app.use(helmet({
+    contentSecurityPolicy: {
+        directives: {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'", "'unsafe-inline'"],
+            scriptSrcAttr: ["'unsafe-inline'"],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+            imgSrc: ["'self'", "data:", "blob:"],
+            connectSrc: ["'self'"],
+        },
+    },
+}));
 app.use(cors());
 app.use(morgan('common')); // Logging
 app.use(express.json());
