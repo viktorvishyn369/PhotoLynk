@@ -1,6 +1,22 @@
-# PhotoLynk — Self‑Hosted. Encrypted Cloud. iOS ↔ Android.
+# PhotoLynk — Self‑Hosted. Encrypted Cloud. iOS ↔ Android ↔ Solana.
+
+**A project by [StealthLynk LLC](https://stealthlynk.io)** — Building secure, privacy-respecting infrastructure for real-world digital systems.
 
 Back up photos/videos to your own server or StealthCloud, and restore on any phone with the same credentials.
+
+---
+
+## 📱 Mobile Apps — Coming Soon
+
+| Platform | Status | Payment Method |
+|----------|--------|----------------|
+| **iOS** | 🔜 Coming to App Store | In-App Purchase |
+| **Android** | 🔜 Coming to Google Play | In-App Purchase |
+| **Solana Seeker** | 🔜 Coming to Solana dApp Store | SOL (on-chain) |
+
+The PhotoLynk mobile apps feature end-to-end encryption, self-hosted or cloud backup options, and seamless cross-platform restore. The Solana dApp version enables crypto payments directly on the Solana blockchain — no credit cards, no middlemen.
+
+**Stay tuned for release announcements!**
 
 ---
 
@@ -467,7 +483,13 @@ node server.js
 
 ## License
 
-MIT
+MIT — See [License](https://viktorvishyn369.github.io/PhotoLynk/license.html)
+
+## Legal
+
+- [Privacy Policy](https://viktorvishyn369.github.io/PhotoLynk/privacy-policy.html)
+- [Terms of Service](https://viktorvishyn369.github.io/PhotoLynk/terms.html)
+- [Copyright](https://viktorvishyn369.github.io/PhotoLynk/copyright.html)
 
 ## Contributing
 
