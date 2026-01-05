@@ -338,18 +338,28 @@ app.get('/admin', adminAuth, (req, res) => {
         </div>
         <div class="row">
           <div>
-            <label>Expires At (ms epoch)</label>
-            <input type="text" id="update-expiresAt" placeholder="e.g., Date.now() + 30*86400*1000" />
+            <label>Extend Expires by (days)</label>
+            <input type="text" id="update-extendExpiresDays" placeholder="e.g., 15" />
           </div>
           <div>
-            <label>Grace Until (ms epoch)</label>
-            <input type="text" id="update-graceUntil" placeholder="optional" />
+            <label>Extend Trial by (days)</label>
+            <input type="text" id="update-extendTrialDays" placeholder="e.g., 15" />
           </div>
         </div>
         <div class="row">
           <div>
-            <label>Trial Until (ms epoch)</label>
-            <input type="text" id="update-trialUntil" placeholder="optional" />
+            <label>Expires At (ms epoch, optional)</label>
+            <input type="text" id="update-expiresAt" placeholder="absolute epoch" />
+          </div>
+          <div>
+            <label>Trial Until (ms epoch, optional)</label>
+            <input type="text" id="update-trialUntil" placeholder="absolute epoch" />
+          </div>
+        </div>
+        <div class="row">
+          <div>
+            <label>Grace Until (ms epoch)</label>
+            <input type="text" id="update-graceUntil" placeholder="optional" />
           </div>
           <div>
             <label>Status</label>
@@ -406,6 +416,8 @@ app.get('/admin', adminAuth, (req, res) => {
           try {
             var userId = document.getElementById('update-userId').value.trim();
             var planGb = document.getElementById('update-planGb').value.trim();
+            var extendExpiresDays = document.getElementById('update-extendExpiresDays').value.trim();
+            var extendTrialDays = document.getElementById('update-extendTrialDays').value.trim();
             var expiresAt = document.getElementById('update-expiresAt').value.trim();
             var graceUntil = document.getElementById('update-graceUntil').value.trim();
             var trialUntil = document.getElementById('update-trialUntil').value.trim();
@@ -413,6 +425,8 @@ app.get('/admin', adminAuth, (req, res) => {
             var payload = {
               userId: userId ? Number(userId) : null,
               planGb: planGb ? Number(planGb) : null,
+              extendExpiresDays: extendExpiresDays ? Number(extendExpiresDays) : null,
+              extendTrialDays: extendTrialDays ? Number(extendTrialDays) : null,
               expiresAt: expiresAt ? Number(expiresAt) : null,
               graceUntil: graceUntil ? Number(graceUntil) : null,
               trialUntil: trialUntil ? Number(trialUntil) : null,
@@ -486,6 +500,8 @@ app.post('/admin/api/user/plan', adminAuth, async (req, res) => {
         const {
             userId,
             planGb,
+            extendExpiresDays,
+            extendTrialDays,
             expiresAt,
             graceUntil,
             trialUntil,
@@ -500,9 +516,12 @@ app.post('/admin/api/user/plan', adminAuth, async (req, res) => {
 
         await ensurePlanRow(uid);
 
+        const currentPlan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [uid]);
+
         const updates = [];
         const params = [];
         const now = Date.now();
+        const DAY_MS = 24 * 60 * 60 * 1000;
 
         if (planGb !== undefined && planGb !== null && planGb !== '') {
             const normalized = normalizeTierGb(planGb);
@@ -515,20 +534,42 @@ app.post('/admin/api/user/plan', adminAuth, async (req, res) => {
             const n = Number(v);
             return Number.isFinite(n) ? n : null;
         };
+
+        // Handle extend expires by days
+        if (extendExpiresDays !== undefined && extendExpiresDays !== null && extendExpiresDays !== '') {
+            const days = Number(extendExpiresDays);
+            if (!Number.isFinite(days)) return res.status(400).json({ error: 'Invalid extendExpiresDays' });
+            const currentExpires = currentPlan?.expires_at || now;
+            const baseTime = currentExpires > now ? currentExpires : now;
+            updates.push('expires_at = ?');
+            params.push(baseTime + days * DAY_MS);
+        }
+
+        // Handle extend trial by days
+        if (extendTrialDays !== undefined && extendTrialDays !== null && extendTrialDays !== '') {
+            const days = Number(extendTrialDays);
+            if (!Number.isFinite(days)) return res.status(400).json({ error: 'Invalid extendTrialDays' });
+            const currentTrial = currentPlan?.trial_until || now;
+            const baseTime = currentTrial > now ? currentTrial : now;
+            updates.push('trial_until = ?');
+            params.push(baseTime + days * DAY_MS);
+        }
+
+        // Absolute epoch values (override extend if both provided)
         const exp = numericOrNull(expiresAt);
-        if (expiresAt !== undefined) {
+        if (expiresAt !== undefined && expiresAt !== null && expiresAt !== '') {
             if (exp === null) return res.status(400).json({ error: 'Invalid expiresAt' });
             updates.push('expires_at = ?');
             params.push(exp);
         }
         const gu = numericOrNull(graceUntil);
-        if (graceUntil !== undefined) {
+        if (graceUntil !== undefined && graceUntil !== null && graceUntil !== '') {
             if (gu === null) return res.status(400).json({ error: 'Invalid graceUntil' });
             updates.push('grace_until = ?');
             params.push(gu);
         }
         const tu = numericOrNull(trialUntil);
-        if (trialUntil !== undefined) {
+        if (trialUntil !== undefined && trialUntil !== null && trialUntil !== '') {
             if (tu === null) return res.status(400).json({ error: 'Invalid trialUntil' });
             updates.push('trial_until = ?');
             params.push(tu);
