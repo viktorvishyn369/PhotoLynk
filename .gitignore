@@ -120,6 +120,7 @@ install-server-PhotoSync.sh
 
 # StealthLynk private (do not push)
 mobile-v2/
+solana-seeker/
 SERVER SETUP/
 server/generate-capacity-json.js
 server/sweep-expired-users.js
