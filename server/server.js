@@ -418,7 +418,7 @@ app.get('/admin', adminAuth, (req, res) => {
             var res = await fetch('/admin/api/users', { method: 'GET' });
             var data = await res.json();
             if (!res.ok) {
-              usersStatusEl.textContent = 'Error: ' + (data.error || 'Unknown');
+              usersStatusEl.textContent = 'Error: ' + (data.error || 'Unknown') + ' - ' + (data.details || '');
               return;
             }
             usersStatusEl.textContent = 'Loaded ' + data.total_users + ' users';
@@ -427,12 +427,11 @@ app.get('/admin', adminAuth, (req, res) => {
             html += '<thead><tr style="background:#333;color:#fff;">';
             html += '<th style="padding:6px;border:1px solid #555;">ID</th>';
             html += '<th style="padding:6px;border:1px solid #555;">Email</th>';
-            html += '<th style="padding:6px;border:1px solid #555;">Registered</th>';
             html += '<th style="padding:6px;border:1px solid #555;">Plan (GB)</th>';
             html += '<th style="padding:6px;border:1px solid #555;">Status</th>';
             html += '<th style="padding:6px;border:1px solid #555;">Trial Until</th>';
             html += '<th style="padding:6px;border:1px solid #555;">Expires</th>';
-            html += '<th style="padding:6px;border:1px solid #555;">Paid ($)</th>';
+            html += '<th style="padding:6px;border:1px solid #555;">Updated</th>';
             html += '</tr></thead><tbody>';
             
             data.users.forEach(function(u) {
@@ -442,12 +441,11 @@ app.get('/admin', adminAuth, (req, res) => {
               html += '<tr>';
               html += '<td style="padding:4px;border:1px solid #444;">' + u.id + '</td>';
               html += '<td style="padding:4px;border:1px solid #444;">' + (u.email || '-') + '</td>';
-              html += '<td style="padding:4px;border:1px solid #444;">' + formatDate(u.registered_date) + '</td>';
               html += '<td style="padding:4px;border:1px solid #444;">' + (u.plan.plan_gb || '-') + '</td>';
               html += '<td style="padding:4px;border:1px solid #444;color:' + statusColor + ';">' + (u.plan.status || 'none') + '</td>';
               html += '<td style="padding:4px;border:1px solid #444;">' + formatDate(u.plan.trial_until_date) + '</td>';
               html += '<td style="padding:4px;border:1px solid #444;">' + formatDate(u.plan.expires_at_date) + '</td>';
-              html += '<td style="padding:4px;border:1px solid #444;">' + (u.payments.has_paid ? '$' + u.payments.total_paid_usd.toFixed(2) : '-') + '</td>';
+              html += '<td style="padding:4px;border:1px solid #444;">' + formatDate(u.plan.updated_at_date) + '</td>';
               html += '</tr>';
             });
             
@@ -665,87 +663,50 @@ app.post('/admin/api/user/plan', adminAuth, async (req, res) => {
     }
 });
 
-// Admin API: list all users with plans, registration date, and payment info
+// Admin API: list all users with plans
 app.get('/admin/api/users', adminAuth, async (req, res) => {
     try {
-        // Get all users with their plans
+        // Get all users with their plans (users table has no created_at, use plan updated_at as proxy)
         const users = await dbAllAsync(`
             SELECT 
                 u.id,
                 u.email,
                 u.user_uuid,
-                u.created_at as registered_at,
                 p.plan_gb,
                 p.status as plan_status,
                 p.trial_until,
                 p.expires_at,
                 p.grace_until,
-                p.created_at as plan_created_at,
                 p.updated_at as plan_updated_at
             FROM users u
             LEFT JOIN user_plans p ON u.id = p.user_id
-            ORDER BY u.created_at DESC
+            ORDER BY u.id DESC
         `);
 
-        // Get payment info for each user
-        const usersWithPayments = await Promise.all(users.map(async (user) => {
-            let payments = [];
-            try {
-                payments = await dbAllAsync(
-                    `SELECT id, amount_sol, amount_usd, tx_signature, status, created_at 
-                     FROM solana_payments 
-                     WHERE user_id = ? 
-                     ORDER BY created_at DESC`,
-                    [user.id]
-                );
-            } catch (paymentErr) {
-                // Table might not exist or other error - continue without payments
-                console.warn('[Admin] payments query failed for user', user.id, paymentErr?.message);
-                payments = [];
-            }
-            
-            const totalPaidUsd = (payments || [])
-                .filter(p => p.status === 'confirmed' || p.status === 'completed')
-                .reduce((sum, p) => sum + (p.amount_usd || 0), 0);
-            
-            const lastPayment = payments && payments.length > 0 ? payments[0] : null;
-            
-            return {
-                id: user.id,
-                email: user.email,
-                user_uuid: user.user_uuid,
-                registered_at: user.registered_at,
-                registered_date: user.registered_at ? new Date(user.registered_at).toISOString() : null,
-                plan: {
-                    plan_gb: user.plan_gb,
-                    status: user.plan_status,
-                    trial_until: user.trial_until,
-                    trial_until_date: user.trial_until ? new Date(user.trial_until).toISOString() : null,
-                    expires_at: user.expires_at,
-                    expires_at_date: user.expires_at ? new Date(user.expires_at).toISOString() : null,
-                    grace_until: user.grace_until,
-                },
-                payments: {
-                    total_paid_usd: totalPaidUsd,
-                    payment_count: (payments || []).length,
-                    has_paid: totalPaidUsd > 0,
-                    last_payment: lastPayment ? {
-                        amount_usd: lastPayment.amount_usd,
-                        amount_sol: lastPayment.amount_sol,
-                        status: lastPayment.status,
-                        date: lastPayment.created_at ? new Date(lastPayment.created_at).toISOString() : null,
-                    } : null,
-                },
-            };
+        const formattedUsers = users.map(user => ({
+            id: user.id,
+            email: user.email,
+            user_uuid: user.user_uuid,
+            plan: {
+                plan_gb: user.plan_gb,
+                status: user.plan_status,
+                trial_until: user.trial_until,
+                trial_until_date: user.trial_until ? new Date(user.trial_until).toISOString() : null,
+                expires_at: user.expires_at,
+                expires_at_date: user.expires_at ? new Date(user.expires_at).toISOString() : null,
+                grace_until: user.grace_until,
+                updated_at: user.plan_updated_at,
+                updated_at_date: user.plan_updated_at ? new Date(user.plan_updated_at).toISOString() : null,
+            },
         }));
 
         return res.json({
-            total_users: usersWithPayments.length,
-            users: usersWithPayments,
+            total_users: formattedUsers.length,
+            users: formattedUsers,
         });
     } catch (e) {
         console.error('[Admin] list users error', e);
-        return res.status(500).json({ error: 'Server error' });
+        return res.status(500).json({ error: 'Server error', details: e?.message });
     }
 });
 
