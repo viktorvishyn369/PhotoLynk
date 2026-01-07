@@ -4,12 +4,17 @@ const { execFileSync } = require('child_process');
 const sqlite3 = require('sqlite3').verbose();
 
 const CLOUD_DIR = process.env.CLOUD_DIR;
-const CHUNKS_DIR = process.env.CHUNKS_DIR; // HDD RAID10 for actual chunk storage
+let CHUNKS_DIR = process.env.CHUNKS_DIR; // HDD RAID10 for actual chunk storage
 const CAPACITY_JSON_PATH = process.env.CAPACITY_JSON_PATH;
 const DB_PATH = process.env.DB_PATH;
 
 if (!CLOUD_DIR || !CAPACITY_JSON_PATH) {
   process.exit(2);
+}
+
+// Auto-detect CHUNKS_DIR if not provided but common mount exists
+if (!CHUNKS_DIR && fs.existsSync('/data/chunks')) {
+  CHUNKS_DIR = '/data/chunks';
 }
 
 // Use CHUNKS_DIR for capacity check if available (split storage mode)
