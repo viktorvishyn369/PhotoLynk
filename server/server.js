@@ -1596,6 +1596,37 @@ app.get('/api/subscription/status', authenticateToken, async (req, res) => {
     }
 });
 
+app.post('/api/subscription/sync', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { productId, tierGb, entitlementId } = req.body || {};
+        const tier = normalizeTierGb(tierGb) || normalizeTierGb(inferTierGbFromProductId(productId));
+        if (!tier) return res.status(400).json({ error: 'Invalid or missing tier' });
+
+        await ensurePlanRow(userId);
+        const now = Date.now();
+        await dbRunAsync(
+            `UPDATE user_plans
+                SET plan_gb = ?,
+                    status = 'active',
+                    rc_product_id = ?,
+                    rc_entitlement = COALESCE(?, rc_entitlement),
+                    rc_app_user_id = COALESCE(rc_app_user_id, ?),
+                    grace_until = NULL,
+                    deleted_at = NULL,
+                    updated_at = ?
+              WHERE user_id = ?`,
+            [tier, productId || null, entitlementId || null, req.user.email || null, now, userId]
+        );
+
+        const plan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [userId]);
+        return res.json({ ok: true, plan });
+    } catch (e) {
+        console.error('[Subscription sync] error', e);
+        return res.status(500).json({ error: 'Sync failed' });
+    }
+});
+
 app.post('/api/revenuecat/webhook', async (req, res) => {
     try {
         if (REVENUECAT_WEBHOOK_SECRET) {
