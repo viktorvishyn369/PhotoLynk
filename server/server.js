@@ -1552,6 +1552,11 @@ app.post('/api/login', authRateLimiter, (req, res) => {
                 } catch (e) {
                     // ignore
                 }
+                // Backfill hardware_device_id for legacy accounts on login
+                db.run(
+                    `UPDATE users SET hardware_device_id = COALESCE(hardware_device_id, ?) WHERE id = ?`,
+                    [device_uuid, user.id]
+                );
                 db.run(
                     `UPDATE user_plans SET rc_app_user_id = ?, updated_at = ? WHERE user_id = ?`,
                     [normalizedEmail, now, user.id]
