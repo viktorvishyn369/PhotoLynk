@@ -1021,7 +1021,8 @@ db.serialize(() => {
         user_uuid TEXT,
         email TEXT UNIQUE,
         password TEXT,
-        hardware_device_id TEXT
+        hardware_device_id TEXT,
+        created_at INTEGER
     )`);
 
     // Migrate existing DBs: add hardware_device_id column if missing
@@ -1030,6 +1031,12 @@ db.serialize(() => {
         const names = Array.isArray(cols) ? cols.map(c => c && c.name).filter(Boolean) : [];
         if (!names.includes('hardware_device_id')) {
             db.run(`ALTER TABLE users ADD COLUMN hardware_device_id TEXT`, [], () => {});
+        }
+        if (!names.includes('created_at')) {
+            db.run(`ALTER TABLE users ADD COLUMN created_at INTEGER`, [], () => {
+                const now = Date.now();
+                db.run(`UPDATE users SET created_at = ? WHERE created_at IS NULL`, [now]);
+            });
         }
     });
 
@@ -1045,6 +1052,8 @@ db.serialize(() => {
         grace_until INTEGER,
         trial_until INTEGER,
         deleted_at INTEGER,
+        payment_type TEXT,
+        payment_at INTEGER,
         updated_at INTEGER,
         FOREIGN KEY(user_id) REFERENCES users(id)
     )`);
@@ -1061,6 +1070,12 @@ db.serialize(() => {
         }
         if (!names.includes('deleted_at')) {
             db.run(`ALTER TABLE user_plans ADD COLUMN deleted_at INTEGER`, [], () => {});
+        }
+        if (!names.includes('payment_type')) {
+            db.run(`ALTER TABLE user_plans ADD COLUMN payment_type TEXT`, [], () => {});
+        }
+        if (!names.includes('payment_at')) {
+            db.run(`ALTER TABLE user_plans ADD COLUMN payment_at INTEGER`, [], () => {});
         }
     });
 
