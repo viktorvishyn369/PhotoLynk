@@ -689,19 +689,26 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
 
         // Get payment info for each user
         const usersWithPayments = await Promise.all(users.map(async (user) => {
-            const payments = await dbAllAsync(
-                `SELECT id, amount_sol, amount_usd, tx_signature, status, created_at 
-                 FROM solana_payments 
-                 WHERE user_id = ? 
-                 ORDER BY created_at DESC`,
-                [user.id]
-            );
+            let payments = [];
+            try {
+                payments = await dbAllAsync(
+                    `SELECT id, amount_sol, amount_usd, tx_signature, status, created_at 
+                     FROM solana_payments 
+                     WHERE user_id = ? 
+                     ORDER BY created_at DESC`,
+                    [user.id]
+                );
+            } catch (paymentErr) {
+                // Table might not exist or other error - continue without payments
+                console.warn('[Admin] payments query failed for user', user.id, paymentErr?.message);
+                payments = [];
+            }
             
-            const totalPaidUsd = payments
+            const totalPaidUsd = (payments || [])
                 .filter(p => p.status === 'confirmed' || p.status === 'completed')
                 .reduce((sum, p) => sum + (p.amount_usd || 0), 0);
             
-            const lastPayment = payments.length > 0 ? payments[0] : null;
+            const lastPayment = payments && payments.length > 0 ? payments[0] : null;
             
             return {
                 id: user.id,
@@ -720,13 +727,13 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 },
                 payments: {
                     total_paid_usd: totalPaidUsd,
-                    payment_count: payments.length,
+                    payment_count: (payments || []).length,
                     has_paid: totalPaidUsd > 0,
                     last_payment: lastPayment ? {
                         amount_usd: lastPayment.amount_usd,
                         amount_sol: lastPayment.amount_sol,
                         status: lastPayment.status,
-                        date: new Date(lastPayment.created_at).toISOString(),
+                        date: lastPayment.created_at ? new Date(lastPayment.created_at).toISOString() : null,
                     } : null,
                 },
             };
