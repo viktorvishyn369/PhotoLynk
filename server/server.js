@@ -1483,9 +1483,9 @@ app.post('/api/register', authRateLimiter, async (req, res) => {
             const trialUntil = (normalizedPlanGb && trialMs > 0) ? (now + trialMs) : null;
             const initialStatus = trialUntil ? 'trial' : 'none';
             db.run(
-                `INSERT INTO user_plans (user_id, plan_gb, status, trial_until, updated_at) VALUES (?, ?, ?, ?, ?)
-                 ON CONFLICT(user_id) DO UPDATE SET plan_gb=COALESCE(excluded.plan_gb, plan_gb), status=excluded.status, trial_until=excluded.trial_until, updated_at=excluded.updated_at`,
-                [newUserId, normalizedPlanGb, initialStatus, trialUntil, now]
+                `INSERT INTO user_plans (user_id, plan_gb, status, trial_until, rc_app_user_id, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(user_id) DO UPDATE SET plan_gb=COALESCE(excluded.plan_gb, plan_gb), status=excluded.status, trial_until=excluded.trial_until, rc_app_user_id=excluded.rc_app_user_id, updated_at=excluded.updated_at`,
+                [newUserId, normalizedPlanGb, initialStatus, trialUntil, normalizedEmail, now]
             );
 
             // Generate token for auto-login after registration (same as login flow)
@@ -1525,7 +1525,7 @@ app.post('/api/login', authRateLimiter, (req, res) => {
                 }
                 db.run(
                     `UPDATE user_plans SET rc_app_user_id = ?, updated_at = ? WHERE user_id = ?`,
-                    [String(device_uuid), now, user.id]
+                    [normalizedEmail, now, user.id]
                 );
                 
                 // Generate Token BOUND to this device
