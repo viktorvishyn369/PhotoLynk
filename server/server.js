@@ -431,6 +431,9 @@ app.get('/admin', adminAuth, (req, res) => {
             html += '<th style="padding:6px;border:1px solid #555;">Status</th>';
             html += '<th style="padding:6px;border:1px solid #555;">Trial Until</th>';
             html += '<th style="padding:6px;border:1px solid #555;">Expires</th>';
+            html += '<th style="padding:6px;border:1px solid #555;">Registered</th>';
+            html += '<th style="padding:6px;border:1px solid #555;">Payment Type</th>';
+            html += '<th style="padding:6px;border:1px solid #555;">Payment At</th>';
             html += '<th style="padding:6px;border:1px solid #555;">Updated</th>';
             html += '</tr></thead><tbody>';
             
@@ -445,6 +448,9 @@ app.get('/admin', adminAuth, (req, res) => {
               html += '<td style="padding:4px;border:1px solid #444;color:' + statusColor + ';">' + (u.plan.status || 'none') + '</td>';
               html += '<td style="padding:4px;border:1px solid #444;">' + formatDate(u.plan.trial_until_date) + '</td>';
               html += '<td style="padding:4px;border:1px solid #444;">' + formatDate(u.plan.expires_at_date) + '</td>';
+              html += '<td style="padding:4px;border:1px solid #444;">' + formatDate(u.user_created_at_date) + '</td>';
+              html += '<td style="padding:4px;border:1px solid #444;">' + (u.plan.payment_type || '-') + '</td>';
+              html += '<td style="padding:4px;border:1px solid #444;">' + formatDate(u.plan.payment_at_date) + '</td>';
               html += '<td style="padding:4px;border:1px solid #444;">' + formatDate(u.plan.updated_at_date) + '</td>';
               html += '</tr>';
             });
@@ -672,11 +678,14 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 u.id,
                 u.email,
                 u.user_uuid,
+                u.created_at AS user_created_at,
                 p.plan_gb,
                 p.status as plan_status,
                 p.trial_until,
                 p.expires_at,
                 p.grace_until,
+                p.payment_type,
+                p.payment_at,
                 p.updated_at as plan_updated_at
             FROM users u
             LEFT JOIN user_plans p ON u.id = p.user_id
@@ -687,6 +696,8 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
             id: user.id,
             email: user.email,
             user_uuid: user.user_uuid,
+            user_created_at: user.user_created_at,
+            user_created_at_date: user.user_created_at ? new Date(user.user_created_at).toISOString() : null,
             plan: {
                 plan_gb: user.plan_gb,
                 status: user.plan_status,
@@ -695,6 +706,9 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 expires_at: user.expires_at,
                 expires_at_date: user.expires_at ? new Date(user.expires_at).toISOString() : null,
                 grace_until: user.grace_until,
+                payment_type: user.payment_type,
+                payment_at: user.payment_at,
+                payment_at_date: user.payment_at ? new Date(user.payment_at).toISOString() : null,
                 updated_at: user.plan_updated_at,
                 updated_at_date: user.plan_updated_at ? new Date(user.plan_updated_at).toISOString() : null,
             },
@@ -1614,7 +1628,7 @@ app.get('/api/subscription/status', authenticateToken, async (req, res) => {
 app.post('/api/subscription/sync', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
-        const { productId, tierGb, entitlementId } = req.body || {};
+        const { productId, tierGb, entitlementId, paymentType } = req.body || {};
         const tier = normalizeTierGb(tierGb) || normalizeTierGb(inferTierGbFromProductId(productId));
         if (!tier) return res.status(400).json({ error: 'Invalid or missing tier' });
 
@@ -1627,11 +1641,22 @@ app.post('/api/subscription/sync', authenticateToken, async (req, res) => {
                     rc_product_id = ?,
                     rc_entitlement = COALESCE(?, rc_entitlement),
                     rc_app_user_id = COALESCE(rc_app_user_id, ?),
+                    payment_type = COALESCE(?, payment_type),
+                    payment_at = COALESCE(payment_at, ?),
                     grace_until = NULL,
                     deleted_at = NULL,
                     updated_at = ?
               WHERE user_id = ?`,
-            [tier, productId || null, entitlementId || null, req.user.email || null, now, userId]
+            [
+                tier,
+                productId || null,
+                entitlementId || null,
+                req.user.email || null,
+                paymentType || null,
+                now,
+                now,
+                userId,
+            ]
         );
 
         const plan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [userId]);
@@ -1661,6 +1686,12 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
         const tierGbFromEvent = normalizeTierGb(event && (event.plan_gb || event.planGb || event.tier_gb || event.tierGb));
         const tierGb = tierGbFromEvent || normalizeTierGb(inferTierGbFromProductId(productId));
 
+        const store = (event && (event.store || event.Store)) ? String(event.store || event.Store).toUpperCase() : '';
+        const paymentType =
+            store === 'APP_STORE' ? 'apple' :
+            store === 'PLAY_STORE' ? 'google' :
+            null;
+
         db.get(
             `SELECT up.user_id AS user_id
                FROM user_plans up
@@ -1684,10 +1715,12 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
                                 deleted_at = NULL,
                                 rc_product_id = ?,
                                 rc_entitlement = ?,
+                                payment_type = COALESCE(?, payment_type),
+                                payment_at = COALESCE(payment_at, ?),
                                 plan_gb = COALESCE(?, plan_gb),
                                 updated_at = ?
                           WHERE user_id = ?`,
-                        ['active', expiresMs, productId, entitlementId, tierGb, now, row.user_id]
+                        ['active', expiresMs, productId, entitlementId, paymentType, now, tierGb, now, row.user_id]
                     );
                     return res.json({ ok: true });
                 }
@@ -1701,9 +1734,11 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
                             grace_until = COALESCE(grace_until, ?),
                             rc_product_id = ?,
                             rc_entitlement = ?,
+                            payment_type = COALESCE(?, payment_type),
+                            payment_at = COALESCE(payment_at, ?),
                             updated_at = ?
                       WHERE user_id = ?`,
-                    ['grace', expiresMs, graceUntil, productId, entitlementId, now, row.user_id]
+                    ['grace', expiresMs, graceUntil, productId, entitlementId, paymentType, now, now, row.user_id]
                 );
                 return res.json({ ok: true });
             }
@@ -1826,6 +1861,8 @@ app.post('/api/solana/verify-payment', async (req, res) => {
                 plan_gb = excluded.plan_gb,
                 status = 'active',
                 expires_at = excluded.expires_at,
+                payment_type = COALESCE(user_plans.payment_type, 'solana'),
+                payment_at = COALESCE(user_plans.payment_at, excluded.updated_at),
                 grace_until = NULL,
                 updated_at = excluded.updated_at`,
             [user.id, normalizedTier, expiresAt, now]
