@@ -1250,14 +1250,21 @@ const authenticateToken = (req, res, next) => {
 };
 
 const getStealthCloudUserKey = (user) => {
+    // StealthCloud files are stored per USER (not per device) so all devices
+    // for the same account can access the same files.
+    // Use user_id as the primary key for storage.
+    if (user && user.id) {
+        return String(user.id);
+    }
+    
+    // Fallback to device_uuid only if user_id is not available (legacy)
     const deviceKey = (user && (user.device_uuid || user.deviceUuid)) ? String(user.device_uuid || user.deviceUuid) : '';
     const safeDevice = deviceKey.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
     if (safeDevice) return safeDevice;
 
     const key = (user && (user.user_uuid || user.userUuid)) ? String(user.user_uuid || user.userUuid) : '';
-    // UUID safe-ish folder: keep only [a-zA-Z0-9_-]
     const safe = key.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
-    return safe || String(user.id);
+    return safe || 'unknown';
 };
 
 const ensureStealthCloudUserDirs = (user) => {
@@ -1271,40 +1278,60 @@ const ensureStealthCloudUserDirs = (user) => {
     if (!fs.existsSync(chunksDir)) fs.mkdirSync(chunksDir, { recursive: true });
     if (!fs.existsSync(manifestsDir)) fs.mkdirSync(manifestsDir, { recursive: true });
 
-    // Backward-compat migration: if old numeric folder exists and new doesn't have data, move it once
+    // Backward-compat migration: move files from old device_uuid or user_uuid folders to user_id folder
     const oldKeys = [];
+    // Migration from device_uuid folders (old per-device storage)
+    if (user && (user.device_uuid || user.deviceUuid)) {
+        const oldDeviceUuid = String(user.device_uuid || user.deviceUuid).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
+        if (oldDeviceUuid) oldKeys.push(oldDeviceUuid);
+    }
+    // Migration from user_uuid folders
     if (user && (user.user_uuid || user.userUuid)) {
         const oldUserUuid = String(user.user_uuid || user.userUuid).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
         if (oldUserUuid) oldKeys.push(oldUserUuid);
-    }
-    if (user && user.id) {
-        oldKeys.push(String(user.id));
     }
     oldKeys
         .filter((v, i, a) => v && a.indexOf(v) === i)
         .filter(k => k !== key)
         .forEach(oldKey => {
+            // Migrate from CLOUD_DIR (NVMe) - manifests and possibly chunks
             const oldDir = path.join(CLOUD_DIR, 'users', oldKey);
-            if (!fs.existsSync(oldDir)) return;
-            const oldChunks = path.join(oldDir, 'chunks');
-            const oldManifests = path.join(oldDir, 'manifests');
-            try {
-                if (fs.existsSync(oldChunks)) {
-                    fs.readdirSync(oldChunks).forEach(f => {
-                        const src = path.join(oldChunks, f);
-                        const dst = path.join(chunksDir, f);
-                        if (!fs.existsSync(dst)) fs.renameSync(src, dst);
-                    });
+            if (fs.existsSync(oldDir)) {
+                const oldChunksCloud = path.join(oldDir, 'chunks');
+                const oldManifests = path.join(oldDir, 'manifests');
+                try {
+                    if (fs.existsSync(oldChunksCloud)) {
+                        fs.readdirSync(oldChunksCloud).forEach(f => {
+                            const src = path.join(oldChunksCloud, f);
+                            const dst = path.join(chunksDir, f);
+                            if (!fs.existsSync(dst)) fs.renameSync(src, dst);
+                        });
+                    }
+                    if (fs.existsSync(oldManifests)) {
+                        fs.readdirSync(oldManifests).forEach(f => {
+                            const src = path.join(oldManifests, f);
+                            const dst = path.join(manifestsDir, f);
+                            if (!fs.existsSync(dst)) fs.renameSync(src, dst);
+                        });
+                    }
+                } catch (e) {
+                    // ignore migration errors
                 }
-                if (fs.existsSync(oldManifests)) {
-                    fs.readdirSync(oldManifests).forEach(f => {
-                        const src = path.join(oldManifests, f);
-                        const dst = path.join(manifestsDir, f);
-                        if (!fs.existsSync(dst)) fs.renameSync(src, dst);
-                    });
+            }
+            // Migrate from CHUNKS_DIR (HDD RAID) if separate from CLOUD_DIR
+            if (CHUNKS_DIR) {
+                const oldChunksHdd = path.join(CHUNKS_DIR, 'users', oldKey, 'chunks');
+                if (fs.existsSync(oldChunksHdd)) {
+                    try {
+                        fs.readdirSync(oldChunksHdd).forEach(f => {
+                            const src = path.join(oldChunksHdd, f);
+                            const dst = path.join(chunksDir, f);
+                            if (!fs.existsSync(dst)) fs.renameSync(src, dst);
+                        });
+                    } catch (e) {
+                        // ignore migration errors
+                    }
                 }
-            } catch (e) {
-                // ignore migration errors
             }
         });
 
