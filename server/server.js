@@ -891,6 +891,7 @@ const resolveSubscriptionState = async (userId) => {
             graceUntil: graceUntil || null,
             deletedAt,
             planGb: row.plan_gb || null,
+            paymentType: row.payment_type || null,
         };
     }
 
@@ -902,6 +903,7 @@ const resolveSubscriptionState = async (userId) => {
             expiresAt: expiresAt || null,
             graceUntil: graceUntil || null,
             planGb: row.plan_gb || null,
+            paymentType: row.payment_type || null,
         };
     }
 
@@ -922,6 +924,7 @@ const resolveSubscriptionState = async (userId) => {
             expiresAt: expiresAt || null,
             graceUntil: graceUntil || null,
             planGb: row.plan_gb || null,
+            paymentType: row.payment_type || null,
         };
     }
 
@@ -942,6 +945,7 @@ const resolveSubscriptionState = async (userId) => {
             expiresAt,
             graceUntil: gu,
             planGb: row.plan_gb || null,
+            paymentType: row.payment_type || null,
         };
     }
 
@@ -952,6 +956,7 @@ const resolveSubscriptionState = async (userId) => {
             expiresAt: expiresAt || null,
             graceUntil: graceUntil || null,
             planGb: row.plan_gb || null,
+            paymentType: row.payment_type || null,
         };
     }
 
@@ -962,6 +967,7 @@ const resolveSubscriptionState = async (userId) => {
         expiresAt: expiresAt || null,
         graceUntil: graceUntil || null,
         planGb: row.plan_gb || null,
+        paymentType: row.payment_type || null,
     };
 };
 
