@@ -11,6 +11,7 @@ const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
 const crypto = require('crypto');
+const axios = require('axios');
 const updater = require('./updater');
 let sharp;
 try { sharp = require('sharp'); } catch (e) { sharp = null; }
@@ -1929,7 +1930,6 @@ app.post('/api/solana/verify-payment', async (req, res) => {
 // Helper function to verify Solana transaction
 async function verifySolanaTransaction(txSignature, expectedSolAmount) {
     console.log('[Solana] Verifying transaction:', txSignature, 'expected amount:', expectedSolAmount);
-    const axios = require('axios');
     
     // Retry up to 5 times with 2 second intervals to allow tx to propagate
     const maxRetries = 5;
