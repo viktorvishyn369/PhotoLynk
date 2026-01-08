@@ -2043,9 +2043,9 @@ app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => 
     const fileBuffer = fs.readFileSync(filePath);
     const fileHash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
     
-    // Check if this exact file already exists for this user (by hash OR filename)
-    db.get(`SELECT filename, file_hash FROM files WHERE user_id = ? AND (file_hash = ? OR filename = ?)`, 
-        [req.user.id, fileHash, originalname], 
+    // Check if this exact file already exists for this user (by hash only - same content = duplicate)
+    db.get(`SELECT filename, file_hash FROM files WHERE user_id = ? AND file_hash = ?`, 
+        [req.user.id, fileHash], 
         (err, row) => {
             if (row) {
                 // Check if the file actually exists on disk
@@ -2060,7 +2060,7 @@ app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => 
                 } else {
                     // File in DB but not on disk - remove from DB and continue with upload
                     console.log(`File ${row.filename} in DB but missing from disk - cleaning up DB`);
-                    db.run(`DELETE FROM files WHERE user_id = ? AND (file_hash = ? OR filename = ?)`, [req.user.id, fileHash, originalname]);
+                    db.run(`DELETE FROM files WHERE user_id = ? AND file_hash = ?`, [req.user.id, fileHash]);
                     // Continue to save the new file below
                 }
             }
@@ -2133,8 +2133,8 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
         const size = writtenBytes;
 
         db.get(
-            `SELECT filename, file_hash FROM files WHERE user_id = ? AND (file_hash = ? OR filename = ?)`,
-            [req.user.id, fileHash, safeName],
+            `SELECT filename, file_hash FROM files WHERE user_id = ? AND file_hash = ?`,
+            [req.user.id, fileHash],
             (err, row) => {
                 if (err) {
                     cleanupTmp();
@@ -2149,7 +2149,7 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
                         return res.json({ message: 'File already exists (duplicate)', filename: row.filename, duplicate: true });
                     }
                     console.log(`File ${row.filename} in DB but missing from disk - cleaning up DB`);
-                    db.run(`DELETE FROM files WHERE user_id = ? AND (file_hash = ? OR filename = ?)`, [req.user.id, fileHash, safeName]);
+                    db.run(`DELETE FROM files WHERE user_id = ? AND file_hash = ?`, [req.user.id, fileHash]);
                 }
 
                 try {
