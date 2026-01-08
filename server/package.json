@@ -31,6 +31,9 @@
   },
   "homepage": "https://github.com/viktorvishyn369/PhotoLynk#readme",
   "type": "commonjs",
+  "optionalDependencies": {
+    "@ffmpeg-installer/ffmpeg": "^1.1.0"
+  },
   "dependencies": {
     "bcrypt": "^6.0.0",
     "cors": "^2.8.5",

@@ -15,12 +15,40 @@ const updater = require('./updater');
 let sharp;
 try { sharp = require('sharp'); } catch (e) { sharp = null; }
 
-// Try to use bundled ffmpeg-static, fallback to system ffmpeg
+// Try to use bundled ffmpeg, fallback to system ffmpeg
 let ffmpegPath = 'ffmpeg';
 try {
-    ffmpegPath = require('ffmpeg-static');
+    // Try @ffmpeg-installer/ffmpeg first (better Electron support)
+    const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
+    let installerPath = ffmpegInstaller.path;
+    if (installerPath && typeof installerPath === 'string') {
+        // Handle Electron asar unpacking
+        if (installerPath.includes('app.asar')) {
+            installerPath = installerPath.replace('app.asar', 'app.asar.unpacked');
+        }
+        if (fs.existsSync(installerPath)) {
+            ffmpegPath = installerPath;
+            console.log('Using bundled ffmpeg:', ffmpegPath);
+        } else {
+            console.log('Bundled ffmpeg not found at:', installerPath, '- trying system ffmpeg');
+        }
+    }
 } catch (e) {
-    // ffmpeg-static not available, use system ffmpeg
+    // Try ffmpeg-static as fallback
+    try {
+        let staticPath = require('ffmpeg-static');
+        if (staticPath && typeof staticPath === 'string') {
+            if (staticPath.includes('app.asar')) {
+                staticPath = staticPath.replace('app.asar', 'app.asar.unpacked');
+            }
+            if (fs.existsSync(staticPath)) {
+                ffmpegPath = staticPath;
+                console.log('Using bundled ffmpeg-static:', ffmpegPath);
+            }
+        }
+    } catch (e2) {
+        console.log('No bundled ffmpeg available, using system ffmpeg');
+    }
 }
 
 require('dotenv').config();
