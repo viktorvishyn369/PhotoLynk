@@ -1294,6 +1294,27 @@ const ensureStealthCloudUserDirs = (user) => {
         .filter((v, i, a) => v && a.indexOf(v) === i)
         .filter(k => k !== key)
         .forEach(oldKey => {
+            // Safe migration helper: copy first, then delete source only if copy succeeded
+            const safeMigrateFile = (src, dst) => {
+                if (!fs.existsSync(src)) return;
+                if (fs.existsSync(dst)) return; // Already migrated or exists
+                try {
+                    // Copy file to new location
+                    fs.copyFileSync(src, dst);
+                    // Verify copy succeeded before deleting source
+                    if (fs.existsSync(dst)) {
+                        const srcSize = fs.statSync(src).size;
+                        const dstSize = fs.statSync(dst).size;
+                        if (srcSize === dstSize) {
+                            fs.unlinkSync(src); // Safe to delete source
+                        }
+                    }
+                } catch (e) {
+                    console.error(`[Migration] Failed to migrate ${src} -> ${dst}:`, e.message);
+                    // Source file is preserved on error
+                }
+            };
+
             // Migrate from CLOUD_DIR (NVMe) - manifests and possibly chunks
             const oldDir = path.join(CLOUD_DIR, 'users', oldKey);
             if (fs.existsSync(oldDir)) {
@@ -1302,20 +1323,16 @@ const ensureStealthCloudUserDirs = (user) => {
                 try {
                     if (fs.existsSync(oldChunksCloud)) {
                         fs.readdirSync(oldChunksCloud).forEach(f => {
-                            const src = path.join(oldChunksCloud, f);
-                            const dst = path.join(chunksDir, f);
-                            if (!fs.existsSync(dst)) fs.renameSync(src, dst);
+                            safeMigrateFile(path.join(oldChunksCloud, f), path.join(chunksDir, f));
                         });
                     }
                     if (fs.existsSync(oldManifests)) {
                         fs.readdirSync(oldManifests).forEach(f => {
-                            const src = path.join(oldManifests, f);
-                            const dst = path.join(manifestsDir, f);
-                            if (!fs.existsSync(dst)) fs.renameSync(src, dst);
+                            safeMigrateFile(path.join(oldManifests, f), path.join(manifestsDir, f));
                         });
                     }
                 } catch (e) {
-                    // ignore migration errors
+                    console.error(`[Migration] Error reading old directory ${oldDir}:`, e.message);
                 }
             }
             // Migrate from CHUNKS_DIR (HDD RAID) if separate from CLOUD_DIR
@@ -1324,12 +1341,10 @@ const ensureStealthCloudUserDirs = (user) => {
                 if (fs.existsSync(oldChunksHdd)) {
                     try {
                         fs.readdirSync(oldChunksHdd).forEach(f => {
-                            const src = path.join(oldChunksHdd, f);
-                            const dst = path.join(chunksDir, f);
-                            if (!fs.existsSync(dst)) fs.renameSync(src, dst);
+                            safeMigrateFile(path.join(oldChunksHdd, f), path.join(chunksDir, f));
                         });
                     } catch (e) {
-                        // ignore migration errors
+                        console.error(`[Migration] Error reading old HDD chunks ${oldChunksHdd}:`, e.message);
                     }
                 }
             }
