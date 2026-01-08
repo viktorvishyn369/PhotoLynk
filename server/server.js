@@ -15,6 +15,14 @@ const updater = require('./updater');
 let sharp;
 try { sharp = require('sharp'); } catch (e) { sharp = null; }
 
+// Try to use bundled ffmpeg-static, fallback to system ffmpeg
+let ffmpegPath = 'ffmpeg';
+try {
+    ffmpegPath = require('ffmpeg-static');
+} catch (e) {
+    // ffmpeg-static not available, use system ffmpeg
+}
+
 require('dotenv').config();
 
 const app = express();
@@ -2267,7 +2275,7 @@ app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
         const tmpThumb = path.join(os.tmpdir(), `thumb_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`);
         try {
             await new Promise((resolve, reject) => {
-                execFile('ffmpeg', [
+                execFile(ffmpegPath, [
                     '-i', filePath,
                     '-ss', '00:00:01',
                     '-vframes', '1',
