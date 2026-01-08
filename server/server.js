@@ -2238,7 +2238,7 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
     }
 });
 
-// Thumbnail endpoint - returns resized image (150px)
+// Thumbnail endpoint - returns resized image (150px) or video frame
 app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
     const filename = req.params.filename;
     const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
@@ -2255,12 +2255,45 @@ app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
 
     const ext = (filename || '').split('.').pop()?.toLowerCase() || '';
     const isImage = ['jpg', 'jpeg', 'png', 'heic', 'heif', 'webp', 'gif', 'bmp', 'tiff'].includes(ext);
-    
-    if (!isImage) {
-        return res.status(400).json({ error: 'Not an image file' });
+    const isVideo = ['mp4', 'mov', 'avi', 'mkv', 'm4v', '3gp', 'webm'].includes(ext);
+
+    if (!isImage && !isVideo) {
+        return res.status(400).json({ error: 'Not a media file' });
     }
 
-    // If sharp is available, generate thumbnail
+    // Handle video thumbnails using ffmpeg
+    if (isVideo) {
+        const { execFile } = require('child_process');
+        const tmpThumb = path.join(os.tmpdir(), `thumb_${Date.now()}_${Math.random().toString(36).slice(2)}.jpg`);
+        try {
+            await new Promise((resolve, reject) => {
+                execFile('ffmpeg', [
+                    '-i', filePath,
+                    '-ss', '00:00:01',
+                    '-vframes', '1',
+                    '-vf', 'scale=150:150:force_original_aspect_ratio=increase,crop=150:150',
+                    '-y',
+                    tmpThumb
+                ], { timeout: 10000 }, (err) => {
+                    if (err) reject(err);
+                    else resolve();
+                });
+            });
+            if (fs.existsSync(tmpThumb)) {
+                const thumbBuffer = fs.readFileSync(tmpThumb);
+                fs.unlinkSync(tmpThumb);
+                res.set('Content-Type', 'image/jpeg');
+                res.set('Cache-Control', 'public, max-age=86400');
+                return res.send(thumbBuffer);
+            }
+        } catch (e) {
+            if (fs.existsSync(tmpThumb)) fs.unlinkSync(tmpThumb);
+            console.log('Video thumbnail generation failed:', e.message);
+        }
+        return res.status(500).json({ error: 'Video thumbnail generation failed' });
+    }
+
+    // If sharp is available, generate thumbnail for images
     if (sharp) {
         try {
             const thumbBuffer = await sharp(filePath)
