@@ -2680,8 +2680,9 @@ app.get('/api/cloud/chunks/:chunkId', authenticateToken, blockDeletedSubscriptio
 });
 
 // Upload encrypted manifest JSON
+// Now accepts optional hash metadata for fast deduplication (hashes are not sensitive)
 app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (req, res) => {
-    const { manifestId, encryptedManifest, chunkCount } = req.body || {};
+    const { manifestId, encryptedManifest, chunkCount, filename, originalSize, fileHash, perceptualHash, creationTime } = req.body || {};
     const clientBuild = (req.headers['x-client-build'] || '').toString();
     if (clientBuild) {
         console.log(`[SC] /manifests client=${clientBuild} user=${req.user.id} chunkCount=${typeof chunkCount === 'number' ? chunkCount : 'na'}`);
@@ -2708,20 +2709,30 @@ app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (
         return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'manifestId' });
     }
     
+    // Store encrypted manifest + unencrypted metadata for fast dedup lookups
     const payload = {
         manifestId: safeId,
         encryptedManifest,
-        createdAt: new Date().toISOString()
+        createdAt: new Date().toISOString(),
+        // Unencrypted metadata for fast dedup (hashes don't reveal content)
+        meta: {
+            filename: typeof filename === 'string' ? filename : null,
+            originalSize: typeof originalSize === 'number' ? originalSize : null,
+            fileHash: typeof fileHash === 'string' ? fileHash : null,
+            perceptualHash: typeof perceptualHash === 'string' ? perceptualHash : null,
+            creationTime: creationTime || null,
+        }
     };
     fs.writeFileSync(manifestPath, JSON.stringify(payload));
 
     res.json({ ok: true, manifestId: safeId });
 });
 
-// List manifests
+// List manifests - now includes metadata for fast client-side deduplication
 app.get('/api/cloud/manifests', authenticateToken, blockDeletedSubscription, (req, res) => {
     const rawOffset = req.query && req.query.offset ? req.query.offset : null;
     const rawLimit = req.query && req.query.limit ? req.query.limit : null;
+    const includeMeta = req.query && req.query.meta === 'true'; // ?meta=true to include hash metadata
     const offset = rawOffset !== null ? Math.max(0, parseInt(String(rawOffset), 10) || 0) : 0;
     const limit = rawLimit !== null ? Math.max(0, parseInt(String(rawLimit), 10) || 0) : 0;
 
@@ -2731,10 +2742,34 @@ app.get('/api/cloud/manifests', authenticateToken, blockDeletedSubscription, (re
     res.setHeader('ETag', '');
     const { manifestsDir } = ensureStealthCloudUserDirs(req.user);
     if (!fs.existsSync(manifestsDir)) return res.json({ manifests: [], total: 0 });
-    let list = fs.readdirSync(manifestsDir)
+    
+    const files = fs.readdirSync(manifestsDir)
         .filter(f => f.endsWith('.json'))
-        .filter(f => !f.startsWith('.')) // Skip hidden files like .DS_Store
-        .map(f => ({ manifestId: f.replace(/\.json$/, '') }));
+        .filter(f => !f.startsWith('.')); // Skip hidden files like .DS_Store
+    
+    let list = files.map(f => {
+        const manifestId = f.replace(/\.json$/, '');
+        const entry = { manifestId };
+        
+        // Include metadata if requested (for fast dedup without decryption)
+        if (includeMeta) {
+            try {
+                const manifestPath = path.join(manifestsDir, f);
+                const content = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+                if (content.meta) {
+                    entry.filename = content.meta.filename || null;
+                    entry.originalSize = content.meta.originalSize || null;
+                    entry.fileHash = content.meta.fileHash || null;
+                    entry.perceptualHash = content.meta.perceptualHash || null;
+                    entry.creationTime = content.meta.creationTime || null;
+                }
+            } catch (e) {
+                // Ignore read errors, just return manifestId
+            }
+        }
+        
+        return entry;
+    });
 
     list.sort((a, b) => String(a.manifestId || '').localeCompare(String(b.manifestId || '')));
     const total = list.length;
