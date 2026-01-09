@@ -1715,12 +1715,83 @@ app.get('/api/subscription/status', authenticateToken, async (req, res) => {
     }
 });
 
+// Check if user can downgrade to a specific tier based on current storage usage
+const canDowngradeToTier = async (userId, targetTierGb) => {
+    const usedBytes = await getUserUsedBytes(userId);
+    const GB = 1000 * 1000 * 1000;
+    const targetBytes = targetTierGb * GB;
+    // Allow downgrade only if used storage is less than target tier capacity
+    return usedBytes < targetBytes;
+};
+
+// Get minimum required tier based on current storage usage
+const getMinRequiredTier = async (userId) => {
+    const usedBytes = await getUserUsedBytes(userId);
+    const GB = 1000 * 1000 * 1000;
+    const tiers = [100, 200, 400, 1000];
+    for (const tier of tiers) {
+        if (usedBytes < tier * GB) return tier;
+    }
+    return 1000; // Max tier if usage exceeds all
+};
+
+// API endpoint to check downgrade eligibility
+app.get('/api/subscription/downgrade-check', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const usedBytes = await getUserUsedBytes(userId);
+        const currentPlan = await getUserPlanGb(userId);
+        const minRequiredTier = await getMinRequiredTier(userId);
+        const GB = 1000 * 1000 * 1000;
+        
+        // Check each tier
+        const tiers = [100, 200, 400, 1000];
+        const tierStatus = {};
+        for (const tier of tiers) {
+            const tierBytes = tier * GB;
+            tierStatus[tier] = {
+                allowed: usedBytes < tierBytes,
+                tierBytes,
+                usedBytes,
+                usedPercent: tierBytes > 0 ? Math.round((usedBytes / tierBytes) * 100) : 0,
+            };
+        }
+        
+        return res.json({
+            currentPlanGb: currentPlan,
+            usedBytes,
+            minRequiredTier,
+            tiers: tierStatus,
+        });
+    } catch (e) {
+        console.error('[Downgrade check] error', e);
+        return res.status(500).json({ error: 'Downgrade check failed' });
+    }
+});
+
 app.post('/api/subscription/sync', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
         const { productId, tierGb, entitlementId, paymentType } = req.body || {};
         const tier = normalizeTierGb(tierGb) || normalizeTierGb(inferTierGbFromProductId(productId));
         if (!tier) return res.status(400).json({ error: 'Invalid or missing tier' });
+
+        // DOWNGRADE GUARD: Reject if user's storage exceeds target tier
+        const currentPlanGb = await getUserPlanGb(userId);
+        if (currentPlanGb && tier < currentPlanGb) {
+            const canDowngrade = await canDowngradeToTier(userId, tier);
+            if (!canDowngrade) {
+                const usedBytes = await getUserUsedBytes(userId);
+                const minTier = await getMinRequiredTier(userId);
+                return res.status(400).json({
+                    error: 'Cannot downgrade: storage usage exceeds target plan capacity',
+                    code: 'DOWNGRADE_BLOCKED',
+                    usedBytes,
+                    targetTierGb: tier,
+                    minRequiredTier: minTier,
+                });
+            }
+        }
 
         await ensurePlanRow(userId);
         const now = Date.now();
@@ -1791,6 +1862,26 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
             async (err, row) => {
                 if (err) return res.status(500).json({ error: 'Database error' });
                 if (!row || !row.user_id) return res.status(404).json({ error: 'User not found' });
+
+                // DOWNGRADE GUARD: Reject if user's storage exceeds target tier
+                if (tierGb) {
+                    const currentPlanGb = await getUserPlanGb(row.user_id);
+                    if (currentPlanGb && tierGb < currentPlanGb) {
+                        const canDowngrade = await canDowngradeToTier(row.user_id, tierGb);
+                        if (!canDowngrade) {
+                            const usedBytes = await getUserUsedBytes(row.user_id);
+                            const minTier = await getMinRequiredTier(row.user_id);
+                            console.log(`[RevenueCat Webhook] DOWNGRADE BLOCKED: user ${row.user_id} tried ${currentPlanGb}GB -> ${tierGb}GB, used ${usedBytes} bytes, min tier ${minTier}GB`);
+                            return res.status(400).json({
+                                error: 'Cannot downgrade: storage usage exceeds target plan capacity',
+                                code: 'DOWNGRADE_BLOCKED',
+                                usedBytes,
+                                targetTierGb: tierGb,
+                                minRequiredTier: minTier,
+                            });
+                        }
+                    }
+                }
 
                 const now = Date.now();
                 const expiresMs = Number.isFinite(expiresAtMs) ? expiresAtMs : null;
@@ -1892,6 +1983,23 @@ app.post('/api/solana/verify-payment', async (req, res) => {
         const user = await dbGetAsync(`SELECT id, email FROM users WHERE id = ?`, [decoded.id]);
         if (!user) {
             return res.status(404).json({ error: 'User not found' });
+        }
+        
+        // DOWNGRADE GUARD: Reject if user's storage exceeds target tier
+        const currentPlanGb = await getUserPlanGb(user.id);
+        if (currentPlanGb && normalizedTier < currentPlanGb) {
+            const canDowngrade = await canDowngradeToTier(user.id, normalizedTier);
+            if (!canDowngrade) {
+                const usedBytes = await getUserUsedBytes(user.id);
+                const minTier = await getMinRequiredTier(user.id);
+                return res.status(400).json({
+                    error: 'Cannot downgrade: storage usage exceeds target plan capacity',
+                    code: 'DOWNGRADE_BLOCKED',
+                    usedBytes,
+                    targetTierGb: normalizedTier,
+                    minRequiredTier: minTier,
+                });
+            }
         }
         
         // Verify transaction on Solana blockchain
