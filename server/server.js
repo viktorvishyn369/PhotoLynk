@@ -2787,10 +2787,106 @@ app.get('/api/cloud/chunks/:chunkId', authenticateToken, blockDeletedSubscriptio
     return res.status(404).json({ error: 'Chunk not found' });
 });
 
+// ============================================================================
+// SERVER-SIDE DEDUPLICATION HELPERS
+// Extra precaution: check all dedup criteria on server before accepting upload
+// ============================================================================
+
+// Hamming distance for 16-char hex hash (64 bits) - for perceptual hash fuzzy matching
+function hammingDistance64(a, b) {
+    if (!a || !b || a.length !== 16 || b.length !== 16) return Number.MAX_SAFE_INTEGER;
+    let dist = 0;
+    for (let i = 0; i < 16; i += 8) {
+        const valA = parseInt(a.substring(i, i + 8), 16);
+        const valB = parseInt(b.substring(i, i + 8), 16);
+        let x = valA ^ valB;
+        while (x) {
+            dist += x & 1;
+            x >>>= 1;
+        }
+    }
+    return dist;
+}
+
+// Cross-platform dHash threshold (6 bits = ~9% difference tolerance)
+const SERVER_DHASH_THRESHOLD = 6;
+
+// Normalize filename for comparison
+function normalizeFilenameForCompare(name) {
+    if (!name || typeof name !== 'string') return null;
+    const trimmed = name.trim();
+    if (!trimmed) return null;
+    return trimmed.toLowerCase();
+}
+
+// Build server-side dedup sets from existing manifests
+function buildServerDedupSets(manifestsDir) {
+    const sets = {
+        manifestIds: new Set(),
+        filenames: new Set(),
+        fileHashes: new Set(),
+        perceptualHashes: new Set(),
+        exifFull: new Set(),      // captureTime|make|model
+        exifTimeModel: new Set(), // captureTime|model
+        exifTimeMake: new Set(),  // captureTime|make
+    };
+    
+    if (!fs.existsSync(manifestsDir)) return sets;
+    
+    try {
+        const files = fs.readdirSync(manifestsDir).filter(f => f.endsWith('.json') && !f.startsWith('.'));
+        for (const f of files) {
+            try {
+                const content = JSON.parse(fs.readFileSync(path.join(manifestsDir, f), 'utf8'));
+                const manifestId = f.replace(/\.json$/, '');
+                sets.manifestIds.add(manifestId);
+                
+                if (content.meta) {
+                    if (content.meta.filename) {
+                        const normalized = normalizeFilenameForCompare(content.meta.filename);
+                        if (normalized) sets.filenames.add(normalized);
+                    }
+                    if (content.meta.fileHash) sets.fileHashes.add(content.meta.fileHash);
+                    if (content.meta.perceptualHash) sets.perceptualHashes.add(content.meta.perceptualHash);
+                    
+                    // EXIF-based dedup keys
+                    const ct = content.meta.exifCaptureTime;
+                    const mk = content.meta.exifMake;
+                    const md = content.meta.exifModel;
+                    if (ct && mk && md) sets.exifFull.add(`${ct}|${mk}|${md}`);
+                    if (ct && md) sets.exifTimeModel.add(`${ct}|${md}`);
+                    if (ct && mk) sets.exifTimeMake.add(`${ct}|${mk}`);
+                }
+            } catch (e) {
+                // Skip unreadable manifests
+            }
+        }
+    } catch (e) {
+        console.warn('[SC] Failed to build dedup sets:', e.message);
+    }
+    
+    return sets;
+}
+
+// Check if perceptual hash matches any existing hash (fuzzy matching)
+function findPerceptualHashMatchServer(hash, hashSet) {
+    if (!hash || hash.length !== 16 || !hashSet || hashSet.size === 0) return { match: false };
+    if (hashSet.has(hash)) return { match: true, reason: 'exact' };
+    for (const existing of hashSet) {
+        if (existing && existing.length === 16) {
+            const dist = hammingDistance64(hash, existing);
+            if (dist <= SERVER_DHASH_THRESHOLD) {
+                return { match: true, reason: 'fuzzy', distance: dist };
+            }
+        }
+    }
+    return { match: false };
+}
+
 // Upload encrypted manifest JSON
-// Now accepts optional hash metadata for fast deduplication (hashes are not sensitive)
+// Now includes comprehensive server-side deduplication as extra precaution
 app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (req, res) => {
-    const { manifestId, encryptedManifest, chunkCount, filename, originalSize, fileHash, perceptualHash, creationTime } = req.body || {};
+    const { manifestId, encryptedManifest, chunkCount, filename, originalSize, fileHash, perceptualHash, creationTime, exifCaptureTime, exifMake, exifModel } = req.body || {};
     const clientBuild = (req.headers['x-client-build'] || '').toString();
     if (clientBuild) {
         console.log(`[SC] /manifests client=${clientBuild} user=${req.user.id} chunkCount=${typeof chunkCount === 'number' ? chunkCount : 'na'}`);
@@ -2807,15 +2903,67 @@ app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (
 
     const { manifestsDir } = ensureStealthCloudUserDirs(req.user);
 
-    const manifestPath = path.join(manifestsDir, `${safeId}.json`);
+    // ========== SERVER-SIDE DEDUPLICATION (Extra Precaution) ==========
+    // Build dedup sets from existing manifests
+    const dedupSets = buildServerDedupSets(manifestsDir);
     
-    // Cross-device deduplication: if manifest already exists, skip (don't overwrite)
-    // This allows iOS and Android to upload the same file with the same stable manifestId
-    // Client-side handles all hash-based deduplication (exact file hash and perceptual hash)
-    if (fs.existsSync(manifestPath)) {
-        console.log(`[SC] Manifest ${safeId} already exists for user ${req.user.id}, skipping (cross-device dedupe by manifestId)`);
+    // Check 1: ManifestId (filename + size hash)
+    if (dedupSets.manifestIds.has(safeId)) {
+        console.log(`[SC-Dedup] Skipping ${safeId} - manifestId already exists`);
         return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'manifestId' });
     }
+    
+    // Check 2: Exact filename match
+    if (filename) {
+        const normalizedFilename = normalizeFilenameForCompare(filename);
+        if (normalizedFilename && dedupSets.filenames.has(normalizedFilename)) {
+            console.log(`[SC-Dedup] Skipping ${safeId} - filename "${filename}" already exists`);
+            return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'filename' });
+        }
+    }
+    
+    // Check 3: Exact file hash match (videos and byte-identical files)
+    if (fileHash && dedupSets.fileHashes.has(fileHash)) {
+        console.log(`[SC-Dedup] Skipping ${safeId} - fileHash already exists`);
+        return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'fileHash' });
+    }
+    
+    // Check 4: Perceptual hash match (images - fuzzy matching)
+    if (perceptualHash) {
+        const phashMatch = findPerceptualHashMatchServer(perceptualHash, dedupSets.perceptualHashes);
+        if (phashMatch.match) {
+            console.log(`[SC-Dedup] Skipping ${safeId} - perceptualHash match (${phashMatch.reason}${phashMatch.distance !== undefined ? ', dist=' + phashMatch.distance : ''})`);
+            return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'perceptualHash' });
+        }
+    }
+    
+    // Check 5: EXIF-based dedup (cross-platform HEIC matching)
+    if (exifCaptureTime) {
+        const ct = exifCaptureTime;
+        const mk = exifMake;
+        const md = exifModel;
+        
+        // Full EXIF match (captureTime + make + model)
+        if (ct && mk && md && dedupSets.exifFull.has(`${ct}|${mk}|${md}`)) {
+            console.log(`[SC-Dedup] Skipping ${safeId} - EXIF full match (time+make+model)`);
+            return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'exifFull' });
+        }
+        
+        // Time + model match
+        if (ct && md && dedupSets.exifTimeModel.has(`${ct}|${md}`)) {
+            console.log(`[SC-Dedup] Skipping ${safeId} - EXIF time+model match`);
+            return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'exifTimeModel' });
+        }
+        
+        // Time + make match
+        if (ct && mk && dedupSets.exifTimeMake.has(`${ct}|${mk}`)) {
+            console.log(`[SC-Dedup] Skipping ${safeId} - EXIF time+make match`);
+            return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'exifTimeMake' });
+        }
+    }
+    
+    // ========== No duplicates found - store the manifest ==========
+    const manifestPath = path.join(manifestsDir, `${safeId}.json`);
     
     // Store encrypted manifest + unencrypted metadata for fast dedup lookups
     const payload = {
@@ -2829,10 +2977,14 @@ app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (
             fileHash: typeof fileHash === 'string' ? fileHash : null,
             perceptualHash: typeof perceptualHash === 'string' ? perceptualHash : null,
             creationTime: creationTime || null,
+            exifCaptureTime: typeof exifCaptureTime === 'string' ? exifCaptureTime : null,
+            exifMake: typeof exifMake === 'string' ? exifMake : null,
+            exifModel: typeof exifModel === 'string' ? exifModel : null,
         }
     };
     fs.writeFileSync(manifestPath, JSON.stringify(payload));
-
+    
+    console.log(`[SC] Stored manifest ${safeId} for user ${req.user.id}`);
     res.json({ ok: true, manifestId: safeId });
 });
 
@@ -2870,6 +3022,10 @@ app.get('/api/cloud/manifests', authenticateToken, blockDeletedSubscription, (re
                     entry.fileHash = content.meta.fileHash || null;
                     entry.perceptualHash = content.meta.perceptualHash || null;
                     entry.creationTime = content.meta.creationTime || null;
+                    // EXIF metadata for cross-platform dedup
+                    entry.exifCaptureTime = content.meta.exifCaptureTime || null;
+                    entry.exifMake = content.meta.exifMake || null;
+                    entry.exifModel = content.meta.exifModel || null;
                 }
             } catch (e) {
                 // Ignore read errors, just return manifestId
