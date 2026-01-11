@@ -16,6 +16,42 @@ const updater = require('./updater');
 let sharp;
 try { sharp = require('sharp'); } catch (e) { sharp = null; }
 
+/**
+ * Compute perceptual hash (dHash) for an image file
+ * Returns 16-character hex string (64-bit hash)
+ */
+const computePerceptualHash = async (filePath) => {
+    if (!sharp) return null;
+    try {
+        // Resize to 9x8 grayscale for dHash
+        const { data, info } = await sharp(filePath)
+            .resize(9, 8, { fit: 'fill' })
+            .grayscale()
+            .raw()
+            .toBuffer({ resolveWithObject: true });
+        
+        if (info.width !== 9 || info.height !== 8) return null;
+        
+        // Compute difference hash - compare adjacent horizontal pixels
+        let hash = BigInt(0);
+        for (let y = 0; y < 8; y++) {
+            for (let x = 0; x < 8; x++) {
+                const left = data[y * 9 + x];
+                const right = data[y * 9 + x + 1];
+                if (left > right) {
+                    hash |= BigInt(1) << BigInt(y * 8 + x);
+                }
+            }
+        }
+        
+        // Convert to 16-char hex string
+        return hash.toString(16).padStart(16, '0');
+    } catch (e) {
+        console.log('computePerceptualHash error:', e.message);
+        return null;
+    }
+};
+
 // Try to use bundled ffmpeg, fallback to system ffmpeg
 let ffmpegPath = 'ffmpeg';
 try {
@@ -1181,10 +1217,16 @@ db.serialize(() => {
         mime_type TEXT,
         size INTEGER,
         file_hash TEXT,
+        perceptual_hash TEXT,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(user_id, filename),
         UNIQUE(user_id, file_hash)
     )`);
+    
+    // Add perceptual_hash column if it doesn't exist (migration for existing DBs)
+    db.run(`ALTER TABLE files ADD COLUMN perceptual_hash TEXT`, (err) => {
+        // Ignore error if column already exists
+    });
 
     db.run(`CREATE TABLE IF NOT EXISTS cloud_chunks (
         user_id INTEGER,
@@ -2321,18 +2363,33 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
                     return res.status(500).json({ error: 'Failed to finalize upload' });
                 }
 
-                db.run(
-                    `INSERT OR REPLACE INTO files (user_id, filename, original_name, mime_type, size, file_hash) VALUES (?, ?, ?, ?, ?, ?)`,
-                    [req.user.id, safeName, safeName, mimetype, size, fileHash],
-                    (err2) => {
-                        if (err2) {
-                            console.error('Metadata save error:', err2);
-                            try { fs.unlinkSync(finalPath); } catch (e) {}
-                            return res.status(500).json({ error: 'Failed to save file metadata' });
+                // Compute perceptual hash for images (async, non-blocking)
+                const isImage = /\.(jpg|jpeg|png|gif|bmp|webp|heic|heif|tiff?)$/i.test(safeName);
+                const saveToDb = (perceptualHash) => {
+                    db.run(
+                        `INSERT OR REPLACE INTO files (user_id, filename, original_name, mime_type, size, file_hash, perceptual_hash) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                        [req.user.id, safeName, safeName, mimetype, size, fileHash, perceptualHash],
+                        (err2) => {
+                            if (err2) {
+                                console.error('Metadata save error:', err2);
+                                try { fs.unlinkSync(finalPath); } catch (e) {}
+                                return res.status(500).json({ error: 'Failed to save file metadata' });
+                            }
+                            return res.json({ message: 'File uploaded', filename: safeName, fileHash, perceptualHash });
                         }
-                        return res.json({ message: 'File uploaded', filename: safeName });
-                    }
-                );
+                    );
+                };
+
+                if (isImage) {
+                    computePerceptualHash(finalPath).then(phash => {
+                        saveToDb(phash);
+                    }).catch(e => {
+                        console.log('Perceptual hash failed:', e.message);
+                        saveToDb(null);
+                    });
+                } else {
+                    saveToDb(null);
+                }
             }
         );
     });
@@ -2340,17 +2397,18 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
     req.pipe(out);
 });
 
-// List Files (for Sync)
+// List Files (for Sync) - includes hash metadata for cross-device dedup
 app.get('/api/files', authenticateToken, (req, res) => {
     const rawOffset = req.query && req.query.offset ? req.query.offset : null;
     const rawLimit = req.query && req.query.limit ? req.query.limit : null;
+    const includeMeta = req.query && req.query.meta === 'true';
     const offset = rawOffset !== null ? Math.max(0, parseInt(String(rawOffset), 10) || 0) : 0;
     const limit = rawLimit !== null ? Math.max(0, parseInt(String(rawLimit), 10) || 0) : 0;
 
     // Read files from device UUID folder
     const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
     
-    console.log(`[LIST FILES] Device UUID: ${req.user.device_uuid}`);
+    console.log(`[LIST FILES] Device UUID: ${req.user.device_uuid}, meta=${includeMeta}`);
     console.log(`[LIST FILES] Looking in: ${deviceDir}`);
     
     if (!fs.existsSync(deviceDir)) {
@@ -2382,11 +2440,106 @@ app.get('/api/files', authenticateToken, (req, res) => {
             files = files.slice(offset, offset + limit);
         }
         
-        console.log(`[LIST FILES] Returning ${files.length} files (offset=${offset} limit=${limit || 'all'} total=${total})`);
-        res.json({ files, total });
+        // If meta=true, enrich with hash metadata from database
+        if (includeMeta && files.length > 0) {
+            const filenames = files.map(f => f.filename);
+            const placeholders = filenames.map(() => '?').join(',');
+            db.all(
+                `SELECT filename, file_hash, perceptual_hash, size FROM files WHERE user_id = ? AND filename IN (${placeholders})`,
+                [req.user.id, ...filenames],
+                (err, rows) => {
+                    if (err) {
+                        console.error('[LIST FILES] DB error:', err);
+                        return res.json({ files, total });
+                    }
+                    
+                    // Create lookup map
+                    const hashMap = {};
+                    for (const row of (rows || [])) {
+                        hashMap[row.filename] = {
+                            fileHash: row.file_hash,
+                            perceptualHash: row.perceptual_hash
+                        };
+                    }
+                    
+                    // Enrich files with hash metadata
+                    for (const file of files) {
+                        const meta = hashMap[file.filename];
+                        if (meta) {
+                            file.fileHash = meta.fileHash;
+                            file.perceptualHash = meta.perceptualHash;
+                        }
+                    }
+                    
+                    console.log(`[LIST FILES] Returning ${files.length} files with meta (offset=${offset} limit=${limit || 'all'} total=${total})`);
+                    res.json({ files, total });
+                }
+            );
+        } else {
+            console.log(`[LIST FILES] Returning ${files.length} files (offset=${offset} limit=${limit || 'all'} total=${total})`);
+            res.json({ files, total });
+        }
     } catch (error) {
         console.error('[LIST FILES] Error reading files:', error);
         res.status(500).json({ error: 'Error reading files' });
+    }
+});
+
+// Migrate existing files to compute missing hashes
+app.post('/api/files/migrate-hashes', authenticateToken, async (req, res) => {
+    const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
+    if (!fs.existsSync(deviceDir)) {
+        return res.json({ migrated: 0, message: 'No files to migrate' });
+    }
+
+    try {
+        // Get files without perceptual_hash
+        const rows = await new Promise((resolve, reject) => {
+            db.all(
+                `SELECT id, filename, file_hash FROM files WHERE user_id = ? AND (perceptual_hash IS NULL OR perceptual_hash = '')`,
+                [req.user.id],
+                (err, rows) => err ? reject(err) : resolve(rows || [])
+            );
+        });
+
+        console.log(`[MIGRATE] Found ${rows.length} files without perceptual_hash`);
+        let migrated = 0;
+        let errors = 0;
+
+        for (const row of rows) {
+            const filePath = path.join(deviceDir, row.filename);
+            if (!fs.existsSync(filePath)) {
+                errors++;
+                continue;
+            }
+
+            const isImage = /\.(jpg|jpeg|png|gif|bmp|webp|heic|heif|tiff?)$/i.test(row.filename);
+            if (!isImage) continue; // Only images need perceptual hash
+
+            try {
+                const phash = await computePerceptualHash(filePath);
+                if (phash) {
+                    await new Promise((resolve, reject) => {
+                        db.run(
+                            `UPDATE files SET perceptual_hash = ? WHERE id = ?`,
+                            [phash, row.id],
+                            (err) => err ? reject(err) : resolve()
+                        );
+                    });
+                    migrated++;
+                    console.log(`[MIGRATE] ${row.filename}: ${phash}`);
+                }
+            } catch (e) {
+                errors++;
+                console.log(`[MIGRATE] Error for ${row.filename}: ${e.message}`);
+            }
+        }
+
+        console.log(`[MIGRATE] Complete: ${migrated} migrated, ${errors} errors`);
+        res.json({ migrated, errors, total: rows.length });
+    } catch (e) {
+        console.error('[MIGRATE] Error:', e);
+        res.status(500).json({ error: e.message });
     }
 });
 
@@ -2482,6 +2635,17 @@ app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
             if (fs.existsSync(tmpThumb)) fs.unlinkSync(tmpThumb);
             console.log('Video thumbnail generation failed:', e.message);
         }
+        // Fallback: generate a simple placeholder for videos if ffmpeg fails
+        if (sharp) {
+            try {
+                const placeholder = await sharp({
+                    create: { width: 150, height: 150, channels: 3, background: { r: 40, g: 40, b: 60 } }
+                }).jpeg({ quality: 70 }).toBuffer();
+                res.set('Content-Type', 'image/jpeg');
+                res.set('Cache-Control', 'public, max-age=86400');
+                return res.send(placeholder);
+            } catch (e2) {}
+        }
         return res.status(500).json({ error: 'Video thumbnail generation failed' });
     }
 
@@ -2497,12 +2661,30 @@ app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
             return res.send(thumbBuffer);
         } catch (e) {
             console.log('Thumbnail generation failed:', e.message);
-            // Fall through to serve original
+            // Generate placeholder instead of serving huge original
+            try {
+                const placeholder = await sharp({
+                    create: { width: 150, height: 150, channels: 3, background: { r: 40, g: 60, b: 40 } }
+                }).jpeg({ quality: 70 }).toBuffer();
+                res.set('Content-Type', 'image/jpeg');
+                res.set('Cache-Control', 'public, max-age=86400');
+                return res.send(placeholder);
+            } catch (e2) {}
         }
     }
 
-    // Fallback: serve original file
-    res.download(filePath);
+    // Fallback: generate simple placeholder (don't serve huge original)
+    if (sharp) {
+        try {
+            const placeholder = await sharp({
+                create: { width: 150, height: 150, channels: 3, background: { r: 60, g: 60, b: 60 } }
+            }).jpeg({ quality: 70 }).toBuffer();
+            res.set('Content-Type', 'image/jpeg');
+            res.set('Cache-Control', 'public, max-age=86400');
+            return res.send(placeholder);
+        } catch (e) {}
+    }
+    res.status(500).json({ error: 'Thumbnail generation failed' });
 });
 
 // Download File
