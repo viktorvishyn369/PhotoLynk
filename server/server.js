@@ -3645,6 +3645,94 @@ app.delete('/api/nft/image/:imageId', authenticateToken, async (req, res) => {
     }
 });
 
+// ============================================================================
+// NFT ALBUM SYNC (persists NFT metadata across app reinstalls)
+// ============================================================================
+
+// NFT metadata storage file per user
+const getNftMetadataPath = (userId) => path.join(NFT_DIR, String(userId), 'nft-album.json');
+
+// Get user's NFT album (list of minted NFTs)
+// GET /api/nft/list
+app.get('/api/nft/list', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const metadataPath = getNftMetadataPath(userId);
+        
+        if (!fs.existsSync(metadataPath)) {
+            return res.json({ success: true, nfts: [] });
+        }
+        
+        const data = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+        console.log(`[NFT] Album list: user=${userId} count=${data.nfts?.length || 0}`);
+        res.json({ success: true, nfts: data.nfts || [] });
+    } catch (error) {
+        console.error('[NFT] List error:', error);
+        res.status(500).json({ error: 'Failed to get NFT list' });
+    }
+});
+
+// Sync NFT album (add, remove, or backup NFTs)
+// POST /api/nft/sync
+// Body: { action: 'add'|'remove'|'backup', nft?: {}, mintAddress?: '', nfts?: [] }
+app.post('/api/nft/sync', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { action, nft, mintAddress, nfts } = req.body;
+        
+        const userNftDir = path.join(NFT_DIR, String(userId));
+        if (!fs.existsSync(userNftDir)) {
+            fs.mkdirSync(userNftDir, { recursive: true });
+        }
+        
+        const metadataPath = getNftMetadataPath(userId);
+        let data = { nfts: [] };
+        
+        if (fs.existsSync(metadataPath)) {
+            try {
+                data = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+            } catch (e) {
+                data = { nfts: [] };
+            }
+        }
+        
+        if (action === 'add' && nft) {
+            // Add single NFT (avoid duplicates)
+            const exists = data.nfts.some(n => n.mintAddress === nft.mintAddress);
+            if (!exists) {
+                data.nfts.push(nft);
+                console.log(`[NFT] Album add: user=${userId} mint=${nft.mintAddress}`);
+            }
+        } else if (action === 'remove' && mintAddress) {
+            // Remove NFT by mint address
+            const before = data.nfts.length;
+            data.nfts = data.nfts.filter(n => n.mintAddress !== mintAddress);
+            console.log(`[NFT] Album remove: user=${userId} mint=${mintAddress} removed=${before - data.nfts.length}`);
+        } else if (action === 'backup' && Array.isArray(nfts)) {
+            // Backup: merge all NFTs (avoid duplicates)
+            const existingMints = new Set(data.nfts.map(n => n.mintAddress));
+            let added = 0;
+            for (const n of nfts) {
+                if (!existingMints.has(n.mintAddress)) {
+                    data.nfts.push(n);
+                    existingMints.add(n.mintAddress);
+                    added++;
+                }
+            }
+            console.log(`[NFT] Album backup: user=${userId} added=${added} total=${data.nfts.length}`);
+        } else {
+            return res.status(400).json({ error: 'Invalid action or missing data' });
+        }
+        
+        // Save updated metadata
+        fs.writeFileSync(metadataPath, JSON.stringify(data, null, 2));
+        res.json({ success: true, count: data.nfts.length });
+    } catch (error) {
+        console.error('[NFT] Sync error:', error);
+        res.status(500).json({ error: 'Failed to sync NFT album' });
+    }
+});
+
 const startUpdateChecker = () => {
     updater.startAutoCheck((result) => {
         if (result.available) {
