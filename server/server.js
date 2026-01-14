@@ -837,6 +837,44 @@ const AUTH_RATE_LIMIT_WINDOW_MS = Number.parseInt(process.env.AUTH_RATE_LIMIT_WI
 const AUTH_RATE_LIMIT_MAX = Number.parseInt(process.env.AUTH_RATE_LIMIT_MAX || '25', 10);
 const authRateLimiter = createRateLimiter({ windowMs: AUTH_RATE_LIMIT_WINDOW_MS, max: AUTH_RATE_LIMIT_MAX });
 
+// ============================================================================
+// SECURITY CONFIGURATION
+// ============================================================================
+
+// Email verification: set to true to require email verification before login
+const REQUIRE_EMAIL_VERIFICATION = process.env.REQUIRE_EMAIL_VERIFICATION === 'true' || false;
+
+// Country/geo verification: require re-verification when logging in from a new country
+const REQUIRE_COUNTRY_VERIFICATION = process.env.REQUIRE_COUNTRY_VERIFICATION !== 'false'; // enabled by default
+
+// Get country from IP using free ip-api.com (no API key needed)
+const getCountryFromIP = async (ip) => {
+    try {
+        // Skip for localhost/private IPs
+        if (!ip || ip === '127.0.0.1' || ip === '::1' || ip.startsWith('192.168.') || ip.startsWith('10.') || ip.startsWith('172.')) {
+            return null;
+        }
+        // Clean IP (remove ::ffff: prefix for IPv4-mapped IPv6)
+        const cleanIp = ip.replace(/^::ffff:/, '');
+        const response = await axios.get(`http://ip-api.com/json/${cleanIp}?fields=status,country,countryCode`, { timeout: 5000 });
+        if (response.data && response.data.status === 'success') {
+            return { country: response.data.country, countryCode: response.data.countryCode };
+        }
+    } catch (e) {
+        console.log('[Geo] IP lookup failed:', e.message);
+    }
+    return null;
+};
+
+// Generate 6-digit verification code
+const generateVerificationCode = () => {
+    return Math.floor(100000 + Math.random() * 900000).toString();
+};
+
+// In-memory store for pending verifications (email and country)
+// In production, use Redis or database for persistence across restarts
+const pendingVerifications = new Map();
+
 // Ensure base data directory exists
 if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -1130,6 +1168,18 @@ db.serialize(() => {
                 const now = Date.now();
                 db.run(`UPDATE users SET created_at = ? WHERE created_at IS NULL`, [now]);
             });
+        }
+        // Security: email verification status
+        if (!names.includes('email_verified')) {
+            db.run(`ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0`, [], () => {});
+        }
+        // Security: last known country code for geo verification
+        if (!names.includes('last_country_code')) {
+            db.run(`ALTER TABLE users ADD COLUMN last_country_code TEXT`, [], () => {});
+        }
+        // Security: list of verified country codes (JSON array)
+        if (!names.includes('verified_countries')) {
+            db.run(`ALTER TABLE users ADD COLUMN verified_countries TEXT DEFAULT '[]'`, [], () => {});
         }
     });
 
@@ -1669,8 +1719,8 @@ app.post('/api/register', authRateLimiter, async (req, res) => {
 });
 
 // Login & Bind Device
-app.post('/api/login', authRateLimiter, (req, res) => {
-    const { email, password, device_uuid, device_name } = req.body;
+app.post('/api/login', authRateLimiter, async (req, res) => {
+    const { email, password, device_uuid, device_name, country_verification_code } = req.body;
     if (!email || !password || !device_uuid) return res.status(400).json({ error: 'Missing credentials or device ID' });
     const normalizedEmail = String(email).toLowerCase().trim();
 
@@ -1680,6 +1730,74 @@ app.post('/api/login', authRateLimiter, (req, res) => {
 
         const match = await bcrypt.compare(password, user.password);
         if (!match) return res.status(401).json({ error: 'Invalid credentials' });
+
+        // Check email verification (if enabled)
+        if (REQUIRE_EMAIL_VERIFICATION && !user.email_verified) {
+            return res.status(403).json({ 
+                error: 'Email not verified', 
+                requiresEmailVerification: true,
+                hint: 'Please verify your email before logging in'
+            });
+        }
+
+        // Country/geo verification check
+        let currentCountry = null;
+        if (REQUIRE_COUNTRY_VERIFICATION) {
+            const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
+            currentCountry = await getCountryFromIP(clientIp);
+            
+            if (currentCountry && currentCountry.countryCode) {
+                const verifiedCountries = JSON.parse(user.verified_countries || '[]');
+                const isNewCountry = !verifiedCountries.includes(currentCountry.countryCode) && 
+                                     user.last_country_code && 
+                                     user.last_country_code !== currentCountry.countryCode;
+                
+                if (isNewCountry) {
+                    const verifyKey = `country:${user.id}:${currentCountry.countryCode}`;
+                    const pending = pendingVerifications.get(verifyKey);
+                    
+                    // Check if verification code was provided
+                    if (country_verification_code) {
+                        if (pending && pending.code === country_verification_code && Date.now() < pending.expiresAt) {
+                            // Code is valid - add country to verified list
+                            verifiedCountries.push(currentCountry.countryCode);
+                            db.run(`UPDATE users SET verified_countries = ?, last_country_code = ? WHERE id = ?`,
+                                [JSON.stringify(verifiedCountries), currentCountry.countryCode, user.id]);
+                            pendingVerifications.delete(verifyKey);
+                            console.log(`[Geo] User ${user.id} verified new country: ${currentCountry.country}`);
+                        } else {
+                            return res.status(403).json({
+                                error: 'Invalid or expired verification code',
+                                requiresCountryVerification: true,
+                                newCountry: currentCountry.country,
+                                newCountryCode: currentCountry.countryCode
+                            });
+                        }
+                    } else {
+                        // Generate new verification code and send email
+                        const code = generateVerificationCode();
+                        pendingVerifications.set(verifyKey, {
+                            code,
+                            expiresAt: Date.now() + 15 * 60 * 1000, // 15 minutes
+                            country: currentCountry.country,
+                            countryCode: currentCountry.countryCode
+                        });
+                        
+                        console.log(`[Geo] New country login detected for user ${user.id}: ${currentCountry.country} (code: ${code})`);
+                        // TODO: Send email with code (for now, log it)
+                        // In production: await sendVerificationEmail(user.email, code, currentCountry.country);
+                        
+                        return res.status(403).json({
+                            error: 'Login from new country detected',
+                            requiresCountryVerification: true,
+                            newCountry: currentCountry.country,
+                            newCountryCode: currentCountry.countryCode,
+                            message: `A verification code has been sent to your email. Please enter it to verify this login from ${currentCountry.country}.`
+                        });
+                    }
+                }
+            }
+        }
 
         // Register/Update Device
         db.run(`INSERT OR IGNORE INTO devices (user_id, device_uuid, device_name) VALUES (?, ?, ?)`, 
@@ -1703,6 +1821,16 @@ app.post('/api/login', authRateLimiter, (req, res) => {
                     [normalizedEmail, now, user.id]
                 );
                 
+                // Update last known country
+                if (currentCountry && currentCountry.countryCode) {
+                    const verifiedCountries = JSON.parse(user.verified_countries || '[]');
+                    if (!verifiedCountries.includes(currentCountry.countryCode)) {
+                        verifiedCountries.push(currentCountry.countryCode);
+                    }
+                    db.run(`UPDATE users SET last_country_code = ?, verified_countries = ? WHERE id = ?`,
+                        [currentCountry.countryCode, JSON.stringify(verifiedCountries), user.id]);
+                }
+                
                 // Generate Token BOUND to this device
                 const token = jwt.sign({ id: user.id, user_uuid: user.user_uuid, email: user.email, device_uuid: device_uuid }, JWT_SECRET, { expiresIn: '30d' });
                 res.json({ token, userId: user.id });
@@ -1711,7 +1839,183 @@ app.post('/api/login', authRateLimiter, (req, res) => {
     });
 });
 
-// Device-bound Password Reset
+// ============================================================================
+// EMAIL VERIFICATION ENDPOINTS (inactive by default, ready to enable)
+// ============================================================================
+
+// Request email verification code
+// POST /api/auth/request-email-verification
+app.post('/api/auth/request-email-verification', authRateLimiter, async (req, res) => {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+    const normalizedEmail = String(email).toLowerCase().trim();
+
+    db.get(`SELECT id, email, email_verified FROM users WHERE email = ?`, [normalizedEmail], async (err, user) => {
+        if (err) return res.status(500).json({ error: 'Database error' });
+        if (!user) return res.status(404).json({ error: 'Account not found' });
+        
+        if (user.email_verified) {
+            return res.json({ message: 'Email already verified', alreadyVerified: true });
+        }
+
+        const code = generateVerificationCode();
+        const verifyKey = `email:${user.id}`;
+        pendingVerifications.set(verifyKey, {
+            code,
+            expiresAt: Date.now() + 15 * 60 * 1000, // 15 minutes
+            email: normalizedEmail
+        });
+
+        console.log(`[Email] Verification code for ${normalizedEmail}: ${code}`);
+        // TODO: Send email with code
+        // In production: await sendVerificationEmail(normalizedEmail, code);
+
+        res.json({ message: 'Verification code sent to your email', codeSent: true });
+    });
+});
+
+// Verify email with code
+// POST /api/auth/verify-email
+app.post('/api/auth/verify-email', authRateLimiter, async (req, res) => {
+    const { email, code } = req.body;
+    if (!email || !code) return res.status(400).json({ error: 'Email and code required' });
+    const normalizedEmail = String(email).toLowerCase().trim();
+
+    db.get(`SELECT id, email, email_verified FROM users WHERE email = ?`, [normalizedEmail], async (err, user) => {
+        if (err) return res.status(500).json({ error: 'Database error' });
+        if (!user) return res.status(404).json({ error: 'Account not found' });
+
+        if (user.email_verified) {
+            return res.json({ message: 'Email already verified', success: true });
+        }
+
+        const verifyKey = `email:${user.id}`;
+        const pending = pendingVerifications.get(verifyKey);
+
+        if (!pending || pending.code !== code || Date.now() > pending.expiresAt) {
+            return res.status(400).json({ error: 'Invalid or expired verification code' });
+        }
+
+        // Mark email as verified
+        db.run(`UPDATE users SET email_verified = 1 WHERE id = ?`, [user.id], (updateErr) => {
+            if (updateErr) return res.status(500).json({ error: 'Failed to verify email' });
+            
+            pendingVerifications.delete(verifyKey);
+            console.log(`[Email] User ${user.id} email verified: ${normalizedEmail}`);
+            res.json({ message: 'Email verified successfully', success: true });
+        });
+    });
+});
+
+// ============================================================================
+// COUNTRY VERIFICATION ENDPOINT
+// ============================================================================
+
+// Resend country verification code
+// POST /api/auth/resend-country-code
+app.post('/api/auth/resend-country-code', authRateLimiter, async (req, res) => {
+    const { email, countryCode } = req.body;
+    if (!email || !countryCode) return res.status(400).json({ error: 'Email and country code required' });
+    const normalizedEmail = String(email).toLowerCase().trim();
+
+    db.get(`SELECT id, email FROM users WHERE email = ?`, [normalizedEmail], async (err, user) => {
+        if (err) return res.status(500).json({ error: 'Database error' });
+        if (!user) return res.status(404).json({ error: 'Account not found' });
+
+        const verifyKey = `country:${user.id}:${countryCode}`;
+        const code = generateVerificationCode();
+        
+        pendingVerifications.set(verifyKey, {
+            code,
+            expiresAt: Date.now() + 15 * 60 * 1000,
+            countryCode
+        });
+
+        console.log(`[Geo] Resent country verification code for ${normalizedEmail}: ${code}`);
+        // TODO: Send email with code
+        // In production: await sendVerificationEmail(normalizedEmail, code, countryCode);
+
+        res.json({ message: 'Verification code resent', codeSent: true });
+    });
+});
+
+// ============================================================================
+// PASSWORD RESET
+// ============================================================================
+
+// Email-based Password Reset - Step 1: Request reset code
+// POST /api/auth/request-password-reset
+// Works for all server types (local/remote/stealthcloud)
+app.post('/api/auth/request-password-reset', authRateLimiter, async (req, res) => {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email required' });
+    const normalizedEmail = String(email).toLowerCase().trim();
+
+    db.get(`SELECT id, email FROM users WHERE email = ?`, [normalizedEmail], async (err, user) => {
+        if (err) return res.status(500).json({ error: 'Database error' });
+        
+        // Always return success to prevent email enumeration attacks
+        if (!user) {
+            console.log(`[Password Reset] Request for non-existent email: ${normalizedEmail}`);
+            return res.json({ message: 'If an account exists with this email, a reset code has been sent', codeSent: true });
+        }
+
+        const code = generateVerificationCode();
+        const verifyKey = `pwreset:${user.id}`;
+        pendingVerifications.set(verifyKey, {
+            code,
+            expiresAt: Date.now() + 15 * 60 * 1000, // 15 minutes
+            email: normalizedEmail
+        });
+
+        console.log(`[Password Reset] Code for ${normalizedEmail}: ${code}`);
+        // TODO: Send email with code
+        // In production: await sendPasswordResetEmail(normalizedEmail, code);
+
+        res.json({ message: 'If an account exists with this email, a reset code has been sent', codeSent: true });
+    });
+});
+
+// Email-based Password Reset - Step 2: Verify code and reset password
+// POST /api/auth/reset-password-with-code
+app.post('/api/auth/reset-password-with-code', authRateLimiter, async (req, res) => {
+    const { email, code, newPassword } = req.body;
+    if (!email || !code || !newPassword) {
+        return res.status(400).json({ error: 'Email, code, and new password required' });
+    }
+    if (newPassword.length < 6) {
+        return res.status(400).json({ error: 'Password must be at least 6 characters' });
+    }
+
+    const normalizedEmail = String(email).toLowerCase().trim();
+
+    db.get(`SELECT id, email FROM users WHERE email = ?`, [normalizedEmail], async (err, user) => {
+        if (err) return res.status(500).json({ error: 'Database error' });
+        if (!user) return res.status(404).json({ error: 'Account not found' });
+
+        const verifyKey = `pwreset:${user.id}`;
+        const pending = pendingVerifications.get(verifyKey);
+
+        if (!pending || pending.code !== code || Date.now() > pending.expiresAt) {
+            return res.status(400).json({ error: 'Invalid or expired reset code' });
+        }
+
+        try {
+            const hashedPassword = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
+            db.run(`UPDATE users SET password = ? WHERE id = ?`, [hashedPassword, user.id], function(updateErr) {
+                if (updateErr) return res.status(500).json({ error: 'Failed to update password' });
+
+                pendingVerifications.delete(verifyKey);
+                console.log(`[Password Reset] Password updated for ${normalizedEmail} via email code`);
+                res.json({ message: 'Password has been reset successfully', success: true });
+            });
+        } catch (error) {
+            res.status(500).json({ error: error.message });
+        }
+    });
+});
+
+// Device-bound Password Reset (legacy - still works)
 // Allows password reset if the hardware_device_id matches the one stored during account creation
 // This survives app reinstalls because it uses a persistent hardware identifier
 app.post('/api/reset-password-device', authRateLimiter, async (req, res) => {
