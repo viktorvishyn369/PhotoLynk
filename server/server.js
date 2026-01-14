@@ -1228,6 +1228,20 @@ db.serialize(() => {
         // Ignore error if column already exists
     });
 
+    // Platform-specific hashes for cross-platform dedup fallback
+    // When a device syncs a file, it can submit its platform's computed hash
+    // Next sync from same platform can use this for fast pre-download skip
+    db.run(`CREATE TABLE IF NOT EXISTS platform_hashes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        filename TEXT,
+        platform TEXT,
+        perceptual_hash TEXT,
+        file_hash TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id, filename, platform)
+    )`);
+
     db.run(`CREATE TABLE IF NOT EXISTS cloud_chunks (
         user_id INTEGER,
         chunk_id TEXT,
@@ -2444,6 +2458,8 @@ app.get('/api/files', authenticateToken, (req, res) => {
         if (includeMeta && files.length > 0) {
             const filenames = files.map(f => f.filename);
             const placeholders = filenames.map(() => '?').join(',');
+            
+            // Get primary hashes from files table
             db.all(
                 `SELECT filename, file_hash, perceptual_hash, size FROM files WHERE user_id = ? AND filename IN (${placeholders})`,
                 [req.user.id, ...filenames],
@@ -2453,7 +2469,7 @@ app.get('/api/files', authenticateToken, (req, res) => {
                         return res.json({ files, total });
                     }
                     
-                    // Create lookup map
+                    // Create lookup map for primary hashes
                     const hashMap = {};
                     for (const row of (rows || [])) {
                         hashMap[row.filename] = {
@@ -2462,17 +2478,41 @@ app.get('/api/files', authenticateToken, (req, res) => {
                         };
                     }
                     
-                    // Enrich files with hash metadata
-                    for (const file of files) {
-                        const meta = hashMap[file.filename];
-                        if (meta) {
-                            file.fileHash = meta.fileHash;
-                            file.perceptualHash = meta.perceptualHash;
+                    // Get platform-specific hashes (fallback for cross-platform dedup)
+                    db.all(
+                        `SELECT filename, platform, perceptual_hash, file_hash FROM platform_hashes WHERE user_id = ? AND filename IN (${placeholders})`,
+                        [req.user.id, ...filenames],
+                        (err2, platformRows) => {
+                            // Build platform hash lookup: { filename: { ios: {...}, android: {...} } }
+                            const platformHashMap = {};
+                            for (const row of (platformRows || [])) {
+                                if (!platformHashMap[row.filename]) {
+                                    platformHashMap[row.filename] = {};
+                                }
+                                platformHashMap[row.filename][row.platform] = {
+                                    perceptualHash: row.perceptual_hash,
+                                    fileHash: row.file_hash
+                                };
+                            }
+                            
+                            // Enrich files with hash metadata
+                            for (const file of files) {
+                                const meta = hashMap[file.filename];
+                                if (meta) {
+                                    file.fileHash = meta.fileHash;
+                                    file.perceptualHash = meta.perceptualHash;
+                                }
+                                // Add platform-specific hashes as fallback
+                                const platformMeta = platformHashMap[file.filename];
+                                if (platformMeta) {
+                                    file.platformHashes = platformMeta;
+                                }
+                            }
+                            
+                            console.log(`[LIST FILES] Returning ${files.length} files with meta (offset=${offset} limit=${limit || 'all'} total=${total})`);
+                            res.json({ files, total });
                         }
-                    }
-                    
-                    console.log(`[LIST FILES] Returning ${files.length} files with meta (offset=${offset} limit=${limit || 'all'} total=${total})`);
-                    res.json({ files, total });
+                    );
                 }
             );
         } else {
@@ -2541,6 +2581,74 @@ app.post('/api/files/migrate-hashes', authenticateToken, async (req, res) => {
         console.error('[MIGRATE] Error:', e);
         res.status(500).json({ error: e.message });
     }
+});
+
+// Submit platform-specific hash for a file (for cross-platform dedup fallback)
+// Called by clients after syncing a file to store their platform's computed hash
+app.post('/api/files/platform-hash', authenticateToken, (req, res) => {
+    const { filename, platform, perceptualHash, fileHash } = req.body || {};
+    
+    if (!filename || !platform) {
+        return res.status(400).json({ error: 'filename and platform required' });
+    }
+    
+    if (!perceptualHash && !fileHash) {
+        return res.status(400).json({ error: 'perceptualHash or fileHash required' });
+    }
+    
+    // Validate platform
+    const validPlatforms = ['ios', 'android'];
+    if (!validPlatforms.includes(platform)) {
+        return res.status(400).json({ error: 'Invalid platform. Must be ios or android' });
+    }
+    
+    db.run(
+        `INSERT OR REPLACE INTO platform_hashes (user_id, filename, platform, perceptual_hash, file_hash) VALUES (?, ?, ?, ?, ?)`,
+        [req.user.id, filename, platform, perceptualHash || null, fileHash || null],
+        (err) => {
+            if (err) {
+                console.error('[PLATFORM-HASH] Error:', err);
+                return res.status(500).json({ error: 'Failed to save platform hash' });
+            }
+            res.json({ success: true, filename, platform });
+        }
+    );
+});
+
+// Batch submit platform hashes (more efficient for sync)
+app.post('/api/files/platform-hashes', authenticateToken, (req, res) => {
+    const { platform, hashes } = req.body || {};
+    
+    if (!platform || !Array.isArray(hashes) || hashes.length === 0) {
+        return res.status(400).json({ error: 'platform and hashes array required' });
+    }
+    
+    const validPlatforms = ['ios', 'android'];
+    if (!validPlatforms.includes(platform)) {
+        return res.status(400).json({ error: 'Invalid platform' });
+    }
+    
+    let saved = 0;
+    let errors = 0;
+    
+    const stmt = db.prepare(`INSERT OR REPLACE INTO platform_hashes (user_id, filename, platform, perceptual_hash, file_hash) VALUES (?, ?, ?, ?, ?)`);
+    
+    for (const h of hashes) {
+        if (h.filename && (h.perceptualHash || h.fileHash)) {
+            stmt.run([req.user.id, h.filename, platform, h.perceptualHash || null, h.fileHash || null], (err) => {
+                if (err) errors++;
+                else saved++;
+            });
+        }
+    }
+    
+    stmt.finalize((err) => {
+        if (err) {
+            console.error('[PLATFORM-HASHES] Finalize error:', err);
+        }
+        console.log(`[PLATFORM-HASHES] Saved ${saved} hashes for ${platform}, ${errors} errors`);
+        res.json({ saved, errors, total: hashes.length });
+    });
 });
 
 // Purge classic uploads (non-StealthCloud) for this device
@@ -3297,6 +3405,243 @@ app.delete('/api/account', authenticateToken, async (req, res) => {
     } catch (error) {
         console.error('[Account Deletion] Error:', error);
         res.status(500).json({ error: 'Failed to delete account. Please contact support.' });
+    }
+});
+
+// ============================================================================
+// NFT IMAGE STORAGE (StealthCloud-based, publicly accessible)
+// ============================================================================
+
+// NFT images are stored in a separate 'nft' folder per user
+// They are NOT encrypted so they can be served publicly for NFT metadata
+const NFT_DIR = path.join(CLOUD_DIR, 'nft');
+if (!fs.existsSync(NFT_DIR)) {
+    fs.mkdirSync(NFT_DIR, { recursive: true });
+}
+
+// Ensure user NFT directory exists
+const ensureUserNftDir = (userId) => {
+    const userNftDir = path.join(NFT_DIR, String(userId));
+    if (!fs.existsSync(userNftDir)) {
+        fs.mkdirSync(userNftDir, { recursive: true });
+    }
+    return userNftDir;
+};
+
+// Check if user has StealthCloud subscription with available space
+const checkNftStorageEligibility = async (userId, fileSizeBytes) => {
+    const quotaBytes = await getUserQuotaBytes(userId);
+    const usedBytes = await getUserUsedBytes(userId);
+    
+    if (quotaBytes <= 0) {
+        return { eligible: false, reason: 'No active StealthCloud plan' };
+    }
+    
+    const availableBytes = quotaBytes - usedBytes;
+    if (fileSizeBytes > availableBytes) {
+        return { 
+            eligible: false, 
+            reason: 'Not enough space',
+            availableBytes,
+            requiredBytes: fileSizeBytes,
+        };
+    }
+    
+    return { 
+        eligible: true, 
+        quotaBytes, 
+        usedBytes, 
+        availableBytes,
+    };
+};
+
+// Upload NFT image to StealthCloud (authenticated)
+// POST /api/nft/upload
+// Body: multipart form with 'image' file
+// Returns: { success, imageId, publicUrl }
+const nftUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 50 * 1024 * 1024 }, // 50MB max
+    fileFilter: (req, file, cb) => {
+        const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+        if (allowed.includes(file.mimetype)) {
+            cb(null, true);
+        } else {
+            cb(new Error('Only JPEG, PNG, GIF, WebP images allowed'));
+        }
+    },
+});
+
+app.post('/api/nft/upload', authenticateToken, nftUpload.single('image'), async (req, res) => {
+    try {
+        if (!req.file) {
+            return res.status(400).json({ error: 'No image file provided' });
+        }
+        
+        const userId = req.user.id;
+        const fileSize = req.file.size;
+        
+        // Check eligibility
+        const eligibility = await checkNftStorageEligibility(userId, fileSize);
+        if (!eligibility.eligible) {
+            return res.status(403).json({ 
+                error: eligibility.reason,
+                availableBytes: eligibility.availableBytes,
+                requiredBytes: eligibility.requiredBytes,
+            });
+        }
+        
+        // Generate unique image ID
+        const imageId = crypto.randomBytes(16).toString('hex');
+        const ext = req.file.mimetype.split('/')[1] === 'jpeg' ? 'jpg' : req.file.mimetype.split('/')[1];
+        const filename = `${imageId}.${ext}`;
+        
+        // Save to user's NFT directory
+        const userNftDir = ensureUserNftDir(userId);
+        const filePath = path.join(userNftDir, filename);
+        fs.writeFileSync(filePath, req.file.buffer);
+        
+        // Public URL (served via nft.stealthlynk.io or /api/nft/image/:userId/:imageId)
+        const publicUrl = `https://nft.stealthlynk.io/${userId}/${filename}`;
+        const fallbackUrl = `/api/nft/image/${userId}/${filename}`;
+        
+        console.log(`[NFT] Image uploaded: user=${userId} id=${imageId} size=${fileSize}`);
+        
+        res.json({
+            success: true,
+            imageId,
+            filename,
+            publicUrl,
+            fallbackUrl,
+            size: fileSize,
+        });
+    } catch (error) {
+        console.error('[NFT] Upload error:', error);
+        res.status(500).json({ error: 'Failed to upload NFT image' });
+    }
+});
+
+// Check NFT storage eligibility (for UI to show/hide option)
+// GET /api/nft/eligibility?size=<bytes>
+app.get('/api/nft/eligibility', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const fileSize = parseInt(req.query.size) || 5 * 1024 * 1024; // Default 5MB estimate
+        
+        const eligibility = await checkNftStorageEligibility(userId, fileSize);
+        res.json(eligibility);
+    } catch (error) {
+        console.error('[NFT] Eligibility check error:', error);
+        res.status(500).json({ error: 'Failed to check eligibility' });
+    }
+});
+
+// List user's NFT images
+// GET /api/nft/images
+app.get('/api/nft/images', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const userNftDir = path.join(NFT_DIR, String(userId));
+        
+        if (!fs.existsSync(userNftDir)) {
+            return res.json({ images: [] });
+        }
+        
+        const files = fs.readdirSync(userNftDir);
+        const images = files.map(f => {
+            const filePath = path.join(userNftDir, f);
+            const stats = fs.statSync(filePath);
+            return {
+                filename: f,
+                imageId: f.replace(/\.[^.]+$/, ''),
+                publicUrl: `https://nft.stealthlynk.io/${userId}/${f}`,
+                fallbackUrl: `/api/nft/image/${userId}/${f}`,
+                size: stats.size,
+                createdAt: stats.birthtime,
+            };
+        });
+        
+        res.json({ images });
+    } catch (error) {
+        console.error('[NFT] List images error:', error);
+        res.status(500).json({ error: 'Failed to list NFT images' });
+    }
+});
+
+// PUBLIC: Serve NFT image (no authentication required)
+// GET /api/nft/image/:userId/:filename
+// This endpoint is publicly accessible so NFT wallets/marketplaces can display images
+app.get('/api/nft/image/:userId/:filename', (req, res) => {
+    try {
+        const { userId, filename } = req.params;
+        
+        // Sanitize inputs
+        const safeUserId = String(userId).replace(/[^0-9]/g, '');
+        const safeFilename = String(filename).replace(/[^a-zA-Z0-9._-]/g, '');
+        
+        if (!safeUserId || !safeFilename) {
+            return res.status(400).json({ error: 'Invalid request' });
+        }
+        
+        const filePath = path.join(NFT_DIR, safeUserId, safeFilename);
+        
+        if (!fs.existsSync(filePath)) {
+            return res.status(404).json({ error: 'Image not found' });
+        }
+        
+        // Determine content type
+        const ext = path.extname(safeFilename).toLowerCase();
+        const contentTypes = {
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.gif': 'image/gif',
+            '.webp': 'image/webp',
+        };
+        const contentType = contentTypes[ext] || 'application/octet-stream';
+        
+        // Set cache headers for CDN/browser caching
+        res.set({
+            'Content-Type': contentType,
+            'Cache-Control': 'public, max-age=31536000, immutable', // 1 year cache
+            'Access-Control-Allow-Origin': '*', // Allow cross-origin for NFT viewers
+        });
+        
+        res.sendFile(filePath);
+    } catch (error) {
+        console.error('[NFT] Serve image error:', error);
+        res.status(500).json({ error: 'Failed to serve image' });
+    }
+});
+
+// Delete NFT image (authenticated, owner only)
+// DELETE /api/nft/image/:imageId
+app.delete('/api/nft/image/:imageId', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { imageId } = req.params;
+        
+        const userNftDir = path.join(NFT_DIR, String(userId));
+        if (!fs.existsSync(userNftDir)) {
+            return res.status(404).json({ error: 'Image not found' });
+        }
+        
+        // Find file with this imageId
+        const files = fs.readdirSync(userNftDir);
+        const file = files.find(f => f.startsWith(imageId));
+        
+        if (!file) {
+            return res.status(404).json({ error: 'Image not found' });
+        }
+        
+        const filePath = path.join(userNftDir, file);
+        fs.unlinkSync(filePath);
+        
+        console.log(`[NFT] Image deleted: user=${userId} id=${imageId}`);
+        res.json({ success: true });
+    } catch (error) {
+        console.error('[NFT] Delete image error:', error);
+        res.status(500).json({ error: 'Failed to delete image' });
     }
 });
 
