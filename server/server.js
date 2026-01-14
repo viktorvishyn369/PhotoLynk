@@ -3409,6 +3409,131 @@ app.delete('/api/account', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
+// EXIF METADATA PRESERVATION (Universal cross-platform)
+// ============================================================================
+
+// EXIF data is stored by file hash for universal cross-platform preservation
+// When files are synced/restored, EXIF can be applied regardless of source platform
+const EXIF_DIR = path.join(CLOUD_DIR, 'exif');
+if (!fs.existsSync(EXIF_DIR)) {
+    fs.mkdirSync(EXIF_DIR, { recursive: true });
+}
+
+// Get EXIF file path by hash (uses first 2 chars as subdirectory for performance)
+const getExifPath = (fileHash) => {
+    const safeHash = String(fileHash || '').replace(/[^a-fA-F0-9]/g, '').slice(0, 64);
+    if (!safeHash || safeHash.length < 8) return null;
+    const subDir = safeHash.slice(0, 2);
+    const exifSubDir = path.join(EXIF_DIR, subDir);
+    if (!fs.existsSync(exifSubDir)) {
+        fs.mkdirSync(exifSubDir, { recursive: true });
+    }
+    return path.join(exifSubDir, `${safeHash}.json`);
+};
+
+// Store EXIF metadata by file hash
+app.post('/api/exif/store', authenticateToken, async (req, res) => {
+    try {
+        const { fileHash, exif, platform } = req.body || {};
+        
+        if (!fileHash || typeof fileHash !== 'string') {
+            return res.status(400).json({ error: 'Missing or invalid fileHash' });
+        }
+        
+        if (!exif || typeof exif !== 'object') {
+            return res.status(400).json({ error: 'Missing or invalid exif object' });
+        }
+        
+        const exifPath = getExifPath(fileHash);
+        if (!exifPath) {
+            return res.status(400).json({ error: 'Invalid fileHash format' });
+        }
+        
+        // Don't overwrite existing EXIF (first upload wins)
+        if (fs.existsSync(exifPath)) {
+            return res.json({ ok: true, exists: true, message: 'EXIF already stored' });
+        }
+        
+        const exifData = {
+            fileHash: fileHash.slice(0, 64),
+            platform: String(platform || 'unknown').slice(0, 20),
+            storedAt: new Date().toISOString(),
+            userId: req.user.id,
+            exif: exif,
+        };
+        
+        fs.writeFileSync(exifPath, JSON.stringify(exifData, null, 2), 'utf8');
+        console.log(`[EXIF] Stored EXIF for hash ${fileHash.slice(0, 16)}... (${platform})`);
+        
+        return res.json({ ok: true, stored: true });
+    } catch (e) {
+        console.error('[EXIF] Store error:', e.message);
+        return res.status(500).json({ error: 'Failed to store EXIF' });
+    }
+});
+
+// Retrieve EXIF metadata by file hash
+app.get('/api/exif/:fileHash', authenticateToken, async (req, res) => {
+    try {
+        const fileHash = req.params.fileHash;
+        
+        if (!fileHash || typeof fileHash !== 'string') {
+            return res.status(400).json({ error: 'Missing or invalid fileHash' });
+        }
+        
+        const exifPath = getExifPath(fileHash);
+        if (!exifPath) {
+            return res.status(400).json({ error: 'Invalid fileHash format' });
+        }
+        
+        if (!fs.existsSync(exifPath)) {
+            return res.status(404).json({ error: 'EXIF not found', fileHash });
+        }
+        
+        const exifData = JSON.parse(fs.readFileSync(exifPath, 'utf8'));
+        return res.json(exifData);
+    } catch (e) {
+        console.error('[EXIF] Retrieve error:', e.message);
+        return res.status(500).json({ error: 'Failed to retrieve EXIF' });
+    }
+});
+
+// Batch retrieve EXIF for multiple file hashes (for sync operations)
+app.post('/api/exif/batch', authenticateToken, async (req, res) => {
+    try {
+        const { fileHashes } = req.body || {};
+        
+        if (!Array.isArray(fileHashes)) {
+            return res.status(400).json({ error: 'fileHashes must be an array' });
+        }
+        
+        // Limit batch size to prevent abuse
+        const limitedHashes = fileHashes.slice(0, 100);
+        const results = {};
+        
+        for (const hash of limitedHashes) {
+            if (!hash || typeof hash !== 'string') continue;
+            
+            const exifPath = getExifPath(hash);
+            if (!exifPath) continue;
+            
+            if (fs.existsSync(exifPath)) {
+                try {
+                    results[hash] = JSON.parse(fs.readFileSync(exifPath, 'utf8'));
+                } catch (e) {
+                    // Skip invalid files
+                }
+            }
+        }
+        
+        return res.json({ exifData: results, found: Object.keys(results).length });
+    } catch (e) {
+        console.error('[EXIF] Batch retrieve error:', e.message);
+        return res.status(500).json({ error: 'Failed to retrieve EXIF batch' });
+    }
+});
+
+// ============================================================================
 // NFT IMAGE STORAGE (StealthCloud-based, publicly accessible)
 // ============================================================================
 
