@@ -1,6 +1,6 @@
 # PhotoLynk Privacy Policy
 
-**Last Updated**: December 27, 2024
+**Last Updated**: January 16, 2026
 
 **StealthLynk LLC** ("Company," "we," "us," or "our") operates the PhotoLynk application (the "Service"). This Privacy Policy explains how we collect, use, disclose, and safeguard your information when you use our Service.
 
