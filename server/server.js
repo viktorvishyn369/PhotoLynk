@@ -456,6 +456,27 @@ app.get('/admin', adminAuth, (req, res) => {
         </div>
       </div>
 
+      <div class="card" style="border:2px solid #f44336;">
+        <h3 style="color:#f44336;">⚠️ Delete User (DANGER)</h3>
+        <p style="color:#888;font-size:12px;">This will permanently delete the user, their devices, plan, cloud chunks from DB, and optionally their files from disk.</p>
+        <div class="row">
+          <div>
+            <label>User ID (required)</label>
+            <input type="text" id="delete-userId" placeholder="numeric user_id" />
+          </div>
+          <div>
+            <label style="display:flex;align-items:center;gap:8px;margin-top:20px;">
+              <input type="checkbox" id="delete-files" checked style="width:auto;" />
+              Also delete files from disk
+            </label>
+          </div>
+        </div>
+        <div class="flex">
+          <button type="button" onclick="doDeleteUser()" style="background:#f44336;">Delete User</button>
+          <span id="delete-status" class="muted"></span>
+        </div>
+      </div>
+
       <div class="card">
         <h3>All Users</h3>
         <div class="flex">
@@ -474,6 +495,7 @@ app.get('/admin', adminAuth, (req, res) => {
         var resultsEl = document.getElementById('results');
         var lookupStatusEl = document.getElementById('lookup-status');
         var updateStatusEl = document.getElementById('update-status-msg');
+        var deleteStatusEl = document.getElementById('delete-status');
         var usersStatusEl = document.getElementById('users-status');
         var usersTableContainer = document.getElementById('users-table-container');
 
@@ -553,6 +575,37 @@ app.get('/admin', adminAuth, (req, res) => {
           } catch (e) {
             resultsEl.textContent = formatJson({ error: e.message });
             lookupStatusEl.textContent = 'Error';
+          }
+        }
+
+        async function doDeleteUser() {
+          var userId = document.getElementById('delete-userId').value.trim();
+          var deleteFiles = document.getElementById('delete-files').checked;
+          if (!userId) {
+            deleteStatusEl.textContent = 'User ID required';
+            return;
+          }
+          if (!confirm('Are you sure you want to DELETE user ' + userId + '? This cannot be undone!')) {
+            deleteStatusEl.textContent = 'Cancelled';
+            return;
+          }
+          deleteStatusEl.textContent = 'Deleting...';
+          try {
+            var res = await fetch('/admin/api/user/delete', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ userId: Number(userId), deleteFiles: deleteFiles })
+            });
+            var data = await res.json();
+            resultsEl.textContent = formatJson({ status: res.status, data: data });
+            deleteStatusEl.textContent = res.ok ? 'Deleted!' : 'Error';
+            if (res.ok) {
+              document.getElementById('delete-userId').value = '';
+              loadAllUsers();
+            }
+          } catch (e) {
+            resultsEl.textContent = formatJson({ error: e.message });
+            deleteStatusEl.textContent = 'Error';
           }
         }
 
@@ -793,6 +846,104 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
         });
     } catch (e) {
         console.error('[Admin] list users error', e);
+        return res.status(500).json({ error: 'Server error', details: e?.message });
+    }
+});
+
+// Admin API: delete user completely
+app.post('/admin/api/user/delete', adminAuth, async (req, res) => {
+    try {
+        const { userId, deleteFiles } = req.body;
+        
+        if (!userId || typeof userId !== 'number') {
+            return res.status(400).json({ error: 'userId (number) required' });
+        }
+
+        // Get user info first
+        const user = await dbGetAsync(`SELECT * FROM users WHERE id = ?`, [userId]);
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        // Get all devices for this user
+        const devices = await dbAllAsync(`SELECT * FROM devices WHERE user_id = ?`, [userId]);
+        
+        // Get user key for file deletion
+        const userKey = user.user_uuid || String(userId);
+        
+        const deletedItems = {
+            user: user.email || user.user_uuid,
+            userId: userId,
+            devices: devices.length,
+            filesDeleted: false,
+            directories: []
+        };
+
+        // Delete files from disk if requested
+        if (deleteFiles) {
+            const dirsToDelete = [];
+            
+            // User cloud directory (manifests)
+            const userCloudDir = path.join(CLOUD_DIR, 'users', userKey);
+            if (fs.existsSync(userCloudDir)) {
+                dirsToDelete.push(userCloudDir);
+            }
+            
+            // User chunks directory (if separate CHUNKS_DIR)
+            if (CHUNKS_DIR) {
+                const userChunksDir = path.join(CHUNKS_DIR, 'users', userKey);
+                if (fs.existsSync(userChunksDir)) {
+                    dirsToDelete.push(userChunksDir);
+                }
+            }
+            
+            // Device upload directories
+            for (const device of devices) {
+                if (device.device_uuid) {
+                    const deviceDir = path.join(UPLOAD_DIR, device.device_uuid);
+                    if (fs.existsSync(deviceDir)) {
+                        dirsToDelete.push(deviceDir);
+                    }
+                }
+            }
+            
+            // Also check by user_uuid in cloud/users
+            if (user.user_uuid && user.user_uuid !== userKey) {
+                const altCloudDir = path.join(CLOUD_DIR, 'users', user.user_uuid);
+                if (fs.existsSync(altCloudDir)) {
+                    dirsToDelete.push(altCloudDir);
+                }
+            }
+            
+            // Delete directories
+            for (const dir of dirsToDelete) {
+                try {
+                    fs.rmSync(dir, { recursive: true, force: true });
+                    deletedItems.directories.push(dir);
+                    console.log(`[Admin Delete] Removed directory: ${dir}`);
+                } catch (e) {
+                    console.error(`[Admin Delete] Failed to remove ${dir}:`, e.message);
+                }
+            }
+            
+            deletedItems.filesDeleted = dirsToDelete.length > 0;
+        }
+
+        // Delete from database (order matters due to foreign keys)
+        await dbRunAsync(`DELETE FROM cloud_chunks WHERE user_id = ?`, [userId]);
+        await dbRunAsync(`DELETE FROM user_plans WHERE user_id = ?`, [userId]);
+        await dbRunAsync(`DELETE FROM devices WHERE user_id = ?`, [userId]);
+        await dbRunAsync(`DELETE FROM users WHERE id = ?`, [userId]);
+
+        console.log(`[Admin Delete] User ${userId} (${user.email || user.user_uuid}) deleted completely`);
+        
+        return res.json({ 
+            ok: true, 
+            message: `User ${userId} deleted successfully`,
+            deleted: deletedItems
+        });
+    } catch (e) {
+        console.error('[Admin] delete user error', e);
         return res.status(500).json({ error: 'Server error', details: e?.message });
     }
 });
