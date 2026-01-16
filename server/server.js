@@ -881,41 +881,49 @@ app.post('/admin/api/user/delete', adminAuth, async (req, res) => {
 
         // Delete files from disk if requested
         if (deleteFiles) {
-            const dirsToDelete = [];
+            const dirsToDelete = new Set();
             
-            // User cloud directory (manifests)
-            const userCloudDir = path.join(CLOUD_DIR, 'users', userKey);
-            if (fs.existsSync(userCloudDir)) {
-                dirsToDelete.push(userCloudDir);
-            }
+            // Collect all possible user keys (old uuid folders + new numeric id folders)
+            const possibleKeys = new Set();
+            possibleKeys.add(String(userId)); // numeric user id
+            if (user.user_uuid) possibleKeys.add(user.user_uuid); // user_uuid
             
-            // User chunks directory (if separate CHUNKS_DIR)
-            if (CHUNKS_DIR) {
-                const userChunksDir = path.join(CHUNKS_DIR, 'users', userKey);
-                if (fs.existsSync(userChunksDir)) {
-                    dirsToDelete.push(userChunksDir);
+            // Also add device UUIDs as they may have been used as folder keys
+            for (const device of devices) {
+                if (device.device_uuid) {
+                    possibleKeys.add(device.device_uuid);
                 }
             }
             
-            // Device upload directories
-            for (const device of devices) {
-                if (device.device_uuid) {
-                    const deviceDir = path.join(UPLOAD_DIR, device.device_uuid);
-                    if (fs.existsSync(deviceDir)) {
-                        dirsToDelete.push(deviceDir);
+            // Check all possible keys in CLOUD_DIR/users/
+            for (const key of possibleKeys) {
+                const cloudDir = path.join(CLOUD_DIR, 'users', key);
+                if (fs.existsSync(cloudDir)) {
+                    dirsToDelete.add(cloudDir);
+                }
+            }
+            
+            // Check all possible keys in CHUNKS_DIR/users/ (if separate)
+            if (CHUNKS_DIR) {
+                for (const key of possibleKeys) {
+                    const chunksDir = path.join(CHUNKS_DIR, 'users', key);
+                    if (fs.existsSync(chunksDir)) {
+                        dirsToDelete.add(chunksDir);
                     }
                 }
             }
             
-            // Also check by user_uuid in cloud/users
-            if (user.user_uuid && user.user_uuid !== userKey) {
-                const altCloudDir = path.join(CLOUD_DIR, 'users', user.user_uuid);
-                if (fs.existsSync(altCloudDir)) {
-                    dirsToDelete.push(altCloudDir);
+            // Device upload directories in UPLOAD_DIR
+            for (const device of devices) {
+                if (device.device_uuid) {
+                    const deviceDir = path.join(UPLOAD_DIR, device.device_uuid);
+                    if (fs.existsSync(deviceDir)) {
+                        dirsToDelete.add(deviceDir);
+                    }
                 }
             }
             
-            // Delete directories
+            // Delete all found directories
             for (const dir of dirsToDelete) {
                 try {
                     fs.rmSync(dir, { recursive: true, force: true });
@@ -926,7 +934,8 @@ app.post('/admin/api/user/delete', adminAuth, async (req, res) => {
                 }
             }
             
-            deletedItems.filesDeleted = dirsToDelete.length > 0;
+            deletedItems.filesDeleted = dirsToDelete.size > 0;
+            deletedItems.keysChecked = Array.from(possibleKeys);
         }
 
         // Delete from database (order matters due to foreign keys)
