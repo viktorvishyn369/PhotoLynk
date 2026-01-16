@@ -117,7 +117,8 @@ server/backup.db-journal
 
 # Business-only scripts (not for public repo)
 install-server-PhotoSync.sh
-install-server.sh
+install-server-PhotoLynk*.sh
+**/install-server-PhotoLynk*.sh
 
 # StealthLynk private (do not push)
 mobile-v2/
