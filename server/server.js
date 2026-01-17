@@ -229,7 +229,7 @@ const DB_PATH =
 const AUX_ROOT = process.env.PHOTOSYNC_DATA_DIR || path.dirname(UPLOAD_DIR);
 const CLOUD_DIR = process.env.CLOUD_DIR || path.join(AUX_ROOT, 'cloud'); // NVMe: manifests, small data
 const CHUNKS_DIR = process.env.CHUNKS_DIR || null; // HDD RAID10: chunks only (if set)
-const CAPACITY_JSON_PATH = process.env.CAPACITY_JSON_PATH || path.join(AUX_ROOT, 'capacity', 'photosync-capacity.json');
+const CAPACITY_JSON_PATH = process.env.CAPACITY_JSON_PATH || path.join(AUX_ROOT, '.well-known', 'photolynk-capacity.json');
 
 const SUBSCRIPTION_GRACE_DAYS = Number.parseInt(process.env.SUBSCRIPTION_GRACE_DAYS || '3', 10);
 const TRIAL_DAYS = Number.parseInt(process.env.TRIAL_DAYS || '7', 10);
@@ -261,6 +261,9 @@ app.use(express.json());
 
 // Serve static files from public directory (company website assets)
 app.use('/images', express.static(path.join(__dirname, 'public', 'images')));
+
+// Serve .well-known directory for capacity JSON
+app.use('/.well-known', express.static(path.join(AUX_ROOT, '.well-known')));
 
 // Basic IP allowlist helper
 const isIpAllowed = (ip) => {
