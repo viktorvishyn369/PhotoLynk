@@ -112,6 +112,24 @@ else
     echo -e "${GREEN}✓${NC} ffmpeg found: $(ffmpeg -version 2>&1 | head -n1)"
 fi
 
+# Ensure cron is installed/running before any cron entries are added later
+echo ""
+echo -e "${BLUE}[2.6/7]${NC} Checking cron (crontab)..."
+if command -v cron &> /dev/null || command -v crond &> /dev/null; then
+    echo -e "${GREEN}✓${NC} cron found"
+else
+    echo -e "${YELLOW}⚠${NC}  cron not found. Installing..."
+    if command -v apt-get &> /dev/null; then
+        apt-get update -y
+        apt-get install -y cron
+        systemctl enable cron || true
+        systemctl start cron || true
+        echo -e "${GREEN}✓${NC} cron installed and started"
+    else
+        echo -e "${YELLOW}⚠${NC}  Non-apt system detected. Install cron manually if you plan to use scheduled jobs."
+    fi
+fi
+
 # Clone repository
 echo ""
 echo -e "${BLUE}[3/7]${NC} Downloading PhotoLynk..."
