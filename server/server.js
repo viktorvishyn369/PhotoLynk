@@ -4158,9 +4158,9 @@ app.get('/api/nft/images', authenticateToken, async (req, res) => {
 });
 
 // PUBLIC: Serve NFT image (no authentication required)
-// GET /api/nft/image/:userId/:filename
+// GET /api/nft/image/:userId/:filename OR /:userId/:filename (for nft.stealthlynk.io subdomain)
 // This endpoint is publicly accessible so NFT wallets/marketplaces can display images
-app.get('/api/nft/image/:userId/:filename', (req, res) => {
+const serveNftImage = (req, res) => {
     try {
         const { userId, filename } = req.params;
         
@@ -4190,10 +4190,12 @@ app.get('/api/nft/image/:userId/:filename', (req, res) => {
         const contentType = contentTypes[ext] || 'application/octet-stream';
         
         // Set cache headers for CDN/browser caching
+        // Override helmet's restrictive CORP header for public NFT images
         res.set({
             'Content-Type': contentType,
             'Cache-Control': 'public, max-age=31536000, immutable', // 1 year cache
             'Access-Control-Allow-Origin': '*', // Allow cross-origin for NFT viewers
+            'Cross-Origin-Resource-Policy': 'cross-origin', // Allow embedding in any origin
         });
         
         res.sendFile(filePath);
@@ -4201,6 +4203,18 @@ app.get('/api/nft/image/:userId/:filename', (req, res) => {
         console.error('[NFT] Serve image error:', error);
         res.status(500).json({ error: 'Failed to serve image' });
     }
+};
+
+// Register both routes for NFT image serving
+app.get('/api/nft/image/:userId/:filename', serveNftImage);
+// Also handle /:userId/:filename for nft.stealthlynk.io subdomain (no /api/nft/image prefix)
+app.get('/:userId/:filename', (req, res, next) => {
+    // Only handle if userId is numeric and filename looks like an image
+    const { userId, filename } = req.params;
+    if (/^\d+$/.test(userId) && /\.(jpg|jpeg|png|gif|webp)$/i.test(filename)) {
+        return serveNftImage(req, res);
+    }
+    next(); // Pass to other routes if not an NFT image request
 });
 
 // Delete NFT image (authenticated, owner only)
