@@ -3562,8 +3562,8 @@ function hammingDistance64(a, b) {
     return dist;
 }
 
-// Cross-platform dHash threshold (6 bits = ~9% difference tolerance)
-const SERVER_DHASH_THRESHOLD = 6;
+// Cross-platform dHash threshold (3 bits = tighter match tolerance)
+const SERVER_DHASH_THRESHOLD = 3;
 
 // Normalize filename for comparison
 function normalizeFilenameForCompare(name) {

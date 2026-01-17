@@ -544,4 +544,5 @@ if [ -z "$PROXY_DOMAIN" ]; then
     echo ""
 fi
 echo -e "${GREEN}Installation complete!${NC} 🎉"
+echo -e "${YELLOW}Your uploads will be stored in: /opt/photolynk/server/uploads.${NC}"
 echo ""
