@@ -361,8 +361,8 @@ Deletion behavior:
 - Linux, macOS, or Windows
 
 ### Mobile
-- **Android:** 5.0+ (API 21+)
-- **iOS:** 13.0+
+- **Android:** 7.0+ (API 24+)
+- **iOS:** 15.0+
 - Network access to server
 
 ## Privacy
