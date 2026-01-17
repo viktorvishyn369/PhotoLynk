@@ -233,6 +233,7 @@ const CAPACITY_JSON_PATH = process.env.CAPACITY_JSON_PATH || path.join(AUX_ROOT,
 
 const SUBSCRIPTION_GRACE_DAYS = Number.parseInt(process.env.SUBSCRIPTION_GRACE_DAYS || '3', 10);
 const TRIAL_DAYS = Number.parseInt(process.env.TRIAL_DAYS || '7', 10);
+const TRIAL_COMPLIMENTARY_DAYS = Number.parseInt(process.env.TRIAL_COMPLIMENTARY_DAYS || '3', 10);
 const REVENUECAT_WEBHOOK_SECRET = process.env.REVENUECAT_WEBHOOK_SECRET || '';
 const USER_QUOTA_MARGIN_BYTES = Number.parseInt(process.env.USER_QUOTA_MARGIN_BYTES || String(50 * 1024 * 1024), 10);
 const ENABLE_CLOUD_UPLOAD_LOCK = String(process.env.ENABLE_CLOUD_UPLOAD_LOCK || 'true').toLowerCase() !== 'false';
@@ -1129,6 +1130,9 @@ const resolveSubscriptionState = async (userId) => {
         };
     }
 
+    const complimentaryMs = Math.max(0, TRIAL_COMPLIMENTARY_DAYS) * 24 * 60 * 60 * 1000;
+    const complimentaryUntil = trialUntil ? (trialUntil + complimentaryMs) : null;
+
     if (trialUntil && trialUntil > now) {
         return {
             allowed: true,
@@ -1138,26 +1142,44 @@ const resolveSubscriptionState = async (userId) => {
             graceUntil: graceUntil || null,
             planGb: row.plan_gb || null,
             paymentType: row.payment_type || null,
+            complimentaryUntil,
         };
     }
 
-    if (row.status === 'trial' && trialUntil && trialUntil > 0 && trialUntil <= now) {
+    // Complimentary window after trial for sync-only access
+    if (row.status === 'trial' && trialUntil && trialUntil > 0 && complimentaryUntil && now <= complimentaryUntil) {
+        // Allow read/sync, block uploads via requireUploadSubscription
+        return {
+            allowed: true,
+            status: 'trial_complimentary',
+            trialUntil,
+            complimentaryUntil,
+            expiresAt: expiresAt || null,
+            graceUntil: graceUntil || null,
+            planGb: row.plan_gb || null,
+            paymentType: row.payment_type || null,
+        };
+    }
+
+    // Complimentary ended – clear plan selection to free it up
+    if (row.status === 'trial' && trialUntil && trialUntil > 0 && complimentaryUntil && complimentaryUntil < now) {
         try {
             const updatedAt = Date.now();
             await dbRunAsync(
-                `UPDATE user_plans SET status = ?, updated_at = ? WHERE user_id = ?`,
-                ['trial_expired', updatedAt, userId]
+                `UPDATE user_plans SET status = ?, plan_gb = NULL, trial_until = NULL, grace_until = NULL, expires_at = NULL, updated_at = ? WHERE user_id = ?`,
+                ['trial_complimentary_expired', updatedAt, userId]
             );
         } catch (e) {
             // ignore
         }
         return {
             allowed: false,
-            status: 'trial_expired',
+            status: 'trial_complimentary_expired',
             trialUntil,
-            expiresAt: expiresAt || null,
-            graceUntil: graceUntil || null,
-            planGb: row.plan_gb || null,
+            complimentaryUntil,
+            expiresAt: null,
+            graceUntil: null,
+            planGb: null,
             paymentType: row.payment_type || null,
         };
     }
@@ -1228,6 +1250,10 @@ const requireActiveSubscription = async (req, res, next) => {
         const st = await resolveSubscriptionState(req.user.id);
         if (st.allowed) return next();
 
+        if (st.status === 'trial_complimentary') {
+            return next(); // allow sync/read during complimentary window
+        }
+
         if (st.status === 'grace' || st.status === 'grace_expired') {
             return res.status(402).json({
                 error: 'Subscription expired',
@@ -1238,11 +1264,12 @@ const requireActiveSubscription = async (req, res, next) => {
             });
         }
 
-        if (st.status === 'trial_expired') {
+        if (st.status === 'trial_expired' || st.status === 'trial_complimentary_expired') {
             return res.status(402).json({
                 error: 'Trial expired',
                 code: 'TRIAL_EXPIRED',
                 trialUntil: st.trialUntil,
+                complimentaryUntil: st.complimentaryUntil || null,
             });
         }
 
@@ -1269,6 +1296,15 @@ const requireUploadSubscription = async (req, res, next) => {
     try {
         const st = await resolveSubscriptionState(req.user.id);
         if (st.status === 'active' || st.status === 'trial') return next();
+
+        if (st.status === 'trial_complimentary') {
+            return res.status(402).json({
+                error: 'Trial complimentary window (sync-only)',
+                code: 'TRIAL_COMPLIMENTARY_SYNC_ONLY',
+                trialUntil: st.trialUntil,
+                complimentaryUntil: st.complimentaryUntil || null,
+            });
+        }
 
         if (st.status === 'grace' || st.status === 'grace_expired') {
             return res.status(402).json({
