@@ -263,7 +263,7 @@ app.use(express.json());
 app.use('/images', express.static(path.join(__dirname, 'public', 'images')));
 
 // Serve .well-known directory for capacity JSON
-app.use('/.well-known', express.static(path.join(AUX_ROOT, 'capacity')));
+app.use('/.well-known', express.static(path.join(AUX_ROOT, '.well-known')));
 
 // Basic IP allowlist helper
 const isIpAllowed = (ip) => {
