@@ -3319,8 +3319,8 @@ app.get('/api/files/:filename', authenticateToken, (req, res) => {
 // --- StealthCloud (zero-knowledge) routes ---
 // Server stores encrypted chunks and encrypted manifests only.
 
-// Server uptime status (for stealthlynk.io display) - persistent across restarts
-const UPTIME_STATE_PATH = path.join(DATA_DIR, 'uptime.json');
+// Server uptime status (for stealthlynk.io display) - persistent across restarts and shareable via rsync
+const UPTIME_STATE_PATH = process.env.UPTIME_STATE_PATH || path.join(DATA_DIR, 'uptime.json');
 function loadUptimeState() {
     try {
         if (!fs.existsSync(UPTIME_STATE_PATH)) {
