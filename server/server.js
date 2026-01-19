@@ -3319,24 +3319,78 @@ app.get('/api/files/:filename', authenticateToken, (req, res) => {
 // --- StealthCloud (zero-knowledge) routes ---
 // Server stores encrypted chunks and encrypted manifests only.
 
-// Server uptime status (for stealthlynk.io display)
-const SERVER_STARTED_AT = Date.now();
+// Server uptime status (for stealthlynk.io display) - persistent across restarts
+const UPTIME_STATE_PATH = path.join(DATA_DIR, 'uptime.json');
+function loadUptimeState() {
+    try {
+        if (!fs.existsSync(UPTIME_STATE_PATH)) {
+            return null;
+        }
+        const raw = fs.readFileSync(UPTIME_STATE_PATH, 'utf8');
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object') return null;
+        const { startedAt, lastSeen, downtimeMs } = parsed;
+        if (!startedAt || !lastSeen || downtimeMs === undefined) return null;
+        return {
+            startedAt: Number(startedAt),
+            lastSeen: Number(lastSeen),
+            downtimeMs: Math.max(0, Number(downtimeMs) || 0)
+        };
+    } catch (e) {
+        return null;
+    }
+}
+
+function saveUptimeState(state) {
+    try {
+        fs.mkdirSync(path.dirname(UPTIME_STATE_PATH), { recursive: true });
+        fs.writeFileSync(UPTIME_STATE_PATH, JSON.stringify(state));
+    } catch (e) {
+        // best effort
+    }
+}
+
+// Initialize uptime state
+let uptimeState = loadUptimeState();
+const nowInit = Date.now();
+if (!uptimeState) {
+    uptimeState = {
+        startedAt: nowInit,
+        lastSeen: nowInit,
+        downtimeMs: 0
+    };
+    saveUptimeState(uptimeState);
+} else {
+    // count downtime between lastSeen and nowInit
+    const gap = Math.max(0, nowInit - uptimeState.lastSeen);
+    uptimeState.downtimeMs += gap;
+    uptimeState.lastSeen = nowInit;
+    saveUptimeState(uptimeState);
+}
+
+// Heartbeat to persist lastSeen while server is up
+setInterval(() => {
+    uptimeState.lastSeen = Date.now();
+    saveUptimeState(uptimeState);
+}, 60 * 1000).unref();
+
 app.get('/api/status/uptime', (_req, res) => {
     const now = Date.now();
-    const uptimeMs = now - SERVER_STARTED_AT;
-    const uptimeSec = Math.max(0, Math.floor(uptimeMs / 1000));
-    // Start at 100% for the first 24h; afterwards use uptimeSec/86400 capped at 100%
-    const pct24h = uptimeSec < 86400 ? 1 : Math.min(1, uptimeSec / 86400);
+    const elapsedMs = Math.max(0, now - uptimeState.startedAt);
+    const uptimeMs = Math.max(0, elapsedMs - uptimeState.downtimeMs);
+    const uptimeSec = Math.floor(uptimeMs / 1000);
+
+    const pctLifetime = elapsedMs > 0 ? Math.max(0, Math.min(1, uptimeMs / elapsedMs)) : 1;
 
     res.setHeader('Cache-Control', 'no-store');
     return res.json({
         ok: true,
-        startedAt: SERVER_STARTED_AT,
+        startedAt: uptimeState.startedAt,
         now,
         uptimeSeconds: uptimeSec,
         uptimeHours: +(uptimeSec / 3600).toFixed(2),
         uptimeDays: +(uptimeSec / 86400).toFixed(3),
-        uptimePct24h: +(pct24h * 100).toFixed(2)
+        uptimePct24h: +(pctLifetime * 100).toFixed(2)
     });
 });
 
