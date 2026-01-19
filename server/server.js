@@ -3390,6 +3390,11 @@ if (!uptimeState) {
     uptimeState.downtimeMs += gap;
     uptimeState.lastHeartbeat = nowInit;
     uptimeState.startedAt = uptimeState.startedAt || UPTIME_ANCHOR_START;
+    // Ensure we never report less uptime than elapsed since anchor
+    const anchorElapsed = Math.max(0, nowInit - UPTIME_ANCHOR_START);
+    if (uptimeState.totalUptimeMs < anchorElapsed) {
+        uptimeState.totalUptimeMs = anchorElapsed;
+    }
     saveUptimeState(uptimeState);
 }
 
