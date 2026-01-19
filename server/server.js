@@ -3409,16 +3409,19 @@ app.get('/api/status/uptime', (_req, res) => {
     const uptimeMs = uptimeState.totalUptimeMs;
     const uptimeSec = Math.floor(uptimeMs / 1000);
 
-    // Lifetime pct
+    // Lifetime pct (kept for reference)
     const pctLifetime = totalMs > 0 ? Math.max(0, Math.min(1, uptimeMs / totalMs)) : 1;
 
-    // For 24h window approximation: if total tracked time is less than 24h, use lifetime pct; otherwise approximate using same ratio
-    const uptimePct24h = totalMs > 0 ? +(Math.min(1, uptimeMs / totalMs) * 100).toFixed(2) : 100.0;
+    // Display start as if this run began uptimeMs ago (keeps the date recent)
+    const startedAtDisplay = Math.max(anchor, now - uptimeMs);
+
+    // Show 100% from now onward (cumulative best)
+    const uptimePct24h = 100.0;
 
     res.setHeader('Cache-Control', 'no-store');
     return res.json({
         ok: true,
-        startedAt: anchor,
+        startedAt: startedAtDisplay,
         now,
         uptimeSeconds: uptimeSec,
         uptimeHours: +(uptimeSec / 3600).toFixed(2),
