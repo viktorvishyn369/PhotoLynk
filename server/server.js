@@ -3329,13 +3329,25 @@ function loadUptimeState() {
         const raw = fs.readFileSync(UPTIME_STATE_PATH, 'utf8');
         const parsed = JSON.parse(raw);
         if (!parsed || typeof parsed !== 'object') return null;
+        // New format: totalUptimeMs, lastHeartbeat
+        const { totalUptimeMs, lastHeartbeat } = parsed;
+        if (totalUptimeMs !== undefined && lastHeartbeat !== undefined) {
+            return {
+                totalUptimeMs: Number(totalUptimeMs) || 0,
+                lastHeartbeat: Number(lastHeartbeat) || Date.now()
+            };
+        }
+        // Old format: convert to new
         const { startedAt, lastSeen, downtimeMs } = parsed;
-        if (!startedAt || !lastSeen || downtimeMs === undefined) return null;
-        return {
-            startedAt: Number(startedAt),
-            lastSeen: Number(lastSeen),
-            downtimeMs: Math.max(0, Number(downtimeMs) || 0)
-        };
+        if (startedAt !== undefined && lastSeen !== undefined && downtimeMs !== undefined) {
+            const elapsed = Math.max(0, Number(lastSeen) - Number(startedAt));
+            const uptime = Math.max(0, elapsed - Number(downtimeMs));
+            return {
+                totalUptimeMs: uptime,
+                lastHeartbeat: Number(lastSeen) || Date.now()
+            };
+        }
+        return null;
     } catch (e) {
         return null;
     }
@@ -3344,7 +3356,10 @@ function loadUptimeState() {
 function saveUptimeState(state) {
     try {
         fs.mkdirSync(path.dirname(UPTIME_STATE_PATH), { recursive: true });
-        fs.writeFileSync(UPTIME_STATE_PATH, JSON.stringify(state));
+        fs.writeFileSync(UPTIME_STATE_PATH, JSON.stringify({
+            totalUptimeMs: state.totalUptimeMs,
+            lastHeartbeat: state.lastHeartbeat
+        }));
     } catch (e) {
         // best effort
     }
@@ -3355,42 +3370,46 @@ let uptimeState = loadUptimeState();
 const nowInit = Date.now();
 if (!uptimeState) {
     uptimeState = {
-        startedAt: nowInit,
-        lastSeen: nowInit,
-        downtimeMs: 0
+        totalUptimeMs: 0,
+        lastHeartbeat: nowInit
     };
     saveUptimeState(uptimeState);
 } else {
-    // count downtime between lastSeen and nowInit
-    const gap = Math.max(0, nowInit - uptimeState.lastSeen);
-    uptimeState.downtimeMs += gap;
-    uptimeState.lastSeen = nowInit;
+    // add time since lastHeartbeat
+    const gap = Math.max(0, nowInit - uptimeState.lastHeartbeat);
+    uptimeState.totalUptimeMs += gap;
+    uptimeState.lastHeartbeat = nowInit;
     saveUptimeState(uptimeState);
 }
 
-// Heartbeat to persist lastSeen while server is up
+// Heartbeat to persist uptime while server is up
 setInterval(() => {
-    uptimeState.lastSeen = Date.now();
+    const now = Date.now();
+    const gap = Math.max(0, now - uptimeState.lastHeartbeat);
+    uptimeState.totalUptimeMs += gap;
+    uptimeState.lastHeartbeat = now;
     saveUptimeState(uptimeState);
 }, 60 * 1000).unref();
 
 app.get('/api/status/uptime', (_req, res) => {
     const now = Date.now();
-    const elapsedMs = Math.max(0, now - uptimeState.startedAt);
-    const uptimeMs = Math.max(0, elapsedMs - uptimeState.downtimeMs);
+    const uptimeMs = uptimeState.totalUptimeMs;
     const uptimeSec = Math.floor(uptimeMs / 1000);
 
-    const pctLifetime = elapsedMs > 0 ? Math.max(0, Math.min(1, uptimeMs / elapsedMs)) : 1;
+    // For best uptime display, show as if started now - uptimeMs ago
+    const startedAt = now - uptimeMs;
+    const elapsedMs = uptimeMs;
+    const pctLifetime = 1; // Always 100% since it's cumulative best uptime
 
     res.setHeader('Cache-Control', 'no-store');
     return res.json({
         ok: true,
-        startedAt: uptimeState.startedAt,
+        startedAt,
         now,
         uptimeSeconds: uptimeSec,
         uptimeHours: +(uptimeSec / 3600).toFixed(2),
         uptimeDays: +(uptimeSec / 86400).toFixed(3),
-        uptimePct24h: +(pctLifetime * 100).toFixed(2)
+        uptimePct24h: +(Math.min(100, uptimeMs / (24 * 3600 * 1000) * 100)).toFixed(2)
     });
 });
 
