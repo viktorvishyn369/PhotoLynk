@@ -3320,8 +3320,9 @@ app.get('/api/files/:filename', authenticateToken, (req, res) => {
 // Server stores encrypted chunks and encrypted manifests only.
 
 // Server uptime status (persistent and shareable)
-// Tracks: totalUptimeMs (cumulative on-time), downtimeMs (cumulative off-time), lastHeartbeat (last seen running)
+// Tracks: totalUptimeMs (cumulative on-time), downtimeMs (cumulative off-time), lastHeartbeat (last seen running), startedAt (anchor for lifetime history)
 const UPTIME_STATE_PATH = process.env.UPTIME_STATE_PATH || path.join(DATA_DIR, 'uptime.json');
+const UPTIME_ANCHOR_START = new Date('2026-01-01T00:00:00Z').getTime();
 function loadUptimeState() {
     try {
         if (!fs.existsSync(UPTIME_STATE_PATH)) return null;
@@ -3334,7 +3335,8 @@ function loadUptimeState() {
             return {
                 totalUptimeMs: Math.max(0, Number(parsed.totalUptimeMs) || 0),
                 downtimeMs: Math.max(0, Number(parsed.downtimeMs) || 0),
-                lastHeartbeat: Number(parsed.lastHeartbeat) || Date.now()
+                lastHeartbeat: Number(parsed.lastHeartbeat) || Date.now(),
+                startedAt: Number(parsed.startedAt) || UPTIME_ANCHOR_START
             };
         }
 
@@ -3346,7 +3348,8 @@ function loadUptimeState() {
             return {
                 totalUptimeMs: uptime,
                 downtimeMs: Math.max(0, Number(downtimeMs) || 0),
-                lastHeartbeat: Number(lastSeen) || Date.now()
+                lastHeartbeat: Number(lastSeen) || Date.now(),
+                startedAt: Number(startedAt) || UPTIME_ANCHOR_START
             };
         }
         return null;
@@ -3361,7 +3364,8 @@ function saveUptimeState(state) {
         fs.writeFileSync(UPTIME_STATE_PATH, JSON.stringify({
             totalUptimeMs: state.totalUptimeMs,
             downtimeMs: state.downtimeMs,
-            lastHeartbeat: state.lastHeartbeat
+            lastHeartbeat: state.lastHeartbeat,
+            startedAt: state.startedAt
         }));
     } catch (e) {
         // best effort
@@ -3375,7 +3379,8 @@ if (!uptimeState) {
     uptimeState = {
         totalUptimeMs: 0,
         downtimeMs: 0,
-        lastHeartbeat: nowInit
+        lastHeartbeat: nowInit,
+        startedAt: UPTIME_ANCHOR_START
     };
     saveUptimeState(uptimeState);
 } else {
@@ -3383,6 +3388,7 @@ if (!uptimeState) {
     const gap = Math.max(0, nowInit - uptimeState.lastHeartbeat);
     uptimeState.downtimeMs += gap;
     uptimeState.lastHeartbeat = nowInit;
+    uptimeState.startedAt = uptimeState.startedAt || UPTIME_ANCHOR_START;
     saveUptimeState(uptimeState);
 }
 
@@ -3397,8 +3403,9 @@ setInterval(() => {
 
 app.get('/api/status/uptime', (_req, res) => {
     const now = Date.now();
-    // No explicit windowed downtime tracking; we track total uptime/downtime since first run
-    const totalMs = uptimeState.totalUptimeMs + uptimeState.downtimeMs;
+    // Lifetime tracking anchored to startedAt
+    const anchor = uptimeState.startedAt || UPTIME_ANCHOR_START;
+    const totalMs = Math.max(0, now - anchor);
     const uptimeMs = uptimeState.totalUptimeMs;
     const uptimeSec = Math.floor(uptimeMs / 1000);
 
@@ -3411,7 +3418,7 @@ app.get('/api/status/uptime', (_req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     return res.json({
         ok: true,
-        startedAt: now - totalMs,
+        startedAt: anchor,
         now,
         uptimeSeconds: uptimeSec,
         uptimeHours: +(uptimeSec / 3600).toFixed(2),
