@@ -3319,6 +3319,26 @@ app.get('/api/files/:filename', authenticateToken, (req, res) => {
 // --- StealthCloud (zero-knowledge) routes ---
 // Server stores encrypted chunks and encrypted manifests only.
 
+// Server uptime status (for stealthlynk.io display)
+const SERVER_STARTED_AT = Date.now();
+app.get('/api/status/uptime', (_req, res) => {
+    const now = Date.now();
+    const uptimeMs = now - SERVER_STARTED_AT;
+    const uptimeSec = Math.max(0, Math.floor(uptimeMs / 1000));
+    const pct24h = Math.min(1, uptimeSec / 86400);
+
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json({
+        ok: true,
+        startedAt: SERVER_STARTED_AT,
+        now,
+        uptimeSeconds: uptimeSec,
+        uptimeHours: +(uptimeSec / 3600).toFixed(2),
+        uptimeDays: +(uptimeSec / 86400).toFixed(3),
+        uptimePct24h: +(pct24h * 100).toFixed(2)
+    });
+});
+
 app.post('/api/cloud/purge', authenticateToken, async (req, res) => {
     try {
         const { chunksDir, manifestsDir } = ensureStealthCloudUserDirs(req.user);
