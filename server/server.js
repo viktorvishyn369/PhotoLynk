@@ -3411,18 +3411,21 @@ app.get('/api/status/uptime', (_req, res) => {
     const now = Date.now();
     // Lifetime tracking anchored to startedAt
     const anchor = uptimeState.startedAt || UPTIME_ANCHOR_START;
-    const totalMs = Math.max(0, now - anchor);
+    const totalMs = Math.max(0, uptimeState.totalUptimeMs + uptimeState.downtimeMs);
+    const anchorElapsed = Math.max(0, now - anchor);
+    // If totals drift behind wall-clock since anchor, clamp totalMs up so pct math stays valid
+    const effectiveTotalMs = Math.max(totalMs, anchorElapsed);
     const uptimeMs = uptimeState.totalUptimeMs;
     const uptimeSec = Math.floor(uptimeMs / 1000);
 
     // Lifetime pct (kept for reference)
-    const pctLifetime = totalMs > 0 ? Math.max(0, Math.min(1, uptimeMs / totalMs)) : 1;
+    const pctLifetime = effectiveTotalMs > 0 ? Math.max(0, Math.min(1, uptimeMs / effectiveTotalMs)) : 1;
 
     // Use anchor as lifetime start (shows history from 2026-01-01)
     const startedAtDisplay = anchor;
 
-    // Show 100% from now onward (cumulative best)
-    const uptimePct24h = 100.0;
+    // Reflect actual uptime ratio (adds uptime when up, downtime when down)
+    const uptimePct24h = +(pctLifetime * 100).toFixed(2);
 
     res.setHeader('Cache-Control', 'no-store');
     return res.json({
