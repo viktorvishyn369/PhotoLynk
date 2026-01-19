@@ -3412,8 +3412,8 @@ app.get('/api/status/uptime', (_req, res) => {
     // Lifetime pct (kept for reference)
     const pctLifetime = totalMs > 0 ? Math.max(0, Math.min(1, uptimeMs / totalMs)) : 1;
 
-    // Display start as if this run began uptimeMs ago (keeps the date recent)
-    const startedAtDisplay = Math.max(anchor, now - uptimeMs);
+    // Use anchor as lifetime start (shows history from 2026-01-01)
+    const startedAtDisplay = anchor;
 
     // Show 100% from now onward (cumulative best)
     const uptimePct24h = 100.0;
