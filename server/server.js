@@ -3325,7 +3325,9 @@ app.get('/api/status/uptime', (_req, res) => {
     const now = Date.now();
     const uptimeMs = now - SERVER_STARTED_AT;
     const uptimeSec = Math.max(0, Math.floor(uptimeMs / 1000));
-    const pct24h = Math.min(1, uptimeSec / 86400);
+    // Start at 100% and keep 100% until a full 24h window is available
+    const baselineWindowSec = Math.max(uptimeSec, 86400);
+    const pct24h = Math.min(1, uptimeSec / baselineWindowSec);
 
     res.setHeader('Cache-Control', 'no-store');
     return res.json({
