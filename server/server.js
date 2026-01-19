@@ -3377,7 +3377,8 @@ let uptimeState = loadUptimeState();
 const nowInit = Date.now();
 if (!uptimeState) {
     uptimeState = {
-        totalUptimeMs: 0,
+        // On first install, prefill uptime with elapsed time since anchor so counters start from history
+        totalUptimeMs: Math.max(0, nowInit - UPTIME_ANCHOR_START),
         downtimeMs: 0,
         lastHeartbeat: nowInit,
         startedAt: UPTIME_ANCHOR_START
