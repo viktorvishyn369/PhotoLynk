@@ -3319,31 +3319,33 @@ app.get('/api/files/:filename', authenticateToken, (req, res) => {
 // --- StealthCloud (zero-knowledge) routes ---
 // Server stores encrypted chunks and encrypted manifests only.
 
-// Server uptime status (for stealthlynk.io display) - persistent across restarts and shareable via rsync
+// Server uptime status (persistent and shareable)
+// Tracks: totalUptimeMs (cumulative on-time), downtimeMs (cumulative off-time), lastHeartbeat (last seen running)
 const UPTIME_STATE_PATH = process.env.UPTIME_STATE_PATH || path.join(DATA_DIR, 'uptime.json');
 function loadUptimeState() {
     try {
-        if (!fs.existsSync(UPTIME_STATE_PATH)) {
-            return null;
-        }
+        if (!fs.existsSync(UPTIME_STATE_PATH)) return null;
         const raw = fs.readFileSync(UPTIME_STATE_PATH, 'utf8');
         const parsed = JSON.parse(raw);
         if (!parsed || typeof parsed !== 'object') return null;
-        // New format: totalUptimeMs, lastHeartbeat
-        const { totalUptimeMs, lastHeartbeat } = parsed;
-        if (totalUptimeMs !== undefined && lastHeartbeat !== undefined) {
+
+        // New format
+        if (parsed.totalUptimeMs !== undefined && parsed.downtimeMs !== undefined && parsed.lastHeartbeat !== undefined) {
             return {
-                totalUptimeMs: Number(totalUptimeMs) || 0,
-                lastHeartbeat: Number(lastHeartbeat) || Date.now()
+                totalUptimeMs: Math.max(0, Number(parsed.totalUptimeMs) || 0),
+                downtimeMs: Math.max(0, Number(parsed.downtimeMs) || 0),
+                lastHeartbeat: Number(parsed.lastHeartbeat) || Date.now()
             };
         }
-        // Old format: convert to new
+
+        // Old format: convert startedAt/lastSeen/downtimeMs
         const { startedAt, lastSeen, downtimeMs } = parsed;
         if (startedAt !== undefined && lastSeen !== undefined && downtimeMs !== undefined) {
             const elapsed = Math.max(0, Number(lastSeen) - Number(startedAt));
             const uptime = Math.max(0, elapsed - Number(downtimeMs));
             return {
                 totalUptimeMs: uptime,
+                downtimeMs: Math.max(0, Number(downtimeMs) || 0),
                 lastHeartbeat: Number(lastSeen) || Date.now()
             };
         }
@@ -3358,6 +3360,7 @@ function saveUptimeState(state) {
         fs.mkdirSync(path.dirname(UPTIME_STATE_PATH), { recursive: true });
         fs.writeFileSync(UPTIME_STATE_PATH, JSON.stringify({
             totalUptimeMs: state.totalUptimeMs,
+            downtimeMs: state.downtimeMs,
             lastHeartbeat: state.lastHeartbeat
         }));
     } catch (e) {
@@ -3371,18 +3374,19 @@ const nowInit = Date.now();
 if (!uptimeState) {
     uptimeState = {
         totalUptimeMs: 0,
+        downtimeMs: 0,
         lastHeartbeat: nowInit
     };
     saveUptimeState(uptimeState);
 } else {
-    // add time since lastHeartbeat
+    // If we were down between lastHeartbeat and now, count it as downtime
     const gap = Math.max(0, nowInit - uptimeState.lastHeartbeat);
-    uptimeState.totalUptimeMs += gap;
+    uptimeState.downtimeMs += gap;
     uptimeState.lastHeartbeat = nowInit;
     saveUptimeState(uptimeState);
 }
 
-// Heartbeat to persist uptime while server is up
+// Heartbeat: add uptime since last heartbeat
 setInterval(() => {
     const now = Date.now();
     const gap = Math.max(0, now - uptimeState.lastHeartbeat);
@@ -3393,23 +3397,27 @@ setInterval(() => {
 
 app.get('/api/status/uptime', (_req, res) => {
     const now = Date.now();
+    // No explicit windowed downtime tracking; we track total uptime/downtime since first run
+    const totalMs = uptimeState.totalUptimeMs + uptimeState.downtimeMs;
     const uptimeMs = uptimeState.totalUptimeMs;
     const uptimeSec = Math.floor(uptimeMs / 1000);
 
-    // For best uptime display, show as if started now - uptimeMs ago
-    const startedAt = now - uptimeMs;
-    const elapsedMs = uptimeMs;
-    const pctLifetime = 1; // Always 100% since it's cumulative best uptime
+    // Lifetime pct
+    const pctLifetime = totalMs > 0 ? Math.max(0, Math.min(1, uptimeMs / totalMs)) : 1;
+
+    // For 24h window approximation: if total tracked time is less than 24h, use lifetime pct; otherwise approximate using same ratio
+    const uptimePct24h = totalMs > 0 ? +(Math.min(1, uptimeMs / totalMs) * 100).toFixed(2) : 100.0;
 
     res.setHeader('Cache-Control', 'no-store');
     return res.json({
         ok: true,
-        startedAt,
+        startedAt: now - totalMs,
         now,
         uptimeSeconds: uptimeSec,
         uptimeHours: +(uptimeSec / 3600).toFixed(2),
         uptimeDays: +(uptimeSec / 86400).toFixed(3),
-        uptimePct24h: +(Math.min(100, uptimeMs / (24 * 3600 * 1000) * 100)).toFixed(2)
+        uptimePct24h,
+        pctLifetime: +(pctLifetime * 100).toFixed(2)
     });
 });
 
