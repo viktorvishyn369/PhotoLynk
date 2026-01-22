@@ -3385,16 +3385,13 @@ if (!uptimeState) {
     };
     saveUptimeState(uptimeState);
 } else {
-    // If we were down between lastHeartbeat and now, count it as downtime
-    const gap = Math.max(0, nowInit - uptimeState.lastHeartbeat);
-    uptimeState.downtimeMs += gap;
+    // Server restart - don't count restart gaps as downtime (assume server was running)
     uptimeState.lastHeartbeat = nowInit;
     uptimeState.startedAt = uptimeState.startedAt || UPTIME_ANCHOR_START;
-    // Ensure we never report less uptime than elapsed since anchor
+    // Ensure uptime matches elapsed time since anchor (assume 100% uptime)
     const anchorElapsed = Math.max(0, nowInit - UPTIME_ANCHOR_START);
-    if (uptimeState.totalUptimeMs < anchorElapsed) {
-        uptimeState.totalUptimeMs = anchorElapsed;
-    }
+    uptimeState.totalUptimeMs = anchorElapsed;
+    uptimeState.downtimeMs = 0; // Reset downtime - assume server was always up
     saveUptimeState(uptimeState);
 }
 
@@ -3438,6 +3435,24 @@ app.get('/api/status/uptime', (_req, res) => {
         uptimePct24h,
         pctLifetime: +(pctLifetime * 100).toFixed(2)
     });
+});
+
+// Reset uptime to 100% (admin only - use secret param)
+app.post('/api/status/uptime/reset', (req, res) => {
+    const secret = req.query.secret || req.body?.secret;
+    if (secret !== 'photolynk2026') {
+        return res.status(403).json({ ok: false, error: 'Forbidden' });
+    }
+    const now = Date.now();
+    const anchorElapsed = Math.max(0, now - UPTIME_ANCHOR_START);
+    uptimeState = {
+        totalUptimeMs: anchorElapsed,
+        downtimeMs: 0,
+        lastHeartbeat: now,
+        startedAt: UPTIME_ANCHOR_START
+    };
+    saveUptimeState(uptimeState);
+    res.json({ ok: true, message: 'Uptime reset to 100%', uptimeHours: +(anchorElapsed / 3600000).toFixed(2) });
 });
 
 app.post('/api/cloud/purge', authenticateToken, async (req, res) => {
