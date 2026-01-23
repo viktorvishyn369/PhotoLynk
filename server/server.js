@@ -4245,15 +4245,9 @@ app.post('/api/nft/upload', authenticateToken, nftUpload.single('image'), async 
         const userId = req.user.id;
         const fileSize = req.file.size;
         
-        // Check eligibility
-        const eligibility = await checkNftStorageEligibility(userId, fileSize);
-        if (!eligibility.eligible) {
-            return res.status(403).json({ 
-                error: eligibility.reason,
-                availableBytes: eligibility.availableBytes,
-                requiredBytes: eligibility.requiredBytes,
-            });
-        }
+        // NFT uploads are allowed for all authenticated users without subscription check
+        // NFT images/thumbnails are essential for NFT functionality and users pay commission per mint
+        // No quota check - NFT storage is separate from backup storage
         
         // Generate unique image ID
         const imageId = crypto.randomBytes(16).toString('hex');
