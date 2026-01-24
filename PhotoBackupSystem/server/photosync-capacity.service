@@ -1,0 +1,9 @@
+[Unit]
+Description=PhotoSync Capacity JSON Generator
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/photolynk/server
+EnvironmentFile=-/etc/photosync/photosync.env
+ExecStart=/usr/bin/env node /opt/photolynk/server/generate-capacity-json.js

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run PhotoSync capacity generator periodically
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=2min
+Unit=photosync-capacity.service
+
+[Install]
+WantedBy=timers.target
