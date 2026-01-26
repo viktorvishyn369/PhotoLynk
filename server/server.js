@@ -4505,6 +4505,1051 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
     }
 });
 
+// Solana RPC proxy - avoids CORS issues when calling from browser
+app.post('/solana-rpc', async (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    
+    const rpcEndpoints = [
+        'https://api.mainnet-beta.solana.com',
+        'https://rpc.ankr.com/solana',
+        'https://solana-mainnet.g.alchemy.com/v2/demo'
+    ];
+    
+    for (const rpc of rpcEndpoints) {
+        try {
+            const response = await axios.post(rpc, req.body, {
+                headers: { 'Content-Type': 'application/json' },
+                timeout: 10000
+            });
+            return res.json(response.data);
+        } catch (e) {
+            console.log('[Solana RPC] Failed:', rpc, e.message);
+        }
+    }
+    
+    res.status(503).json({ error: 'All RPC endpoints failed' });
+});
+
+// Handle CORS preflight for solana-rpc
+app.options('/solana-rpc', (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.sendStatus(200);
+});
+
+// Serve local images via HTTP (for Electron renderer which can't access file:// directly)
+app.get('/local-image', (req, res) => {
+    const imagePath = req.query.path;
+    if (!imagePath) {
+        return res.status(400).json({ error: 'No path provided' });
+    }
+    
+    const resolvedPath = path.resolve(imagePath);
+    
+    // Allow any path for now (desktop app is trusted)
+    if (!fs.existsSync(resolvedPath)) {
+        return res.status(404).json({ error: 'File not found' });
+    }
+    
+    // Determine content type
+    const ext = path.extname(resolvedPath).toLowerCase();
+    const mimeTypes = {
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.png': 'image/png',
+        '.gif': 'image/gif',
+        '.webp': 'image/webp',
+        '.heic': 'image/heic',
+        '.heif': 'image/heif',
+    };
+    
+    // Add CORS headers for Electron renderer
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET');
+    res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+    res.setHeader('Content-Type', mimeTypes[ext] || 'image/jpeg');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    fs.createReadStream(resolvedPath).pipe(res);
+});
+
+// NFT Payment page - served via HTTP so Phantom extension can interact with it
+app.get('/nft-payment', (req, res) => {
+    // Set permissive CSP to allow Solana CDN and IPFS gateways
+    res.setHeader('Content-Security-Policy', "default-src 'self' 'unsafe-inline' 'unsafe-eval'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net https://unpkg.com https://bundle.run; img-src 'self' data: blob: https: http:; connect-src 'self' https: wss:; style-src 'self' 'unsafe-inline';");
+    res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PhotoLynk NFT Payment</title>
+  <script src="https://bundle.run/buffer@6.0.3"></script>
+  <script>if(typeof window.Buffer==='undefined')window.Buffer=buffer.Buffer;</script>
+  <script src="https://unpkg.com/@solana/web3.js@1.87.6/lib/index.iife.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f0f23 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; color: #fff; }
+    .container { background: rgba(30, 30, 50, 0.95); border-radius: 24px; padding: 40px; max-width: 420px; width: 90%; text-align: center; box-shadow: 0 20px 60px rgba(0,0,0,0.5); border: 1px solid rgba(153, 69, 255, 0.3); }
+    .logo { font-size: 48px; margin-bottom: 16px; }
+    h1 { font-size: 24px; margin-bottom: 8px; }
+    .subtitle { color: #888; font-size: 14px; margin-bottom: 24px; }
+    .nft-preview { width: 120px; height: 120px; border-radius: 16px; margin: 0 auto 20px; overflow: hidden; border: 2px solid rgba(153, 69, 255, 0.5); background: #222; }
+    .nft-preview img { width: 100%; height: 100%; object-fit: cover; }
+    .nft-name { font-size: 18px; font-weight: 600; margin-bottom: 4px; }
+    .nft-type { font-size: 12px; color: #9945FF; margin-bottom: 20px; }
+    .amount-box { background: rgba(20, 241, 149, 0.1); border: 1px solid rgba(20, 241, 149, 0.3); border-radius: 12px; padding: 16px; margin-bottom: 24px; }
+    .amount-label { font-size: 12px; color: #888; margin-bottom: 4px; }
+    .amount-value { font-size: 28px; font-weight: 700; color: #14F195; }
+    .amount-usd { font-size: 14px; color: #888; }
+    .btn { width: 100%; padding: 16px; border: none; border-radius: 12px; font-size: 16px; font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 10px; transition: all 0.2s; margin-bottom: 12px; }
+    .btn-phantom { background: linear-gradient(135deg, #9945FF 0%, #7B3FE4 100%); color: #fff; }
+    .btn-phantom:hover { box-shadow: 0 8px 24px rgba(153, 69, 255, 0.4); transform: translateY(-2px); }
+    .btn-phantom:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    .btn-secondary { background: transparent; border: 1px solid rgba(255,255,255,0.2); color: #888; }
+    .status { margin-top: 16px; padding: 12px; border-radius: 8px; font-size: 14px; display: none; }
+    .status.error { display: block; background: rgba(248, 113, 113, 0.1); color: #F87171; }
+    .status.success { display: block; background: rgba(20, 241, 149, 0.1); color: #14F195; }
+    .status.info { display: block; background: rgba(153, 69, 255, 0.1); color: #9945FF; }
+    .wallet-info { font-size: 12px; color: #666; margin-top: 16px; }
+    .spinner { width: 20px; height: 20px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 1s linear infinite; display: inline-block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .success-icon { font-size: 64px; margin-bottom: 16px; }
+  </style>
+</head>
+<body>
+  <div class="container" id="main-container">
+    <div class="logo">⬡</div>
+    <h1>PhotoLynk NFT</h1>
+    <p class="subtitle">Complete payment to mint your memory</p>
+    <div class="nft-preview"><img id="nft-image" src="" alt="NFT" onerror="this.style.display='none'"></div>
+    <div class="nft-name" id="nft-name">Loading...</div>
+    <div class="nft-type" id="nft-type">Compressed NFT</div>
+    <div class="amount-box">
+      <div class="amount-label">Mint Fee</div>
+      <div class="amount-value" id="amount-sol">0.000 SOL</div>
+      <div class="amount-usd" id="amount-usd">≈ $0.00 USD</div>
+    </div>
+    <button class="btn btn-phantom" id="pay-btn" onclick="connectAndPay()"><span>👻</span> Connect Phantom & Pay</button>
+    <div style="margin:16px 0;color:#666;font-size:12px;">— or scan with mobile wallet —</div>
+    <div id="qr-container" style="background:#fff;padding:16px;border-radius:12px;display:inline-block;margin-bottom:16px;"><canvas id="qr-code"></canvas></div>
+    <div style="font-size:11px;color:#888;margin-bottom:16px;">Scan with Phantom mobile app</div>
+    <button class="btn btn-secondary" onclick="window.close()">Cancel</button>
+    <div class="status" id="status"></div>
+    <div class="wallet-info">Recipient: <span id="recipient">...</span></div>
+  </div>
+  <div class="container" id="success-container" style="display:none;">
+    <div class="success-icon">✅</div>
+    <h1>Payment Successful!</h1>
+    <p class="subtitle">Your NFT is being minted on Solana</p>
+    <div class="status success" style="display:block;" id="tx-link"></div>
+    <button class="btn btn-phantom" onclick="window.close()" style="margin-top:24px;">Close Window</button>
+  </div>
+  <script>
+    const params = new URLSearchParams(window.location.search);
+    const recipient = params.get('recipient') || '';
+    const amount = parseFloat(params.get('amount')) || 0;
+    const name = params.get('name') || 'PhotoLynk Memory';
+    const imageUrl = decodeURIComponent(params.get('imageUrl') || '');
+    const nftType = params.get('nftType') || 'compressed';
+    console.log('[NFT Payment] imageUrl:', imageUrl);
+    document.getElementById('nft-name').textContent = name;
+    document.getElementById('nft-type').textContent = nftType === 'compressed' ? 'Compressed NFT (cNFT)' : 'Standard NFT';
+    document.getElementById('amount-sol').textContent = amount.toFixed(6) + ' SOL';
+    document.getElementById('amount-usd').textContent = '≈ $' + (amount * 200).toFixed(2) + ' USD';
+    document.getElementById('recipient').textContent = recipient ? recipient.slice(0,4) + '...' + recipient.slice(-4) : '...';
+    if (imageUrl) {
+      const img = document.getElementById('nft-image');
+      img.src = imageUrl;
+      img.onerror = function() { console.log('[NFT Payment] Image failed to load:', imageUrl); this.parentElement.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#666;">📷</div>'; };
+    }
+    
+    // Generate Solana Pay QR code
+    const reference = params.get('reference') || crypto.randomUUID();
+    const solanaPayUrl = 'solana:' + recipient + '?amount=' + amount + '&reference=' + reference + '&label=PhotoLynk&message=' + encodeURIComponent(name);
+    if (typeof QRCode !== 'undefined') {
+      QRCode.toCanvas(document.getElementById('qr-code'), solanaPayUrl, { width: 180, margin: 0 }, (err) => {
+        if (err) console.error('[NFT Payment] QR error:', err);
+      });
+    }
+    
+    // Disable auto-polling for QR payments - user must click button or scan QR
+    // QR code is for mobile wallet scanning only
+    console.log('[NFT Payment] QR code ready for mobile wallet scanning');
+    
+    function showStatus(msg, type) { const el = document.getElementById('status'); el.textContent = msg; el.className = 'status ' + type; }
+    function setLoading(loading) { const btn = document.getElementById('pay-btn'); btn.disabled = loading; btn.innerHTML = loading ? '<div class="spinner"></div> Processing...' : '<span>👻</span> Connect Phantom & Pay'; }
+    
+    async function connectAndPay() {
+      const provider = window.phantom?.solana || window.solana;
+      if (!provider?.isPhantom) { showStatus('Phantom wallet not found. Install it from phantom.app', 'error'); setTimeout(() => window.open('https://phantom.app/', '_blank'), 1500); return; }
+      setLoading(true); showStatus('Connecting to Phantom...', 'info');
+      try {
+        // Try multiple connection methods
+        let pubkeyStr;
+        if (provider.publicKey) {
+          // Already connected
+          pubkeyStr = provider.publicKey.toString();
+        } else {
+          // Try connect with different approaches
+          try {
+            const resp = await provider.connect();
+            pubkeyStr = resp.publicKey.toString();
+          } catch (connectErr) {
+            console.log('[NFT Payment] connect() failed, trying request():', connectErr.message);
+            try {
+              const resp = await provider.request({ method: 'connect' });
+              pubkeyStr = resp.publicKey.toString();
+            } catch (reqErr) {
+              console.log('[NFT Payment] request() also failed:', reqErr.message);
+              throw new Error('Could not connect to Phantom. Please unlock your wallet and try again.');
+            }
+          }
+        }
+        showStatus('Connected: ' + pubkeyStr.slice(0,4) + '...' + pubkeyStr.slice(-4), 'info');
+        
+        // Get blockhash via local proxy (avoids CORS issues)
+        showStatus('Getting blockhash...', 'info');
+        const rpcRes = await fetch('/solana-rpc', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getLatestBlockhash', params: [{commitment:'confirmed'}] })
+        });
+        const rpcData = await rpcRes.json();
+        if (!rpcData.result?.value?.blockhash) throw new Error('Could not get blockhash');
+        const blockhash = rpcData.result.value.blockhash;
+        console.log('[NFT Payment] Got blockhash:', blockhash.slice(0,8) + '...');
+        
+        // Use Solana web3.js to build transaction
+        showStatus('Creating transaction...', 'info');
+        
+        if (typeof solanaWeb3 === 'undefined') {
+          throw new Error('Solana library not loaded. Please refresh the page.');
+        }
+        
+        const { Connection, PublicKey, Transaction, SystemProgram, LAMPORTS_PER_SOL, TransactionInstruction } = solanaWeb3;
+        const fromPubkey = new PublicKey(pubkeyStr);
+        const toPubkey = new PublicKey(recipient);
+        const lamports = Math.ceil(amount * LAMPORTS_PER_SOL);
+        
+        console.log('[NFT Payment] Creating transfer:', lamports, 'lamports to', recipient);
+        
+        const paymentTx = new Transaction().add(
+          SystemProgram.transfer({
+            fromPubkey,
+            toPubkey,
+            lamports
+          })
+        );
+        paymentTx.recentBlockhash = blockhash;
+        paymentTx.feePayer = fromPubkey;
+        
+        showStatus('Approve payment in Phantom...', 'info');
+        const { signature: paymentSig } = await provider.signAndSendTransaction(paymentTx);
+        console.log('[NFT Payment] Payment sent:', paymentSig);
+        
+        // Now mint the NFT based on type
+        showStatus('Minting your NFT...', 'info');
+        const nftTypeParam = new URLSearchParams(window.location.search).get('nftType') || 'compressed';
+        
+        // Get fresh blockhash for mint transaction
+        const rpcRes2 = await fetch('/solana-rpc', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getLatestBlockhash', params: [{commitment:'confirmed'}] })
+        });
+        const rpcData2 = await rpcRes2.json();
+        const blockhash2 = rpcData2.result.value.blockhash;
+        
+        let mintSig;
+        
+        if (nftTypeParam === 'standard') {
+          // ========== STANDARD NFT MINTING ==========
+          // Standard NFTs require SPL Token + Metaplex Token Metadata
+          // This is more expensive (~0.02 SOL) but creates a traditional NFT
+          
+          const { Keypair } = solanaWeb3;
+          const TOKEN_PROGRAM_ID = new PublicKey('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA');
+          const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey('ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL');
+          const TOKEN_METADATA_PROGRAM_ID = new PublicKey('metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s');
+          const SYSVAR_RENT_PUBKEY = new PublicKey('SysvarRent111111111111111111111111111111111');
+          
+          // Generate new mint keypair
+          const mintKeypair = Keypair.generate();
+          const mintPubkey = mintKeypair.publicKey;
+          console.log('[NFT Payment] Standard NFT mint address:', mintPubkey.toBase58());
+          
+          // Derive PDAs
+          const [associatedTokenAccount] = PublicKey.findProgramAddressSync(
+            [fromPubkey.toBuffer(), TOKEN_PROGRAM_ID.toBuffer(), mintPubkey.toBuffer()],
+            ASSOCIATED_TOKEN_PROGRAM_ID
+          );
+          const [metadataAccount] = PublicKey.findProgramAddressSync(
+            [new TextEncoder().encode('metadata'), TOKEN_METADATA_PROGRAM_ID.toBuffer(), mintPubkey.toBuffer()],
+            TOKEN_METADATA_PROGRAM_ID
+          );
+          const [masterEditionAccount] = PublicKey.findProgramAddressSync(
+            [new TextEncoder().encode('metadata'), TOKEN_METADATA_PROGRAM_ID.toBuffer(), mintPubkey.toBuffer(), new TextEncoder().encode('edition')],
+            TOKEN_METADATA_PROGRAM_ID
+          );
+          
+          // Get rent for mint account (82 bytes)
+          const rentRes = await fetch('/solana-rpc', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getMinimumBalanceForRentExemption', params: [82] })
+          });
+          const rentData = await rentRes.json();
+          const mintRent = rentData.result;
+          
+          // 1. Create mint account
+          const createMintIx = SystemProgram.createAccount({
+            fromPubkey: fromPubkey,
+            newAccountPubkey: mintPubkey,
+            space: 82,
+            lamports: mintRent,
+            programId: TOKEN_PROGRAM_ID,
+          });
+          
+          // 2. Initialize mint (0 decimals, owner is user)
+          const initMintData = new Uint8Array([0, 0, ...fromPubkey.toBytes(), 1, ...fromPubkey.toBytes()]);
+          const initMintIx = new TransactionInstruction({
+            keys: [
+              { pubkey: mintPubkey, isSigner: false, isWritable: true },
+              { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
+            ],
+            programId: TOKEN_PROGRAM_ID,
+            data: initMintData,
+          });
+          
+          // 3. Create ATA
+          const createATAIx = new TransactionInstruction({
+            keys: [
+              { pubkey: fromPubkey, isSigner: true, isWritable: true },
+              { pubkey: associatedTokenAccount, isSigner: false, isWritable: true },
+              { pubkey: fromPubkey, isSigner: false, isWritable: false },
+              { pubkey: mintPubkey, isSigner: false, isWritable: false },
+              { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+              { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+            ],
+            programId: ASSOCIATED_TOKEN_PROGRAM_ID,
+            data: new Uint8Array([]),
+          });
+          
+          // 4. Mint 1 token
+          const mintToData = new Uint8Array([7, 1, 0, 0, 0, 0, 0, 0, 0]);
+          const mintToIx = new TransactionInstruction({
+            keys: [
+              { pubkey: mintPubkey, isSigner: false, isWritable: true },
+              { pubkey: associatedTokenAccount, isSigner: false, isWritable: true },
+              { pubkey: fromPubkey, isSigner: true, isWritable: false },
+            ],
+            programId: TOKEN_PROGRAM_ID,
+            data: mintToData,
+          });
+          
+          // 5. Create Metadata (CreateMetadataAccountV3 - discriminator 33)
+          const nftNameParam = new URLSearchParams(window.location.search).get('name') || 'PhotoLynk Memory';
+          const metadataUrlParam = new URLSearchParams(window.location.search).get('metadataUrl') || '';
+          
+          // Serialize metadata instruction data
+          function serializeMetadataV3(name, symbol, uri, sellerFeeBasisPoints) {
+            const nameBytes = new TextEncoder().encode(name.slice(0, 32));
+            const symbolBytes = new TextEncoder().encode(symbol.slice(0, 10));
+            const uriBytes = new TextEncoder().encode(uri.slice(0, 200));
+            
+            // Calculate total size: discriminator(1) + name(4+len) + symbol(4+len) + uri(4+len) + fee(2) + creators(1) + collection(1) + uses(1) + isMutable(1) + collectionDetails(1)
+            const totalSize = 1 + 4 + nameBytes.length + 4 + symbolBytes.length + 4 + uriBytes.length + 2 + 1 + 1 + 1 + 1 + 1;
+            const data = new Uint8Array(totalSize);
+            let offset = 0;
+            
+            data[offset++] = 33; // CreateMetadataAccountV3 discriminator
+            
+            // Name (borsh string)
+            new DataView(data.buffer).setUint32(offset, nameBytes.length, true); offset += 4;
+            data.set(nameBytes, offset); offset += nameBytes.length;
+            
+            // Symbol
+            new DataView(data.buffer).setUint32(offset, symbolBytes.length, true); offset += 4;
+            data.set(symbolBytes, offset); offset += symbolBytes.length;
+            
+            // URI
+            new DataView(data.buffer).setUint32(offset, uriBytes.length, true); offset += 4;
+            data.set(uriBytes, offset); offset += uriBytes.length;
+            
+            // Seller fee basis points
+            new DataView(data.buffer).setUint16(offset, sellerFeeBasisPoints, true); offset += 2;
+            
+            // Creators: None (0)
+            data[offset++] = 0;
+            // Collection: None (0)
+            data[offset++] = 0;
+            // Uses: None (0)
+            data[offset++] = 0;
+            // Is mutable: true (1)
+            data[offset++] = 1;
+            // Collection details: None (0)
+            data[offset++] = 0;
+            
+            return data;
+          }
+          
+          const metadataData = serializeMetadataV3(nftNameParam, 'PLNK', metadataUrlParam, 500);
+          const createMetadataIx = new TransactionInstruction({
+            keys: [
+              { pubkey: metadataAccount, isSigner: false, isWritable: true },
+              { pubkey: mintPubkey, isSigner: false, isWritable: false },
+              { pubkey: fromPubkey, isSigner: true, isWritable: false },  // mint authority
+              { pubkey: fromPubkey, isSigner: true, isWritable: true },   // payer
+              { pubkey: fromPubkey, isSigner: false, isWritable: false }, // update authority
+              { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+              { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
+            ],
+            programId: TOKEN_METADATA_PROGRAM_ID,
+            data: metadataData,
+          });
+          
+          // 6. Create Master Edition (CreateMasterEditionV3 - discriminator 17)
+          // Data: discriminator(1) + max_supply Option<u64> = Some(0) means no prints
+          const masterEditionData = new Uint8Array([17, 1, 0, 0, 0, 0, 0, 0, 0, 0]); // discriminator + Some(0)
+          const createMasterEditionIx = new TransactionInstruction({
+            keys: [
+              { pubkey: masterEditionAccount, isSigner: false, isWritable: true },
+              { pubkey: mintPubkey, isSigner: false, isWritable: true },
+              { pubkey: fromPubkey, isSigner: true, isWritable: false },  // update authority
+              { pubkey: fromPubkey, isSigner: true, isWritable: false },  // mint authority
+              { pubkey: fromPubkey, isSigner: true, isWritable: true },   // payer
+              { pubkey: metadataAccount, isSigner: false, isWritable: true },
+              { pubkey: TOKEN_PROGRAM_ID, isSigner: false, isWritable: false },
+              { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+              { pubkey: SYSVAR_RENT_PUBKEY, isSigner: false, isWritable: false },
+            ],
+            programId: TOKEN_METADATA_PROGRAM_ID,
+            data: masterEditionData,
+          });
+          
+          const standardTx = new Transaction()
+            .add(createMintIx)
+            .add(initMintIx)
+            .add(createATAIx)
+            .add(mintToIx)
+            .add(createMetadataIx)
+            .add(createMasterEditionIx);
+          standardTx.recentBlockhash = blockhash2;
+          standardTx.feePayer = fromPubkey;
+          standardTx.partialSign(mintKeypair);
+          
+          showStatus('Approve standard NFT mint in Phantom...', 'info');
+          const result = await provider.signAndSendTransaction(standardTx);
+          mintSig = result.signature;
+          console.log('[NFT Payment] Standard NFT minted:', mintSig, 'Mint:', mintPubkey.toBase58());
+          
+          // Send success data to app
+          const imageUrlStd = new URLSearchParams(window.location.search).get('imageUrl') || '';
+          const amountStd = new URLSearchParams(window.location.search).get('amount') || '0';
+          fetch('/nft-mint-success', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              paymentTx: paymentSig,
+              mintTx: mintSig,
+              imageUrl: imageUrlStd,
+              amount: parseFloat(amountStd),
+              nftType: 'standard',
+              mintAddress: mintPubkey.toBase58()
+            })
+          }).catch(e => console.log('Failed to notify app:', e));
+          
+          document.getElementById('main-container').style.display = 'none';
+          document.getElementById('success-container').style.display = 'block';
+          document.getElementById('tx-link').innerHTML = 'Payment: <a href="https://solscan.io/tx/' + paymentSig + '" target="_blank" style="color:#14F195;">' + paymentSig.slice(0,8) + '...</a><br>NFT Mint: <a href="https://solscan.io/tx/' + mintSig + '" target="_blank" style="color:#14F195;">' + mintSig.slice(0,8) + '...</a><br>Mint Address: <span style="color:#9945FF;font-size:10px;">' + mintPubkey.toBase58() + '</span>';
+          
+          // Auto-close after 3 seconds
+          setTimeout(() => window.close(), 3000);
+          return;
+        }
+        
+        // ========== COMPRESSED NFT (cNFT) MINTING ==========
+        // Bubblegum program IDs - PhotoLynk shared Merkle tree
+        const MERKLE_TREE = '7qSKB5q1JMmsGx2cHzAJPxvjzXCbAfpWNDTKDM3tSunS';
+        const BUBBLEGUM_PROGRAM_ID = new PublicKey('BGUMAp9Gq7iTEuizy4pqaxsTyUCBK68MDfK752saRPUY');
+        const SPL_NOOP_PROGRAM_ID = new PublicKey('noopb9bkMVfRPU8AsbpTUg8AQkHtKwMYZiFUjNRtMmV');
+        const SPL_ACCOUNT_COMPRESSION_PROGRAM_ID = new PublicKey('cmtDvXumGCrqC1Age74AVPhSRVXJMd8PJS91L8KbNCK');
+        const merkleTreePubkey = new PublicKey(MERKLE_TREE);
+        
+        // Derive tree config PDA
+        const [treeConfig] = PublicKey.findProgramAddressSync(
+          [merkleTreePubkey.toBuffer()],
+          BUBBLEGUM_PROGRAM_ID
+        );
+        
+        // Build metadata for the cNFT - exact borsh serialization matching mobile app
+        const nftNameParam = new URLSearchParams(window.location.search).get('name') || 'PhotoLynk Memory';
+        const metadataUrlParam = new URLSearchParams(window.location.search).get('metadataUrl') || '';
+        
+        // Serialize metadata args for Bubblegum mintV1 (exact order from mpl-bubblegum)
+        function serializeString(str) {
+          const bytes = new TextEncoder().encode(str || '');
+          const len = new Uint8Array(4);
+          new DataView(len.buffer).setUint32(0, bytes.length, true);
+          return new Uint8Array([...len, ...bytes]);
+        }
+        
+        const buffers = [];
+        // name (string: 4-byte length + data)
+        buffers.push(serializeString(nftNameParam.slice(0, 32)));
+        // symbol (string)
+        buffers.push(serializeString('PLNK'));
+        // uri (string)
+        buffers.push(serializeString(metadataUrlParam));
+        // sellerFeeBasisPoints (u16) - 500 = 5%
+        const feeBuf = new Uint8Array(2);
+        new DataView(feeBuf.buffer).setUint16(0, 500, true);
+        buffers.push(feeBuf);
+        // primarySaleHappened (bool) - false
+        buffers.push(new Uint8Array([0]));
+        // isMutable (bool) - true
+        buffers.push(new Uint8Array([1]));
+        // editionNonce (Option<u8>): None = 0
+        buffers.push(new Uint8Array([0]));
+        // tokenStandard (Option<TokenStandard>): Some(NonFungible=0) = [1, 0]
+        buffers.push(new Uint8Array([1, 0]));
+        // collection (Option<Collection>): None = 0
+        buffers.push(new Uint8Array([0]));
+        // uses (Option<Uses>): None = 0
+        buffers.push(new Uint8Array([0]));
+        // tokenProgramVersion (enum: 0 = Original)
+        buffers.push(new Uint8Array([0]));
+        // creators (Vec<Creator>): 4-byte length + array
+        const creatorsLen = new Uint8Array(4);
+        new DataView(creatorsLen.buffer).setUint32(0, 1, true);
+        buffers.push(creatorsLen);
+        // Creator: address (32 bytes) + verified (bool) + share (u8)
+        buffers.push(fromPubkey.toBytes());
+        buffers.push(new Uint8Array([1])); // verified = true (matches successful tx)
+        buffers.push(new Uint8Array([100])); // share = 100%
+        
+        // Combine all buffers
+        const totalLen = buffers.reduce((acc, b) => acc + b.length, 0);
+        const metadataArgs = new Uint8Array(totalLen);
+        let offset = 0;
+        for (const buf of buffers) { metadataArgs.set(buf, offset); offset += buf.length; }
+        
+        // Discriminator for mintV1 instruction
+        const discriminator = new Uint8Array([145, 98, 192, 118, 184, 147, 118, 104]);
+        const instructionData = new Uint8Array(discriminator.length + metadataArgs.length);
+        instructionData.set(discriminator, 0);
+        instructionData.set(metadataArgs, discriminator.length);
+        
+        const mintInstruction = new TransactionInstruction({
+          keys: [
+            { pubkey: treeConfig, isSigner: false, isWritable: true },       // 0: treeConfig
+            { pubkey: fromPubkey, isSigner: false, isWritable: false },      // 1: leafOwner
+            { pubkey: fromPubkey, isSigner: false, isWritable: false },      // 2: leafDelegate
+            { pubkey: merkleTreePubkey, isSigner: false, isWritable: true }, // 3: merkleTree
+            { pubkey: fromPubkey, isSigner: true, isWritable: true },        // 4: payer
+            { pubkey: fromPubkey, isSigner: true, isWritable: false },       // 5: treeCreatorOrDelegate
+            { pubkey: SPL_NOOP_PROGRAM_ID, isSigner: false, isWritable: false },
+            { pubkey: SPL_ACCOUNT_COMPRESSION_PROGRAM_ID, isSigner: false, isWritable: false },
+            { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+          ],
+          programId: BUBBLEGUM_PROGRAM_ID,
+          data: instructionData,
+        });
+        
+        const mintTx = new Transaction().add(mintInstruction);
+        mintTx.recentBlockhash = blockhash2;
+        mintTx.feePayer = fromPubkey;
+        
+        showStatus('Approve NFT mint in Phantom...', 'info');
+        const mintResult = await provider.signAndSendTransaction(mintTx);
+        mintSig = mintResult.signature;
+        console.log('[NFT Payment] NFT minted:', mintSig);
+        
+        // Send success data to app
+        const imageUrl = new URLSearchParams(window.location.search).get('imageUrl') || '';
+        const amountParam = new URLSearchParams(window.location.search).get('amount') || '0';
+        fetch('/nft-mint-success', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            paymentTx: paymentSig,
+            mintTx: mintSig,
+            imageUrl: imageUrl,
+            amount: parseFloat(amountParam),
+            nftType: nftTypeParam
+          })
+        }).catch(e => console.log('Failed to notify app:', e));
+        
+        document.getElementById('main-container').style.display = 'none';
+        document.getElementById('success-container').style.display = 'block';
+        document.getElementById('tx-link').innerHTML = 'Payment: <a href="https://solscan.io/tx/' + paymentSig + '" target="_blank" style="color:#14F195;">' + paymentSig.slice(0,8) + '...</a><br>NFT Mint: <a href="https://solscan.io/tx/' + mintSig + '" target="_blank" style="color:#14F195;">' + mintSig.slice(0,8) + '...</a>';
+        
+        // Auto-close after 3 seconds
+        setTimeout(() => window.close(), 3000);
+      } catch (err) { console.error('Payment error:', err); showStatus(err.message || 'Payment failed', 'error'); setLoading(false); }
+    }
+  </script>
+</body>
+</html>`);
+});
+
+// NFT mint success callback - receives mint details from browser to show in app
+app.post('/nft-mint-success', (req, res) => {
+    const { paymentTx, mintTx, imageUrl, amount, nftType } = req.body;
+    console.log('[NFT] Mint success received:', { paymentTx, mintTx, amount, nftType });
+    // Store for app to poll
+    global.nftMintSuccess = {
+        paymentTx,
+        mintTx,
+        imageUrl,
+        amount,
+        nftType,
+        timestamp: Date.now()
+    };
+    res.json({ success: true });
+});
+
+// NFT mint success poll endpoint - app polls this to get mint details
+app.get('/nft-mint-success', (req, res) => {
+    const data = global.nftMintSuccess;
+    if (data && Date.now() - data.timestamp < 60000) { // Valid for 60 seconds
+        global.nftMintSuccess = null; // Clear after reading
+        res.json({ success: true, ...data });
+    } else {
+        res.json({ success: false });
+    }
+});
+
+// Wallet connected callback - receives address from browser and broadcasts to Electron app
+app.post('/wallet-connected', (req, res) => {
+    const { address } = req.body;
+    if (!address) {
+        return res.status(400).json({ success: false, error: 'No address provided' });
+    }
+    console.log('[Wallet] Connected from browser:', address);
+    // Store in memory for the app to poll
+    global.connectedWalletAddress = address;
+    global.walletJustConnected = true; // Flag to bring app to front
+    res.json({ success: true });
+});
+
+// Wallet address poll endpoint - Electron app polls this to get the connected address
+// Note: Address is cleared 5 seconds after first read to allow multiple windows to receive it
+app.get('/wallet-address', (req, res) => {
+    const address = global.connectedWalletAddress;
+    const bringToFront = global.walletJustConnected;
+    if (address) {
+        // Clear bringToFront immediately but keep address for 5 seconds
+        // This allows multiple windows to receive the address
+        if (bringToFront) {
+            global.walletJustConnected = false;
+            // Clear address after 5 seconds
+            setTimeout(() => {
+                if (global.connectedWalletAddress === address) {
+                    global.connectedWalletAddress = null;
+                }
+            }, 5000);
+        }
+        res.json({ success: true, address, bringToFront });
+    } else {
+        res.json({ success: false });
+    }
+});
+
+// Wallet connect page - for connecting Phantom in browser
+app.get('/wallet-connect', (req, res) => {
+    // Headers to help Phantom extension work properly
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Content-Security-Policy', "default-src 'self' 'unsafe-inline' 'unsafe-eval'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; img-src 'self' data: blob: https: http:; connect-src 'self' https: wss:; style-src 'self' 'unsafe-inline';");
+    res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Connect Wallet - PhotoLynk</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f0f23 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; color: #fff; }
+    .container { background: rgba(30, 30, 50, 0.95); border-radius: 24px; padding: 40px; max-width: 420px; width: 90%; text-align: center; box-shadow: 0 20px 60px rgba(0,0,0,0.5); border: 1px solid rgba(153, 69, 255, 0.3); }
+    .logo { font-size: 48px; margin-bottom: 16px; }
+    h1 { font-size: 24px; margin-bottom: 8px; }
+    .subtitle { color: #888; font-size: 14px; margin-bottom: 32px; }
+    .btn { width: 100%; padding: 16px; border: none; border-radius: 12px; font-size: 16px; font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 12px; transition: all 0.2s; margin-bottom: 12px; }
+    .btn-phantom { background: linear-gradient(135deg, #9945FF 0%, #7B3FE4 100%); color: #fff; }
+    .btn-phantom:hover { box-shadow: 0 8px 24px rgba(153, 69, 255, 0.4); transform: translateY(-2px); }
+    .btn-phantom:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    .btn-secondary { background: transparent; border: 1px solid rgba(255,255,255,0.2); color: #888; }
+    .status { margin-top: 20px; padding: 14px; border-radius: 10px; font-size: 14px; display: none; }
+    .status.error { display: block; background: rgba(248, 113, 113, 0.1); color: #F87171; }
+    .status.success { display: block; background: rgba(20, 241, 149, 0.1); color: #14F195; }
+    .status.info { display: block; background: rgba(153, 69, 255, 0.1); color: #9945FF; }
+    .spinner { width: 20px; height: 20px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 1s linear infinite; display: inline-block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .wallet-address { font-family: monospace; font-size: 12px; word-break: break-all; margin-top: 8px; color: #14F195; }
+    .success-icon { font-size: 64px; margin-bottom: 16px; }
+    .copy-btn { background: rgba(153,69,255,0.2); border: none; color: #9945FF; padding: 8px 16px; border-radius: 8px; cursor: pointer; margin-top: 12px; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="container" id="connect-container">
+    <div class="logo">👻</div>
+    <h1>Connect Phantom</h1>
+    <p class="subtitle">Connect your Solana wallet to PhotoLynk</p>
+    <button class="btn btn-phantom" id="connect-btn"><span>🔗</span> Connect Phantom Wallet</button>
+    <button class="btn btn-secondary" onclick="window.close()" style="margin-top:12px;">Cancel</button>
+    <div class="status" id="status"></div>
+  </div>
+  <div class="container" id="waiting-container" style="display:none;">
+    <div class="logo" style="animation: pulse 2s infinite;">👻</div>
+    <h1>Waiting for Phantom...</h1>
+    <p class="subtitle">Approve the connection in your Phantom wallet</p>
+    <div class="spinner" style="margin: 20px auto;"></div>
+    <button class="btn btn-secondary" onclick="cancelConnect()" style="margin-top:12px;">Cancel</button>
+  </div>
+  <style>@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }</style>
+  <div class="container" id="success-container" style="display:none;">
+    <div class="success-icon">✅</div>
+    <h1>Wallet Connected!</h1>
+    <p class="subtitle">Copy your address and paste it in PhotoLynk</p>
+    <div class="wallet-address" id="wallet-address"></div>
+    <button class="copy-btn" onclick="copyAddress()">📋 Copy Address</button>
+    <div class="status success" style="display:block; margin-top:16px;">You can now close this window and paste the address in PhotoLynk</div>
+  </div>
+  <script>
+    let connectedAddress = '';
+    let connectPollInterval = null;
+    
+    function showStatus(msg, type) { const el = document.getElementById('status'); el.textContent = msg; el.className = 'status ' + type; el.style.display = 'block'; }
+    function setLoading(loading) { const btn = document.getElementById('connect-btn'); btn.disabled = loading; btn.innerHTML = loading ? '<div class="spinner"></div> Connecting...' : '<span>🔗</span> Connect Phantom Wallet'; }
+    
+    function showWaiting() {
+      document.getElementById('connect-container').style.display = 'none';
+      document.getElementById('waiting-container').style.display = 'block';
+    }
+    
+    function hideWaiting() {
+      document.getElementById('waiting-container').style.display = 'none';
+      document.getElementById('connect-container').style.display = 'block';
+    }
+    
+    function cancelConnect() {
+      if (connectPollInterval) clearInterval(connectPollInterval);
+      hideWaiting();
+    }
+    
+    // Send address back to desktop app automatically
+    async function sendAddressToApp(address) {
+      try {
+        await fetch('/wallet-connected', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ address })
+        });
+        return true;
+      } catch (e) {
+        console.error('Failed to send address to app:', e);
+        return false;
+      }
+    }
+    
+    function showSuccess(address) {
+      connectedAddress = address;
+      document.getElementById('connect-container').style.display = 'none';
+      document.getElementById('success-container').style.display = 'block';
+      document.getElementById('wallet-address').textContent = address;
+      
+      // Automatically send to app
+      sendAddressToApp(address).then(sent => {
+        if (sent) {
+          document.querySelector('.copy-btn').style.display = 'none';
+          document.querySelector('#success-container .status').innerHTML = '✓ Address sent to PhotoLynk!<br><small>You can close this window.</small>';
+          // Auto-close after 2 seconds
+          setTimeout(() => window.close(), 2000);
+        }
+      });
+    }
+    
+    function copyAddress() { 
+      navigator.clipboard.writeText(connectedAddress).then(() => { 
+        const btn = document.querySelector('.copy-btn'); 
+        btn.textContent = '✓ Copied!'; 
+        setTimeout(() => btn.textContent = '📋 Copy Address', 2000); 
+      }); 
+    }
+    
+    // Connect using Phantom Universal Links (deeplinks) - works even when wallet is locked
+    document.getElementById('connect-btn').addEventListener('click', async function() {
+      const provider = window.phantom?.solana || window.solana;
+      
+      // First try the provider API if available and connected
+      if (provider?.isPhantom && provider.isConnected && provider.publicKey) {
+        showSuccess(provider.publicKey.toString());
+        return;
+      }
+      
+      // Try provider.connect() first (works if wallet is unlocked)
+      if (provider?.isPhantom) {
+        setLoading(true);
+        showStatus('Connecting...', 'info');
+        
+        try {
+          const resp = await provider.connect();
+          showSuccess(resp.publicKey.toString());
+          return;
+        } catch (err) {
+          console.log('Provider connect failed, trying deeplink:', err.message);
+          setLoading(false);
+        }
+      }
+      
+      // Fallback: Use Phantom Universal Link (deeplink) - this ALWAYS opens Phantom
+      const redirectUrl = encodeURIComponent(window.location.origin + '/wallet-callback');
+      const appUrl = encodeURIComponent('https://stealthlynk.io');
+      const cluster = 'mainnet-beta';
+      
+      // Phantom Universal Link format
+      const phantomConnectUrl = 'https://phantom.app/ul/v1/connect?' + 
+        'app_url=' + appUrl + 
+        '&redirect_link=' + redirectUrl +
+        '&cluster=' + cluster;
+      
+      console.log('Opening Phantom via Universal Link:', phantomConnectUrl);
+      showWaiting();
+      
+      // Open Phantom - this will trigger the extension or open phantom.app
+      window.open(phantomConnectUrl, '_blank');
+      
+      // Poll for connection (Phantom will redirect back or user will approve in extension)
+      let attempts = 0;
+      connectPollInterval = setInterval(async () => {
+        attempts++;
+        
+        // Check if provider is now connected
+        const p = window.phantom?.solana || window.solana;
+        if (p?.isConnected && p?.publicKey) {
+          clearInterval(connectPollInterval);
+          showSuccess(p.publicKey.toString());
+          return;
+        }
+        
+        // Try eager connect
+        if (p?.isPhantom) {
+          try {
+            const resp = await p.connect({ onlyIfTrusted: true });
+            if (resp?.publicKey) {
+              clearInterval(connectPollInterval);
+              showSuccess(resp.publicKey.toString());
+              return;
+            }
+          } catch (e) { /* not yet */ }
+        }
+        
+        // Timeout after 2 minutes
+        if (attempts > 120) {
+          clearInterval(connectPollInterval);
+          hideWaiting();
+          showStatus('Connection timed out. Please try again.', 'error');
+        }
+      }, 1000);
+    });
+    
+    // On page load: try eager connect (no popup) for already-trusted wallets
+    window.addEventListener('load', async () => {
+      const provider = window.phantom?.solana || window.solana;
+      if (!provider?.isPhantom) {
+        showStatus('Phantom wallet not detected. Please install it.', 'error');
+        return;
+      }
+      
+      // Try eager connect (no popup, only works if already trusted)
+      try {
+        const resp = await provider.connect({ onlyIfTrusted: true });
+        if (resp?.publicKey) {
+          showSuccess(resp.publicKey.toString());
+        }
+      } catch (e) {
+        // Not trusted yet - user needs to click button
+      }
+    });
+  </script>
+</body>
+</html>`);
+});
+
+// NFT Transfer state
+let nftTransferStatus = { completed: false, success: false, signature: null, error: null };
+
+// NFT Transfer status endpoint - polled by desktop app
+app.get('/nft-transfer-status', (req, res) => {
+    res.json(nftTransferStatus);
+});
+
+// NFT Transfer completed callback - receives result from browser
+app.post('/nft-transfer-complete', (req, res) => {
+    const { success, signature, error } = req.body;
+    nftTransferStatus = { completed: true, success: !!success, signature: signature || null, error: error || null };
+    // Reset after 30 seconds
+    setTimeout(() => { nftTransferStatus = { completed: false, success: false, signature: null, error: null }; }, 30000);
+    res.json({ success: true });
+});
+
+// NFT Transfer signing page - opens in browser with Phantom
+app.get('/nft-transfer-sign', (req, res) => {
+    const { tx, mint, to, versioned } = req.query;
+    if (!tx || !mint || !to) {
+        return res.status(400).send('Missing parameters');
+    }
+    const isVersioned = versioned === '1';
+    
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.send(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sign NFT Transfer - PhotoLynk</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f0f23 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; color: #fff; }
+    .container { background: rgba(30, 30, 50, 0.95); border-radius: 24px; padding: 40px; max-width: 420px; width: 90%; text-align: center; box-shadow: 0 20px 60px rgba(0,0,0,0.5); border: 1px solid rgba(153, 69, 255, 0.3); }
+    .logo { font-size: 48px; margin-bottom: 16px; }
+    h1 { font-size: 24px; margin-bottom: 8px; }
+    .subtitle { color: #888; font-size: 14px; margin-bottom: 24px; }
+    .info-box { background: rgba(0,0,0,0.3); border-radius: 12px; padding: 16px; margin-bottom: 24px; text-align: left; }
+    .info-row { display: flex; justify-content: space-between; margin-bottom: 8px; }
+    .info-row:last-child { margin-bottom: 0; }
+    .info-label { color: #888; font-size: 12px; }
+    .info-value { color: #fff; font-size: 12px; font-family: monospace; }
+    .btn { width: 100%; padding: 16px; border: none; border-radius: 12px; font-size: 16px; font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 12px; transition: all 0.2s; margin-bottom: 12px; }
+    .btn-phantom { background: linear-gradient(135deg, #9945FF 0%, #7B3FE4 100%); color: #fff; }
+    .btn-phantom:hover { box-shadow: 0 8px 24px rgba(153, 69, 255, 0.4); transform: translateY(-2px); }
+    .btn-phantom:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    .btn-secondary { background: transparent; border: 1px solid rgba(255,255,255,0.2); color: #888; }
+    .status { margin-top: 20px; padding: 14px; border-radius: 10px; font-size: 14px; display: none; }
+    .status.error { display: block; background: rgba(248, 113, 113, 0.1); color: #F87171; }
+    .status.success { display: block; background: rgba(20, 241, 149, 0.1); color: #14F195; }
+    .status.info { display: block; background: rgba(153, 69, 255, 0.1); color: #9945FF; }
+    .spinner { width: 20px; height: 20px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 1s linear infinite; display: inline-block; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="logo">🖼️</div>
+    <h1>Sign NFT Transfer</h1>
+    <p class="subtitle">Approve this transaction in Phantom to transfer your NFT</p>
+    
+    <div class="info-box">
+      <div class="info-row">
+        <span class="info-label">NFT Mint</span>
+        <span class="info-value">${mint.slice(0, 8)}...${mint.slice(-8)}</span>
+      </div>
+      <div class="info-row">
+        <span class="info-label">Recipient</span>
+        <span class="info-value">${to.slice(0, 8)}...${to.slice(-8)}</span>
+      </div>
+    </div>
+    
+    <button class="btn btn-phantom" id="sign-btn"><span>✍️</span> Sign & Send Transaction</button>
+    <button class="btn btn-secondary" onclick="cancelTransfer()">Cancel</button>
+    <div class="status" id="status"></div>
+  </div>
+  
+  <script>
+    const txBase64 = '${tx}';
+    const isVersioned = ${isVersioned};
+    
+    function showStatus(msg, type) { 
+      const el = document.getElementById('status'); 
+      el.textContent = msg; 
+      el.className = 'status ' + type; 
+      el.style.display = 'block'; 
+    }
+    
+    function setLoading(loading) { 
+      const btn = document.getElementById('sign-btn'); 
+      btn.disabled = loading; 
+      btn.innerHTML = loading ? '<div class="spinner"></div> Signing...' : '<span>✍️</span> Sign & Send Transaction'; 
+    }
+    
+    async function notifyApp(success, signature, error) {
+      try {
+        await fetch('/nft-transfer-complete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ success, signature, error })
+        });
+      } catch (e) {
+        console.error('Failed to notify app:', e);
+      }
+    }
+    
+    function cancelTransfer() {
+      notifyApp(false, null, 'User cancelled');
+      window.close();
+    }
+    
+    document.getElementById('sign-btn').addEventListener('click', async function() {
+      const provider = window.phantom?.solana || window.solana;
+      
+      if (!provider?.isPhantom) {
+        showStatus('Phantom wallet not detected. Please install it.', 'error');
+        return;
+      }
+      
+      setLoading(true);
+      showStatus('Connecting to Phantom...', 'info');
+      
+      try {
+        // Connect if not connected
+        if (!provider.isConnected) {
+          await provider.connect();
+        }
+        
+        showStatus('Please approve the transaction in Phantom...', 'info');
+        
+        // Decode the transaction
+        const txBuffer = Uint8Array.from(atob(txBase64), c => c.charCodeAt(0));
+        
+        // Sign and send the transaction
+        // For versioned transactions (cNFTs), Phantom handles them the same way
+        const { signature } = await provider.signAndSendTransaction({
+          serialize: () => txBuffer,
+          // Phantom auto-detects versioned vs legacy transactions from the buffer
+        });
+        
+        showStatus('Transaction sent! Signature: ' + signature.slice(0, 16) + '...', 'success');
+        
+        // Notify the desktop app
+        await notifyApp(true, signature, null);
+        
+        // Auto-close after 3 seconds
+        setTimeout(() => window.close(), 3000);
+        
+      } catch (err) {
+        console.error('Transfer error:', err);
+        const errorMsg = err.message || 'Transaction failed';
+        showStatus(errorMsg, 'error');
+        setLoading(false);
+        
+        // Notify app of failure
+        await notifyApp(false, null, errorMsg);
+      }
+    });
+    
+    // Check for Phantom on load
+    window.addEventListener('load', () => {
+      const provider = window.phantom?.solana || window.solana;
+      if (!provider?.isPhantom) {
+        showStatus('Phantom wallet not detected. Please install it.', 'error');
+        document.getElementById('sign-btn').disabled = true;
+      }
+    });
+  </script>
+</body>
+</html>`);
+});
+
 const startUpdateChecker = () => {
     updater.startAutoCheck((result) => {
         if (result.available) {
