@@ -4588,7 +4588,7 @@ app.get('/nft-payment', (req, res) => {
   <script src="https://bundle.run/buffer@6.0.3"></script>
   <script>if(typeof window.Buffer==='undefined')window.Buffer=buffer.Buffer;</script>
   <script src="https://unpkg.com/@solana/web3.js@1.87.6/lib/index.iife.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js" onerror="console.error('QRCode CDN failed, trying fallback');var s=document.createElement('script');s.src='https://unpkg.com/qrcode@1.5.3/build/qrcode.min.js';document.head.appendChild(s);"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f0f23 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; color: #fff; }
@@ -4693,26 +4693,35 @@ app.get('/nft-payment', (req, res) => {
       walletLinksEl.appendChild(btn);
     });
     
+    let qrAttempts = 0;
     function generateQR() {
-      if (typeof QRCode !== 'undefined') {
-        QRCode.toCanvas(document.getElementById('qr-code'), solanaPayUrl, { width: 180, margin: 0 }, (err) => {
+      qrAttempts++;
+      console.log('[NFT Payment] QR attempt', qrAttempts, 'QRCode defined:', typeof QRCode !== 'undefined');
+      if (typeof QRCode !== 'undefined' && QRCode.toCanvas) {
+        const canvas = document.getElementById('qr-code');
+        if (!canvas) {
+          console.error('[NFT Payment] Canvas element not found');
+          return;
+        }
+        QRCode.toCanvas(canvas, solanaPayUrl, { width: 180, margin: 1, color: { dark: '#000000', light: '#ffffff' } }, (err) => {
           if (err) {
             console.error('[NFT Payment] QR error:', err);
-            document.getElementById('qr-container').innerHTML = '<div style="width:180px;height:180px;display:flex;align-items:center;justify-content:center;color:#666;font-size:12px;">QR unavailable</div>';
+            if (qrAttempts < 5) setTimeout(generateQR, 500);
+            else document.getElementById('qr-container').innerHTML = '<div style="width:180px;height:180px;display:flex;align-items:center;justify-content:center;color:#666;font-size:12px;">QR unavailable</div>';
+          } else {
+            console.log('[NFT Payment] QR generated successfully');
           }
         });
+      } else if (qrAttempts < 10) {
+        console.log('[NFT Payment] QRCode not ready, retrying in 300ms...');
+        setTimeout(generateQR, 300);
       } else {
-        console.error('[NFT Payment] QRCode library not loaded');
+        console.error('[NFT Payment] QRCode library failed to load after', qrAttempts, 'attempts');
         document.getElementById('qr-container').innerHTML = '<div style="width:180px;height:180px;display:flex;align-items:center;justify-content:center;color:#666;font-size:12px;">QR unavailable</div>';
       }
     }
-    // Wait for QRCode library to load
-    if (typeof QRCode !== 'undefined') {
-      generateQR();
-    } else {
-      window.addEventListener('load', generateQR);
-      setTimeout(generateQR, 1000);
-    }
+    // Start QR generation with delay to ensure library loads
+    setTimeout(generateQR, 100);
     
     // Poll for QR payment by checking recipient's recent transactions
     let qrPaymentDetected = false;
