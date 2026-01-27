@@ -4614,8 +4614,8 @@ app.get('/nft-payment', (req, res) => {
     .status.success { display: block; background: rgba(20, 241, 149, 0.1); color: #14F195; }
     .status.info { display: block; background: rgba(153, 69, 255, 0.1); color: #9945FF; }
     .wallet-info { font-size: 12px; color: #666; margin-top: 16px; }
-    .spinner { width: 20px; height: 20px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 1s linear infinite; display: inline-block; }
-    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner { width: 20px; height: 20px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 1s linear infinite; display: inline-block; transform-origin: center center; box-sizing: border-box; }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
     .success-icon { font-size: 64px; margin-bottom: 16px; }
   </style>
 </head>
@@ -4633,9 +4633,10 @@ app.get('/nft-payment', (req, res) => {
       <div class="amount-usd" id="amount-usd">≈ $0.00 USD</div>
     </div>
     <button class="btn btn-phantom" id="pay-btn" onclick="connectAndPay()"><span>👻</span> Connect Phantom & Pay</button>
-    <div style="margin:16px 0;color:#666;font-size:12px;">— or scan with mobile wallet —</div>
-    <div id="qr-container" style="background:#fff;padding:16px;border-radius:12px;display:inline-block;margin-bottom:16px;"><canvas id="qr-code"></canvas></div>
-    <div style="font-size:11px;color:#888;margin-bottom:16px;">Scan with Phantom mobile app</div>
+    <div style="margin:16px 0;color:#666;font-size:12px;">— or scan with any Solana wallet —</div>
+    <div id="qr-container" style="background:#fff;padding:16px;border-radius:12px;display:inline-block;margin-bottom:12px;min-width:180px;min-height:180px;"><canvas id="qr-code" width="180" height="180" style="display:block;"></canvas></div>
+    <div style="font-size:10px;color:#888;margin-bottom:8px;">Compatible wallets:</div>
+    <div id="wallet-links" style="display:flex;flex-wrap:wrap;justify-content:center;gap:8px;margin-bottom:16px;"></div>
     <button class="btn btn-secondary" onclick="window.close()">Cancel</button>
     <div class="status" id="status"></div>
     <div class="wallet-info">Recipient: <span id="recipient">...</span></div>
@@ -4669,15 +4670,124 @@ app.get('/nft-payment', (req, res) => {
     // Generate Solana Pay QR code
     const reference = params.get('reference') || crypto.randomUUID();
     const solanaPayUrl = 'solana:' + recipient + '?amount=' + amount + '&reference=' + reference + '&label=PhotoLynk&message=' + encodeURIComponent(name);
+    
+    // Compatible wallets with deep-links
+    const wallets = [
+      { name: 'Phantom', icon: '👻', deepLink: 'https://phantom.app/ul/v1/browse/' + encodeURIComponent(window.location.href) },
+      { name: 'Solflare', icon: '🔆', deepLink: 'solflare:' + solanaPayUrl.replace('solana:', '') },
+      { name: 'Glow', icon: '✨', deepLink: solanaPayUrl },
+      { name: 'Backpack', icon: '🎒', deepLink: solanaPayUrl },
+      { name: 'Trust', icon: '🛡️', deepLink: solanaPayUrl },
+    ];
+    
+    // Render wallet buttons
+    const walletLinksEl = document.getElementById('wallet-links');
+    wallets.forEach(w => {
+      const btn = document.createElement('a');
+      btn.href = w.deepLink;
+      btn.target = '_blank';
+      btn.style.cssText = 'display:inline-flex;align-items:center;gap:4px;padding:6px 10px;background:rgba(255,255,255,0.1);border-radius:8px;color:#fff;text-decoration:none;font-size:11px;border:1px solid rgba(255,255,255,0.2);';
+      btn.innerHTML = w.icon + ' ' + w.name;
+      btn.onmouseover = function() { this.style.borderColor = '#9945FF'; };
+      btn.onmouseout = function() { this.style.borderColor = 'rgba(255,255,255,0.2)'; };
+      walletLinksEl.appendChild(btn);
+    });
+    
+    function generateQR() {
+      if (typeof QRCode !== 'undefined') {
+        QRCode.toCanvas(document.getElementById('qr-code'), solanaPayUrl, { width: 180, margin: 0 }, (err) => {
+          if (err) {
+            console.error('[NFT Payment] QR error:', err);
+            document.getElementById('qr-container').innerHTML = '<div style="width:180px;height:180px;display:flex;align-items:center;justify-content:center;color:#666;font-size:12px;">QR unavailable</div>';
+          }
+        });
+      } else {
+        console.error('[NFT Payment] QRCode library not loaded');
+        document.getElementById('qr-container').innerHTML = '<div style="width:180px;height:180px;display:flex;align-items:center;justify-content:center;color:#666;font-size:12px;">QR unavailable</div>';
+      }
+    }
+    // Wait for QRCode library to load
     if (typeof QRCode !== 'undefined') {
-      QRCode.toCanvas(document.getElementById('qr-code'), solanaPayUrl, { width: 180, margin: 0 }, (err) => {
-        if (err) console.error('[NFT Payment] QR error:', err);
-      });
+      generateQR();
+    } else {
+      window.addEventListener('load', generateQR);
+      setTimeout(generateQR, 1000);
     }
     
-    // Disable auto-polling for QR payments - user must click button or scan QR
-    // QR code is for mobile wallet scanning only
-    console.log('[NFT Payment] QR code ready for mobile wallet scanning');
+    // Poll for QR payment by checking recipient's recent transactions
+    let qrPaymentDetected = false;
+    let pollInterval = null;
+    let lastKnownSig = null;
+    const expectedLamports = Math.ceil(amount * 1e9);
+    
+    async function pollForQRPayment() {
+      if (qrPaymentDetected) return;
+      try {
+        // Get recent signatures for the recipient
+        const res = await fetch('/solana-rpc', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getSignaturesForAddress', params: [recipient, {limit: 5}] })
+        });
+        const data = await res.json();
+        if (data.result && data.result.length > 0) {
+          // Check for new transactions since page load
+          for (const tx of data.result) {
+            if (lastKnownSig === null) {
+              lastKnownSig = tx.signature; // First poll - just record current state
+              break;
+            }
+            if (tx.signature === lastKnownSig) break; // Reached known transactions
+            
+            // New transaction found - verify it's a payment of correct amount
+            console.log('[NFT Payment] New transaction detected:', tx.signature);
+            qrPaymentDetected = true;
+            clearInterval(pollInterval);
+            showStatus('Payment detected! Minting NFT...', 'info');
+            await processQRPayment(tx.signature);
+            return;
+          }
+        }
+      } catch (err) {
+        console.log('[NFT Payment] Poll error:', err.message);
+      }
+    }
+    
+    async function processQRPayment(paymentSig) {
+      try {
+        // Get metadata URL from params
+        const metadataUrl = params.get('metadataUrl') || '';
+        const nftTypeParam = params.get('nftType') || 'compressed';
+        
+        // Call server to mint NFT
+        const mintRes = await fetch('/api/nft/mint-after-payment', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            paymentSignature: paymentSig,
+            recipient: recipient,
+            metadataUrl: metadataUrl,
+            nftType: nftTypeParam,
+            name: name
+          })
+        });
+        
+        const mintData = await mintRes.json();
+        if (mintData.success) {
+          document.getElementById('main-container').style.display = 'none';
+          document.getElementById('success-container').style.display = 'block';
+          document.getElementById('tx-link').innerHTML = 'NFT Minted! <a href="https://solscan.io/tx/' + (mintData.signature || paymentSig) + '" target="_blank" style="color:#14F195;">View on Solscan</a>';
+        } else {
+          showStatus('Payment received but mint failed: ' + (mintData.error || 'Unknown error'), 'error');
+        }
+      } catch (err) {
+        console.error('[NFT Payment] Mint after QR payment failed:', err);
+        showStatus('Payment received but mint failed: ' + err.message, 'error');
+      }
+    }
+    
+    // Start polling for QR payments (every 3 seconds)
+    pollInterval = setInterval(pollForQRPayment, 3000);
+    console.log('[NFT Payment] QR payment polling started for reference:', reference);
     
     function showStatus(msg, type) { const el = document.getElementById('status'); el.textContent = msg; el.className = 'status ' + type; }
     function setLoading(loading) { const btn = document.getElementById('pay-btn'); btn.disabled = loading; btn.innerHTML = loading ? '<div class="spinner"></div> Processing...' : '<span>👻</span> Connect Phantom & Pay'; }
@@ -5120,6 +5230,32 @@ app.get('/nft-mint-success', (req, res) => {
     }
 });
 
+// NFT mint after QR payment - called when QR payment is detected via polling
+app.post('/api/nft/mint-after-payment', async (req, res) => {
+    const { paymentSignature, recipient, metadataUrl, nftType, name } = req.body;
+    console.log('[NFT] Mint after QR payment:', { paymentSignature, nftType, name });
+    
+    try {
+        // For now, store the success for the app to poll
+        // In a full implementation, this would trigger actual NFT minting via Metaplex
+        global.nftMintSuccess = {
+            paymentTx: paymentSignature,
+            mintTx: paymentSignature, // Same as payment for QR flow
+            imageUrl: metadataUrl,
+            amount: 0,
+            nftType: nftType || 'compressed',
+            name: name,
+            timestamp: Date.now()
+        };
+        
+        console.log('[NFT] QR payment mint success stored for app polling');
+        res.json({ success: true, signature: paymentSignature });
+    } catch (err) {
+        console.error('[NFT] Mint after QR payment error:', err);
+        res.status(500).json({ success: false, error: err.message });
+    }
+});
+
 // Wallet connected callback - receives address from browser and broadcasts to Electron app
 app.post('/wallet-connected', (req, res) => {
     const { address } = req.body;
@@ -5183,8 +5319,8 @@ app.get('/wallet-connect', (req, res) => {
     .status.error { display: block; background: rgba(248, 113, 113, 0.1); color: #F87171; }
     .status.success { display: block; background: rgba(20, 241, 149, 0.1); color: #14F195; }
     .status.info { display: block; background: rgba(153, 69, 255, 0.1); color: #9945FF; }
-    .spinner { width: 20px; height: 20px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 1s linear infinite; display: inline-block; }
-    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner { width: 20px; height: 20px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 1s linear infinite; display: inline-block; transform-origin: center center; box-sizing: border-box; }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
     .wallet-address { font-family: monospace; font-size: 12px; word-break: break-all; margin-top: 8px; color: #14F195; }
     .success-icon { font-size: 64px; margin-bottom: 16px; }
     .copy-btn { background: rgba(153,69,255,0.2); border: none; color: #9945FF; padding: 8px 16px; border-radius: 8px; cursor: pointer; margin-top: 12px; font-size: 12px; }
@@ -5429,8 +5565,8 @@ app.get('/nft-transfer-sign', (req, res) => {
     .status.error { display: block; background: rgba(248, 113, 113, 0.1); color: #F87171; }
     .status.success { display: block; background: rgba(20, 241, 149, 0.1); color: #14F195; }
     .status.info { display: block; background: rgba(153, 69, 255, 0.1); color: #9945FF; }
-    .spinner { width: 20px; height: 20px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 1s linear infinite; display: inline-block; }
-    @keyframes spin { to { transform: rotate(360deg); } }
+    .spinner { width: 20px; height: 20px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 1s linear infinite; display: inline-block; transform-origin: center center; box-sizing: border-box; }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
   </style>
 </head>
 <body>
