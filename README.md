@@ -355,8 +355,13 @@ Deletion behavior:
 
 ## Requirements
 
-### Server
-- Node.js 18+ (auto-installed by scripts)
+### Desktop App (Server Tray)
+- **macOS:** 10.15 (Catalina) or later
+- **Windows:** Windows 10 version 1809 (October 2018 Update) or later, Windows 11
+- **Linux:** Ubuntu 18.04+, Debian 10+, or equivalent (x64)
+
+### Server (Headless)
+- Node.js 18+ (Node 20 LTS recommended)
 - Port 3000 available
 - Linux, macOS, or Windows
 
@@ -364,6 +369,14 @@ Deletion behavior:
 - **Android:** 7.0+ (API 24+)
 - **iOS:** 15.0+
 - Network access to server
+
+### Build Requirements (for building from source)
+- Node.js 20 LTS
+- Python 3.x
+- Build tools for native dependencies (`sqlite3`, `bcrypt`, `sharp`):
+  - **macOS:** Xcode Command Line Tools
+  - **Windows:** Visual Studio Build Tools + Python (install via `npm install -g windows-build-tools`)
+  - **Linux:** build-essential, gcc, g++, make, Python
 
 ## Privacy
 
