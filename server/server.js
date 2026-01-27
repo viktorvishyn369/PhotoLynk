@@ -4633,11 +4633,13 @@ app.get('/nft-payment', (req, res) => {
       <div class="amount-usd" id="amount-usd">≈ $0.00 USD</div>
     </div>
     <button class="btn btn-phantom" id="pay-btn" onclick="connectAndPay()"><span>👻</span> Connect Phantom & Pay</button>
-    <div style="margin:16px 0;color:#666;font-size:12px;">— or scan with any Solana wallet —</div>
-    <div id="qr-container" style="background:#fff;padding:16px;border-radius:12px;display:inline-block;margin-bottom:12px;min-width:180px;min-height:180px;"><canvas id="qr-code" width="180" height="180" style="display:block;"></canvas></div>
-    <div style="font-size:10px;color:#888;margin-bottom:8px;">Compatible wallets:</div>
-    <div id="wallet-links" style="display:flex;flex-wrap:wrap;justify-content:center;gap:8px;margin-bottom:16px;"></div>
-    <button class="btn btn-secondary" onclick="window.close()">Cancel</button>
+    <!-- QR code and external wallets hidden for now - kept for future development -->
+    <div style="display:none;margin:16px 0;color:#666;font-size:12px;">— or scan with any Solana wallet —</div>
+    <div id="qr-container" style="display:none;background:#fff;padding:16px;border-radius:12px;margin-bottom:12px;min-width:180px;min-height:180px;"><canvas id="qr-code" width="180" height="180" style="display:block;"></canvas></div>
+    <div style="display:none;font-size:10px;color:#888;margin-bottom:8px;">Compatible wallets:</div>
+    <div id="wallet-links" style="display:none;flex-wrap:wrap;justify-content:center;gap:8px;margin-bottom:16px;"></div>
+    <!-- End hidden QR section -->
+    <button class="btn btn-secondary" onclick="window.close()" style="margin-top:16px;">Cancel</button>
     <div class="status" id="status"></div>
     <div class="wallet-info">Recipient: <span id="recipient">...</span></div>
   </div>
