@@ -5500,23 +5500,40 @@ app.get('/wallet-connect', (req, res) => {
       }, 1000);
     });
     
-    // On page load: try eager connect (no popup) for already-trusted wallets
-    window.addEventListener('load', async () => {
+    // Wait for Phantom extension to inject (can take 1-3 seconds on some browsers)
+    let phantomCheckAttempts = 0;
+    const maxPhantomChecks = 15; // Check for up to 7.5 seconds
+    
+    function waitForPhantom() {
+      phantomCheckAttempts++;
       const provider = window.phantom?.solana || window.solana;
-      if (!provider?.isPhantom) {
-        showStatus('Phantom wallet not detected. Please install it.', 'error');
-        return;
-      }
       
-      // Try eager connect (no popup, only works if already trusted)
-      try {
-        const resp = await provider.connect({ onlyIfTrusted: true });
-        if (resp?.publicKey) {
-          showSuccess(resp.publicKey.toString());
-        }
-      } catch (e) {
-        // Not trusted yet - user needs to click button
+      if (provider?.isPhantom) {
+        // Phantom found - try eager connect
+        showStatus('Phantom detected!', 'info');
+        provider.connect({ onlyIfTrusted: true }).then(resp => {
+          if (resp?.publicKey) showSuccess(resp.publicKey.toString());
+          else showStatus('Click Connect to link your wallet', 'info');
+        }).catch(() => {
+          showStatus('Click Connect to link your wallet', 'info');
+        });
+      } else if (phantomCheckAttempts < maxPhantomChecks) {
+        // Keep checking - extension may still be loading
+        showStatus('Looking for Phantom wallet... (' + phantomCheckAttempts + '/' + maxPhantomChecks + ')', 'info');
+        setTimeout(waitForPhantom, 500);
+      } else {
+        // Phantom not found after all attempts
+        showStatus('Phantom wallet not detected. Make sure the extension is installed and enabled for this site.', 'error');
+        document.getElementById('connect-btn').innerHTML = '<span>📥</span> Install Phantom';
+        document.getElementById('connect-btn').onclick = function() {
+          window.open('https://phantom.app/', '_blank');
+        };
       }
+    }
+    
+    // Start checking for Phantom after page load
+    window.addEventListener('load', () => {
+      setTimeout(waitForPhantom, 300);
     });
   </script>
 </body>
