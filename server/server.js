@@ -4628,9 +4628,15 @@ app.get('/nft-payment', (req, res) => {
     <div class="nft-name" id="nft-name">Loading...</div>
     <div class="nft-type" id="nft-type">Compressed NFT</div>
     <div class="amount-box">
-      <div class="amount-label">Mint Fee</div>
+      <div class="amount-label">Pay now (App Fee)</div>
       <div class="amount-value" id="amount-sol">0.000 SOL</div>
       <div class="amount-usd" id="amount-usd">≈ $0.00 USD</div>
+    </div>
+
+    <div class="amount-box" id="estimated-box" style="display:none;">
+      <div class="amount-label">Estimated total cost</div>
+      <div class="amount-value" id="estimated-sol">0.000 SOL</div>
+      <div class="amount-usd" id="estimated-usd">≈ $0.00 USD</div>
     </div>
     <button class="btn btn-phantom" id="pay-btn" onclick="connectAndPay()"><span>👻</span> Connect Phantom & Pay</button>
     <!-- QR code and external wallets hidden for future development -->
@@ -4653,15 +4659,125 @@ app.get('/nft-payment', (req, res) => {
   <script>
     const params = new URLSearchParams(window.location.search);
     const recipient = params.get('recipient') || '';
-    const amount = parseFloat(params.get('amount')) || 0;
+    let amount = parseFloat(params.get('amount')) || 0;
+    const feeUsd = parseFloat(params.get('feeUsd')) || 0;
+    let solPrice = parseFloat(params.get('solPrice')) || 0;
+    const estimatedTotalUsd = parseFloat(params.get('estimatedTotalUsd')) || 0;
+    const estimatedTotalSol = parseFloat(params.get('estimatedTotalSol')) || 0;
     const name = params.get('name') || 'PhotoLynk Memory';
     const imageUrl = decodeURIComponent(params.get('imageUrl') || '');
     const nftType = params.get('nftType') || 'compressed';
+    const storageOption = params.get('storageOption') || '';
+    const fileSizeBytes = parseInt(params.get('fileSizeBytes') || '0', 10) || 0;
     console.log('[NFT Payment] imageUrl:', imageUrl);
     document.getElementById('nft-name').textContent = name;
-    document.getElementById('nft-type').textContent = nftType === 'compressed' ? 'Compressed NFT (cNFT)' : 'Standard NFT';
-    document.getElementById('amount-sol').textContent = amount.toFixed(6) + ' SOL';
-    document.getElementById('amount-usd').textContent = '≈ $' + (amount * 200).toFixed(2) + ' USD';
+    const typeLabel = nftType === 'compressed' ? 'Compressed NFT (cNFT)' : 'Standard NFT';
+    const storageLabel = storageOption === 'cloud' ? 'StealthCloud' : (storageOption === 'ipfs' ? 'IPFS' : '');
+    document.getElementById('nft-type').textContent = storageLabel ? (typeLabel + ' • ' + storageLabel) : typeLabel;
+    function renderAmounts(extra) {
+      const usdRate = solPrice > 0 ? solPrice : 200;
+
+      // If feeUsd is provided, recompute SOL amount so the USD fee stays constant
+      if (feeUsd > 0 && usdRate > 0) {
+        amount = feeUsd / usdRate;
+      }
+
+      document.getElementById('amount-sol').textContent = amount.toFixed(6) + ' SOL';
+      document.getElementById('amount-usd').textContent = '≈ $' + (amount * usdRate).toFixed(2) + ' USD';
+
+      if (estimatedTotalUsd > 0 || estimatedTotalSol > 0) {
+        document.getElementById('estimated-box').style.display = 'block';
+        let estSol = estimatedTotalSol > 0 ? estimatedTotalSol : (estimatedTotalUsd / usdRate);
+        let estUsd = estimatedTotalUsd > 0 ? estimatedTotalUsd : (estimatedTotalSol * usdRate);
+
+        if (extra && typeof extra.estSol === 'number' && extra.estSol > 0) {
+          estSol = extra.estSol;
+          estUsd = estSol * usdRate;
+        }
+        document.getElementById('estimated-sol').textContent = estSol.toFixed(6) + ' SOL';
+        document.getElementById('estimated-usd').textContent = '≈ $' + estUsd.toFixed(2) + ' USD';
+      }
+    }
+
+    async function refreshSolPrice() {
+      try {
+        const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', { cache: 'no-store' });
+        const json = await res.json();
+        const p = Number(json?.solana?.usd);
+        if (Number.isFinite(p) && p > 0) {
+          solPrice = p;
+          renderAmounts();
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+
+    async function rpc(method, params) {
+      const res = await fetch('/solana-rpc', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params: params || [] })
+      });
+      const json = await res.json();
+      if (json && json.error) throw new Error(json.error.message || 'RPC error');
+      return json.result;
+    }
+
+    function storageUsdEstimate() {
+      if (storageOption === 'cloud') return 0;
+      const ARWEAVE_UPLOAD_BASE_USD = 0.01;
+      const ARWEAVE_PER_KB_USD = 0.00001;
+      const metadataBytes = 2000;
+      const imageBytes = fileSizeBytes > 0 ? fileSizeBytes : 0;
+      const imgUsd = ARWEAVE_UPLOAD_BASE_USD + (imageBytes / 1024) * ARWEAVE_PER_KB_USD;
+      const metaUsd = ARWEAVE_UPLOAD_BASE_USD + (metadataBytes / 1024) * ARWEAVE_PER_KB_USD;
+      return imgUsd + metaUsd;
+    }
+
+    async function refreshRealtimeEstimate() {
+      try {
+        const usdRate = solPrice > 0 ? solPrice : 200;
+
+        // Priority fee market (median)
+        let priorityLamports = 0;
+        try {
+          const fees = await rpc('getRecentPrioritizationFees', []);
+          if (Array.isArray(fees) && fees.length) {
+            const vals = fees.map(x => Number(x && x.prioritizationFee)).filter(n => Number.isFinite(n) && n >= 0).sort((a,b)=>a-b);
+            const microLamportsPerCu = vals.length ? vals[Math.floor(vals.length/2)] : 0;
+            const cuEstimate = nftType === 'compressed' ? 80000 : 250000;
+            priorityLamports = Math.ceil((microLamportsPerCu * cuEstimate) / 1000000);
+          }
+        } catch (e) {}
+
+        // Rent (standard NFT only)
+        let rentLamports = 0;
+        if (nftType !== 'compressed') {
+          const sizes = [82, 165, 679, 282];
+          const rents = await Promise.all(sizes.map(s => rpc('getMinimumBalanceForRentExemption', [s]).catch(()=>0)));
+          rentLamports = rents.reduce((a,b)=>a+(Number(b)||0),0);
+        }
+
+        const baseFeeLamports = 5000;
+        const networkLamports = rentLamports + baseFeeLamports + priorityLamports;
+        const networkSol = networkLamports / 1e9;
+
+        const feeSolLive = feeUsd > 0 ? (feeUsd / usdRate) : amount;
+        const storageUsd = storageUsdEstimate();
+        const storageSol = storageUsd / usdRate;
+
+        const estSol = feeSolLive + networkSol + storageSol;
+        renderAmounts({ estSol });
+      } catch (e) {
+        // ignore
+      }
+    }
+
+    renderAmounts();
+    setInterval(refreshSolPrice, 15000);
+    refreshRealtimeEstimate();
+    setInterval(refreshRealtimeEstimate, 15000);
     document.getElementById('recipient').textContent = recipient ? recipient.slice(0,4) + '...' + recipient.slice(-4) : '...';
     if (imageUrl) {
       const img = document.getElementById('nft-image');
