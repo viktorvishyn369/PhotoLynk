@@ -1009,7 +1009,8 @@ const authRateLimiter = createRateLimiter({ windowMs: AUTH_RATE_LIMIT_WINDOW_MS,
 const REQUIRE_EMAIL_VERIFICATION = process.env.REQUIRE_EMAIL_VERIFICATION === 'true' || false;
 
 // Country/geo verification: require re-verification when logging in from a new country
-const REQUIRE_COUNTRY_VERIFICATION = process.env.REQUIRE_COUNTRY_VERIFICATION !== 'false'; // enabled by default
+// DISABLED for development - set to true in production if needed
+const REQUIRE_COUNTRY_VERIFICATION = false; // process.env.REQUIRE_COUNTRY_VERIFICATION === 'true';
 
 // Get country from IP using free ip-api.com (no API key needed)
 const getCountryFromIP = async (ip) => {
