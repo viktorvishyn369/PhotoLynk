@@ -3815,7 +3815,26 @@ function findPerceptualHashMatchServer(hash, hashSet) {
 // Upload encrypted manifest JSON
 // Now includes comprehensive server-side deduplication as extra precaution
 app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (req, res) => {
-    const { manifestId, encryptedManifest, chunkCount, filename, originalSize, fileHash, perceptualHash, creationTime, exifCaptureTime, exifMake, exifModel } = req.body || {};
+    const {
+        manifestId,
+        encryptedManifest,
+        chunkCount,
+        filename,
+        originalSize,
+        fileHash,
+        perceptualHash,
+        creationTime,
+        exifCaptureTime,
+        exifMake,
+        exifModel,
+        mediaType,
+        thumbChunkId,
+        thumbNonce,
+        thumbSize,
+        thumbW,
+        thumbH,
+        thumbMime,
+    } = req.body || {};
     const clientBuild = (req.headers['x-client-build'] || '').toString();
     if (clientBuild) {
         console.log(`[SC] /manifests client=${clientBuild} user=${req.user.id} chunkCount=${typeof chunkCount === 'number' ? chunkCount : 'na'}`);
@@ -3902,6 +3921,7 @@ app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (
         // Unencrypted metadata for fast dedup (hashes don't reveal content)
         meta: {
             filename: typeof filename === 'string' ? filename : null,
+            mediaType: typeof mediaType === 'string' ? mediaType : null,
             originalSize: typeof originalSize === 'number' ? originalSize : null,
             fileHash: typeof fileHash === 'string' ? fileHash : null,
             perceptualHash: typeof perceptualHash === 'string' ? perceptualHash : null,
@@ -3909,6 +3929,12 @@ app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (
             exifCaptureTime: typeof exifCaptureTime === 'string' ? exifCaptureTime : null,
             exifMake: typeof exifMake === 'string' ? exifMake : null,
             exifModel: typeof exifModel === 'string' ? exifModel : null,
+            thumbChunkId: typeof thumbChunkId === 'string' ? thumbChunkId : null,
+            thumbNonce: typeof thumbNonce === 'string' ? thumbNonce : null,
+            thumbSize: typeof thumbSize === 'number' ? thumbSize : null,
+            thumbW: typeof thumbW === 'number' ? thumbW : null,
+            thumbH: typeof thumbH === 'number' ? thumbH : null,
+            thumbMime: typeof thumbMime === 'string' ? thumbMime : null,
         }
     };
     fs.writeFileSync(manifestPath, JSON.stringify(payload));
@@ -3947,6 +3973,7 @@ app.get('/api/cloud/manifests', authenticateToken, blockDeletedSubscription, (re
                 const content = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
                 if (content.meta) {
                     entry.filename = content.meta.filename || null;
+                    entry.mediaType = content.meta.mediaType || null;
                     entry.originalSize = content.meta.originalSize || null;
                     entry.fileHash = content.meta.fileHash || null;
                     entry.perceptualHash = content.meta.perceptualHash || null;
@@ -3955,6 +3982,12 @@ app.get('/api/cloud/manifests', authenticateToken, blockDeletedSubscription, (re
                     entry.exifCaptureTime = content.meta.exifCaptureTime || null;
                     entry.exifMake = content.meta.exifMake || null;
                     entry.exifModel = content.meta.exifModel || null;
+                    entry.thumbChunkId = content.meta.thumbChunkId || null;
+                    entry.thumbNonce = content.meta.thumbNonce || null;
+                    entry.thumbSize = content.meta.thumbSize || null;
+                    entry.thumbW = content.meta.thumbW || null;
+                    entry.thumbH = content.meta.thumbH || null;
+                    entry.thumbMime = content.meta.thumbMime || null;
                 }
             } catch (e) {
                 // Ignore read errors, just return manifestId
