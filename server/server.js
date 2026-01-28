@@ -203,22 +203,37 @@ const inferTierGbFromProductId = (productId) => {
     const pidLower = pid.toLowerCase();
     if (pidLower === 'stealthcloud_1tb_monthly' || pidLower === 'stealthcloud.1tb.monthly') return 1000;
 
-    const m = pid.match(/(?:^|[._])stealthcloud[._](\d+)(gb|tb)[._]monthly$/i);
+    // Handle modern IDs with optional colon/base plan suffix (e.g., stealthcloud.100gb.monthly:monthly)
+    const m = pid.match(/(?:^|[._])stealthcloud[._](\d+)(gb|tb)[._]monthly(?::.*)?$/i);
     if (!m) {
         const legacy = pid.match(/^stealthcloud_(\d+)(gb|tb)_monthly$/i);
-        if (!legacy) return null;
+        if (legacy) {
+            const qtyLegacy = Number(legacy[1]);
+            const unitLegacy = String(legacy[2]).toLowerCase();
+            if (!Number.isFinite(qtyLegacy) || qtyLegacy <= 0) return null;
+            if (unitLegacy === 'tb') return qtyLegacy * 1000;
+            if (unitLegacy === 'gb') return qtyLegacy;
+            return null;
+        }
 
-        const qtyLegacy = Number(legacy[1]);
-        const unitLegacy = String(legacy[2]).toLowerCase();
-        if (!Number.isFinite(qtyLegacy) || qtyLegacy <= 0) return null;
-        if (unitLegacy === 'tb') return qtyLegacy * 1000;
-        return qtyLegacy;
+        // Fallback: any product ID containing digits + gb/tb (captures future SKUs)
+        const generic = pidLower.match(/(\d+)(gb|tb)/);
+        if (generic) {
+            const qtyGen = Number(generic[1]);
+            const unitGen = String(generic[2]).toLowerCase();
+            if (!Number.isFinite(qtyGen) || qtyGen <= 0) return null;
+            if (unitGen === 'tb') return qtyGen * 1000;
+            if (unitGen === 'gb') return qtyGen;
+        }
+        return null;
     }
+
     const qty = Number(m[1]);
     const unit = String(m[2]).toLowerCase();
     if (!Number.isFinite(qty) || qty <= 0) return null;
     if (unit === 'tb') return qty * 1000;
-    return qty;
+    if (unit === 'gb') return qty;
+    return null;
 };
 
 const DATA_DIR = resolveDataDir();
