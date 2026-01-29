@@ -3855,6 +3855,7 @@ app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (
     // ========== SERVER-SIDE DEDUPLICATION (Extra Precaution) ==========
     // Build dedup sets from existing manifests
     const dedupSets = buildServerDedupSets(manifestsDir);
+    console.log(`[SC-Dedup] Checking ${safeId}: ${dedupSets.manifestIds.size} manifestIds, ${dedupSets.filenames.size} filenames, ${dedupSets.perceptualHashes.size} pHashes, ${dedupSets.fileHashes.size} fHashes`);
     
     // Check 1: ManifestId (filename + size hash)
     if (dedupSets.manifestIds.has(safeId)) {
