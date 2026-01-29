@@ -3,7 +3,7 @@ const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 
-const CURRENT_VERSION = '1.0.0';
+const CURRENT_VERSION = '1.5.2';
 const GITHUB_REPO = 'viktorvishyn369/PhotoLynk';
 const UPDATE_CHECK_INTERVAL = 24 * 60 * 60 * 1000; // 24 hours
 
