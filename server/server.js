@@ -16,6 +16,10 @@ const updater = require('./updater');
 let sharp;
 try { sharp = require('sharp'); } catch (e) { sharp = null; }
 
+// HEIC conversion support - try to load heic-convert for HEIC thumbnail generation
+let heicConvert;
+try { heicConvert = require('heic-convert'); } catch (e) { heicConvert = null; }
+
 /**
  * Compute perceptual hash (dHash) for an image file
  * Returns 16-character hex string (64-bit hash)
@@ -2877,73 +2881,161 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
         }
     });
 
-    out.on('finish', () => {
+    out.on('finish', async () => {
         const fileHash = hasher.digest('hex');
         const mimetype = (req.headers['content-type'] || 'application/octet-stream').toString();
         const size = writtenBytes;
+        
+        // Detect real file format from magic bytes and fix extension if mismatched
+        // Android sometimes reports screenshots as .jpg when they're actually PNG
+        let correctedSafeName = safeName;
+        try {
+            const fd = fs.openSync(tmpPath, 'r');
+            const magicBuf = Buffer.alloc(12);
+            fs.readSync(fd, magicBuf, 0, 12, 0);
+            fs.closeSync(fd);
+            
+            const ext = safeName.split('.').pop()?.toLowerCase();
+            const isPNG = magicBuf[0] === 0x89 && magicBuf[1] === 0x50 && magicBuf[2] === 0x4E && magicBuf[3] === 0x47;
+            const isJPEG = magicBuf[0] === 0xFF && magicBuf[1] === 0xD8 && magicBuf[2] === 0xFF;
+            
+            if (isPNG && ext !== 'png') {
+                correctedSafeName = safeName.replace(/\.[^.]+$/, '.png');
+                console.log(`[Format] Corrected ${safeName} -> ${correctedSafeName} (PNG magic bytes)`);
+            } else if (isJPEG && ext !== 'jpg' && ext !== 'jpeg') {
+                correctedSafeName = safeName.replace(/\.[^.]+$/, '.jpg');
+                console.log(`[Format] Corrected ${safeName} -> ${correctedSafeName} (JPEG magic bytes)`);
+            }
+        } catch (e) {
+            // If detection fails, use original name
+        }
+        
+        const isImage = /\.(jpg|jpeg|png|gif|bmp|webp|heic|heif|tiff?)$/i.test(correctedSafeName);
 
-        db.get(
-            `SELECT filename, file_hash FROM files WHERE user_id = ? AND file_hash = ?`,
-            [req.user.id, fileHash],
-            (err, row) => {
-                if (err) {
-                    cleanupTmp();
-                    return res.status(500).json({ error: 'Database error' });
+        // Get client's perceptual hash from header (for HEIC files where sharp fails)
+        const clientPerceptualHash = (req.headers['x-perceptual-hash'] || '').toString().trim();
+
+        // Compute perceptual hash BEFORE dedup check (for images)
+        // Use client's hash as fallback if server can't compute (HEIC on macOS)
+        let perceptualHash = null;
+        if (isImage) {
+            try {
+                perceptualHash = await computePerceptualHash(tmpPath);
+            } catch (e) {
+                console.log('computePerceptualHash error:', e.message);
+            }
+            // Use client's hash if server failed (critical for HEIC)
+            if (!perceptualHash && clientPerceptualHash && clientPerceptualHash.length === 16) {
+                perceptualHash = clientPerceptualHash;
+                console.log(`[Dedup] Using client perceptual hash for ${safeName}: ${perceptualHash}`);
+            }
+        }
+
+        // Hamming distance for perceptual hash fuzzy matching
+        const hammingDistance64 = (a, b) => {
+            if (!a || !b || a.length !== 16 || b.length !== 16) return Number.MAX_SAFE_INTEGER;
+            let dist = 0;
+            for (let i = 0; i < 16; i += 8) {
+                const valA = parseInt(a.substring(i, i + 8), 16);
+                const valB = parseInt(b.substring(i, i + 8), 16);
+                let x = valA ^ valB;
+                while (x) { dist += x & 1; x >>>= 1; }
+            }
+            return dist;
+        };
+        const DHASH_THRESHOLD = 3;
+
+        // Check file_hash dedup
+        const checkFileHash = () => new Promise((resolve, reject) => {
+            db.get(
+                `SELECT filename, file_hash FROM files WHERE user_id = ? AND file_hash = ?`,
+                [req.user.id, fileHash],
+                (err, row) => {
+                    if (err) return reject(err);
+                    resolve(row);
                 }
+            );
+        });
 
-                if (row) {
-                    const existingFilePath = path.join(deviceDir, row.filename);
-                    if (fs.existsSync(existingFilePath)) {
-                        cleanupTmp();
-                        console.log(`Duplicate raw upload detected: ${safeName} (matches ${row.filename})`);
-                        return res.json({ message: 'File already exists (duplicate)', filename: row.filename, duplicate: true });
-                    }
-                    console.log(`File ${row.filename} in DB but missing from disk - cleaning up DB`);
-                    db.run(`DELETE FROM files WHERE user_id = ? AND file_hash = ?`, [req.user.id, fileHash]);
-                }
-
-                try {
-                    if (fs.existsSync(finalPath)) {
-                        fs.unlinkSync(finalPath);
-                    }
-                } catch (e) {}
-
-                try {
-                    fs.renameSync(tmpPath, finalPath);
-                } catch (e) {
-                    cleanupTmp();
-                    return res.status(500).json({ error: 'Failed to finalize upload' });
-                }
-
-                // Compute perceptual hash for images (async, non-blocking)
-                const isImage = /\.(jpg|jpeg|png|gif|bmp|webp|heic|heif|tiff?)$/i.test(safeName);
-                const saveToDb = (perceptualHash) => {
-                    db.run(
-                        `INSERT OR REPLACE INTO files (user_id, filename, original_name, mime_type, size, file_hash, perceptual_hash) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                        [req.user.id, safeName, safeName, mimetype, size, fileHash, perceptualHash],
-                        (err2) => {
-                            if (err2) {
-                                console.error('Metadata save error:', err2);
-                                try { fs.unlinkSync(finalPath); } catch (e) {}
-                                return res.status(500).json({ error: 'Failed to save file metadata' });
+        // Check perceptual_hash dedup (fuzzy matching with threshold)
+        const checkPerceptualHash = () => new Promise((resolve, reject) => {
+            if (!perceptualHash) return resolve(null);
+            db.all(
+                `SELECT filename, perceptual_hash FROM files WHERE user_id = ? AND perceptual_hash IS NOT NULL`,
+                [req.user.id],
+                (err, rows) => {
+                    if (err) return reject(err);
+                    for (const row of rows || []) {
+                        if (row.perceptual_hash && row.perceptual_hash.length === 16) {
+                            const dist = hammingDistance64(perceptualHash, row.perceptual_hash);
+                            if (dist <= DHASH_THRESHOLD) {
+                                return resolve({ ...row, distance: dist });
                             }
-                            return res.json({ message: 'File uploaded', filename: safeName, fileHash, perceptualHash });
                         }
-                    );
-                };
+                    }
+                    resolve(null);
+                }
+            );
+        });
 
-                if (isImage) {
-                    computePerceptualHash(finalPath).then(phash => {
-                        saveToDb(phash);
-                    }).catch(e => {
-                        console.log('Perceptual hash failed:', e.message);
-                        saveToDb(null);
-                    });
-                } else {
-                    saveToDb(null);
+        try {
+            // Check file hash first (exact match)
+            const fileHashMatch = await checkFileHash();
+            if (fileHashMatch) {
+                const existingFilePath = path.join(deviceDir, fileHashMatch.filename);
+                if (fs.existsSync(existingFilePath)) {
+                    cleanupTmp();
+                    console.log(`Duplicate raw upload detected: ${safeName} (fileHash matches ${fileHashMatch.filename})`);
+                    return res.json({ message: 'File already exists (duplicate)', filename: fileHashMatch.filename, duplicate: true });
+                }
+                console.log(`File ${fileHashMatch.filename} in DB but missing from disk - cleaning up DB`);
+                db.run(`DELETE FROM files WHERE user_id = ? AND file_hash = ?`, [req.user.id, fileHash]);
+            }
+
+            // Check perceptual hash (fuzzy match for images)
+            const phashMatch = await checkPerceptualHash();
+            if (phashMatch) {
+                const existingFilePath = path.join(deviceDir, phashMatch.filename);
+                if (fs.existsSync(existingFilePath)) {
+                    cleanupTmp();
+                    console.log(`Duplicate raw upload detected: ${safeName} (perceptualHash matches ${phashMatch.filename}, dist=${phashMatch.distance})`);
+                    return res.json({ message: 'File already exists (duplicate)', filename: phashMatch.filename, duplicate: true });
                 }
             }
-        );
+
+            // No duplicate - finalize upload with corrected filename
+            const correctedFinalPath = path.join(deviceDir, correctedSafeName);
+            try {
+                if (fs.existsSync(correctedFinalPath)) {
+                    fs.unlinkSync(correctedFinalPath);
+                }
+            } catch (e) {}
+
+            try {
+                fs.renameSync(tmpPath, correctedFinalPath);
+            } catch (e) {
+                cleanupTmp();
+                return res.status(500).json({ error: 'Failed to finalize upload' });
+            }
+
+            // Save to DB with corrected filename
+            db.run(
+                `INSERT OR REPLACE INTO files (user_id, filename, original_name, mime_type, size, file_hash, perceptual_hash) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                [req.user.id, correctedSafeName, safeName, mimetype, size, fileHash, perceptualHash],
+                (err2) => {
+                    if (err2) {
+                        console.error('Metadata save error:', err2);
+                        try { fs.unlinkSync(correctedFinalPath); } catch (e) {}
+                        return res.status(500).json({ error: 'Failed to save file metadata' });
+                    }
+                    return res.json({ message: 'File uploaded', filename: correctedSafeName, fileHash, perceptualHash });
+                }
+            );
+        } catch (err) {
+            cleanupTmp();
+            console.error('Dedup check error:', err);
+            return res.status(500).json({ error: 'Database error' });
+        }
     });
 
     req.pipe(out);
@@ -3302,9 +3394,35 @@ app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
         return res.status(404).json({ error: 'File not found' });
     }
 
-    const ext = (filename || '').split('.').pop()?.toLowerCase() || '';
-    const isImage = ['jpg', 'jpeg', 'png', 'heic', 'heif', 'webp', 'gif', 'bmp', 'tiff'].includes(ext);
-    const isVideo = ['mp4', 'mov', 'avi', 'mkv', 'm4v', '3gp', 'webm'].includes(ext);
+    // Detect actual file type from magic bytes (extension may be wrong for old uploads)
+    let ext = (filename || '').split('.').pop()?.toLowerCase() || '';
+    let isImage = ['jpg', 'jpeg', 'png', 'heic', 'heif', 'webp', 'gif', 'bmp', 'tiff'].includes(ext);
+    let isVideo = ['mp4', 'mov', 'avi', 'mkv', 'm4v', '3gp', 'webm'].includes(ext);
+    
+    // Check magic bytes to detect actual format (handles mismatched extensions)
+    try {
+        const fd = fs.openSync(filePath, 'r');
+        const magicBuf = Buffer.alloc(12);
+        fs.readSync(fd, magicBuf, 0, 12, 0);
+        fs.closeSync(fd);
+        
+        const isPNG = magicBuf[0] === 0x89 && magicBuf[1] === 0x50 && magicBuf[2] === 0x4E && magicBuf[3] === 0x47;
+        const isJPEG = magicBuf[0] === 0xFF && magicBuf[1] === 0xD8 && magicBuf[2] === 0xFF;
+        const isGIF = magicBuf[0] === 0x47 && magicBuf[1] === 0x49 && magicBuf[2] === 0x46;
+        const isWEBP = magicBuf[8] === 0x57 && magicBuf[9] === 0x45 && magicBuf[10] === 0x42 && magicBuf[11] === 0x50;
+        
+        // If magic bytes indicate image but extension says otherwise, trust magic bytes
+        if (isPNG || isJPEG || isGIF || isWEBP) {
+            const detectedFormat = isPNG ? 'PNG' : isJPEG ? 'JPEG' : isGIF ? 'GIF' : 'WEBP';
+            if (!isImage) {
+                console.log(`[THUMB] Magic bytes detected ${detectedFormat} for ${filename} (ext was ${ext})`);
+            }
+            isImage = true;
+            isVideo = false;
+        }
+    } catch (e) {
+        // If magic byte detection fails, fall back to extension
+    }
 
     if (!isImage && !isVideo) {
         return res.status(400).json({ error: 'Not a media file' });
@@ -3355,8 +3473,31 @@ app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
 
     // If sharp is available, generate thumbnail for images
     if (sharp) {
+        // Check if this is a HEIC file that needs conversion
+        const isHeicFile = ['heic', 'heif'].includes(ext);
+        let inputBuffer = null;
+        
+        // Try to convert HEIC to JPEG first if heic-convert is available
+        if (isHeicFile && heicConvert) {
+            try {
+                console.log(`[THUMB] Converting HEIC: ${filename}`);
+                const heicBuffer = fs.readFileSync(filePath);
+                const jpegBuffer = await heicConvert({
+                    buffer: heicBuffer,
+                    format: 'JPEG',
+                    quality: 0.8
+                });
+                inputBuffer = jpegBuffer;
+                console.log(`[THUMB] HEIC converted: ${filename}, size: ${jpegBuffer.length}`);
+            } catch (heicErr) {
+                console.log(`[THUMB] HEIC conversion failed for ${filename}:`, heicErr.message);
+            }
+        }
+        
         try {
-            const thumbBuffer = await sharp(filePath)
+            // Use converted buffer for HEIC, or file path for others
+            const sharpInput = inputBuffer || filePath;
+            const thumbBuffer = await sharp(sharpInput, { failOn: 'none' })
                 .resize(150, 150, { fit: 'cover', position: 'center' })
                 .jpeg({ quality: 70 })
                 .toBuffer();
@@ -3364,16 +3505,33 @@ app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
             res.set('Cache-Control', 'public, max-age=86400');
             return res.send(thumbBuffer);
         } catch (e) {
-            console.log('Thumbnail generation failed:', e.message);
-            // Generate placeholder instead of serving huge original
+            console.log(`[THUMB] Generation failed for ${filename}:`, e.message);
+            // Generate a larger placeholder with gradient so client accepts it
             try {
+                // Create a 150x150 gradient placeholder that's large enough to pass client check
                 const placeholder = await sharp({
-                    create: { width: 150, height: 150, channels: 3, background: { r: 40, g: 60, b: 40 } }
-                }).jpeg({ quality: 70 }).toBuffer();
+                    create: { width: 150, height: 150, channels: 3, background: { r: 60, g: 60, b: 80 } }
+                })
+                .composite([{
+                    input: Buffer.from(`<svg width="150" height="150">
+                        <rect width="150" height="150" fill="url(#grad)"/>
+                        <defs><linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
+                            <stop offset="0%" style="stop-color:#3a3a4a"/>
+                            <stop offset="100%" style="stop-color:#5a5a6a"/>
+                        </linearGradient></defs>
+                        <text x="75" y="80" text-anchor="middle" fill="#888" font-size="12">No Preview</text>
+                    </svg>`),
+                    top: 0,
+                    left: 0
+                }])
+                .jpeg({ quality: 80 })
+                .toBuffer();
                 res.set('Content-Type', 'image/jpeg');
-                res.set('Cache-Control', 'public, max-age=86400');
+                res.set('Cache-Control', 'public, max-age=3600'); // Shorter cache for placeholders
                 return res.send(placeholder);
-            } catch (e2) {}
+            } catch (e2) {
+                console.log(`[THUMB] Placeholder failed for ${filename}:`, e2.message);
+            }
         }
     }
 
