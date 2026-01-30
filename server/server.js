@@ -1662,7 +1662,15 @@ const ensureStealthCloudUserDirs = (user) => {
             }
         });
 
-    return { userDir, chunksDir, manifestsDir };
+    // Raw files go to RAID10 alongside chunks (same storage tier as chunks)
+    const rawDir = CHUNKS_DIR 
+        ? path.join(CHUNKS_DIR, 'users', key, 'raw')
+        : path.join(userDir, 'raw');
+    const rawMetaDir = path.join(userDir, 'raw-meta'); // Metadata for raw files (thumbnails, EXIF) - on NVMe
+    if (!fs.existsSync(rawDir)) fs.mkdirSync(rawDir, { recursive: true });
+    if (!fs.existsSync(rawMetaDir)) fs.mkdirSync(rawMetaDir, { recursive: true });
+
+    return { userDir, chunksDir, manifestsDir, rawDir, rawMetaDir };
 };
 
 // File Storage Config
@@ -4024,6 +4032,276 @@ app.get('/api/cloud/manifests/:manifestId', authenticateToken, blockDeletedSubsc
     if (!fs.existsSync(manifestPath)) return res.status(404).json({ error: 'Manifest not found' });
     res.sendFile(manifestPath);
 });
+
+// ============================================================================
+// STEALTHCLOUD RAW MODE (Unencrypted fast uploads - optional)
+// ============================================================================
+
+// Upload raw file to StealthCloud (unencrypted mode)
+app.post('/api/cloud/raw', authenticateToken, requireUploadSubscription, express.raw({ type: '*/*', limit: '500mb' }), async (req, res) => {
+    const filename = (req.headers['x-filename'] || '').toString();
+    if (!filename) return res.status(400).json({ error: 'Missing X-Filename header' });
+    
+    const safeName = path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 255);
+    if (!safeName) return res.status(400).json({ error: 'Invalid filename' });
+    
+    const { rawDir, rawMetaDir } = ensureStealthCloudUserDirs(req.user);
+    const filePath = path.join(rawDir, safeName);
+    
+    if (!filePath.startsWith(rawDir)) {
+        return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    // Check quota
+    const fileSize = req.body?.length || 0;
+    const reservation = await reserveStealthCloudIncomingBytes({ userId: req.user.id, incomingBytes: fileSize });
+    if (!reservation.allowed) {
+        return res.status(413).json({
+            error: 'Storage limit reached',
+            code: 'QUOTA_EXCEEDED',
+            usedBytes: reservation.usedBytes,
+            quotaBytes: reservation.quotaBytes,
+            remainingBytes: reservation.remainingBytes,
+        });
+    }
+    
+    try {
+        // Compute file hash for deduplication
+        const fileHash = crypto.createHash('sha256').update(req.body).digest('hex');
+        
+        // Check if file already exists (by hash)
+        const existingFiles = fs.readdirSync(rawDir);
+        for (const existing of existingFiles) {
+            const existingPath = path.join(rawDir, existing);
+            if (fs.statSync(existingPath).isFile()) {
+                const existingHash = crypto.createHash('sha256').update(fs.readFileSync(existingPath)).digest('hex');
+                if (existingHash === fileHash) {
+                    reservation.release();
+                    return res.json({ 
+                        success: true, 
+                        filename: existing, 
+                        fileHash,
+                        duplicate: true,
+                        message: 'File already exists (duplicate)'
+                    });
+                }
+            }
+        }
+        
+        // Write file
+        fs.writeFileSync(filePath, req.body);
+        
+        console.log(`[SC-RAW] Uploaded: ${safeName} (${fileSize} bytes) for user ${req.user.id}`);
+        
+        res.json({ 
+            success: true, 
+            filename: safeName, 
+            fileHash,
+            size: fileSize,
+            duplicate: false
+        });
+    } catch (e) {
+        console.error(`[SC-RAW] Upload failed for ${safeName}:`, e.message);
+        res.status(500).json({ error: 'Failed to save file' });
+    } finally {
+        try { reservation.release(); } catch (e) {}
+    }
+});
+
+// Upload metadata (thumbnail, EXIF) for a raw file
+app.post('/api/cloud/raw/:filename/meta', authenticateToken, express.json({ limit: '10mb' }), (req, res) => {
+    const filename = req.params.filename;
+    const safeName = path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 255);
+    if (!safeName) return res.status(400).json({ error: 'Invalid filename' });
+    
+    const { rawMetaDir } = ensureStealthCloudUserDirs(req.user);
+    const metaPath = path.join(rawMetaDir, `${safeName}.json`);
+    
+    if (!metaPath.startsWith(rawMetaDir)) {
+        return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    const meta = req.body || {};
+    
+    try {
+        fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
+        console.log(`[SC-RAW] Saved metadata for ${safeName}`);
+        res.json({ success: true, filename: safeName });
+    } catch (e) {
+        console.error(`[SC-RAW] Failed to save metadata for ${safeName}:`, e.message);
+        res.status(500).json({ error: 'Failed to save metadata' });
+    }
+});
+
+// List raw files
+app.get('/api/cloud/raw', authenticateToken, (req, res) => {
+    const { rawDir, rawMetaDir } = ensureStealthCloudUserDirs(req.user);
+    const includeMeta = req.query.meta === 'true';
+    
+    if (!fs.existsSync(rawDir)) {
+        return res.json({ files: [], total: 0 });
+    }
+    
+    try {
+        const files = fs.readdirSync(rawDir)
+            .filter(f => !f.startsWith('.'))
+            .map(filename => {
+                const filePath = path.join(rawDir, filename);
+                const stats = fs.statSync(filePath);
+                if (!stats.isFile()) return null;
+                
+                const file = {
+                    type: 'raw',
+                    filename,
+                    size: stats.size,
+                    createdAt: stats.mtime.toISOString(),
+                };
+                
+                // Include metadata if requested
+                if (includeMeta) {
+                    const metaPath = path.join(rawMetaDir, `${filename}.json`);
+                    if (fs.existsSync(metaPath)) {
+                        try {
+                            const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+                            file.meta = meta;
+                        } catch (e) {}
+                    }
+                }
+                
+                return file;
+            })
+            .filter(Boolean);
+        
+        res.json({ files, total: files.length });
+    } catch (e) {
+        console.error('[SC-RAW] List error:', e.message);
+        res.status(500).json({ error: 'Failed to list files' });
+    }
+});
+
+// Download raw file
+app.get('/api/cloud/raw/:filename', authenticateToken, (req, res) => {
+    const filename = req.params.filename;
+    const safeName = path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 255);
+    if (!safeName) return res.status(400).json({ error: 'Invalid filename' });
+    
+    const { rawDir } = ensureStealthCloudUserDirs(req.user);
+    const filePath = path.join(rawDir, safeName);
+    
+    if (!filePath.startsWith(rawDir)) {
+        return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    if (!fs.existsSync(filePath)) {
+        return res.status(404).json({ error: 'File not found' });
+    }
+    
+    res.sendFile(filePath);
+});
+
+// Get thumbnail for raw file
+app.get('/api/cloud/raw/:filename/thumb', authenticateToken, async (req, res) => {
+    const filename = req.params.filename;
+    const safeName = path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 255);
+    if (!safeName) return res.status(400).json({ error: 'Invalid filename' });
+    
+    const { rawDir, rawMetaDir } = ensureStealthCloudUserDirs(req.user);
+    
+    // First check if we have a stored thumbnail in metadata
+    const metaPath = path.join(rawMetaDir, `${safeName}.json`);
+    if (fs.existsSync(metaPath)) {
+        try {
+            const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+            if (meta.thumbBase64) {
+                const thumbBuffer = Buffer.from(meta.thumbBase64, 'base64');
+                res.setHeader('Content-Type', meta.thumbMime || 'image/jpeg');
+                return res.send(thumbBuffer);
+            }
+        } catch (e) {}
+    }
+    
+    // Generate thumbnail on-the-fly if sharp is available
+    const filePath = path.join(rawDir, safeName);
+    if (!fs.existsSync(filePath)) {
+        return res.status(404).json({ error: 'File not found' });
+    }
+    
+    const ext = path.extname(safeName).toLowerCase();
+    const isImage = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif'].includes(ext);
+    const isVideo = ['.mp4', '.mov', '.avi', '.mkv', '.m4v', '.3gp'].includes(ext);
+    
+    if (isImage && sharp) {
+        try {
+            const thumbBuffer = await sharp(filePath)
+                .resize(220, 220, { fit: 'inside', withoutEnlargement: true })
+                .jpeg({ quality: 60 })
+                .toBuffer();
+            res.setHeader('Content-Type', 'image/jpeg');
+            return res.send(thumbBuffer);
+        } catch (e) {
+            console.log(`[SC-RAW] Thumb generation failed for ${safeName}:`, e.message);
+        }
+    }
+    
+    // For videos, try ffmpeg if available
+    if (isVideo && ffmpegPath !== 'ffmpeg') {
+        try {
+            const { execSync } = require('child_process');
+            const tmpThumb = path.join(rawMetaDir, `${safeName}.thumb.jpg`);
+            execSync(`"${ffmpegPath}" -y -i "${filePath}" -ss 00:00:01 -vframes 1 -vf "scale=220:-1" "${tmpThumb}"`, { timeout: 10000 });
+            if (fs.existsSync(tmpThumb)) {
+                const thumbBuffer = fs.readFileSync(tmpThumb);
+                fs.unlinkSync(tmpThumb);
+                res.setHeader('Content-Type', 'image/jpeg');
+                return res.send(thumbBuffer);
+            }
+        } catch (e) {
+            console.log(`[SC-RAW] Video thumb failed for ${safeName}:`, e.message);
+        }
+    }
+    
+    res.status(404).json({ error: 'Thumbnail not available' });
+});
+
+// Delete raw file
+app.delete('/api/cloud/raw/:filename', authenticateToken, (req, res) => {
+    const filename = req.params.filename;
+    const safeName = path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 255);
+    if (!safeName) return res.status(400).json({ error: 'Invalid filename' });
+    
+    const { rawDir, rawMetaDir } = ensureStealthCloudUserDirs(req.user);
+    const filePath = path.join(rawDir, safeName);
+    const metaPath = path.join(rawMetaDir, `${safeName}.json`);
+    
+    if (!filePath.startsWith(rawDir)) {
+        return res.status(403).json({ error: 'Access denied' });
+    }
+    
+    try {
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+        if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
+        console.log(`[SC-RAW] Deleted: ${safeName}`);
+        res.json({ success: true, filename: safeName });
+    } catch (e) {
+        console.error(`[SC-RAW] Delete failed for ${safeName}:`, e.message);
+        res.status(500).json({ error: 'Failed to delete file' });
+    }
+});
+
+// Unified list: Get both encrypted manifests and raw files
+app.get('/api/cloud/files', authenticateToken, (req, res) => {
+    const { manifestsDir, rawDir, rawMetaDir } = ensureStealthCloudUserDirs(req.user);
+    const includeMeta = req.query.meta === 'true';
+    
+    const files = [];
+    
+    // Get encrypted files from manifests
+    if (fs.existsSync(manifestsDir)) {
+        try {
+            const manifests = fs.readdirSync(manifestsDir)
+                .filter(f => f.endsWith('.json'))
+                .map(f => {
+
 
 // DELETE /api/account - Delete user account and all associated data (GDPR compliance)
 app.delete('/api/account', authenticateToken, async (req, res) => {
