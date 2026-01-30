@@ -3189,6 +3189,30 @@ app.post('/api/files/platform-hashes', authenticateToken, (req, res) => {
     });
 });
 
+// Register synced file metadata (called by desktop sync after downloading from StealthCloud)
+// This enables mobile sync to get fileHash for EXIF lookup
+app.post('/api/files/register', authenticateToken, (req, res) => {
+    const { filename, fileHash, perceptualHash, size, mimeType } = req.body || {};
+    
+    if (!filename) {
+        return res.status(400).json({ error: 'filename required' });
+    }
+    
+    console.log(`[REGISTER] Registering file: ${filename}, hash: ${fileHash?.substring(0, 16)}...`);
+    
+    db.run(
+        `INSERT OR REPLACE INTO files (user_id, filename, original_name, mime_type, size, file_hash, perceptual_hash) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [req.user.id, filename, filename, mimeType || 'application/octet-stream', size || 0, fileHash || null, perceptualHash || null],
+        (err) => {
+            if (err) {
+                console.error('[REGISTER] DB error:', err);
+                return res.status(500).json({ error: 'Failed to register file' });
+            }
+            res.json({ success: true, filename, fileHash });
+        }
+    );
+});
+
 // Purge classic uploads (non-StealthCloud) for this device
 app.post('/api/files/purge', authenticateToken, async (req, res) => {
     try {
