@@ -3233,8 +3233,34 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
 
         const filesBefore = countFiles(deviceDir);
 
+        // Collect fileHashes from database before deleting (for EXIF cleanup)
+        const fileHashes = [];
+        try {
+            const rows = await new Promise((resolve, reject) => {
+                db.all(`SELECT file_hash FROM files WHERE user_id = ? AND file_hash IS NOT NULL`, [req.user.id], (err, rows) => {
+                    if (err) reject(err);
+                    else resolve(rows || []);
+                });
+            });
+            for (const row of rows) {
+                if (row.file_hash) fileHashes.push(row.file_hash);
+            }
+        } catch (e) {}
+
         try { fs.rmSync(deviceDir, { recursive: true, force: true }); } catch (e) {}
         try { fs.mkdirSync(deviceDir, { recursive: true }); } catch (e) {}
+
+        // Delete EXIF files for this user's files
+        let exifDeleted = 0;
+        for (const hash of fileHashes) {
+            try {
+                const exifPath = getExifFilePath(hash);
+                if (exifPath && fs.existsSync(exifPath)) {
+                    fs.unlinkSync(exifPath);
+                    exifDeleted++;
+                }
+            } catch (e) {}
+        }
 
         try {
             await dbRunAsync(`DELETE FROM files WHERE user_id = ?`, [req.user.id]);
@@ -3242,10 +3268,18 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
             return res.status(500).json({ error: 'Failed to clear file index' });
         }
 
+        // Delete platform hashes for this user (local/remote mode)
+        try {
+            await dbRunAsync(`DELETE FROM platform_hashes WHERE user_id = ?`, [req.user.id]);
+        } catch (e) {}
+
+        console.log(`[Purge-Classic] User ${req.user.id}: files=${filesBefore}, exif=${exifDeleted}`);
+
         return res.json({
             ok: true,
             deleted: {
                 files: filesBefore,
+                exif: exifDeleted
             }
         });
     } catch (e) {
@@ -3531,6 +3565,20 @@ app.post('/api/cloud/purge', authenticateToken, async (req, res) => {
         const manifestsBefore = countFiles(manifestsDir);
         const rawBefore = countFiles(rawDir);
 
+        // Collect fileHashes from manifests before deleting (for EXIF cleanup)
+        const fileHashes = [];
+        try {
+            if (fs.existsSync(manifestsDir)) {
+                const manifestFiles = fs.readdirSync(manifestsDir).filter(f => f.endsWith('.json'));
+                for (const mf of manifestFiles) {
+                    try {
+                        const content = JSON.parse(fs.readFileSync(path.join(manifestsDir, mf), 'utf8'));
+                        if (content?.meta?.fileHash) fileHashes.push(content.meta.fileHash);
+                    } catch (e) {}
+                }
+            }
+        } catch (e) {}
+
         // Delete encrypted files
         try { fs.rmSync(chunksDir, { recursive: true, force: true }); } catch (e) {}
         try { fs.rmSync(manifestsDir, { recursive: true, force: true }); } catch (e) {}
@@ -3539,24 +3587,50 @@ app.post('/api/cloud/purge', authenticateToken, async (req, res) => {
         try { fs.rmSync(rawDir, { recursive: true, force: true }); } catch (e) {}
         try { fs.rmSync(rawMetaDir, { recursive: true, force: true }); } catch (e) {}
 
+        // Delete EXIF files for this user's files
+        let exifDeleted = 0;
+        for (const hash of fileHashes) {
+            try {
+                const exifPath = getExifFilePath(hash);
+                if (exifPath && fs.existsSync(exifPath)) {
+                    fs.unlinkSync(exifPath);
+                    exifDeleted++;
+                }
+            } catch (e) {}
+        }
+
         // Recreate directories
         try { fs.mkdirSync(chunksDir, { recursive: true }); } catch (e) {}
         try { fs.mkdirSync(manifestsDir, { recursive: true }); } catch (e) {}
         try { fs.mkdirSync(rawDir, { recursive: true }); } catch (e) {}
         try { fs.mkdirSync(rawMetaDir, { recursive: true }); } catch (e) {}
 
+        // Delete database entries
         try {
             await dbRunAsync(`DELETE FROM cloud_chunks WHERE user_id = ?`, [req.user.id]);
         } catch (e) {
             return res.status(500).json({ error: 'Failed to clear cloud index' });
         }
+        
+        // Delete platform hashes for this user
+        try {
+            await dbRunAsync(`DELETE FROM platform_hashes WHERE user_id = ?`, [req.user.id]);
+        } catch (e) {}
+        
+        // Delete device state for this user
+        try {
+            await dbRunAsync(`DELETE FROM cloud_device_state WHERE user_id = ?`, [req.user.id]);
+        } catch (e) {}
+
+        console.log(`[Purge] User ${req.user.id}: chunks=${chunksBefore}, manifests=${manifestsBefore}, raw=${rawBefore}, exif=${exifDeleted}`);
 
         return res.json({
             ok: true,
             deleted: {
                 chunks: chunksBefore,
                 manifests: manifestsBefore,
-                raw: rawBefore
+                raw: rawBefore,
+                exif: exifDeleted
             }
         });
     } catch (e) {
