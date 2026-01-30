@@ -384,13 +384,8 @@ const adminLayout = (contentHtml) => `<!doctype html>
 </body>
 </html>`;
 
-// Admin page: Disabled for desktop server
-app.get('/admin', (req, res) => {
-    res.status(404).send('Not Found');
-});
-
-// Admin page (Basic Auth + IP allowlist + no cache) - DISABLED
-app.get('/admin-disabled', adminAuth, (req, res) => {
+// Admin page (Basic Auth + IP allowlist + no cache)
+app.get('/admin', adminAuth, (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
@@ -1718,9 +1713,13 @@ const rawCloudChunk = express.raw({ type: '*/*', limit: '250mb' });
 
 // --- ROUTES ---
 
-// Root: Disabled for desktop server (no landing page)
+// Root: Serve company visit card page
 app.get('/', (req, res) => {
-    res.status(404).send('Not Found');
+    const publicIndexPath = path.join(__dirname, 'public', 'index.html');
+    if (fs.existsSync(publicIndexPath)) {
+        return res.sendFile(publicIndexPath);
+    }
+    res.status(403).send('Access Forbidden');
 });
 
 app.get('/health', (req, res) => {
