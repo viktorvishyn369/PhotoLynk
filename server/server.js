@@ -384,8 +384,13 @@ const adminLayout = (contentHtml) => `<!doctype html>
 </body>
 </html>`;
 
-// Admin page (Basic Auth + IP allowlist + no cache)
-app.get('/admin', adminAuth, (req, res) => {
+// Admin page: Disabled for desktop server
+app.get('/admin', (req, res) => {
+    res.status(404).send('Not Found');
+});
+
+// Admin page (Basic Auth + IP allowlist + no cache) - DISABLED
+app.get('/admin-disabled', adminAuth, (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
@@ -1587,8 +1592,15 @@ const ensureStealthCloudUserDirs = (user) => {
         ? path.join(CHUNKS_DIR, 'users', key, 'chunks')
         : path.join(userDir, 'chunks');
     const manifestsDir = path.join(userDir, 'manifests'); // Manifests always on NVMe (CLOUD_DIR)
+    // Raw files go to RAID10 alongside chunks (same storage tier as chunks)
+    const rawDir = CHUNKS_DIR 
+        ? path.join(CHUNKS_DIR, 'users', key, 'raw')
+        : path.join(userDir, 'raw');
+    const rawMetaDir = path.join(userDir, 'raw-meta'); // Metadata for raw files (thumbnails, EXIF) - on NVMe
     if (!fs.existsSync(chunksDir)) fs.mkdirSync(chunksDir, { recursive: true });
     if (!fs.existsSync(manifestsDir)) fs.mkdirSync(manifestsDir, { recursive: true });
+    if (!fs.existsSync(rawDir)) fs.mkdirSync(rawDir, { recursive: true });
+    if (!fs.existsSync(rawMetaDir)) fs.mkdirSync(rawMetaDir, { recursive: true });
 
     // Backward-compat migration: move files from old device_uuid or user_uuid folders to user_id folder
     const oldKeys = [];
@@ -1662,14 +1674,6 @@ const ensureStealthCloudUserDirs = (user) => {
             }
         });
 
-    // Raw files go to RAID10 alongside chunks (same storage tier as chunks)
-    const rawDir = CHUNKS_DIR 
-        ? path.join(CHUNKS_DIR, 'users', key, 'raw')
-        : path.join(userDir, 'raw');
-    const rawMetaDir = path.join(userDir, 'raw-meta'); // Metadata for raw files (thumbnails, EXIF) - on NVMe
-    if (!fs.existsSync(rawDir)) fs.mkdirSync(rawDir, { recursive: true });
-    if (!fs.existsSync(rawMetaDir)) fs.mkdirSync(rawMetaDir, { recursive: true });
-
     return { userDir, chunksDir, manifestsDir, rawDir, rawMetaDir };
 };
 
@@ -1714,13 +1718,9 @@ const rawCloudChunk = express.raw({ type: '*/*', limit: '250mb' });
 
 // --- ROUTES ---
 
-// Root: Serve company visit card page
+// Root: Disabled for desktop server (no landing page)
 app.get('/', (req, res) => {
-    const publicIndexPath = path.join(__dirname, 'public', 'index.html');
-    if (fs.existsSync(publicIndexPath)) {
-        return res.sendFile(publicIndexPath);
-    }
-    res.status(403).send('Access Forbidden');
+    res.status(404).send('Not Found');
 });
 
 app.get('/health', (req, res) => {
@@ -1744,13 +1744,40 @@ const getUserPlanGb = async (userId) => {
     return Number.isFinite(planGb) ? planGb : null;
 };
 
-const getUserUsedBytes = async (userId) => {
+const getUserUsedBytes = async (userId, userOrNull) => {
+    // Get encrypted chunks size from database
     const row = await dbGetAsync(
         `SELECT COALESCE(SUM(size), 0) AS usedBytes FROM cloud_chunks WHERE user_id = ?`,
         [userId]
     );
-    const used = row && row.usedBytes !== undefined && row.usedBytes !== null ? Number(row.usedBytes) : 0;
-    return Number.isFinite(used) ? used : 0;
+    const encryptedBytes = row && row.usedBytes !== undefined && row.usedBytes !== null ? Number(row.usedBytes) : 0;
+    
+    // Get raw files size from filesystem
+    let rawBytes = 0;
+    // If user object not provided, look it up from database
+    let user = userOrNull;
+    if (!user && userId) {
+        try {
+            user = await dbGetAsync(`SELECT id, email, device_uuid FROM users WHERE id = ?`, [userId]);
+        } catch (e) {}
+    }
+    if (user) {
+        try {
+            const { rawDir } = ensureStealthCloudUserDirs(user);
+            if (fs.existsSync(rawDir)) {
+                const files = fs.readdirSync(rawDir).filter(f => !f.startsWith('.'));
+                for (const file of files) {
+                    try {
+                        const stat = fs.statSync(path.join(rawDir, file));
+                        if (stat.isFile()) rawBytes += stat.size;
+                    } catch (e) {}
+                }
+            }
+        } catch (e) {}
+    }
+    
+    const total = encryptedBytes + rawBytes;
+    return Number.isFinite(total) ? total : 0;
 };
 
 const getUserQuotaBytes = async (userId) => {
@@ -1869,7 +1896,7 @@ app.get('/api/cloud/usage', authenticateToken, async (req, res) => {
         const GB = 1000 * 1000 * 1000;
         const planBytes = planGb ? Math.floor(Number(planGb) * GB) : 0;
         const quotaBytes = planBytes ? (planBytes + USER_QUOTA_MARGIN_BYTES) : 0;
-        const usedBytes = await getUserUsedBytes(req.user.id);
+        const usedBytes = await getUserUsedBytes(req.user.id, req.user);
         const subscription = await resolveSubscriptionState(req.user.id);
         const serverFreeBytes = getServerFreeBytes();
 
@@ -3466,7 +3493,7 @@ app.post('/api/status/uptime/reset', (req, res) => {
 
 app.post('/api/cloud/purge', authenticateToken, async (req, res) => {
     try {
-        const { chunksDir, manifestsDir } = ensureStealthCloudUserDirs(req.user);
+        const { chunksDir, manifestsDir, rawDir, rawMetaDir } = ensureStealthCloudUserDirs(req.user);
 
         const countFiles = (dir) => {
             try {
@@ -3479,12 +3506,21 @@ app.post('/api/cloud/purge', authenticateToken, async (req, res) => {
 
         const chunksBefore = countFiles(chunksDir);
         const manifestsBefore = countFiles(manifestsDir);
+        const rawBefore = countFiles(rawDir);
 
+        // Delete encrypted files
         try { fs.rmSync(chunksDir, { recursive: true, force: true }); } catch (e) {}
         try { fs.rmSync(manifestsDir, { recursive: true, force: true }); } catch (e) {}
 
+        // Delete raw (unencrypted) files
+        try { fs.rmSync(rawDir, { recursive: true, force: true }); } catch (e) {}
+        try { fs.rmSync(rawMetaDir, { recursive: true, force: true }); } catch (e) {}
+
+        // Recreate directories
         try { fs.mkdirSync(chunksDir, { recursive: true }); } catch (e) {}
         try { fs.mkdirSync(manifestsDir, { recursive: true }); } catch (e) {}
+        try { fs.mkdirSync(rawDir, { recursive: true }); } catch (e) {}
+        try { fs.mkdirSync(rawMetaDir, { recursive: true }); } catch (e) {}
 
         try {
             await dbRunAsync(`DELETE FROM cloud_chunks WHERE user_id = ?`, [req.user.id]);
@@ -3496,7 +3532,8 @@ app.post('/api/cloud/purge', authenticateToken, async (req, res) => {
             ok: true,
             deleted: {
                 chunks: chunksBefore,
-                manifests: manifestsBefore
+                manifests: manifestsBefore,
+                raw: rawBefore
             }
         });
     } catch (e) {
@@ -4301,7 +4338,61 @@ app.get('/api/cloud/files', authenticateToken, (req, res) => {
             const manifests = fs.readdirSync(manifestsDir)
                 .filter(f => f.endsWith('.json'))
                 .map(f => {
-
+                    try {
+                        const manifestPath = path.join(manifestsDir, f);
+                        const content = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+                        return {
+                            type: 'encrypted',
+                            manifestId: f.replace('.json', ''),
+                            filename: content.filename || f,
+                            size: content.size || 0,
+                            createdAt: content.createdAt || null,
+                            mediaType: content.mediaType || null,
+                        };
+                    } catch (e) {
+                        return null;
+                    }
+                })
+                .filter(Boolean);
+            files.push(...manifests);
+        } catch (e) {}
+    }
+    
+    // Get raw files
+    if (fs.existsSync(rawDir)) {
+        try {
+            const rawFiles = fs.readdirSync(rawDir)
+                .filter(f => !f.startsWith('.'))
+                .map(filename => {
+                    const filePath = path.join(rawDir, filename);
+                    const stats = fs.statSync(filePath);
+                    if (!stats.isFile()) return null;
+                    
+                    const file = {
+                        type: 'raw',
+                        filename,
+                        size: stats.size,
+                        createdAt: stats.mtime.toISOString(),
+                    };
+                    
+                    if (includeMeta) {
+                        const metaPath = path.join(rawMetaDir, `${filename}.json`);
+                        if (fs.existsSync(metaPath)) {
+                            try {
+                                file.meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+                            } catch (e) {}
+                        }
+                    }
+                    
+                    return file;
+                })
+                .filter(Boolean);
+            files.push(...rawFiles);
+        } catch (e) {}
+    }
+    
+    res.json({ files, total: files.length });
+});
 
 // DELETE /api/account - Delete user account and all associated data (GDPR compliance)
 app.delete('/api/account', authenticateToken, async (req, res) => {
