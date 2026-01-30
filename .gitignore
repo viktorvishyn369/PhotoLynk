@@ -222,3 +222,4 @@ server/package-lock.json
 !server-tray/build/entitlements.mac.plist
 !server-tray/build/entitlements.mac.inherit.plist
 server/sync/
+.windsurf
