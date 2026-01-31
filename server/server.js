@@ -4853,14 +4853,21 @@ const ensureUserNftDir = (userId) => {
 
 // Check if user has StealthCloud subscription with available space
 const checkNftStorageEligibility = async (userId, fileSizeBytes) => {
-    const quotaBytes = await getUserQuotaBytes(userId);
-    const usedBytes = await getUserUsedBytes(userId);
+    // First check subscription status - trial users should also be eligible
+    const subscriptionState = await resolveSubscriptionState(userId);
+    const isActiveSubscription = subscriptionState.status === 'active' || subscriptionState.status === 'trial';
     
-    if (quotaBytes <= 0) {
+    if (!isActiveSubscription) {
         return { eligible: false, reason: 'No active StealthCloud plan' };
     }
     
-    const availableBytes = quotaBytes - usedBytes;
+    const quotaBytes = await getUserQuotaBytes(userId);
+    const usedBytes = await getUserUsedBytes(userId);
+    
+    // If user has active/trial status but no plan_gb set, use default trial quota (5GB)
+    const effectiveQuotaBytes = quotaBytes > 0 ? quotaBytes : (5 * 1000 * 1000 * 1000);
+    
+    const availableBytes = effectiveQuotaBytes - usedBytes;
     if (fileSizeBytes > availableBytes) {
         return { 
             eligible: false, 
@@ -4872,7 +4879,7 @@ const checkNftStorageEligibility = async (userId, fileSizeBytes) => {
     
     return { 
         eligible: true, 
-        quotaBytes, 
+        quotaBytes: effectiveQuotaBytes, 
         usedBytes, 
         availableBytes,
     };
