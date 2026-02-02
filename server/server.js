@@ -2943,7 +2943,7 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
             }
             return dist;
         };
-        const DHASH_THRESHOLD = 3;
+        const DHASH_THRESHOLD = 0;
 
         // Check file_hash dedup
         const checkFileHash = () => new Promise((resolve, reject) => {
@@ -2961,7 +2961,7 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
         const checkPerceptualHash = () => new Promise((resolve, reject) => {
             if (!perceptualHash) return resolve(null);
             db.all(
-                `SELECT filename, perceptual_hash FROM files WHERE user_id = ? AND perceptual_hash IS NOT NULL`,
+                `SELECT filename, perceptual_hash, size FROM files WHERE user_id = ? AND perceptual_hash IS NOT NULL`,
                 [req.user.id],
                 (err, rows) => {
                     if (err) return reject(err);
@@ -2969,6 +2969,15 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
                         if (row.perceptual_hash && row.perceptual_hash.length === 16) {
                             const dist = hammingDistance64(perceptualHash, row.perceptual_hash);
                             if (dist <= DHASH_THRESHOLD) {
+                                // Extra guard against false positives: require near-identical byte size
+                                // when using perceptual-hash dedup.
+                                const rowSize = typeof row.size === 'number' ? row.size : null;
+                                if (rowSize !== null && typeof size === 'number' && size > 0) {
+                                    const tol = Math.max(4096, Math.round(size * 0.002));
+                                    if (Math.abs(rowSize - size) > tol) {
+                                        continue;
+                                    }
+                                }
                                 return resolve({ ...row, distance: dist });
                             }
                         }
