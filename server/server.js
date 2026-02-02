@@ -1125,6 +1125,7 @@ const resolveSubscriptionState = async (userId) => {
     const graceUntil = typeof row.grace_until === 'number' ? row.grace_until : (row.grace_until ? Number(row.grace_until) : null);
     const deletedAt = typeof row.deleted_at === 'number' ? row.deleted_at : (row.deleted_at ? Number(row.deleted_at) : null);
     const trialUntil = typeof row.trial_until === 'number' ? row.trial_until : (row.trial_until ? Number(row.trial_until) : null);
+    const updatedAt = typeof row.updated_at === 'number' ? row.updated_at : (row.updated_at ? Number(row.updated_at) : null);
 
     if (deletedAt && deletedAt > 0) {
         return {
@@ -1190,6 +1191,32 @@ const resolveSubscriptionState = async (userId) => {
             planGb: null,
             paymentType: row.payment_type || null,
         };
+    }
+
+    // Self-heal: if client/server marked the plan as active but a stale past expires_at remains,
+    // don't immediately force grace/expired popups.
+    if (row.status === 'active' && expiresAt && expiresAt > 0 && expiresAt <= now) {
+        try {
+            // Only clear if this row has been updated after the expiration timestamp.
+            // This indicates expires_at is stale from a previous plan.
+            if (updatedAt && updatedAt > expiresAt) {
+                const now2 = Date.now();
+                await dbRunAsync(
+                    `UPDATE user_plans SET expires_at = NULL, grace_until = NULL, updated_at = ? WHERE user_id = ?`,
+                    [now2, userId]
+                );
+                return {
+                    allowed: true,
+                    status: 'active',
+                    expiresAt: null,
+                    graceUntil: null,
+                    planGb: row.plan_gb || null,
+                    paymentType: row.payment_type || null,
+                };
+            }
+        } catch (e) {
+            // ignore
+        }
     }
 
     if (expiresAt && expiresAt > 0 && expiresAt <= now) {
@@ -2402,6 +2429,7 @@ app.post('/api/subscription/sync', authenticateToken, async (req, res) => {
                     rc_app_user_id = COALESCE(rc_app_user_id, ?),
                     payment_type = ?,
                     payment_at = ?,
+                    expires_at = CASE WHEN expires_at IS NOT NULL AND expires_at > ? THEN expires_at ELSE NULL END,
                     grace_until = NULL,
                     deleted_at = NULL,
                     updated_at = ?
@@ -2412,6 +2440,7 @@ app.post('/api/subscription/sync', authenticateToken, async (req, res) => {
                 entitlementId || null,
                 req.user.email || null,
                 paymentType || null,
+                now,
                 now,
                 now,
                 userId,
