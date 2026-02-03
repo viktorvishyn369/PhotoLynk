@@ -366,9 +366,21 @@ Deletion behavior:
 - Linux, macOS, or Windows
 
 ### Mobile
-- **Android:** 7.0+ (API 24+)
+- **Android:** 10+ (API 29+) — HEIC/HEIF support requires Android 10+
 - **iOS:** 15.0+
 - Network access to server
+
+### Supported Media Formats
+
+**Photos:**
+- **Standard:** JPEG, PNG, GIF, BMP, WebP, TIFF
+- **Apple:** HEIC, HEIF (iOS native, Android 10+)
+- **Professional/RAW:** DNG, CR2, CR3, NEF, ARW, ORF, RW2, RAF, PEF, SRW, NRW, 3FR, FFF, IIQ, ERF, RWL, KDC, DCR, MRW, SR2, X3F, MEF, MOS, GPR, CRW
+
+**Videos:**
+- MP4, MOV, M4V, 3GP, AVI, MKV, WebM, MPEG, MPG, WMV, FLV, TS, MTS, M2TS
+
+**Note:** RAW format support depends on platform capabilities. HEIC/HEIF on Android requires API 29+ (Android 10).
 
 ### Build Requirements (for building from source)
 - Node.js 20 LTS
