@@ -2419,11 +2419,15 @@ app.post('/api/subscription/sync', authenticateToken, async (req, res) => {
         }
 
         await ensurePlanRow(userId);
+        const currentPlan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [userId]);
         const now = Date.now();
+        const trialUntil = currentPlan && currentPlan.trial_until ? Number(currentPlan.trial_until) : null;
+        const isInTrialWindow = trialUntil && Number.isFinite(trialUntil) && trialUntil > now;
+        const nextStatus = isInTrialWindow ? 'trial' : 'active';
         await dbRunAsync(
             `UPDATE user_plans
                 SET plan_gb = ?,
-                    status = 'active',
+                    status = ?,
                     rc_product_id = ?,
                     rc_entitlement = COALESCE(?, rc_entitlement),
                     rc_app_user_id = COALESCE(rc_app_user_id, ?),
@@ -2436,6 +2440,7 @@ app.post('/api/subscription/sync', authenticateToken, async (req, res) => {
               WHERE user_id = ?`,
             [
                 tier,
+                nextStatus,
                 productId || null,
                 entitlementId || null,
                 req.user.email || null,
@@ -2939,7 +2944,7 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
             // If detection fails, use original name
         }
         
-        const isImage = /\.(jpg|jpeg|png|gif|bmp|webp|heic|heif|tiff?)$/i.test(correctedSafeName);
+        const isImage = /\.(jpg|jpeg|png|gif|bmp|webp|heic|heif|tiff?|raw|cr2|cr3|nef|arw|dng|orf|rw2|pef|srw|raf|psd|psb|exr|hdr|avif)$/i.test(correctedSafeName);
 
         // Get client's perceptual hash from header (for HEIC files where sharp fails)
         const clientPerceptualHash = (req.headers['x-perceptual-hash'] || '').toString().trim();
@@ -3221,7 +3226,7 @@ app.post('/api/files/migrate-hashes', authenticateToken, async (req, res) => {
                 continue;
             }
 
-            const isImage = /\.(jpg|jpeg|png|gif|bmp|webp|heic|heif|tiff?)$/i.test(row.filename);
+            const isImage = /\.(jpg|jpeg|png|gif|bmp|webp|heic|heif|tiff?|raw|cr2|cr3|nef|arw|dng|orf|rw2|pef|srw|raf|psd|psb|exr|hdr|avif)$/i.test(row.filename);
             if (!isImage) continue; // Only images need perceptual hash
 
             try {
@@ -3434,7 +3439,7 @@ app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
 
     // Detect actual file type from magic bytes (extension may be wrong for old uploads)
     let ext = (filename || '').split('.').pop()?.toLowerCase() || '';
-    let isImage = ['jpg', 'jpeg', 'png', 'heic', 'heif', 'webp', 'gif', 'bmp', 'tiff'].includes(ext);
+    let isImage = ['jpg', 'jpeg', 'png', 'heic', 'heif', 'webp', 'gif', 'bmp', 'tiff', 'tif', 'raw', 'cr2', 'cr3', 'nef', 'arw', 'dng', 'orf', 'rw2', 'pef', 'srw', 'raf', 'psd', 'psb', 'exr', 'hdr', 'avif'].includes(ext);
     let isVideo = ['mp4', 'mov', 'avi', 'mkv', 'm4v', '3gp', 'webm'].includes(ext);
     
     // Check magic bytes to detect actual format (handles mismatched extensions)
@@ -4557,7 +4562,7 @@ app.get('/api/cloud/raw/:filename/thumb', authenticateToken, async (req, res) =>
     }
     
     const ext = path.extname(safeName).toLowerCase();
-    const isImage = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif'].includes(ext);
+    const isImage = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif', '.bmp', '.tiff', '.tif', '.raw', '.cr2', '.cr3', '.nef', '.arw', '.dng', '.orf', '.rw2', '.pef', '.srw', '.raf', '.psd', '.psb', '.exr', '.hdr', '.avif'].includes(ext);
     const isVideo = ['.mp4', '.mov', '.avi', '.mkv', '.m4v', '.3gp'].includes(ext);
     
     if (isImage && sharp) {
