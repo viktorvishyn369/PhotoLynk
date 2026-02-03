@@ -382,6 +382,26 @@ Deletion behavior:
 
 **Note:** RAW format support depends on platform capabilities. HEIC/HEIF on Android requires API 29+ (Android 10).
 
+### EXIF Metadata Preservation
+
+PhotoLynk extracts and stores EXIF metadata during backup and writes it back during sync/restore. However, EXIF write support varies by platform due to OS limitations:
+
+| Format | Android Write | iOS Write | Desktop Write |
+|--------|:-------------:|:---------:|:-------------:|
+| JPEG | ✅ | ✅ | ✅ |
+| PNG | ✅ | ✅ | ✅ |
+| WebP | ✅ | ✅ | ✅ |
+| HEIC/HEIF | ❌ | ✅ | ⚠️ |
+| TIFF | ❌ | ✅ | ✅ |
+| GIF | ❌ | ✅ | ❌ |
+| RAW (DNG, CR2, NEF, etc.) | ❌ | ❌ | ❌ |
+
+- ✅ = Full support
+- ⚠️ = Depends on system libraries
+- ❌ = Read-only (EXIF extracted but not written back)
+
+**Note:** Even when EXIF write is not supported, files sync correctly and EXIF data remains stored on the server. RAW formats are intentionally read-only to preserve original sensor data.
+
 ### Build Requirements (for building from source)
 - Node.js 20 LTS
 - Python 3.x
