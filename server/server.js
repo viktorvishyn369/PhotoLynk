@@ -58,24 +58,46 @@ const computePerceptualHash = async (filePath) => {
 
 // Try to use bundled ffmpeg, fallback to system ffmpeg
 let ffmpegPath = 'ffmpeg';
-try {
-    // Try @ffmpeg-installer/ffmpeg first (better Electron support)
-    const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
-    let installerPath = ffmpegInstaller.path;
-    if (installerPath && typeof installerPath === 'string') {
-        // Handle Electron asar unpacking
-        if (installerPath.includes('app.asar')) {
-            installerPath = installerPath.replace('app.asar', 'app.asar.unpacked');
-        }
-        if (fs.existsSync(installerPath)) {
-            ffmpegPath = installerPath;
-            console.log('Using bundled ffmpeg:', ffmpegPath);
-        } else {
-            console.log('Bundled ffmpeg not found at:', installerPath, '- trying system ffmpeg');
+const findFfmpeg = () => {
+    // 1. Try ffmpeg relative to this script (for Electron bundled app)
+    const scriptDir = __dirname;
+    const platform = process.platform === 'darwin' ? 'darwin' : process.platform === 'win32' ? 'win32' : 'linux';
+    const arch = process.arch === 'arm64' ? 'arm64' : process.arch === 'x64' ? 'x64' : process.arch;
+    const ffmpegName = platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
+    
+    // Check in node_modules relative to script
+    const localPaths = [
+        path.join(scriptDir, 'node_modules', '@ffmpeg-installer', `${platform}-${arch}`, ffmpegName),
+        path.join(scriptDir, 'node_modules', '@ffmpeg-installer', `${platform}-x64`, ffmpegName),
+        path.join(scriptDir, '..', 'app.asar.unpacked', 'node_modules', '@ffmpeg-installer', `${platform}-${arch}`, ffmpegName),
+        path.join(scriptDir, '..', 'app.asar.unpacked', 'node_modules', '@ffmpeg-installer', `${platform}-x64`, ffmpegName),
+    ];
+    
+    for (const p of localPaths) {
+        if (fs.existsSync(p)) {
+            console.log('Using bundled ffmpeg (local):', p);
+            return p;
         }
     }
-} catch (e) {
-    // Try ffmpeg-static as fallback
+    
+    // 2. Try @ffmpeg-installer/ffmpeg module
+    try {
+        const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
+        let installerPath = ffmpegInstaller.path;
+        if (installerPath && typeof installerPath === 'string') {
+            if (installerPath.includes('app.asar')) {
+                installerPath = installerPath.replace('app.asar', 'app.asar.unpacked');
+            }
+            if (fs.existsSync(installerPath)) {
+                console.log('Using bundled ffmpeg:', installerPath);
+                return installerPath;
+            } else {
+                console.log('Bundled ffmpeg not found at:', installerPath);
+            }
+        }
+    } catch (e) {}
+    
+    // 3. Try ffmpeg-static
     try {
         let staticPath = require('ffmpeg-static');
         if (staticPath && typeof staticPath === 'string') {
@@ -83,14 +105,16 @@ try {
                 staticPath = staticPath.replace('app.asar', 'app.asar.unpacked');
             }
             if (fs.existsSync(staticPath)) {
-                ffmpegPath = staticPath;
-                console.log('Using bundled ffmpeg-static:', ffmpegPath);
+                console.log('Using bundled ffmpeg-static:', staticPath);
+                return staticPath;
             }
         }
-    } catch (e2) {
-        console.log('No bundled ffmpeg available, using system ffmpeg');
-    }
-}
+    } catch (e2) {}
+    
+    console.log('No bundled ffmpeg available, using system ffmpeg');
+    return 'ffmpeg';
+};
+ffmpegPath = findFfmpeg();
 
 require('dotenv').config();
 
