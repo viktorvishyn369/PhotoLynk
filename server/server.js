@@ -4219,33 +4219,24 @@ app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (
 
     const { manifestsDir } = ensureStealthCloudUserDirs(req.user);
 
-    // ========== SERVER-SIDE DEDUPLICATION (Extra Precaution) ==========
+    // ========== SERVER-SIDE DEDUPLICATION (Minimal - only reliable checks) ==========
     // Build dedup sets from existing manifests
     const dedupSets = buildServerDedupSets(manifestsDir);
-    console.log(`[SC-Dedup] Checking ${safeId}: ${dedupSets.manifestIds.size} manifestIds, ${dedupSets.filenames.size} filenames, ${dedupSets.perceptualHashes.size} pHashes, ${dedupSets.fileHashes.size} fHashes`);
+    console.log(`[SC-Dedup] Checking ${safeId}: ${dedupSets.manifestIds.size} manifestIds, ${dedupSets.fileHashes.size} fHashes, ${dedupSets.perceptualHashes.size} pHashes`);
     
-    // Check 1: ManifestId (filename + size hash)
+    // Check 1: ManifestId (filename + size hash) - exact match only
     if (dedupSets.manifestIds.has(safeId)) {
         console.log(`[SC-Dedup] Skipping ${safeId} - manifestId already exists`);
         return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'manifestId' });
     }
     
-    // Check 2: Exact filename match
-    if (filename) {
-        const normalizedFilename = normalizeFilenameForCompare(filename);
-        if (normalizedFilename && dedupSets.filenames.has(normalizedFilename)) {
-            console.log(`[SC-Dedup] Skipping ${safeId} - filename "${filename}" already exists`);
-            return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'filename' });
-        }
-    }
-    
-    // Check 3: Exact file hash match (videos and byte-identical files)
+    // Check 2: Exact file hash match (byte-identical files)
     if (fileHash && dedupSets.fileHashes.has(fileHash)) {
         console.log(`[SC-Dedup] Skipping ${safeId} - fileHash already exists`);
         return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'fileHash' });
     }
     
-    // Check 4: Perceptual hash match (images - fuzzy matching)
+    // Check 3: Perceptual hash match (images - 1-bit tolerance for identical)
     if (perceptualHash) {
         const phashMatch = findPerceptualHashMatchServer(perceptualHash, dedupSets.perceptualHashes);
         if (phashMatch.match) {
@@ -4254,30 +4245,8 @@ app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (
         }
     }
     
-    // Check 5: EXIF-based dedup (cross-platform HEIC matching)
-    if (exifCaptureTime) {
-        const ct = exifCaptureTime;
-        const mk = exifMake;
-        const md = exifModel;
-        
-        // Full EXIF match (captureTime + make + model)
-        if (ct && mk && md && dedupSets.exifFull.has(`${ct}|${mk}|${md}`)) {
-            console.log(`[SC-Dedup] Skipping ${safeId} - EXIF full match (time+make+model)`);
-            return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'exifFull' });
-        }
-        
-        // Time + model match
-        if (ct && md && dedupSets.exifTimeModel.has(`${ct}|${md}`)) {
-            console.log(`[SC-Dedup] Skipping ${safeId} - EXIF time+model match`);
-            return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'exifTimeModel' });
-        }
-        
-        // Time + make match
-        if (ct && mk && dedupSets.exifTimeMake.has(`${ct}|${mk}`)) {
-            console.log(`[SC-Dedup] Skipping ${safeId} - EXIF time+make match`);
-            return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'exifTimeMake' });
-        }
-    }
+    // NOTE: Removed filename-only and EXIF-only dedup checks - too many false positives
+    // Client already does thorough dedup, server is just a safety net
     
     // ========== No duplicates found - store the manifest ==========
     const manifestPath = path.join(manifestsDir, `${safeId}.json`);
