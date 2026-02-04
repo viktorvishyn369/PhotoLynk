@@ -4392,6 +4392,58 @@ app.get('/api/cloud/manifests/:manifestId', authenticateToken, blockDeletedSubsc
     res.sendFile(manifestPath);
 });
 
+// Update manifest metadata (backfill for old manifests missing metadata)
+app.patch('/api/cloud/manifests/:manifestId', authenticateToken, (req, res) => {
+    const safeId = (req.params.manifestId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
+    if (!safeId) return res.status(400).json({ error: 'Invalid manifest id' });
+    
+    const { manifestsDir } = ensureStealthCloudUserDirs(req.user);
+    const manifestPath = path.join(manifestsDir, `${safeId}.json`);
+    
+    if (!manifestPath.startsWith(manifestsDir)) {
+        return res.status(403).json({ error: 'Access denied' });
+    }
+    if (!fs.existsSync(manifestPath)) {
+        return res.status(404).json({ error: 'Manifest not found' });
+    }
+    
+    try {
+        const content = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+        const {
+            filename, mediaType, originalSize, fileHash, perceptualHash,
+            creationTime, exifCaptureTime, exifMake, exifModel,
+            thumbChunkId, thumbNonce, thumbSize, thumbW, thumbH, thumbMime
+        } = req.body || {};
+        
+        // Initialize meta if missing
+        if (!content.meta) content.meta = {};
+        
+        // Only update fields that are provided and not already set
+        if (filename && !content.meta.filename) content.meta.filename = filename;
+        if (mediaType && !content.meta.mediaType) content.meta.mediaType = mediaType;
+        if (typeof originalSize === 'number' && !content.meta.originalSize) content.meta.originalSize = originalSize;
+        if (fileHash && !content.meta.fileHash) content.meta.fileHash = fileHash;
+        if (perceptualHash && !content.meta.perceptualHash) content.meta.perceptualHash = perceptualHash;
+        if (creationTime && !content.meta.creationTime) content.meta.creationTime = creationTime;
+        if (exifCaptureTime && !content.meta.exifCaptureTime) content.meta.exifCaptureTime = exifCaptureTime;
+        if (exifMake && !content.meta.exifMake) content.meta.exifMake = exifMake;
+        if (exifModel && !content.meta.exifModel) content.meta.exifModel = exifModel;
+        if (thumbChunkId && !content.meta.thumbChunkId) content.meta.thumbChunkId = thumbChunkId;
+        if (thumbNonce && !content.meta.thumbNonce) content.meta.thumbNonce = thumbNonce;
+        if (typeof thumbSize === 'number' && !content.meta.thumbSize) content.meta.thumbSize = thumbSize;
+        if (typeof thumbW === 'number' && !content.meta.thumbW) content.meta.thumbW = thumbW;
+        if (typeof thumbH === 'number' && !content.meta.thumbH) content.meta.thumbH = thumbH;
+        if (thumbMime && !content.meta.thumbMime) content.meta.thumbMime = thumbMime;
+        
+        fs.writeFileSync(manifestPath, JSON.stringify(content));
+        console.log(`[SC] Updated metadata for manifest ${safeId}`);
+        res.json({ ok: true, manifestId: safeId });
+    } catch (e) {
+        console.error('[SC] Failed to update manifest metadata:', e.message);
+        res.status(500).json({ error: 'Failed to update manifest' });
+    }
+});
+
 // ============================================================================
 // STEALTHCLOUD RAW MODE (Unencrypted fast uploads - optional)
 // ============================================================================
