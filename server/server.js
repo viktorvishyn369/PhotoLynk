@@ -14,11 +14,11 @@ const crypto = require('crypto');
 const axios = require('axios');
 const updater = require('./updater');
 let sharp;
-try { sharp = require('sharp'); } catch (e) { sharp = null; }
+try { sharp = require('sharp'); console.log('[Server] sharp loaded'); } catch (e) { sharp = null; console.log('[Server] sharp failed to load:', e.message); }
 
 // HEIC conversion support - try to load heic-convert for HEIC thumbnail generation
 let heicConvert;
-try { heicConvert = require('heic-convert'); } catch (e) { heicConvert = null; }
+try { heicConvert = require('heic-convert'); console.log('[Server] heic-convert loaded'); } catch (e) { heicConvert = null; console.log('[Server] heic-convert failed to load:', e.message); }
 
 /**
  * Compute perceptual hash (dHash) for an image file
