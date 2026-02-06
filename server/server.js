@@ -3072,7 +3072,7 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
             if (fileHashMatch) {
                 const existingFilePath = path.join(deviceDir, fileHashMatch.filename);
                 if (fs.existsSync(existingFilePath)) {
-                    cleanupTmp();
+                    cleanupTmp(200);
                     console.log(`Duplicate raw upload detected: ${safeName} (fileHash matches ${fileHashMatch.filename})`);
                     return res.json({ message: 'File already exists (duplicate)', filename: fileHashMatch.filename, duplicate: true });
                 }
@@ -3085,7 +3085,7 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
             if (phashMatch) {
                 const existingFilePath = path.join(deviceDir, phashMatch.filename);
                 if (fs.existsSync(existingFilePath)) {
-                    cleanupTmp();
+                    cleanupTmp(200);
                     console.log(`Duplicate raw upload detected: ${safeName} (perceptualHash matches ${phashMatch.filename}, dist=${phashMatch.distance})`);
                     return res.json({ message: 'File already exists (duplicate)', filename: phashMatch.filename, duplicate: true });
                 }
@@ -3102,7 +3102,7 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
             try {
                 fs.renameSync(tmpPath, correctedFinalPath);
             } catch (e) {
-                cleanupTmp();
+                cleanupTmp(200);
                 return res.status(500).json({ error: 'Failed to finalize upload' });
             }
 
@@ -3442,37 +3442,57 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
         } catch (e) {}
 
         // Windows-robust deletion: delete files individually with retries for locked files
+        // First pass: delete what we can immediately
+        // Second pass: wait and retry for locked .uploading files
         let filesDeleted = 0;
-        let deletionErrors = [];
+        let lockedFiles = [];
         if (fs.existsSync(deviceDir)) {
             try {
                 const entries = fs.readdirSync(deviceDir);
                 for (const entry of entries) {
                     const entryPath = path.join(deviceDir, entry);
-                    let deleted = false;
-                    for (let attempt = 0; attempt < 5 && !deleted; attempt++) {
-                        try {
-                            const stat = fs.statSync(entryPath);
-                            if (stat.isFile()) {
-                                fs.unlinkSync(entryPath);
-                                filesDeleted++;
-                                deleted = true;
-                            } else if (stat.isDirectory()) {
-                                fs.rmSync(entryPath, { recursive: true, force: true });
-                                deleted = true;
-                            }
-                        } catch (e) {
-                            if (attempt < 4) {
-                                // Wait before retry (file might be locked by upload)
-                                await new Promise(r => setTimeout(r, 200));
-                            } else {
-                                deletionErrors.push({ file: entry, error: e.message });
-                            }
+                    try {
+                        const stat = fs.statSync(entryPath);
+                        if (stat.isFile()) {
+                            fs.unlinkSync(entryPath);
+                            filesDeleted++;
+                        } else if (stat.isDirectory()) {
+                            fs.rmSync(entryPath, { recursive: true, force: true });
                         }
+                    } catch (e) {
+                        lockedFiles.push({ entry, entryPath });
                     }
                 }
             } catch (e) {
                 console.error(`[Purge-Classic] Error reading deviceDir: ${e.message}`);
+            }
+        }
+        
+        // Second pass: retry locked files with longer delays (for Windows file locks)
+        let deletionErrors = [];
+        if (lockedFiles.length > 0) {
+            console.log(`[Purge-Classic] ${lockedFiles.length} files locked, waiting to retry...`);
+            await new Promise(r => setTimeout(r, 1000)); // Wait 1 second for uploads to abort
+            
+            for (const { entry, entryPath } of lockedFiles) {
+                let deleted = false;
+                for (let attempt = 0; attempt < 10 && !deleted; attempt++) {
+                    try {
+                        if (fs.existsSync(entryPath)) {
+                            fs.unlinkSync(entryPath);
+                            filesDeleted++;
+                            deleted = true;
+                        } else {
+                            deleted = true; // File already gone
+                        }
+                    } catch (e) {
+                        if (attempt < 9) {
+                            await new Promise(r => setTimeout(r, 500));
+                        } else {
+                            deletionErrors.push({ file: entry, error: e.message });
+                        }
+                    }
+                }
             }
         }
         
