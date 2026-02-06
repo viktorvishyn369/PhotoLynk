@@ -2911,22 +2911,43 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
     let writtenBytes = 0;
 
     const out = fs.createWriteStream(tmpPath);
-    const cleanupTmp = () => {
-        try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e) {}
+    const cleanupTmp = (delay = 0) => {
+        const doCleanup = () => {
+            for (let i = 0; i < 5; i++) {
+                try { 
+                    if (fs.existsSync(tmpPath)) {
+                        fs.unlinkSync(tmpPath);
+                        return;
+                    }
+                } catch (e) {
+                    // On Windows, file might still be locked - wait and retry
+                    if (i < 4 && process.platform === 'win32') {
+                        const start = Date.now();
+                        while (Date.now() - start < 100) {} // sync wait
+                    }
+                }
+            }
+        };
+        if (delay > 0) {
+            setTimeout(doCleanup, delay);
+        } else {
+            doCleanup();
+        }
     };
 
     req.on('aborted', () => {
         try { out.destroy(); } catch (e) {}
-        cleanupTmp();
+        cleanupTmp(500); // Delay cleanup on Windows to let stream close
     });
 
     req.on('error', (e) => {
         try { out.destroy(); } catch (e2) {}
-        cleanupTmp();
+        cleanupTmp(500);
     });
 
     out.on('error', (e) => {
-        cleanupTmp();
+        try { out.destroy(); } catch (e2) {}
+        cleanupTmp(500);
         return res.status(500).json({ error: 'Failed to write upload' });
     });
 
