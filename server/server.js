@@ -27,29 +27,42 @@ try { heicConvert = require('heic-convert'); console.log('[Server] heic-convert 
 const computePerceptualHash = async (filePath) => {
     if (!sharp) return null;
     try {
-        // Resize to 9x8 grayscale for dHash
-        const { data, info } = await sharp(filePath)
-            .resize(9, 8, { fit: 'fill' })
-            .grayscale()
-            .raw()
-            .toBuffer({ resolveWithObject: true });
-        
-        if (info.width !== 9 || info.height !== 8) return null;
-        
-        // Compute difference hash - compare adjacent horizontal pixels
-        let hash = BigInt(0);
-        for (let y = 0; y < 8; y++) {
-            for (let x = 0; x < 8; x++) {
-                const left = data[y * 9 + x];
-                const right = data[y * 9 + x + 1];
-                if (left > right) {
-                    hash |= BigInt(1) << BigInt(y * 8 + x);
+        // Timeout to prevent hanging on problematic files (animated GIFs on Windows)
+        const timeoutMs = 5000;
+        const hashPromise = (async () => {
+            // Read file into buffer to avoid Sharp holding file handle open on Windows
+            const fileBuffer = fs.readFileSync(filePath);
+            // Resize to 9x8 grayscale for dHash
+            // Use { pages: 1 } to only process first frame of animated images
+            const { data, info } = await sharp(fileBuffer, { pages: 1 })
+                .resize(9, 8, { fit: 'fill' })
+                .grayscale()
+                .raw()
+                .toBuffer({ resolveWithObject: true });
+            
+            if (info.width !== 9 || info.height !== 8) return null;
+            
+            // Compute difference hash - compare adjacent horizontal pixels
+            let hash = BigInt(0);
+            for (let y = 0; y < 8; y++) {
+                for (let x = 0; x < 8; x++) {
+                    const left = data[y * 9 + x];
+                    const right = data[y * 9 + x + 1];
+                    if (left > right) {
+                        hash |= BigInt(1) << BigInt(y * 8 + x);
+                    }
                 }
             }
-        }
+            
+            // Convert to 16-char hex string
+            return hash.toString(16).padStart(16, '0');
+        })();
         
-        // Convert to 16-char hex string
-        return hash.toString(16).padStart(16, '0');
+        const timeoutPromise = new Promise((_, reject) => 
+            setTimeout(() => reject(new Error('Perceptual hash timeout')), timeoutMs)
+        );
+        
+        return await Promise.race([hashPromise, timeoutPromise]);
     } catch (e) {
         console.log('computePerceptualHash error:', e.message);
         return null;
@@ -2928,44 +2941,54 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
     let writtenBytes = 0;
 
     const out = fs.createWriteStream(tmpPath);
-    const cleanupTmp = (delay = 0) => {
-        const doCleanup = () => {
-            for (let i = 0; i < 5; i++) {
-                try { 
-                    if (fs.existsSync(tmpPath)) {
-                        fs.unlinkSync(tmpPath);
-                        return;
-                    }
-                } catch (e) {
-                    // On Windows, file might still be locked - wait and retry
-                    if (i < 4 && process.platform === 'win32') {
-                        const start = Date.now();
-                        while (Date.now() - start < 100) {} // sync wait
-                    }
+    let streamClosed = false;
+    
+    // Properly close stream and wait for file handle release before cleanup
+    const closeStreamAndCleanup = () => {
+        if (streamClosed) return;
+        streamClosed = true;
+        
+        const doDelete = () => {
+            try {
+                if (fs.existsSync(tmpPath)) {
+                    fs.unlinkSync(tmpPath);
+                    console.log(`[Upload] Cleaned up temp file: ${path.basename(tmpPath)}`);
                 }
+            } catch (e) {
+                // File still locked, schedule retry
+                setTimeout(doDelete, 500);
             }
         };
-        if (delay > 0) {
-            setTimeout(doCleanup, delay);
-        } else {
-            doCleanup();
+        
+        try {
+            if (!out.destroyed) {
+                out.end(() => {
+                    // Wait for 'close' event which indicates file handle is released
+                    out.once('close', () => setTimeout(doDelete, 100));
+                    // Fallback if close doesn't fire
+                    setTimeout(doDelete, 1000);
+                });
+            } else {
+                setTimeout(doDelete, 500);
+            }
+        } catch (e) {
+            setTimeout(doDelete, 500);
         }
     };
 
     req.on('aborted', () => {
-        try { out.destroy(); } catch (e) {}
-        cleanupTmp(500); // Delay cleanup on Windows to let stream close
+        console.log(`[Upload] Request aborted for ${safeName}`);
+        closeStreamAndCleanup();
     });
 
     req.on('error', (e) => {
-        try { out.destroy(); } catch (e2) {}
-        cleanupTmp(500);
+        console.log(`[Upload] Request error for ${safeName}: ${e.message}`);
+        closeStreamAndCleanup();
     });
 
     out.on('error', (e) => {
         console.error(`[Upload] Write stream error for ${safeName}: ${e.message}`);
-        try { out.destroy(); } catch (e2) {}
-        cleanupTmp(500);
+        closeStreamAndCleanup();
         return res.status(500).json({ error: 'Failed to write upload' });
     });
 
@@ -3667,9 +3690,9 @@ app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
         }
         
         try {
-            // Use converted buffer for HEIC, or file path for others
-            const sharpInput = inputBuffer || filePath;
-            const thumbBuffer = await sharp(sharpInput, { failOn: 'none' })
+            // Read file into buffer to avoid Sharp holding file handle open on Windows
+            const sharpInput = inputBuffer || fs.readFileSync(filePath);
+            const thumbBuffer = await sharp(sharpInput, { failOn: 'none', pages: 1 })
                 .resize(150, 150, { fit: 'cover', position: 'center' })
                 .jpeg({ quality: 70 })
                 .toBuffer();
@@ -4717,7 +4740,9 @@ app.get('/api/cloud/raw/:filename/thumb', authenticateToken, async (req, res) =>
     
     if (isImage && sharp) {
         try {
-            const thumbBuffer = await sharp(filePath)
+            // Read file into buffer first to avoid Sharp holding file handle open on Windows
+            const fileBuffer = fs.readFileSync(filePath);
+            const thumbBuffer = await sharp(fileBuffer, { pages: 1 })
                 .resize(220, 220, { fit: 'inside', withoutEnlargement: true })
                 .jpeg({ quality: 60 })
                 .toBuffer();
