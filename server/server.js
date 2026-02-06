@@ -3460,9 +3460,10 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
             }
         } catch (e) {}
 
-        // Windows-robust deletion: delete files individually with retries for locked files
+        // Fast deletion pass - no retries, return quickly to unfreeze phone
+        // Stubborn locked files (Windows Defender, indexer, etc.) will be retried in background
         let filesDeleted = 0;
-        let deletionErrors = [];
+        let stubbornFiles = [];
         
         if (fs.existsSync(deviceDir)) {
             const entries = fs.readdirSync(deviceDir);
@@ -3470,53 +3471,45 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
             
             for (const entry of entries) {
                 const entryPath = path.join(deviceDir, entry);
-                let deleted = false;
-                let lastError = null;
-                
-                // Try up to 10 times with 300ms delays
-                for (let attempt = 0; attempt < 10 && !deleted; attempt++) {
-                    try {
-                        if (!fs.existsSync(entryPath)) {
-                            deleted = true;
-                            break;
-                        }
-                        const stat = fs.statSync(entryPath);
-                        if (stat.isFile()) {
-                            // On Windows, make file writable before deletion (fixes EPERM)
-                            try { fs.chmodSync(entryPath, 0o666); } catch (e) {}
-                            fs.unlinkSync(entryPath);
-                            filesDeleted++;
-                            deleted = true;
-                        } else if (stat.isDirectory()) {
-                            fs.rmSync(entryPath, { recursive: true, force: true });
-                            deleted = true;
-                        }
-                    } catch (e) {
-                        lastError = e.message;
-                        if (attempt < 9) {
-                            await new Promise(r => setTimeout(r, 300));
+                try {
+                    if (!fs.existsSync(entryPath)) continue;
+                    const stat = fs.statSync(entryPath);
+                    if (stat.isFile()) {
+                        try { fs.chmodSync(entryPath, 0o666); } catch (e) {}
+                        fs.unlinkSync(entryPath);
+                        filesDeleted++;
+                    } else if (stat.isDirectory()) {
+                        fs.rmSync(entryPath, { recursive: true, force: true });
+                    }
+                } catch (e) {
+                    stubbornFiles.push(entryPath);
+                }
+            }
+            
+            // Schedule background cleanup for stubborn files (Windows file locks)
+            if (stubbornFiles.length > 0) {
+                console.log(`[Purge-Classic] ${stubbornFiles.length} stubborn files, scheduling background cleanup`);
+                setTimeout(async () => {
+                    for (const filePath of stubbornFiles) {
+                        for (let attempt = 0; attempt < 20; attempt++) {
+                            try {
+                                if (!fs.existsSync(filePath)) break;
+                                try { fs.chmodSync(filePath, 0o666); } catch (e) {}
+                                fs.unlinkSync(filePath);
+                                console.log(`[Purge-BG] Deleted stubborn file: ${path.basename(filePath)}`);
+                                break;
+                            } catch (e) {
+                                if (attempt < 19) await new Promise(r => setTimeout(r, 500));
+                            }
                         }
                     }
-                }
-                
-                if (!deleted && lastError) {
-                    deletionErrors.push({ file: entry, error: lastError });
-                    console.log(`[Purge-Classic] FAILED to delete: ${entry} - ${lastError}`);
-                }
+                }, 1000);
             }
         } else {
             console.log(`[Purge-Classic] deviceDir does not exist: ${deviceDir}`);
         }
         
-        console.log(`[Purge-Classic] Deleted ${filesDeleted} files, ${deletionErrors.length} errors`);
-        
-        // Verify deletion - check what's left
-        if (fs.existsSync(deviceDir)) {
-            const remaining = fs.readdirSync(deviceDir);
-            if (remaining.length > 0) {
-                console.log(`[Purge-Classic] WARNING: ${remaining.length} files still remain: ${JSON.stringify(remaining.slice(0, 10))}`);
-            }
-        }
+        console.log(`[Purge-Classic] Deleted ${filesDeleted} files, ${stubbornFiles.length} deferred to background`)
         
         // Ensure directory exists after cleanup
         try { fs.mkdirSync(deviceDir, { recursive: true }); } catch (e) {}
