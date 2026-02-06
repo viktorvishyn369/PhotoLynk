@@ -3442,63 +3442,59 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
         } catch (e) {}
 
         // Windows-robust deletion: delete files individually with retries for locked files
-        // First pass: delete what we can immediately
-        // Second pass: wait and retry for locked .uploading files
         let filesDeleted = 0;
-        let lockedFiles = [];
+        let deletionErrors = [];
+        
         if (fs.existsSync(deviceDir)) {
-            try {
-                const entries = fs.readdirSync(deviceDir);
-                for (const entry of entries) {
-                    const entryPath = path.join(deviceDir, entry);
+            const entries = fs.readdirSync(deviceDir);
+            console.log(`[Purge-Classic] Found ${entries.length} entries to delete`);
+            
+            for (const entry of entries) {
+                const entryPath = path.join(deviceDir, entry);
+                let deleted = false;
+                let lastError = null;
+                
+                // Try up to 10 times with 300ms delays
+                for (let attempt = 0; attempt < 10 && !deleted; attempt++) {
                     try {
+                        if (!fs.existsSync(entryPath)) {
+                            deleted = true;
+                            break;
+                        }
                         const stat = fs.statSync(entryPath);
                         if (stat.isFile()) {
                             fs.unlinkSync(entryPath);
                             filesDeleted++;
+                            deleted = true;
                         } else if (stat.isDirectory()) {
                             fs.rmSync(entryPath, { recursive: true, force: true });
-                        }
-                    } catch (e) {
-                        lockedFiles.push({ entry, entryPath });
-                    }
-                }
-            } catch (e) {
-                console.error(`[Purge-Classic] Error reading deviceDir: ${e.message}`);
-            }
-        }
-        
-        // Second pass: retry locked files with longer delays (for Windows file locks)
-        let deletionErrors = [];
-        if (lockedFiles.length > 0) {
-            console.log(`[Purge-Classic] ${lockedFiles.length} files locked, waiting to retry...`);
-            await new Promise(r => setTimeout(r, 1000)); // Wait 1 second for uploads to abort
-            
-            for (const { entry, entryPath } of lockedFiles) {
-                let deleted = false;
-                for (let attempt = 0; attempt < 10 && !deleted; attempt++) {
-                    try {
-                        if (fs.existsSync(entryPath)) {
-                            fs.unlinkSync(entryPath);
-                            filesDeleted++;
                             deleted = true;
-                        } else {
-                            deleted = true; // File already gone
                         }
                     } catch (e) {
+                        lastError = e.message;
                         if (attempt < 9) {
-                            await new Promise(r => setTimeout(r, 500));
-                        } else {
-                            deletionErrors.push({ file: entry, error: e.message });
+                            await new Promise(r => setTimeout(r, 300));
                         }
                     }
                 }
+                
+                if (!deleted && lastError) {
+                    deletionErrors.push({ file: entry, error: lastError });
+                    console.log(`[Purge-Classic] FAILED to delete: ${entry} - ${lastError}`);
+                }
             }
+        } else {
+            console.log(`[Purge-Classic] deviceDir does not exist: ${deviceDir}`);
         }
         
         console.log(`[Purge-Classic] Deleted ${filesDeleted} files, ${deletionErrors.length} errors`);
-        if (deletionErrors.length > 0) {
-            console.log(`[Purge-Classic] Deletion errors: ${JSON.stringify(deletionErrors.slice(0, 5))}`);
+        
+        // Verify deletion - check what's left
+        if (fs.existsSync(deviceDir)) {
+            const remaining = fs.readdirSync(deviceDir);
+            if (remaining.length > 0) {
+                console.log(`[Purge-Classic] WARNING: ${remaining.length} files still remain: ${JSON.stringify(remaining.slice(0, 10))}`);
+            }
         }
         
         // Ensure directory exists after cleanup
