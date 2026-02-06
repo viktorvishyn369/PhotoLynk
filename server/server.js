@@ -1153,37 +1153,6 @@ const ensurePlanRow = async (userId) => {
     return await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [userId]);
 };
 
-const getUserDeviceUuids = async (user) => {
-    const current = (user && (user.device_uuid || user.deviceUuid)) ? String(user.device_uuid || user.deviceUuid) : '';
-    let rows = [];
-    try {
-        rows = await dbAllAsync(`SELECT device_uuid FROM devices WHERE user_id = ?`, [user.id]);
-    } catch (e) {
-        rows = [];
-    }
-    const uuids = [current, ...(rows || []).map(r => (r && r.device_uuid) ? String(r.device_uuid) : '')]
-        .filter(Boolean);
-    return Array.from(new Set(uuids));
-};
-
-const resolveClassicFileForUser = async (user, filename) => {
-    const safeName = path.basename(filename || '').replace(/\0/g, '');
-    if (!safeName) return null;
-
-    const uuids = await getUserDeviceUuids(user);
-    for (const uuid of uuids) {
-        const deviceDir = path.join(UPLOAD_DIR, uuid);
-        const filePath = path.join(deviceDir, safeName);
-        if (!filePath.startsWith(deviceDir)) continue;
-        try {
-            if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
-                return { filePath, deviceUuid: uuid };
-            }
-        } catch (e) {}
-    }
-    return null;
-};
-
 const resolveSubscriptionState = async (userId) => {
     const now = Date.now();
     const row = await ensurePlanRow(userId);
@@ -3173,8 +3142,6 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
 
             try {
                 fs.renameSync(tmpPath, correctedFinalPath);
-                // Make file readable by all (fixes Linux permission issues for downloads)
-                try { fs.chmodSync(correctedFinalPath, 0o644); } catch (e) {}
             } catch (e) {
                 console.error(`[Upload] Failed to rename ${tmpPath} -> ${correctedFinalPath}: ${e.message}`);
                 cleanupTmp(200);
@@ -3205,54 +3172,41 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
 });
 
 // List Files (for Sync) - includes hash metadata for cross-device dedup
-app.get('/api/files', authenticateToken, async (req, res) => {
+app.get('/api/files', authenticateToken, (req, res) => {
     const rawOffset = req.query && req.query.offset ? req.query.offset : null;
     const rawLimit = req.query && req.query.limit ? req.query.limit : null;
     const includeMeta = req.query && req.query.meta === 'true';
     const offset = rawOffset !== null ? Math.max(0, parseInt(String(rawOffset), 10) || 0) : 0;
     const limit = rawLimit !== null ? Math.max(0, parseInt(String(rawLimit), 10) || 0) : 0;
 
+    // Read files from device UUID folder
+    const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
+    
+    console.log(`[LIST FILES] Device UUID: ${req.user.device_uuid}, meta=${includeMeta}`);
+    console.log(`[LIST FILES] Looking in: ${deviceDir}`);
+    
+    if (!fs.existsSync(deviceDir)) {
+        console.log(`[LIST FILES] Directory does not exist`);
+        return res.json({ files: [], total: 0 });
+    }
+    
     try {
-        // List across ALL device UUID folders for this user.
-        // This fixes Linux setups where files were uploaded under a different device UUID,
-        // causing iOS/Android to see different (or zero) server totals during Sync.
-        const deviceUuids = await getUserDeviceUuids(req.user);
-        console.log(`[LIST FILES] User ${req.user.id} devices=${deviceUuids.length}, meta=${includeMeta}`);
-
-        const byName = new Map();
-        for (const uuid of deviceUuids) {
-            const deviceDir = path.join(UPLOAD_DIR, uuid);
-            if (!fs.existsSync(deviceDir)) continue;
-
-            let dirItems = [];
-            try {
-                dirItems = fs.readdirSync(deviceDir);
-            } catch (e) {
-                continue;
-            }
-
-            for (const filename of dirItems) {
-                if (!filename || filename.startsWith('.')) continue;
+        const allFiles = fs.readdirSync(deviceDir);
+        console.log(`[LIST FILES] Found ${allFiles.length} items in directory`);
+        
+        // Filter out system files and only include actual media files
+        let files = allFiles
+            .filter(filename => !filename.startsWith('.')) // Skip hidden files like .DS_Store
+            .filter(filename => fs.statSync(path.join(deviceDir, filename)).isFile()) // Only files, not directories
+            .map(filename => {
                 const filePath = path.join(deviceDir, filename);
-                if (!filePath.startsWith(deviceDir)) continue;
-                try {
-                    const st = fs.statSync(filePath);
-                    if (!st.isFile()) continue;
-
-                    const existing = byName.get(filename);
-                    const next = {
-                        filename,
-                        size: st.size,
-                        created_at: st.mtime
-                    };
-                    if (!existing || (existing.created_at && next.created_at && next.created_at > existing.created_at)) {
-                        byName.set(filename, next);
-                    }
-                } catch (e) {}
-            }
-        }
-
-        let files = Array.from(byName.values());
+                const stats = fs.statSync(filePath);
+                return {
+                    filename,
+                    size: stats.size,
+                    created_at: stats.mtime
+                };
+            });
 
         files.sort((a, b) => String(a.filename || '').localeCompare(String(b.filename || '')));
         const total = files.length;
@@ -3623,9 +3577,17 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
 // Thumbnail endpoint - returns resized image (150px) or video frame
 app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
     const filename = req.params.filename;
-    const resolved = await resolveClassicFileForUser(req.user, filename);
-    if (!resolved) return res.status(404).json({ error: 'File not found' });
-    const filePath = resolved.filePath;
+    const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
+    const filePath = path.join(deviceDir, filename);
+
+    // Security check: prevent directory traversal
+    if (!filePath.startsWith(deviceDir)) {
+        return res.status(403).json({ error: 'Access denied' });
+    }
+
+    if (!fs.existsSync(filePath)) {
+        return res.status(404).json({ error: 'File not found' });
+    }
 
     // Detect actual file type from magic bytes (extension may be wrong for old uploads)
     let ext = (filename || '').split('.').pop()?.toLowerCase() || '';
@@ -3783,23 +3745,21 @@ app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
 });
 
 // Download File
-app.get('/api/files/:filename', authenticateToken, async (req, res) => {
+app.get('/api/files/:filename', authenticateToken, (req, res) => {
     const filename = req.params.filename;
-    const resolved = await resolveClassicFileForUser(req.user, filename);
-    if (!resolved) return res.status(404).json({ error: 'File not found' });
-    
-    // Check file is readable before attempting download
-    try {
-        fs.accessSync(resolved.filePath, fs.constants.R_OK);
-    } catch (e) {
-        return res.status(403).json({ error: 'Permission denied' });
+    const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
+    const filePath = path.join(deviceDir, filename);
+
+    // Security check: prevent directory traversal
+    if (!filePath.startsWith(deviceDir)) {
+        return res.status(403).json({ error: 'Access denied' });
     }
-    
-    res.download(resolved.filePath, (err) => {
-        if (err && !res.headersSent) {
-            res.status(500).json({ error: 'Download failed' });
-        }
-    });
+
+    if (fs.existsSync(filePath)) {
+        res.download(filePath);
+    } else {
+        res.status(404).json({ error: 'File not found' });
+    }
 });
 
 // --- StealthCloud (zero-knowledge) routes ---
@@ -6386,6 +6346,14 @@ app.get('/wallet-connect', (req, res) => {
     <button class="btn btn-secondary" onclick="window.close()" style="margin-top:12px;">Cancel</button>
     <div class="status" id="status"></div>
   </div>
+  <div class="container" id="waiting-container" style="display:none;">
+    <div class="logo" style="animation: pulse 2s infinite;">👻</div>
+    <h1>Waiting for Phantom...</h1>
+    <p class="subtitle">Approve the connection in your Phantom wallet</p>
+    <div class="spinner" style="margin: 20px auto;"></div>
+    <button class="btn btn-secondary" onclick="cancelConnect()" style="margin-top:12px;">Cancel</button>
+  </div>
+  <style>@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }</style>
   <div class="container" id="success-container" style="display:none;">
     <div class="success-icon">✅</div>
     <h1>Wallet Connected!</h1>
@@ -6400,6 +6368,21 @@ app.get('/wallet-connect', (req, res) => {
     
     function showStatus(msg, type) { const el = document.getElementById('status'); el.textContent = msg; el.className = 'status ' + type; el.style.display = 'block'; }
     function setLoading(loading) { const btn = document.getElementById('connect-btn'); btn.disabled = loading; btn.innerHTML = loading ? '<div class="spinner"></div> Connecting...' : '<span>🔗</span> Connect Phantom Wallet'; }
+    
+    function showWaiting() {
+      document.getElementById('connect-container').style.display = 'none';
+      document.getElementById('waiting-container').style.display = 'block';
+    }
+    
+    function hideWaiting() {
+      document.getElementById('waiting-container').style.display = 'none';
+      document.getElementById('connect-container').style.display = 'block';
+    }
+    
+    function cancelConnect() {
+      if (connectPollInterval) clearInterval(connectPollInterval);
+      hideWaiting();
+    }
     
     // Send address back to desktop app automatically
     async function sendAddressToApp(address) {
@@ -6441,9 +6424,9 @@ app.get('/wallet-connect', (req, res) => {
       }); 
     }
     
-    // Connect button handler
+    // Connect using Phantom Universal Links (deeplinks) - works even when wallet is locked
     document.getElementById('connect-btn').addEventListener('click', async function() {
-      let provider = window.phantom?.solana || window.solana;
+      const provider = window.phantom?.solana || window.solana;
       
       // First try the provider API if available and connected
       if (provider?.isPhantom && provider.isConnected && provider.publicKey) {
@@ -6451,41 +6434,75 @@ app.get('/wallet-connect', (req, res) => {
         return;
       }
       
-      // If not available, wait for user to unlock (poll for 30 seconds)
-      if (!provider?.isPhantom) {
+      // Try provider.connect() first (works if wallet is unlocked)
+      if (provider?.isPhantom) {
         setLoading(true);
-        showStatus('🔓 Click Phantom icon in browser toolbar to unlock...', 'info');
+        showStatus('Connecting...', 'info');
         
-        for (let i = 0; i < 60; i++) {
-          await new Promise(r => setTimeout(r, 500));
-          provider = window.phantom?.solana || window.solana;
-          if (provider?.isPhantom) break;
-        }
-        
-        if (!provider?.isPhantom) {
-          showStatus('Phantom not detected. Install from phantom.app', 'error');
+        try {
+          const resp = await provider.connect();
+          showSuccess(resp.publicKey.toString());
+          return;
+        } catch (err) {
+          console.log('Provider connect failed, trying deeplink:', err.message);
           setLoading(false);
+        }
+      }
+      
+      // Fallback: Use Phantom Universal Link (deeplink) - this ALWAYS opens Phantom
+      const redirectUrl = encodeURIComponent(window.location.origin + '/wallet-callback');
+      const appUrl = encodeURIComponent('https://stealthlynk.io');
+      const cluster = 'mainnet-beta';
+      
+      // Phantom Universal Link format
+      const phantomConnectUrl = 'https://phantom.app/ul/v1/connect?' + 
+        'app_url=' + appUrl + 
+        '&redirect_link=' + redirectUrl +
+        '&cluster=' + cluster;
+      
+      console.log('Opening Phantom via Universal Link:', phantomConnectUrl);
+      showWaiting();
+      
+      // Open Phantom - this will trigger the extension or open phantom.app
+      window.open(phantomConnectUrl, '_blank');
+      
+      // Poll for connection (Phantom will redirect back or user will approve in extension)
+      let attempts = 0;
+      connectPollInterval = setInterval(async () => {
+        attempts++;
+        
+        // Check if provider is now connected
+        const p = window.phantom?.solana || window.solana;
+        if (p?.isConnected && p?.publicKey) {
+          clearInterval(connectPollInterval);
+          showSuccess(p.publicKey.toString());
           return;
         }
-      }
-      
-      // Try provider.connect()
-      setLoading(true);
-      showStatus('Connecting to Phantom...', 'info');
-      
-      try {
-        const resp = await provider.connect();
-        showSuccess(resp.publicKey.toString());
-      } catch (err) {
-        console.log('Provider connect failed:', err.message);
-        showStatus(err.message || 'Connection failed', 'error');
-        setLoading(false);
-      }
+        
+        // Try eager connect
+        if (p?.isPhantom) {
+          try {
+            const resp = await p.connect({ onlyIfTrusted: true });
+            if (resp?.publicKey) {
+              clearInterval(connectPollInterval);
+              showSuccess(resp.publicKey.toString());
+              return;
+            }
+          } catch (e) { /* not yet */ }
+        }
+        
+        // Timeout after 2 minutes
+        if (attempts > 120) {
+          clearInterval(connectPollInterval);
+          hideWaiting();
+          showStatus('Connection timed out. Please try again.', 'error');
+        }
+      }, 1000);
     });
     
-    // Wait for Phantom extension to inject (can take longer if locked)
+    // Wait for Phantom extension to inject (can take 1-3 seconds on some browsers)
     let phantomCheckAttempts = 0;
-    const maxPhantomChecks = 60; // Check for up to 30 seconds
+    const maxPhantomChecks = 15; // Check for up to 7.5 seconds
     
     function waitForPhantom() {
       phantomCheckAttempts++;
@@ -6501,16 +6518,16 @@ app.get('/wallet-connect', (req, res) => {
           showStatus('Click Connect to link your wallet', 'info');
         });
       } else if (phantomCheckAttempts < maxPhantomChecks) {
-        // Keep checking - extension may still be loading or locked
-        if (phantomCheckAttempts > 5) {
-          showStatus('🔓 Click Phantom icon in browser toolbar to unlock...', 'info');
-        } else {
-          showStatus('Looking for Phantom wallet...', 'info');
-        }
+        // Keep checking - extension may still be loading
+        showStatus('Looking for Phantom wallet... (' + phantomCheckAttempts + '/' + maxPhantomChecks + ')', 'info');
         setTimeout(waitForPhantom, 500);
       } else {
         // Phantom not found after all attempts
-        showStatus('Phantom not detected. Install from phantom.app', 'error');
+        showStatus('Phantom wallet not detected. Make sure the extension is installed and enabled for this site.', 'error');
+        document.getElementById('connect-btn').innerHTML = '<span>📥</span> Install Phantom';
+        document.getElementById('connect-btn').onclick = function() {
+          window.open('https://phantom.app/', '_blank');
+        };
       }
     }
     
