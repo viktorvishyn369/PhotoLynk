@@ -3785,7 +3785,19 @@ app.get('/api/files/:filename', authenticateToken, async (req, res) => {
     const filename = req.params.filename;
     const resolved = await resolveClassicFileForUser(req.user, filename);
     if (!resolved) return res.status(404).json({ error: 'File not found' });
-    res.download(resolved.filePath);
+    
+    // Check file is readable before attempting download
+    try {
+        fs.accessSync(resolved.filePath, fs.constants.R_OK);
+    } catch (e) {
+        return res.status(403).json({ error: 'Permission denied' });
+    }
+    
+    res.download(resolved.filePath, (err) => {
+        if (err && !res.headersSent) {
+            res.status(500).json({ error: 'Download failed' });
+        }
+    });
 });
 
 // --- StealthCloud (zero-knowledge) routes ---
