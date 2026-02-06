@@ -3457,7 +3457,7 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
                 let lastError = null;
                 
                 // Try up to 10 times with 300ms delays
-                for (let attempt = 0; attempt < 10 && !deleted; attempt++) {
+                for (let attempt = 0; attempt < 60 && !deleted; attempt++) {
                     try {
                         if (!fs.existsSync(entryPath)) {
                             deleted = true;
@@ -3467,17 +3467,17 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
                         if (stat.isFile()) {
                             // On Windows, make file writable before deletion (fixes EPERM)
                             try { fs.chmodSync(entryPath, 0o666); } catch (e) {}
-                            fs.unlinkSync(entryPath);
+                            fs.rmSync(entryPath, { force: true, maxRetries: 20, retryDelay: 200 });
                             filesDeleted++;
                             deleted = true;
                         } else if (stat.isDirectory()) {
-                            fs.rmSync(entryPath, { recursive: true, force: true });
+                            fs.rmSync(entryPath, { recursive: true, force: true, maxRetries: 20, retryDelay: 200 });
                             deleted = true;
                         }
                     } catch (e) {
                         lastError = e.message;
-                        if (attempt < 9) {
-                            await new Promise(r => setTimeout(r, 300));
+                        if (attempt < 59) {
+                            await new Promise(r => setTimeout(r, 500));
                         }
                     }
                 }
