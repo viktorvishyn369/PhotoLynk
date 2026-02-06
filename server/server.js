@@ -3375,29 +3375,7 @@ app.post('/api/files/register', authenticateToken, (req, res) => {
 // Purge classic uploads (non-StealthCloud) for this device
 app.post('/api/files/purge', authenticateToken, async (req, res) => {
     try {
-        const deviceUuids = new Set();
-        if (req.user && req.user.device_uuid) deviceUuids.add(String(req.user.device_uuid));
-        try {
-            const rows = await dbAllAsync(`SELECT device_uuid FROM devices WHERE user_id = ?`, [req.user.id]);
-            for (const row of (rows || [])) {
-                if (row && row.device_uuid) deviceUuids.add(String(row.device_uuid));
-            }
-        } catch (e) {}
-
-        const sanitizeDeviceUuidForPath = (value) => {
-            const s = String(value || '').trim();
-            if (!s) return null;
-            if (s.length > 128) return null;
-            if (s.includes('/') || s.includes('\\')) return null;
-            if (s.includes('..')) return null;
-            if (!/^[a-zA-Z0-9._-]+$/.test(s)) return null;
-            return s;
-        };
-
-        const deviceDirs = Array.from(deviceUuids)
-            .map(sanitizeDeviceUuidForPath)
-            .filter(Boolean)
-            .map(u => path.join(UPLOAD_DIR, u));
+        const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
 
         const countFiles = (dir) => {
             try {
@@ -3412,7 +3390,7 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
             }
         };
 
-        const filesBefore = deviceDirs.reduce((sum, d) => sum + countFiles(d), 0);
+        const filesBefore = countFiles(deviceDir);
 
         // Collect fileHashes from database before deleting (for EXIF cleanup)
         const fileHashes = [];
@@ -3428,51 +3406,8 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
             }
         } catch (e) {}
 
-        const makeTreeWritableWindows = (rootDir) => {
-            if (process.platform !== 'win32') return;
-            try {
-                if (!fs.existsSync(rootDir)) return;
-                const stack = [rootDir];
-                while (stack.length) {
-                    const current = stack.pop();
-                    if (!current) continue;
-                    try { fs.chmodSync(current, 0o777); } catch (e) {}
-                    let entries = [];
-                    try { entries = fs.readdirSync(current, { withFileTypes: true }); } catch (e) { entries = []; }
-                    for (const ent of entries) {
-                        const p = path.join(current, ent.name);
-                        if (ent.isDirectory()) {
-                            stack.push(p);
-                        } else {
-                            try { fs.chmodSync(p, 0o666); } catch (e) {}
-                        }
-                    }
-                }
-            } catch (e) {}
-        };
-
-        const deletionErrors = [];
-        for (const dir of deviceDirs) {
-            try {
-                if (!fs.existsSync(dir)) continue;
-                makeTreeWritableWindows(dir);
-                fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
-            } catch (e) {
-                deletionErrors.push({ dir, error: e?.message || String(e) });
-            }
-        }
-
-        if (deletionErrors.length) {
-            console.error('[Purge-Classic] Failed to delete one or more device directories:', deletionErrors);
-            return res.status(500).json({
-                error: 'Failed to delete files from disk',
-                details: deletionErrors,
-            });
-        }
-
-        for (const dir of deviceDirs) {
-            try { fs.mkdirSync(dir, { recursive: true }); } catch (e) {}
-        }
+        try { fs.rmSync(deviceDir, { recursive: true, force: true }); } catch (e) {}
+        try { fs.mkdirSync(deviceDir, { recursive: true }); } catch (e) {}
 
         // Delete EXIF files for this user's files
         let exifDeleted = 0;
