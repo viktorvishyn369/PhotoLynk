@@ -3173,6 +3173,8 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
 
             try {
                 fs.renameSync(tmpPath, correctedFinalPath);
+                // Make file readable by all (fixes Linux permission issues for downloads)
+                try { fs.chmodSync(correctedFinalPath, 0o644); } catch (e) {}
             } catch (e) {
                 console.error(`[Upload] Failed to rename ${tmpPath} -> ${correctedFinalPath}: ${e.message}`);
                 cleanupTmp(200);
