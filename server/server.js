@@ -2946,6 +2946,7 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
     });
 
     out.on('error', (e) => {
+        console.error(`[Upload] Write stream error for ${safeName}: ${e.message}`);
         try { out.destroy(); } catch (e2) {}
         cleanupTmp(500);
         return res.status(500).json({ error: 'Failed to write upload' });
@@ -3102,6 +3103,7 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
             try {
                 fs.renameSync(tmpPath, correctedFinalPath);
             } catch (e) {
+                console.error(`[Upload] Failed to rename ${tmpPath} -> ${correctedFinalPath}: ${e.message}`);
                 cleanupTmp(200);
                 return res.status(500).json({ error: 'Failed to finalize upload' });
             }
