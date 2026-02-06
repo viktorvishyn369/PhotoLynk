@@ -2907,6 +2907,23 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
     const tmpPath = path.join(deviceDir, tmpName);
     const finalPath = path.join(deviceDir, safeName);
 
+    // Clean up any stale .uploading files for this same filename (from previous failed attempts/retries)
+    try {
+        const entries = fs.readdirSync(deviceDir);
+        for (const entry of entries) {
+            if (entry.endsWith(`_${safeName}.uploading`)) {
+                try {
+                    fs.unlinkSync(path.join(deviceDir, entry));
+                    console.log(`[Upload] Cleaned up stale temp file: ${entry}`);
+                } catch (e) {
+                    // Ignore - file might be locked by another upload in progress
+                }
+            }
+        }
+    } catch (e) {
+        // Ignore directory read errors
+    }
+
     const hasher = crypto.createHash('sha256');
     let writtenBytes = 0;
 
@@ -3457,7 +3474,7 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
                 let lastError = null;
                 
                 // Try up to 10 times with 300ms delays
-                for (let attempt = 0; attempt < 60 && !deleted; attempt++) {
+                for (let attempt = 0; attempt < 10 && !deleted; attempt++) {
                     try {
                         if (!fs.existsSync(entryPath)) {
                             deleted = true;
@@ -3467,17 +3484,17 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
                         if (stat.isFile()) {
                             // On Windows, make file writable before deletion (fixes EPERM)
                             try { fs.chmodSync(entryPath, 0o666); } catch (e) {}
-                            fs.rmSync(entryPath, { force: true, maxRetries: 20, retryDelay: 200 });
+                            fs.unlinkSync(entryPath);
                             filesDeleted++;
                             deleted = true;
                         } else if (stat.isDirectory()) {
-                            fs.rmSync(entryPath, { recursive: true, force: true, maxRetries: 20, retryDelay: 200 });
+                            fs.rmSync(entryPath, { recursive: true, force: true });
                             deleted = true;
                         }
                     } catch (e) {
                         lastError = e.message;
-                        if (attempt < 59) {
-                            await new Promise(r => setTimeout(r, 500));
+                        if (attempt < 9) {
+                            await new Promise(r => setTimeout(r, 300));
                         }
                     }
                 }
