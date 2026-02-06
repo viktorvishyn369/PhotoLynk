@@ -3465,6 +3465,8 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
                         }
                         const stat = fs.statSync(entryPath);
                         if (stat.isFile()) {
+                            // On Windows, make file writable before deletion (fixes EPERM)
+                            try { fs.chmodSync(entryPath, 0o666); } catch (e) {}
                             fs.unlinkSync(entryPath);
                             filesDeleted++;
                             deleted = true;
