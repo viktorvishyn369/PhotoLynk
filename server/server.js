@@ -3420,7 +3420,47 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
             }
         } catch (e) {}
 
-        try { fs.rmSync(deviceDir, { recursive: true, force: true }); } catch (e) {}
+        // Windows-robust deletion: delete files individually with retries for locked files
+        let filesDeleted = 0;
+        let deletionErrors = [];
+        if (fs.existsSync(deviceDir)) {
+            try {
+                const entries = fs.readdirSync(deviceDir);
+                for (const entry of entries) {
+                    const entryPath = path.join(deviceDir, entry);
+                    let deleted = false;
+                    for (let attempt = 0; attempt < 5 && !deleted; attempt++) {
+                        try {
+                            const stat = fs.statSync(entryPath);
+                            if (stat.isFile()) {
+                                fs.unlinkSync(entryPath);
+                                filesDeleted++;
+                                deleted = true;
+                            } else if (stat.isDirectory()) {
+                                fs.rmSync(entryPath, { recursive: true, force: true });
+                                deleted = true;
+                            }
+                        } catch (e) {
+                            if (attempt < 4) {
+                                // Wait before retry (file might be locked by upload)
+                                await new Promise(r => setTimeout(r, 200));
+                            } else {
+                                deletionErrors.push({ file: entry, error: e.message });
+                            }
+                        }
+                    }
+                }
+            } catch (e) {
+                console.error(`[Purge-Classic] Error reading deviceDir: ${e.message}`);
+            }
+        }
+        
+        console.log(`[Purge-Classic] Deleted ${filesDeleted} files, ${deletionErrors.length} errors`);
+        if (deletionErrors.length > 0) {
+            console.log(`[Purge-Classic] Deletion errors: ${JSON.stringify(deletionErrors.slice(0, 5))}`);
+        }
+        
+        // Ensure directory exists after cleanup
         try { fs.mkdirSync(deviceDir, { recursive: true }); } catch (e) {}
 
         // Delete EXIF files for this user's files
