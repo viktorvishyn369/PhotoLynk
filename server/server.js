@@ -3377,6 +3377,20 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
     try {
         const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
 
+        // Debug logging for Windows path investigation
+        console.log(`[Purge-Classic] UPLOAD_DIR: ${UPLOAD_DIR}`);
+        console.log(`[Purge-Classic] device_uuid: ${req.user.device_uuid}`);
+        console.log(`[Purge-Classic] deviceDir: ${deviceDir}`);
+        console.log(`[Purge-Classic] deviceDir exists: ${fs.existsSync(deviceDir)}`);
+        
+        // List all folders in UPLOAD_DIR to see what's actually there
+        try {
+            const uploadDirContents = fs.readdirSync(UPLOAD_DIR);
+            console.log(`[Purge-Classic] UPLOAD_DIR contents: ${JSON.stringify(uploadDirContents)}`);
+        } catch (e) {
+            console.log(`[Purge-Classic] Could not list UPLOAD_DIR: ${e.message}`);
+        }
+
         const countFiles = (dir) => {
             try {
                 if (!fs.existsSync(dir)) return 0;
