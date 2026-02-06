@@ -6346,14 +6346,6 @@ app.get('/wallet-connect', (req, res) => {
     <button class="btn btn-secondary" onclick="window.close()" style="margin-top:12px;">Cancel</button>
     <div class="status" id="status"></div>
   </div>
-  <div class="container" id="waiting-container" style="display:none;">
-    <div class="logo" style="animation: pulse 2s infinite;">👻</div>
-    <h1>Waiting for Phantom...</h1>
-    <p class="subtitle">Approve the connection in your Phantom wallet</p>
-    <div class="spinner" style="margin: 20px auto;"></div>
-    <button class="btn btn-secondary" onclick="cancelConnect()" style="margin-top:12px;">Cancel</button>
-  </div>
-  <style>@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }</style>
   <div class="container" id="success-container" style="display:none;">
     <div class="success-icon">✅</div>
     <h1>Wallet Connected!</h1>
@@ -6368,21 +6360,6 @@ app.get('/wallet-connect', (req, res) => {
     
     function showStatus(msg, type) { const el = document.getElementById('status'); el.textContent = msg; el.className = 'status ' + type; el.style.display = 'block'; }
     function setLoading(loading) { const btn = document.getElementById('connect-btn'); btn.disabled = loading; btn.innerHTML = loading ? '<div class="spinner"></div> Connecting...' : '<span>🔗</span> Connect Phantom Wallet'; }
-    
-    function showWaiting() {
-      document.getElementById('connect-container').style.display = 'none';
-      document.getElementById('waiting-container').style.display = 'block';
-    }
-    
-    function hideWaiting() {
-      document.getElementById('waiting-container').style.display = 'none';
-      document.getElementById('connect-container').style.display = 'block';
-    }
-    
-    function cancelConnect() {
-      if (connectPollInterval) clearInterval(connectPollInterval);
-      hideWaiting();
-    }
     
     // Send address back to desktop app automatically
     async function sendAddressToApp(address) {
@@ -6424,9 +6401,9 @@ app.get('/wallet-connect', (req, res) => {
       }); 
     }
     
-    // Connect using Phantom Universal Links (deeplinks) - works even when wallet is locked
+    // Connect button handler
     document.getElementById('connect-btn').addEventListener('click', async function() {
-      const provider = window.phantom?.solana || window.solana;
+      let provider = window.phantom?.solana || window.solana;
       
       // First try the provider API if available and connected
       if (provider?.isPhantom && provider.isConnected && provider.publicKey) {
@@ -6434,75 +6411,41 @@ app.get('/wallet-connect', (req, res) => {
         return;
       }
       
-      // Try provider.connect() first (works if wallet is unlocked)
-      if (provider?.isPhantom) {
+      // If not available, wait for user to unlock (poll for 30 seconds)
+      if (!provider?.isPhantom) {
         setLoading(true);
-        showStatus('Connecting...', 'info');
+        showStatus('🔓 Click Phantom icon in browser toolbar to unlock...', 'info');
         
-        try {
-          const resp = await provider.connect();
-          showSuccess(resp.publicKey.toString());
-          return;
-        } catch (err) {
-          console.log('Provider connect failed, trying deeplink:', err.message);
+        for (let i = 0; i < 60; i++) {
+          await new Promise(r => setTimeout(r, 500));
+          provider = window.phantom?.solana || window.solana;
+          if (provider?.isPhantom) break;
+        }
+        
+        if (!provider?.isPhantom) {
+          showStatus('Phantom not detected. Install from phantom.app', 'error');
           setLoading(false);
+          return;
         }
       }
       
-      // Fallback: Use Phantom Universal Link (deeplink) - this ALWAYS opens Phantom
-      const redirectUrl = encodeURIComponent(window.location.origin + '/wallet-callback');
-      const appUrl = encodeURIComponent('https://stealthlynk.io');
-      const cluster = 'mainnet-beta';
+      // Try provider.connect()
+      setLoading(true);
+      showStatus('Connecting to Phantom...', 'info');
       
-      // Phantom Universal Link format
-      const phantomConnectUrl = 'https://phantom.app/ul/v1/connect?' + 
-        'app_url=' + appUrl + 
-        '&redirect_link=' + redirectUrl +
-        '&cluster=' + cluster;
-      
-      console.log('Opening Phantom via Universal Link:', phantomConnectUrl);
-      showWaiting();
-      
-      // Open Phantom - this will trigger the extension or open phantom.app
-      window.open(phantomConnectUrl, '_blank');
-      
-      // Poll for connection (Phantom will redirect back or user will approve in extension)
-      let attempts = 0;
-      connectPollInterval = setInterval(async () => {
-        attempts++;
-        
-        // Check if provider is now connected
-        const p = window.phantom?.solana || window.solana;
-        if (p?.isConnected && p?.publicKey) {
-          clearInterval(connectPollInterval);
-          showSuccess(p.publicKey.toString());
-          return;
-        }
-        
-        // Try eager connect
-        if (p?.isPhantom) {
-          try {
-            const resp = await p.connect({ onlyIfTrusted: true });
-            if (resp?.publicKey) {
-              clearInterval(connectPollInterval);
-              showSuccess(resp.publicKey.toString());
-              return;
-            }
-          } catch (e) { /* not yet */ }
-        }
-        
-        // Timeout after 2 minutes
-        if (attempts > 120) {
-          clearInterval(connectPollInterval);
-          hideWaiting();
-          showStatus('Connection timed out. Please try again.', 'error');
-        }
-      }, 1000);
+      try {
+        const resp = await provider.connect();
+        showSuccess(resp.publicKey.toString());
+      } catch (err) {
+        console.log('Provider connect failed:', err.message);
+        showStatus(err.message || 'Connection failed', 'error');
+        setLoading(false);
+      }
     });
     
-    // Wait for Phantom extension to inject (can take 1-3 seconds on some browsers)
+    // Wait for Phantom extension to inject (can take longer if locked)
     let phantomCheckAttempts = 0;
-    const maxPhantomChecks = 15; // Check for up to 7.5 seconds
+    const maxPhantomChecks = 60; // Check for up to 30 seconds
     
     function waitForPhantom() {
       phantomCheckAttempts++;
@@ -6518,16 +6461,16 @@ app.get('/wallet-connect', (req, res) => {
           showStatus('Click Connect to link your wallet', 'info');
         });
       } else if (phantomCheckAttempts < maxPhantomChecks) {
-        // Keep checking - extension may still be loading
-        showStatus('Looking for Phantom wallet... (' + phantomCheckAttempts + '/' + maxPhantomChecks + ')', 'info');
+        // Keep checking - extension may still be loading or locked
+        if (phantomCheckAttempts > 5) {
+          showStatus('🔓 Click Phantom icon in browser toolbar to unlock...', 'info');
+        } else {
+          showStatus('Looking for Phantom wallet...', 'info');
+        }
         setTimeout(waitForPhantom, 500);
       } else {
         // Phantom not found after all attempts
-        showStatus('Phantom wallet not detected. Make sure the extension is installed and enabled for this site.', 'error');
-        document.getElementById('connect-btn').innerHTML = '<span>📥</span> Install Phantom';
-        document.getElementById('connect-btn').onclick = function() {
-          window.open('https://phantom.app/', '_blank');
-        };
+        showStatus('Phantom not detected. Install from phantom.app', 'error');
       }
     }
     
