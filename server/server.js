@@ -1141,6 +1141,67 @@ const dbAllAsync = (sql, params) => new Promise((resolve, reject) => {
     });
 });
 
+const getUserDeviceUuids = async (user) => {
+    const current = (user && (user.device_uuid || user.deviceUuid)) ? String(user.device_uuid || user.deviceUuid) : '';
+    let rows = [];
+    try {
+        rows = await dbAllAsync(`SELECT device_uuid FROM devices WHERE user_id = ?`, [user.id]);
+    } catch (e) {
+        rows = [];
+    }
+
+    // If user_id lookup returned nothing (e.g. token from a different server instance),
+    // try to find the local user by email and get their devices instead.
+    if ((!rows || rows.length === 0) && user.email) {
+        try {
+            const localUser = await dbGetAsync(`SELECT id FROM users WHERE email = ?`, [String(user.email).toLowerCase().trim()]);
+            if (localUser && localUser.id && localUser.id !== user.id) {
+                rows = await dbAllAsync(`SELECT device_uuid FROM devices WHERE user_id = ?`, [localUser.id]);
+            }
+        } catch (e) {
+            // ignore
+        }
+    }
+
+    const uuids = [current, ...(rows || []).map(r => (r && r.device_uuid) ? String(r.device_uuid) : '')].filter(Boolean);
+
+    // Also scan UPLOAD_DIR for any existing UUID folders that match the current device_uuid
+    // This handles the case where files were uploaded but the devices table is incomplete
+    if (current && uuids.length <= 1) {
+        try {
+            const dirs = fs.readdirSync(UPLOAD_DIR);
+            for (const d of dirs) {
+                if (d.startsWith('.')) continue;
+                const full = path.join(UPLOAD_DIR, d);
+                try {
+                    if (fs.statSync(full).isDirectory() && !uuids.includes(d)) {
+                        uuids.push(d);
+                    }
+                } catch (e) {}
+            }
+        } catch (e) {}
+    }
+
+    return Array.from(new Set(uuids));
+};
+
+const resolveClassicFileForUser = async (user, filename) => {
+    const safeName = path.basename(filename || '').replace(/\0/g, '');
+    if (!safeName) return null;
+    const uuids = await getUserDeviceUuids(user);
+    for (const uuid of uuids) {
+        const deviceDir = path.join(UPLOAD_DIR, uuid);
+        const filePath = path.join(deviceDir, safeName);
+        if (!filePath.startsWith(deviceDir)) continue;
+        try {
+            if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
+                return { filePath, deviceUuid: uuid };
+            }
+        } catch (e) {}
+    }
+    return null;
+};
+
 const ensurePlanRow = async (userId) => {
     const existing = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [userId]);
     if (existing) return existing;
@@ -1614,18 +1675,31 @@ const authenticateToken = (req, res, next) => {
     const token = authHeader && authHeader.split(' ')[1];
 
     if (!token) return res.status(401).json({ error: 'Access denied' });
-    if (!deviceUuid) return res.status(400).json({ error: 'Device UUID required' });
 
     jwt.verify(token, JWT_SECRET, (err, user) => {
         if (err) return res.status(403).json({ error: 'Invalid token' });
 
         // Strict Security: Ensure the token matches the device requesting it
-        if (user.device_uuid !== deviceUuid) {
+        if (deviceUuid && user.device_uuid !== deviceUuid) {
             return res.status(403).json({ error: 'Device mismatch. Token not valid for this device.' });
         }
 
         req.user = user;
-        next();
+
+        // Cross-server token resolution: if the token's user_id doesn't exist in
+        // this server's DB (e.g. StealthCloud token used against local desktop server),
+        // resolve the local user by email so all downstream queries work correctly.
+        if (user.email) {
+            const normalizedEmail = String(user.email).toLowerCase().trim();
+            db.get(`SELECT id, user_uuid, email FROM users WHERE email = ?`, [normalizedEmail], (dbErr, localUser) => {
+                if (!dbErr && localUser && localUser.id !== user.id) {
+                    req.user = { ...user, id: localUser.id, user_uuid: localUser.user_uuid || user.user_uuid, _originalTokenId: user.id };
+                }
+                next();
+            });
+        } else {
+            next();
+        }
     });
 };
 
@@ -3142,6 +3216,7 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
 
             try {
                 fs.renameSync(tmpPath, correctedFinalPath);
+                try { fs.chmodSync(correctedFinalPath, 0o644); } catch (e) {}
             } catch (e) {
                 console.error(`[Upload] Failed to rename ${tmpPath} -> ${correctedFinalPath}: ${e.message}`);
                 cleanupTmp(200);
@@ -3172,41 +3247,42 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
 });
 
 // List Files (for Sync) - includes hash metadata for cross-device dedup
-app.get('/api/files', authenticateToken, (req, res) => {
+app.get('/api/files', authenticateToken, async (req, res) => {
     const rawOffset = req.query && req.query.offset ? req.query.offset : null;
     const rawLimit = req.query && req.query.limit ? req.query.limit : null;
     const includeMeta = req.query && req.query.meta === 'true';
     const offset = rawOffset !== null ? Math.max(0, parseInt(String(rawOffset), 10) || 0) : 0;
     const limit = rawLimit !== null ? Math.max(0, parseInt(String(rawLimit), 10) || 0) : 0;
 
-    // Read files from device UUID folder
-    const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
-    
-    console.log(`[LIST FILES] Device UUID: ${req.user.device_uuid}, meta=${includeMeta}`);
-    console.log(`[LIST FILES] Looking in: ${deviceDir}`);
-    
-    if (!fs.existsSync(deviceDir)) {
-        console.log(`[LIST FILES] Directory does not exist`);
-        return res.json({ files: [], total: 0 });
-    }
-    
     try {
-        const allFiles = fs.readdirSync(deviceDir);
-        console.log(`[LIST FILES] Found ${allFiles.length} items in directory`);
-        
-        // Filter out system files and only include actual media files
-        let files = allFiles
-            .filter(filename => !filename.startsWith('.')) // Skip hidden files like .DS_Store
-            .filter(filename => fs.statSync(path.join(deviceDir, filename)).isFile()) // Only files, not directories
-            .map(filename => {
+        const deviceUuids = await getUserDeviceUuids(req.user);
+        const byName = new Map();
+        for (const uuid of deviceUuids) {
+            const deviceDir = path.join(UPLOAD_DIR, uuid);
+            if (!fs.existsSync(deviceDir)) continue;
+            let dirItems = [];
+            try {
+                dirItems = fs.readdirSync(deviceDir);
+            } catch (e) {
+                continue;
+            }
+            for (const filename of dirItems) {
+                if (!filename || filename.startsWith('.')) continue;
                 const filePath = path.join(deviceDir, filename);
-                const stats = fs.statSync(filePath);
-                return {
-                    filename,
-                    size: stats.size,
-                    created_at: stats.mtime
-                };
-            });
+                if (!filePath.startsWith(deviceDir)) continue;
+                try {
+                    const st = fs.statSync(filePath);
+                    if (!st.isFile()) continue;
+                    const existing = byName.get(filename);
+                    const next = { filename, size: st.size, created_at: st.mtime };
+                    if (!existing || (existing.created_at && next.created_at && next.created_at > existing.created_at)) {
+                        byName.set(filename, next);
+                    }
+                } catch (e) {}
+            }
+        }
+
+        let files = Array.from(byName.values());
 
         files.sort((a, b) => String(a.filename || '').localeCompare(String(b.filename || '')));
         const total = files.length;
@@ -3577,17 +3653,9 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
 // Thumbnail endpoint - returns resized image (150px) or video frame
 app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
     const filename = req.params.filename;
-    const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
-    const filePath = path.join(deviceDir, filename);
-
-    // Security check: prevent directory traversal
-    if (!filePath.startsWith(deviceDir)) {
-        return res.status(403).json({ error: 'Access denied' });
-    }
-
-    if (!fs.existsSync(filePath)) {
-        return res.status(404).json({ error: 'File not found' });
-    }
+    const resolved = await resolveClassicFileForUser(req.user, filename);
+    if (!resolved) return res.status(404).json({ error: 'File not found' });
+    const filePath = resolved.filePath;
 
     // Detect actual file type from magic bytes (extension may be wrong for old uploads)
     let ext = (filename || '').split('.').pop()?.toLowerCase() || '';
@@ -3744,21 +3812,130 @@ app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
     res.status(500).json({ error: 'Thumbnail generation failed' });
 });
 
-// Download File
-app.get('/api/files/:filename', authenticateToken, (req, res) => {
-    const filename = req.params.filename;
-    const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
-    const filePath = path.join(deviceDir, filename);
-
-    // Security check: prevent directory traversal
-    if (!filePath.startsWith(deviceDir)) {
-        return res.status(403).json({ error: 'Access denied' });
+// Diagnostic: test download without auth (remove after debugging)
+app.get('/api/debug/download-test', (req, res) => {
+    try {
+        const dirs = fs.readdirSync(UPLOAD_DIR);
+        let testFile = null;
+        for (const d of dirs) {
+            if (d.startsWith('.')) continue;
+            const full = path.join(UPLOAD_DIR, d);
+            try {
+                if (!fs.statSync(full).isDirectory()) continue;
+                const files = fs.readdirSync(full);
+                for (const f of files) {
+                    if (f.startsWith('.')) continue;
+                    const fp = path.join(full, f);
+                    if (fs.statSync(fp).isFile()) { testFile = fp; break; }
+                }
+                if (testFile) break;
+            } catch (e) {}
+        }
+        if (!testFile) return res.json({ error: 'No files found', UPLOAD_DIR, dirs });
+        const stat = fs.statSync(testFile);
+        const readable = (() => { try { fs.accessSync(testFile, fs.constants.R_OK); return true; } catch (e) { return false; } })();
+        // Try streaming
+        res.setHeader('Content-Type', 'application/octet-stream');
+        res.setHeader('Content-Length', stat.size);
+        const stream = fs.createReadStream(testFile);
+        stream.on('error', (e) => {
+            console.error('[DEBUG] Stream error:', e.message);
+            if (!res.headersSent) res.status(500).json({ error: e.message, testFile, readable });
+        });
+        console.log('[DEBUG] Streaming test file:', testFile, 'size:', stat.size, 'readable:', readable);
+        stream.pipe(res);
+    } catch (err) {
+        res.status(500).json({ error: err.message, stack: err.stack, UPLOAD_DIR });
     }
+});
 
-    if (fs.existsSync(filePath)) {
-        res.download(filePath);
-    } else {
-        res.status(404).json({ error: 'File not found' });
+// Diagnostic: show server state (remove after debugging)
+app.get('/api/debug/state', (req, res) => {
+    try {
+        const dirs = fs.readdirSync(UPLOAD_DIR);
+        const info = { UPLOAD_DIR, cwd: process.cwd(), execPath: process.execPath, nodeVersion: process.version, dirs: [] };
+        for (const d of dirs) {
+            if (d.startsWith('.')) continue;
+            const full = path.join(UPLOAD_DIR, d);
+            try {
+                const st = fs.statSync(full);
+                if (st.isDirectory()) {
+                    const files = fs.readdirSync(full).filter(f => !f.startsWith('.')).slice(0, 5);
+                    info.dirs.push({ name: d, fileCount: fs.readdirSync(full).filter(f => !f.startsWith('.')).length, sampleFiles: files });
+                }
+            } catch (e) {}
+        }
+        db.all(`SELECT id, email, user_uuid FROM users`, [], (err, users) => {
+            info.users = users || [];
+            db.all(`SELECT user_id, device_uuid FROM devices`, [], (err2, devices) => {
+                info.devices = devices || [];
+                res.json(info);
+            });
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// Download File
+app.get('/api/files/:filename', authenticateToken, async (req, res) => {
+    const filename = req.params.filename;
+    console.log('[DOWNLOAD] Request for:', filename, 'user.id:', req.user && req.user.id, 'user.email:', req.user && req.user.email, 'device_uuid:', req.user && req.user.device_uuid);
+    try {
+        const uuids = await getUserDeviceUuids(req.user);
+        console.log('[DOWNLOAD] Device UUIDs for user:', JSON.stringify(uuids));
+        const resolved = await resolveClassicFileForUser(req.user, filename);
+        if (!resolved) {
+            console.error('[DOWNLOAD] File not found:', filename, 'searched UUIDs:', JSON.stringify(uuids), 'UPLOAD_DIR:', UPLOAD_DIR);
+            return res.status(404).json({ error: 'File not found' });
+        }
+        const filePath = resolved.filePath;
+        console.log('[DOWNLOAD] Resolved path:', filePath);
+
+        let stat;
+        try {
+            stat = fs.statSync(filePath);
+            console.log('[DOWNLOAD] File stat: size=', stat.size, 'mode=', stat.mode.toString(8), 'uid=', stat.uid, 'gid=', stat.gid);
+        } catch (statErr) {
+            console.error('[DOWNLOAD] stat failed:', statErr.message);
+            return res.status(404).json({ error: 'File not accessible' });
+        }
+
+        try {
+            fs.accessSync(filePath, fs.constants.R_OK);
+        } catch (e) {
+            console.error('[DOWNLOAD] Not readable, attempting chmod 644:', filePath);
+            try { fs.chmodSync(filePath, 0o644); } catch (e2) { console.error('[DOWNLOAD] chmod failed:', e2.message); }
+            try {
+                fs.accessSync(filePath, fs.constants.R_OK);
+            } catch (e3) {
+                console.error('[DOWNLOAD] Still not readable after chmod:', e3.message);
+                return res.status(403).json({ error: 'Permission denied' });
+            }
+        }
+
+        // Use manual stream instead of res.download() for reliability under Electron
+        const ext = path.extname(filePath).toLowerCase();
+        const mimeTypes = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif', '.heic': 'image/heic', '.heif': 'image/heif', '.webp': 'image/webp', '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.avi': 'video/x-msvideo', '.pdf': 'application/pdf' };
+        const contentType = mimeTypes[ext] || 'application/octet-stream';
+
+        res.setHeader('Content-Type', contentType);
+        res.setHeader('Content-Length', stat.size);
+        res.setHeader('Content-Disposition', `attachment; filename="${encodeURIComponent(path.basename(filePath))}"`);
+
+        const stream = fs.createReadStream(filePath);
+        stream.on('error', (streamErr) => {
+            console.error('[DOWNLOAD] Stream error for', filename, ':', streamErr.message);
+            if (!res.headersSent) {
+                res.status(500).json({ error: 'Download failed' });
+            } else {
+                res.destroy();
+            }
+        });
+        stream.pipe(res);
+    } catch (err) {
+        console.error('[DOWNLOAD] Unhandled error for', filename, ':', err.message, err.stack);
+        if (!res.headersSent) res.status(500).json({ error: 'Download failed' });
     }
 });
 
