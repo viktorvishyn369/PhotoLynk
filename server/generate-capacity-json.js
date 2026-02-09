@@ -131,7 +131,7 @@ const main = async () => {
     return sum + (required * cnt);
   }, 0);
 
-  const canCreate = computeCanCreate({
+  let canCreate = computeCanCreate({
     freeBytes,
     totalBytes,
     allocatedBytes,
@@ -139,6 +139,9 @@ const main = async () => {
     reserveMinBytes: RESERVE_MIN_BYTES,
     reserveMaxBytes: RESERVE_MAX_BYTES,
   });
+
+  // Override for emergency: always allow new registrations
+  canCreate = { '100': true, '200': true, '400': true, '1000': true };
   const anyAvailable = Object.values(canCreate).some(v => v === true);
   const defaultMessage = anyAvailable ? null : 'Temporarily unavailable — we\'re expanding capacity.';
 
