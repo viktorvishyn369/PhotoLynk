@@ -1630,6 +1630,16 @@ db.serialize(() => {
         FOREIGN KEY(user_id) REFERENCES users(id)
     )`);
 
+    // Self-healing: Add missing created_at column if not present (for old DB restores)
+    db.all(`PRAGMA table_info(cloud_chunks)`, (err, rows) => {
+        if (!err && rows) {
+            const hasCreatedAt = rows.some(row => row.name === 'created_at');
+            if (!hasCreatedAt) {
+                db.run(`ALTER TABLE cloud_chunks ADD COLUMN created_at INTEGER`);
+            }
+        }
+    });
+
     db.run(`CREATE TABLE IF NOT EXISTS cloud_device_state (
         user_id INTEGER,
         device_uuid TEXT,
