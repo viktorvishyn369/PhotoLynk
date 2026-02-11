@@ -10,7 +10,7 @@ Back up photos/videos to your own server or StealthCloud, and restore on any pho
 
 | Platform | Status | Payment Method |
 |----------|--------|----------------|
-| **Solana Seeker** | ✅ Live on Solana Mobile Saga dApp Store | SOL (on-chain) |
+| **Solana Seeker** | ✅ Live as dApp on Solana Mobile | SOL (on-chain) |
 | **iOS** | ✅ Live on App Store | In-App Purchase |
 | **Android** | ✅ Live on Google Play | In-App Purchase |
 
