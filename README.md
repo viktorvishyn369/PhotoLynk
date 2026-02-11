@@ -21,7 +21,7 @@ The PhotoLynk mobile apps feature end-to-end encryption, self-hosted or cloud ba
 Store links:
 - iOS (App Store): [Download PhotoLynk](https://apps.apple.com/app/id6748285696)
 - Android (Google Play): [Download PhotoLynk](https://play.google.com/store/apps/details?id=com.photosync.app)
-- Solana dApp Store: [Open](https://solana.com/dapp-store)
+- Solana dApp Store: [Open](https://solanamobile.com/dapp-store)
 
 ---
 
