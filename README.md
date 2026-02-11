@@ -11,12 +11,17 @@ Back up photos/videos to your own server or StealthCloud, and restore on any pho
 | Platform | Status | Payment Method |
 |----------|--------|----------------|
 | **Solana Seeker** | ✅ Live on Solana dApp Store | SOL (on-chain) |
-| **iOS** | 🧪 Testing (App Store release soon) | In-App Purchase |
-| **Android** | 🧪 Testing (Google Play release soon) | In-App Purchase |
+| **iOS** | ✅ Live on App Store | In-App Purchase |
+| **Android** | ✅ Live on Google Play | In-App Purchase |
 
 The PhotoLynk mobile apps feature end-to-end encryption, self-hosted or cloud backup options, and seamless cross-platform restore. The Solana dApp version enables crypto payments directly on the Solana blockchain — no credit cards, no middlemen.
 
-**Solana dApp is live!** iOS and Android versions coming soon to App Store and Google Play.
+**Solana dApp is live. iOS and Android are live on App Store and Google Play.**
+
+Store links:
+- iOS (App Store): [Download](https://apps.apple.com/)
+- Android (Google Play): [Download](https://play.google.com/)
+- Solana dApp Store: [Open](https://solana.com/dapp-store)
 
 ---
 
