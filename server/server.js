@@ -1480,6 +1480,10 @@ db.serialize(() => {
                 const now = Date.now();
                 db.run(`UPDATE users SET created_at = ? WHERE created_at IS NULL`, [now]);
             });
+        } else {
+            // Backfill legacy rows where created_at exists but is NULL
+            const now = Date.now();
+            db.run(`UPDATE users SET created_at = ? WHERE created_at IS NULL`, [now]);
         }
         // Security: email verification status
         if (!names.includes('email_verified')) {
@@ -1517,6 +1521,24 @@ db.serialize(() => {
     db.all(`PRAGMA table_info(user_plans)`, [], (err, cols) => {
         if (err) return;
         const names = Array.isArray(cols) ? cols.map(c => c && c.name).filter(Boolean) : [];
+        if (!names.includes('plan_gb')) {
+            db.run(`ALTER TABLE user_plans ADD COLUMN plan_gb INTEGER`, [], () => {});
+        }
+        if (!names.includes('rc_app_user_id')) {
+            db.run(`ALTER TABLE user_plans ADD COLUMN rc_app_user_id TEXT`, [], () => {});
+        }
+        if (!names.includes('rc_product_id')) {
+            db.run(`ALTER TABLE user_plans ADD COLUMN rc_product_id TEXT`, [], () => {});
+        }
+        if (!names.includes('rc_entitlement')) {
+            db.run(`ALTER TABLE user_plans ADD COLUMN rc_entitlement TEXT`, [], () => {});
+        }
+        if (!names.includes('status')) {
+            db.run(`ALTER TABLE user_plans ADD COLUMN status TEXT`, [], () => {});
+        }
+        if (!names.includes('expires_at')) {
+            db.run(`ALTER TABLE user_plans ADD COLUMN expires_at INTEGER`, [], () => {});
+        }
         if (!names.includes('grace_until')) {
             db.run(`ALTER TABLE user_plans ADD COLUMN grace_until INTEGER`, [], () => {});
         }
@@ -1532,6 +1554,41 @@ db.serialize(() => {
         if (!names.includes('payment_at')) {
             db.run(`ALTER TABLE user_plans ADD COLUMN payment_at INTEGER`, [], () => {});
         }
+        if (!names.includes('updated_at')) {
+            db.run(`ALTER TABLE user_plans ADD COLUMN updated_at INTEGER`, [], () => {});
+        }
+
+        db.all(`PRAGMA table_info(user_plans)`, [], (err2, cols2) => {
+            if (err2) return;
+            const names2 = Array.isArray(cols2) ? cols2.map(c => c && c.name).filter(Boolean) : [];
+            const now = Date.now();
+
+            if (names2.includes('status') && names2.includes('trial_until') && names2.includes('updated_at')) {
+                db.run(
+                    `INSERT INTO user_plans (user_id, status, trial_until, updated_at)
+                     SELECT u.id, 'none', NULL, ?
+                     FROM users u
+                     LEFT JOIN user_plans up ON up.user_id = u.id
+                     WHERE up.user_id IS NULL`,
+                    [now]
+                );
+            } else {
+                db.run(
+                    `INSERT INTO user_plans (user_id)
+                     SELECT u.id
+                     FROM users u
+                     LEFT JOIN user_plans up ON up.user_id = u.id
+                     WHERE up.user_id IS NULL`
+                );
+            }
+
+            if (names2.includes('status')) {
+                db.run(`UPDATE user_plans SET status = 'none' WHERE status IS NULL OR TRIM(status) = ''`);
+            }
+            if (names2.includes('updated_at')) {
+                db.run(`UPDATE user_plans SET updated_at = ? WHERE updated_at IS NULL OR updated_at = 0`, [now]);
+            }
+        });
     });
 
     // Migrate existing DBs: add user_uuid column if missing, and populate it
