@@ -136,6 +136,17 @@ const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'super-secure-secret-key-change-this';
 const BCRYPT_ROUNDS = Number.parseInt(process.env.BCRYPT_ROUNDS || '10', 10);
 
+const computeStorageUuidFromEmail = (email) => {
+    const normalizedEmail = String(email || '').toLowerCase().trim();
+    if (!normalizedEmail) return '';
+    const hex = crypto.createHmac('sha256', JWT_SECRET)
+        .update(`storage:${normalizedEmail}`)
+        .digest('hex')
+        .slice(0, 32);
+    if (!hex || hex.length !== 32) return '';
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
+};
+
 const ENABLE_HTTPS = String(process.env.ENABLE_HTTPS || '').toLowerCase() === 'true';
 const HTTPS_PORT = process.env.HTTPS_PORT || 3443;
 const TLS_KEY_PATH = process.env.TLS_KEY_PATH;
@@ -1462,13 +1473,17 @@ db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS users (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_uuid TEXT,
+        storage_uuid TEXT,
         email TEXT UNIQUE,
         password TEXT,
         hardware_device_id TEXT,
-        created_at INTEGER
+        created_at INTEGER,
+        email_verified INTEGER DEFAULT 0,
+        last_country_code TEXT,
+        verified_countries TEXT DEFAULT '[]'
     )`);
 
-    // Migrate existing DBs: add hardware_device_id column if missing
+    // Migrate existing DBs: add missing columns to users
     db.all(`PRAGMA table_info(users)`, [], (err, cols) => {
         if (err) return;
         const names = Array.isArray(cols) ? cols.map(c => c && c.name).filter(Boolean) : [];
@@ -1496,6 +1511,25 @@ db.serialize(() => {
         // Security: list of verified country codes (JSON array)
         if (!names.includes('verified_countries')) {
             db.run(`ALTER TABLE users ADD COLUMN verified_countries TEXT DEFAULT '[]'`, [], () => {});
+        }
+        if (!names.includes('storage_uuid')) {
+            db.run(`ALTER TABLE users ADD COLUMN storage_uuid TEXT`, [], () => {
+                db.all(`SELECT id, email FROM users WHERE storage_uuid IS NULL OR storage_uuid = ''`, [], (e2, rows) => {
+                    if (e2) return;
+                    (rows || []).forEach(r => {
+                        const su = computeStorageUuidFromEmail(r.email);
+                        if (su) db.run(`UPDATE users SET storage_uuid = ? WHERE id = ?`, [su, r.id]);
+                    });
+                });
+            });
+        } else {
+            db.all(`SELECT id, email FROM users WHERE storage_uuid IS NULL OR storage_uuid = ''`, [], (e2, rows) => {
+                if (e2) return;
+                (rows || []).forEach(r => {
+                    const su = computeStorageUuidFromEmail(r.email);
+                    if (su) db.run(`UPDATE users SET storage_uuid = ? WHERE id = ?`, [su, r.id]);
+                });
+            });
         }
     });
 
@@ -1741,9 +1775,21 @@ const authenticateToken = (req, res, next) => {
         // resolve the local user by email so all downstream queries work correctly.
         if (user.email) {
             const normalizedEmail = String(user.email).toLowerCase().trim();
-            db.get(`SELECT id, user_uuid, email FROM users WHERE email = ?`, [normalizedEmail], (dbErr, localUser) => {
-                if (!dbErr && localUser && localUser.id !== user.id) {
-                    req.user = { ...user, id: localUser.id, user_uuid: localUser.user_uuid || user.user_uuid, _originalTokenId: user.id };
+            db.get(`SELECT id, user_uuid, storage_uuid, email FROM users WHERE email = ?`, [normalizedEmail], (dbErr, localUser) => {
+                if (!dbErr && localUser) {
+                    const merged = {
+                        ...user,
+                        user_uuid: localUser.user_uuid || user.user_uuid,
+                        storage_uuid: localUser.storage_uuid || user.storage_uuid,
+                    };
+                    if (localUser.id !== user.id) {
+                        merged.id = localUser.id;
+                        merged._originalTokenId = user.id;
+                    }
+                    req.user = merged;
+                } else if (!user.storage_uuid && user.email) {
+                    const computed = computeStorageUuidFromEmail(user.email);
+                    if (computed) req.user = { ...user, storage_uuid: computed };
                 }
                 next();
             });
@@ -1756,19 +1802,19 @@ const authenticateToken = (req, res, next) => {
 const getStealthCloudUserKey = (user) => {
     // StealthCloud files are stored per USER (not per device) so all devices
     // for the same account can access the same files.
-    // Use user_id as the primary key for storage.
-    if (user && user.id) {
-        return String(user.id);
-    }
-    
-    // Fallback to device_uuid only if user_id is not available (legacy)
-    const deviceKey = (user && (user.device_uuid || user.deviceUuid)) ? String(user.device_uuid || user.deviceUuid) : '';
-    const safeDevice = deviceKey.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
-    if (safeDevice) return safeDevice;
+    const storageKey = (user && (user.storage_uuid || user.storageUuid)) ? String(user.storage_uuid || user.storageUuid) : '';
+    const safeStorage = storageKey.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
+    if (safeStorage) return safeStorage;
 
     const key = (user && (user.user_uuid || user.userUuid)) ? String(user.user_uuid || user.userUuid) : '';
     const safe = key.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
-    return safe || 'unknown';
+    if (safe) return safe;
+
+    if (user && user.id) return String(user.id);
+
+    const deviceKey = (user && (user.device_uuid || user.deviceUuid)) ? String(user.device_uuid || user.deviceUuid) : '';
+    const safeDevice = deviceKey.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
+    return safeDevice || 'unknown';
 };
 
 const getStealthCloudAllPossibleUserKeys = (user) => {
@@ -1798,12 +1844,91 @@ const getStealthCloudAllPossibleUserKeys = (user) => {
     if (user && (user.user_uuid || user.userUuid)) {
         addSafe(user.user_uuid || user.userUuid);
     }
+    if (user && (user.storage_uuid || user.storageUuid)) {
+        addSafe(user.storage_uuid || user.storageUuid);
+    }
 
     return Array.from(keys);
 };
 
+const getStealthCloudStorageKey = (user) => {
+    const trySafe = (v) => {
+        if (v === undefined || v === null) return '';
+        const raw = String(v);
+        if (!raw) return '';
+        const safe = raw.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
+        return safe || '';
+    };
+
+    const storageKey = trySafe(user && (user.storage_uuid || user.storageUuid));
+    if (storageKey) return storageKey;
+
+    const computed = trySafe(user && user.email ? computeStorageUuidFromEmail(user.email) : '');
+    if (computed) return computed;
+
+    const userUuidKey = trySafe(user && (user.user_uuid || user.userUuid));
+    if (userUuidKey) return userUuidKey;
+
+    const idKey = trySafe(user && user.id);
+    if (idKey) return idKey;
+
+    const deviceKey = trySafe(user && (user.device_uuid || user.deviceUuid));
+    if (deviceKey) return deviceKey;
+
+    return 'unknown';
+};
+
 const ensureStealthCloudUserDirs = (user) => {
-    const key = getStealthCloudUserKey(user);
+    const preferredKey = getStealthCloudStorageKey(user);
+    const keys = [preferredKey, ...getStealthCloudAllPossibleUserKeys(user).filter(k => k !== preferredKey)];
+
+    const canUsePreferred = preferredKey && preferredKey !== 'unknown';
+    const cloudUsersRoot = path.join(CLOUD_DIR, 'users');
+    const chunksUsersRoot = CHUNKS_DIR ? path.join(CHUNKS_DIR, 'users') : null;
+    try { if (!fs.existsSync(cloudUsersRoot)) fs.mkdirSync(cloudUsersRoot, { recursive: true }); } catch (e) {}
+    if (chunksUsersRoot) {
+        try { if (!fs.existsSync(chunksUsersRoot)) fs.mkdirSync(chunksUsersRoot, { recursive: true }); } catch (e) {}
+    }
+
+    // Prefer the stable key only if it already exists; otherwise use the first existing legacy key.
+    let key = preferredKey;
+    if (canUsePreferred) {
+        const preferredCloud = path.join(cloudUsersRoot, preferredKey);
+        const preferredChunks = chunksUsersRoot ? path.join(chunksUsersRoot, preferredKey) : null;
+        const preferredExists = (() => {
+            try {
+                if (fs.existsSync(preferredCloud)) return true;
+                if (preferredChunks && fs.existsSync(preferredChunks)) return true;
+            } catch (e) {}
+            return false;
+        })();
+        if (!preferredExists) {
+            for (const k of keys) {
+                if (!k || k === preferredKey) continue;
+                const cloudUserDir = path.join(cloudUsersRoot, k);
+                const chunksUserDir = chunksUsersRoot ? path.join(chunksUsersRoot, k) : null;
+                try {
+                    if (fs.existsSync(cloudUserDir) || (chunksUserDir && fs.existsSync(chunksUserDir))) {
+                        key = k;
+                        break;
+                    }
+                } catch (e) {}
+            }
+        }
+    } else {
+        for (const k of keys) {
+            if (!k) continue;
+            const cloudUserDir = path.join(cloudUsersRoot, k);
+            const chunksUserDir = chunksUsersRoot ? path.join(chunksUsersRoot, k) : null;
+            try {
+                if (fs.existsSync(cloudUserDir) || (chunksUserDir && fs.existsSync(chunksUserDir))) {
+                    key = k;
+                    break;
+                }
+            } catch (e) {}
+        }
+    }
+
     const userDir = path.join(CLOUD_DIR, 'users', key);
     // Chunks go to HDD RAID10 if CHUNKS_DIR is set, otherwise same as CLOUD_DIR
     const chunksDir = CHUNKS_DIR 
@@ -1821,6 +1946,7 @@ const ensureStealthCloudUserDirs = (user) => {
     if (!fs.existsSync(rawMetaDir)) fs.mkdirSync(rawMetaDir, { recursive: true });
 
     // Backward-compat migration: move files from old device_uuid or user_uuid folders to user_id folder
+    const inlineMigrationEnabled = String(process.env.ENABLE_STEALTHCLOUD_INLINE_MIGRATION || '').toLowerCase() === 'true';
     const oldKeys = [];
     // Migration from device_uuid folders (old per-device storage)
     if (user && (user.device_uuid || user.deviceUuid)) {
@@ -1832,7 +1958,7 @@ const ensureStealthCloudUserDirs = (user) => {
         const oldUserUuid = String(user.user_uuid || user.userUuid).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
         if (oldUserUuid) oldKeys.push(oldUserUuid);
     }
-    oldKeys
+    if (inlineMigrationEnabled) oldKeys
         .filter((v, i, a) => v && a.indexOf(v) === i)
         .filter(k => k !== key)
         .forEach(oldKey => {
@@ -2148,7 +2274,8 @@ app.post('/api/register', authRateLimiter, async (req, res) => {
     try {
         const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
         const u = (crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex'));
-        db.run(`INSERT INTO users (user_uuid, email, password, hardware_device_id) VALUES (?, ?, ?, ?)`, [u, normalizedEmail, hashedPassword, hwDeviceId], function(err) {
+        const storageUuid = computeStorageUuidFromEmail(normalizedEmail);
+        db.run(`INSERT INTO users (user_uuid, storage_uuid, email, password, hardware_device_id) VALUES (?, ?, ?, ?, ?)`, [u, storageUuid, normalizedEmail, hashedPassword, hwDeviceId], function(err) {
             if (err) {
                 if (err.message.includes('UNIQUE constraint failed')) return res.status(409).json({ error: 'Email already exists' });
                 return res.status(500).json({ error: err.message });
@@ -2167,7 +2294,8 @@ app.post('/api/register', authRateLimiter, async (req, res) => {
 
             // Generate token for auto-login after registration (same as login flow)
             const device_uuid = req.body.device_uuid || req.body.deviceUuid || u;
-            const token = jwt.sign({ id: newUserId, user_uuid: u, email: normalizedEmail, device_uuid: device_uuid }, JWT_SECRET, { expiresIn: '30d' });
+            const token = jwt.sign({ id: newUserId, user_uuid: u, storage_uuid: storageUuid, email: normalizedEmail, device_uuid: device_uuid }, JWT_SECRET, { expiresIn: '30d' });
+            db.run(`INSERT OR IGNORE INTO devices (user_id, device_uuid, device_name) VALUES (?, ?, ?)`, [newUserId, device_uuid, req.body.device_name || 'Unknown Device']);
             res.status(201).json({ message: 'User registered successfully', token, userId: newUserId });
         });
     } catch (error) {
@@ -2289,7 +2417,11 @@ app.post('/api/login', authRateLimiter, async (req, res) => {
                 }
                 
                 // Generate Token BOUND to this device
-                const token = jwt.sign({ id: user.id, user_uuid: user.user_uuid, email: user.email, device_uuid: device_uuid }, JWT_SECRET, { expiresIn: '30d' });
+                const storageUuid = user.storage_uuid || computeStorageUuidFromEmail(user.email);
+                if (storageUuid && !user.storage_uuid) {
+                    db.run(`UPDATE users SET storage_uuid = COALESCE(storage_uuid, ?) WHERE id = ?`, [storageUuid, user.id]);
+                }
+                const token = jwt.sign({ id: user.id, user_uuid: user.user_uuid, storage_uuid: storageUuid, email: user.email, device_uuid: device_uuid }, JWT_SECRET, { expiresIn: '30d' });
                 res.json({ token, userId: user.id });
             }
         );
@@ -4201,6 +4333,12 @@ app.post('/api/cloud/purge', authenticateToken, async (req, res) => {
             }
         }
 
+        // Usage is calculated from cloud_chunks DB rows. Since purge deletes the files on disk,
+        // clear the corresponding DB usage rows so /api/cloud/usage returns 0 immediately.
+        try {
+            await dbRunAsync(`DELETE FROM cloud_chunks WHERE user_id = ?`, [req.user.id]);
+        } catch (e) {}
+
         // Recreate directories for the current (canonical) user key
         try { fs.mkdirSync(chunksDir, { recursive: true }); } catch (e) {}
         try { fs.mkdirSync(manifestsDir, { recursive: true }); } catch (e) {}
@@ -5288,9 +5426,35 @@ if (!fs.existsSync(NFT_DIR)) {
     fs.mkdirSync(NFT_DIR, { recursive: true });
 }
 
+const sanitizeUserKey = (v) => {
+    const raw = String(v || '');
+    const safe = raw.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
+    return safe || '';
+};
+
+const resolveNftStorageKeyFromUser = (user) => {
+    return sanitizeUserKey(getStealthCloudUserKey(user));
+};
+
+const resolveNftStorageKeyFromParam = async (userIdParam) => {
+    const raw = String(userIdParam || '');
+    if (!raw) return '';
+    if (/^\d+$/.test(raw)) {
+        try {
+            const row = await dbGetAsync(`SELECT storage_uuid FROM users WHERE id = ?`, [Number(raw)]);
+            const key = sanitizeUserKey(row && row.storage_uuid);
+            return key || sanitizeUserKey(raw);
+        } catch (e) {
+            return sanitizeUserKey(raw);
+        }
+    }
+    return sanitizeUserKey(raw);
+};
+
 // Ensure user NFT directory exists
-const ensureUserNftDir = (userId) => {
-    const userNftDir = path.join(NFT_DIR, String(userId));
+const ensureUserNftDir = (userKey) => {
+    const safeUserKey = sanitizeUserKey(userKey);
+    const userNftDir = path.join(NFT_DIR, safeUserKey);
     if (!fs.existsSync(userNftDir)) {
         fs.mkdirSync(userNftDir, { recursive: true });
     }
@@ -5355,6 +5519,7 @@ app.post('/api/nft/upload', authenticateToken, nftUpload.single('image'), async 
         }
         
         const userId = req.user.id;
+        const userKey = resolveNftStorageKeyFromUser(req.user);
         const fileSize = req.file.size;
         
         // NFT uploads are allowed for all authenticated users without subscription check
@@ -5367,13 +5532,13 @@ app.post('/api/nft/upload', authenticateToken, nftUpload.single('image'), async 
         const filename = `${imageId}.${ext}`;
         
         // Save to user's NFT directory
-        const userNftDir = ensureUserNftDir(userId);
+        const userNftDir = ensureUserNftDir(userKey);
         const filePath = path.join(userNftDir, filename);
         fs.writeFileSync(filePath, req.file.buffer);
         
         // Public URL (served via nft.stealthlynk.io or /api/nft/image/:userId/:imageId)
-        const publicUrl = `https://nft.stealthlynk.io/${userId}/${filename}`;
-        const fallbackUrl = `/api/nft/image/${userId}/${filename}`;
+        const publicUrl = `https://nft.stealthlynk.io/${userKey}/${filename}`;
+        const fallbackUrl = `/api/nft/image/${userKey}/${filename}`;
         
         console.log(`[NFT] Image uploaded: user=${userId} id=${imageId} size=${fileSize}`);
         
@@ -5411,7 +5576,8 @@ app.get('/api/nft/eligibility', authenticateToken, async (req, res) => {
 app.get('/api/nft/images', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
-        const userNftDir = path.join(NFT_DIR, String(userId));
+        const userKey = resolveNftStorageKeyFromUser(req.user);
+        const userNftDir = path.join(NFT_DIR, String(userKey));
         
         if (!fs.existsSync(userNftDir)) {
             return res.json({ images: [] });
@@ -5424,8 +5590,8 @@ app.get('/api/nft/images', authenticateToken, async (req, res) => {
             return {
                 filename: f,
                 imageId: f.replace(/\.[^.]+$/, ''),
-                publicUrl: `https://nft.stealthlynk.io/${userId}/${f}`,
-                fallbackUrl: `/api/nft/image/${userId}/${f}`,
+                publicUrl: `https://nft.stealthlynk.io/${userKey}/${f}`,
+                fallbackUrl: `/api/nft/image/${userKey}/${f}`,
                 size: stats.size,
                 createdAt: stats.birthtime,
             };
@@ -5441,19 +5607,22 @@ app.get('/api/nft/images', authenticateToken, async (req, res) => {
 // PUBLIC: Serve NFT image (no authentication required)
 // GET /api/nft/image/:userId/:filename OR /:userId/:filename (for nft.stealthlynk.io subdomain)
 // This endpoint is publicly accessible so NFT wallets/marketplaces can display images
-const serveNftImage = (req, res) => {
+const serveNftImage = async (req, res) => {
     try {
         const { userId, filename } = req.params;
-        
-        // Sanitize inputs
-        const safeUserId = String(userId).replace(/[^0-9]/g, '');
         const safeFilename = String(filename).replace(/[^a-zA-Z0-9._-]/g, '');
+        const safeKey = await resolveNftStorageKeyFromParam(userId);
         
-        if (!safeUserId || !safeFilename) {
+        if (!safeKey || !safeFilename) {
             return res.status(400).json({ error: 'Invalid request' });
         }
-        
-        const filePath = path.join(NFT_DIR, safeUserId, safeFilename);
+
+        let filePath = path.join(NFT_DIR, safeKey, safeFilename);
+        if (!fs.existsSync(filePath) && /^\d+$/.test(String(userId))) {
+            const legacyNumeric = sanitizeUserKey(userId);
+            const legacyPath = path.join(NFT_DIR, legacyNumeric, safeFilename);
+            if (fs.existsSync(legacyPath)) filePath = legacyPath;
+        }
         
         if (!fs.existsSync(filePath)) {
             return res.status(404).json({ error: 'Image not found' });
@@ -5490,9 +5659,8 @@ const serveNftImage = (req, res) => {
 app.get('/api/nft/image/:userId/:filename', serveNftImage);
 // Also handle /:userId/:filename for nft.stealthlynk.io subdomain (no /api/nft/image prefix)
 app.get('/:userId/:filename', (req, res, next) => {
-    // Only handle if userId is numeric and filename looks like an image
-    const { userId, filename } = req.params;
-    if (/^\d+$/.test(userId) && /\.(jpg|jpeg|png|gif|webp)$/i.test(filename)) {
+    const { filename } = req.params;
+    if (/\.(jpg|jpeg|png|gif|webp)$/i.test(filename)) {
         return serveNftImage(req, res);
     }
     next(); // Pass to other routes if not an NFT image request
@@ -5503,9 +5671,10 @@ app.get('/:userId/:filename', (req, res, next) => {
 app.delete('/api/nft/image/:imageId', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
+        const userKey = resolveNftStorageKeyFromUser(req.user);
         const { imageId } = req.params;
         
-        const userNftDir = path.join(NFT_DIR, String(userId));
+        const userNftDir = path.join(NFT_DIR, String(userKey));
         if (!fs.existsSync(userNftDir)) {
             return res.status(404).json({ error: 'Image not found' });
         }
@@ -5534,14 +5703,15 @@ app.delete('/api/nft/image/:imageId', authenticateToken, async (req, res) => {
 // ============================================================================
 
 // NFT metadata storage file per user
-const getNftMetadataPath = (userId) => path.join(NFT_DIR, String(userId), 'nft-album.json');
+const getNftMetadataPath = (userKey) => path.join(NFT_DIR, String(userKey), 'nft-album.json');
 
 // Get user's NFT album (list of minted NFTs)
 // GET /api/nft/list
 app.get('/api/nft/list', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
-        const metadataPath = getNftMetadataPath(userId);
+        const userKey = resolveNftStorageKeyFromUser(req.user);
+        const metadataPath = getNftMetadataPath(userKey);
         
         if (!fs.existsSync(metadataPath)) {
             return res.json({ success: true, nfts: [] });
@@ -5562,14 +5732,15 @@ app.get('/api/nft/list', authenticateToken, async (req, res) => {
 app.post('/api/nft/sync', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
+        const userKey = resolveNftStorageKeyFromUser(req.user);
         const { action, nft, mintAddress, nfts } = req.body;
         
-        const userNftDir = path.join(NFT_DIR, String(userId));
+        const userNftDir = path.join(NFT_DIR, String(userKey));
         if (!fs.existsSync(userNftDir)) {
             fs.mkdirSync(userNftDir, { recursive: true });
         }
         
-        const metadataPath = getNftMetadataPath(userId);
+        const metadataPath = getNftMetadataPath(userKey);
         let data = { nfts: [] };
         
         if (fs.existsSync(metadataPath)) {
