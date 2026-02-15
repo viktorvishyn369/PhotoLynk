@@ -1165,23 +1165,6 @@ const getUserDeviceUuids = async (user) => {
 
     const uuids = [current, ...(rows || []).map(r => (r && r.device_uuid) ? String(r.device_uuid) : '')].filter(Boolean);
 
-    // Also scan UPLOAD_DIR for any existing UUID folders that match the current device_uuid
-    // This handles the case where files were uploaded but the devices table is incomplete
-    if (current && uuids.length <= 1) {
-        try {
-            const dirs = fs.readdirSync(UPLOAD_DIR);
-            for (const d of dirs) {
-                if (d.startsWith('.')) continue;
-                const full = path.join(UPLOAD_DIR, d);
-                try {
-                    if (fs.statSync(full).isDirectory() && !uuids.includes(d)) {
-                        uuids.push(d);
-                    }
-                } catch (e) {}
-            }
-        } catch (e) {}
-    }
-
     return Array.from(new Set(uuids));
 };
 
@@ -1729,6 +1712,37 @@ const getStealthCloudUserKey = (user) => {
     const key = (user && (user.user_uuid || user.userUuid)) ? String(user.user_uuid || user.userUuid) : '';
     const safe = key.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
     return safe || 'unknown';
+};
+
+const getStealthCloudAllPossibleUserKeys = (user) => {
+    const keys = new Set();
+
+    const addSafe = (v) => {
+        if (v === undefined || v === null) return;
+        const raw = String(v);
+        if (!raw) return;
+        const safe = raw.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
+        if (safe) keys.add(safe);
+    };
+
+    // Current key (primary)
+    addSafe(getStealthCloudUserKey(user));
+
+    // If auth middleware remapped token user_id to local DB user_id, preserve old id too.
+    // This can exist after reinstall when tokens were minted against an old DB.
+    if (user && user._originalTokenId !== undefined && user._originalTokenId !== null) {
+        addSafe(user._originalTokenId);
+    }
+
+    // Legacy per-device or per-user UUID storage
+    if (user && (user.device_uuid || user.deviceUuid)) {
+        addSafe(user.device_uuid || user.deviceUuid);
+    }
+    if (user && (user.user_uuid || user.userUuid)) {
+        addSafe(user.user_uuid || user.userUuid);
+    }
+
+    return Array.from(keys);
 };
 
 const ensureStealthCloudUserDirs = (user) => {
@@ -3524,21 +3538,14 @@ app.post('/api/files/register', authenticateToken, (req, res) => {
 // Purge classic uploads (non-StealthCloud) for this device
 app.post('/api/files/purge', authenticateToken, async (req, res) => {
     try {
-        const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
+        const deviceUuids = await getUserDeviceUuids(req.user);
+        const deviceDirs = (Array.isArray(deviceUuids) ? deviceUuids : [])
+            .filter(Boolean)
+            .map(uuid => ({ uuid: String(uuid), dir: path.join(UPLOAD_DIR, String(uuid)) }));
 
-        // Debug logging for Windows path investigation
         console.log(`[Purge-Classic] UPLOAD_DIR: ${UPLOAD_DIR}`);
-        console.log(`[Purge-Classic] device_uuid: ${req.user.device_uuid}`);
-        console.log(`[Purge-Classic] deviceDir: ${deviceDir}`);
-        console.log(`[Purge-Classic] deviceDir exists: ${fs.existsSync(deviceDir)}`);
-        
-        // List all folders in UPLOAD_DIR to see what's actually there
-        try {
-            const uploadDirContents = fs.readdirSync(UPLOAD_DIR);
-            console.log(`[Purge-Classic] UPLOAD_DIR contents: ${JSON.stringify(uploadDirContents)}`);
-        } catch (e) {
-            console.log(`[Purge-Classic] Could not list UPLOAD_DIR: ${e.message}`);
-        }
+        console.log(`[Purge-Classic] user.id: ${req.user && req.user.id}`);
+        console.log(`[Purge-Classic] device_uuids: ${JSON.stringify(deviceUuids || [])}`);
 
         const countFiles = (dir) => {
             try {
@@ -3553,7 +3560,7 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
             }
         };
 
-        const filesBefore = countFiles(deviceDir);
+        const filesBefore = deviceDirs.reduce((sum, d) => sum + countFiles(d.dir), 0);
 
         // Collect fileHashes from database before deleting (for EXIF cleanup)
         const fileHashes = [];
@@ -3569,15 +3576,19 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
             }
         } catch (e) {}
 
-        // Fast deletion pass - no retries, return quickly to unfreeze phone
-        // Stubborn locked files (Windows Defender, indexer, etc.) will be retried in background
         let filesDeleted = 0;
         let stubbornFiles = [];
-        
-        if (fs.existsSync(deviceDir)) {
+
+        for (const d of deviceDirs) {
+            const deviceDir = d.dir;
+            if (!fs.existsSync(deviceDir)) {
+                console.log(`[Purge-Classic] deviceDir does not exist: ${deviceDir}`);
+                continue;
+            }
+
             const entries = fs.readdirSync(deviceDir);
-            console.log(`[Purge-Classic] Found ${entries.length} entries to delete`);
-            
+            console.log(`[Purge-Classic] Found ${entries.length} entries to delete in ${d.uuid}`);
+
             for (const entry of entries) {
                 const entryPath = path.join(deviceDir, entry);
                 try {
@@ -3594,34 +3605,34 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
                     stubbornFiles.push(entryPath);
                 }
             }
-            
-            // Schedule background cleanup for stubborn files (Windows file locks)
-            if (stubbornFiles.length > 0) {
-                console.log(`[Purge-Classic] ${stubbornFiles.length} stubborn files, scheduling background cleanup`);
-                setTimeout(async () => {
-                    for (const filePath of stubbornFiles) {
-                        for (let attempt = 0; attempt < 20; attempt++) {
-                            try {
-                                if (!fs.existsSync(filePath)) break;
-                                try { fs.chmodSync(filePath, 0o666); } catch (e) {}
-                                fs.unlinkSync(filePath);
-                                console.log(`[Purge-BG] Deleted stubborn file: ${path.basename(filePath)}`);
-                                break;
-                            } catch (e) {
-                                if (attempt < 19) await new Promise(r => setTimeout(r, 500));
-                            }
+        }
+
+        // Schedule background cleanup for stubborn files (Windows file locks)
+        if (stubbornFiles.length > 0) {
+            console.log(`[Purge-Classic] ${stubbornFiles.length} stubborn files, scheduling background cleanup`);
+            setTimeout(async () => {
+                for (const filePath of stubbornFiles) {
+                    for (let attempt = 0; attempt < 20; attempt++) {
+                        try {
+                            if (!fs.existsSync(filePath)) break;
+                            try { fs.chmodSync(filePath, 0o666); } catch (e) {}
+                            fs.unlinkSync(filePath);
+                            console.log(`[Purge-BG] Deleted stubborn file: ${path.basename(filePath)}`);
+                            break;
+                        } catch (e) {
+                            if (attempt < 19) await new Promise(r => setTimeout(r, 500));
                         }
                     }
-                }, 1000);
-            }
-        } else {
-            console.log(`[Purge-Classic] deviceDir does not exist: ${deviceDir}`);
+                }
+            }, 1000);
         }
         
         console.log(`[Purge-Classic] Deleted ${filesDeleted} files, ${stubbornFiles.length} deferred to background`)
         
-        // Ensure directory exists after cleanup
-        try { fs.mkdirSync(deviceDir, { recursive: true }); } catch (e) {}
+        // Ensure device directories exist after cleanup
+        for (const d of deviceDirs) {
+            try { fs.mkdirSync(d.dir, { recursive: true }); } catch (e) {}
+        }
 
         // Delete EXIF files for this user's files
         let exifDeleted = 0;
@@ -4090,7 +4101,8 @@ app.post('/api/status/uptime/reset', (req, res) => {
 
 app.post('/api/cloud/purge', authenticateToken, async (req, res) => {
     try {
-        const { chunksDir, manifestsDir, rawDir, rawMetaDir } = ensureStealthCloudUserDirs(req.user);
+        const { chunksDir, manifestsDir } = ensureStealthCloudUserDirs(req.user);
+        const keysToPurge = getStealthCloudAllPossibleUserKeys(req.user);
 
         const countFiles = (dir) => {
             try {
@@ -4103,74 +4115,46 @@ app.post('/api/cloud/purge', authenticateToken, async (req, res) => {
 
         const chunksBefore = countFiles(chunksDir);
         const manifestsBefore = countFiles(manifestsDir);
-        const rawBefore = countFiles(rawDir);
 
-        // Collect fileHashes from manifests before deleting (for EXIF cleanup)
-        const fileHashes = [];
-        try {
-            if (fs.existsSync(manifestsDir)) {
-                const manifestFiles = fs.readdirSync(manifestsDir).filter(f => f.endsWith('.json'));
-                for (const mf of manifestFiles) {
-                    try {
-                        const content = JSON.parse(fs.readFileSync(path.join(manifestsDir, mf), 'utf8'));
-                        if (content?.meta?.fileHash) fileHashes.push(content.meta.fileHash);
-                    } catch (e) {}
-                }
-            }
-        } catch (e) {}
-
-        // Delete encrypted files
-        try { fs.rmSync(chunksDir, { recursive: true, force: true }); } catch (e) {}
-        try { fs.rmSync(manifestsDir, { recursive: true, force: true }); } catch (e) {}
-
-        // Delete raw (unencrypted) files
-        try { fs.rmSync(rawDir, { recursive: true, force: true }); } catch (e) {}
-        try { fs.rmSync(rawMetaDir, { recursive: true, force: true }); } catch (e) {}
-
-        // Delete EXIF files for this user's files
-        let exifDeleted = 0;
-        for (const hash of fileHashes) {
+        // Delete only StealthCloud manifests + chunks for all possible keys.
+        // This prevents the migration logic from repopulating manifests after purge,
+        // while avoiding deletion of raw files, EXIF, NFTs, and DB state.
+        for (const k of keysToPurge) {
             try {
-                const exifPath = getExifFilePath(hash);
-                if (exifPath && fs.existsSync(exifPath)) {
-                    fs.unlinkSync(exifPath);
-                    exifDeleted++;
+                const cloudManifestsDir = path.join(CLOUD_DIR, 'users', k, 'manifests');
+                if (cloudManifestsDir.startsWith(path.join(CLOUD_DIR, 'users'))) {
+                    fs.rmSync(cloudManifestsDir, { recursive: true, force: true });
                 }
             } catch (e) {}
+
+            if (CHUNKS_DIR) {
+                try {
+                    const chunksUserDir = path.join(CHUNKS_DIR, 'users', k, 'chunks');
+                    if (chunksUserDir.startsWith(path.join(CHUNKS_DIR, 'users'))) {
+                        fs.rmSync(chunksUserDir, { recursive: true, force: true });
+                    }
+                } catch (e) {}
+            } else {
+                try {
+                    const cloudChunksDir = path.join(CLOUD_DIR, 'users', k, 'chunks');
+                    if (cloudChunksDir.startsWith(path.join(CLOUD_DIR, 'users'))) {
+                        fs.rmSync(cloudChunksDir, { recursive: true, force: true });
+                    }
+                } catch (e) {}
+            }
         }
 
-        // Recreate directories
+        // Recreate directories for the current (canonical) user key
         try { fs.mkdirSync(chunksDir, { recursive: true }); } catch (e) {}
         try { fs.mkdirSync(manifestsDir, { recursive: true }); } catch (e) {}
-        try { fs.mkdirSync(rawDir, { recursive: true }); } catch (e) {}
-        try { fs.mkdirSync(rawMetaDir, { recursive: true }); } catch (e) {}
 
-        // Delete database entries
-        try {
-            await dbRunAsync(`DELETE FROM cloud_chunks WHERE user_id = ?`, [req.user.id]);
-        } catch (e) {
-            return res.status(500).json({ error: 'Failed to clear cloud index' });
-        }
-        
-        // Delete platform hashes for this user
-        try {
-            await dbRunAsync(`DELETE FROM platform_hashes WHERE user_id = ?`, [req.user.id]);
-        } catch (e) {}
-        
-        // Delete device state for this user
-        try {
-            await dbRunAsync(`DELETE FROM cloud_device_state WHERE user_id = ?`, [req.user.id]);
-        } catch (e) {}
-
-        console.log(`[Purge] User ${req.user.id}: chunks=${chunksBefore}, manifests=${manifestsBefore}, raw=${rawBefore}, exif=${exifDeleted}`);
+        console.log(`[Purge] User ${req.user.id}: chunks=${chunksBefore}, manifests=${manifestsBefore}`);
 
         return res.json({
             ok: true,
             deleted: {
                 chunks: chunksBefore,
                 manifests: manifestsBefore,
-                raw: rawBefore,
-                exif: exifDeleted
             }
         });
     } catch (e) {
