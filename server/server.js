@@ -347,362 +347,337 @@ const adminAuth = async (req, res, next) => {
     }
 };
 
-// Admin HTML helper
-const adminLayout = (contentHtml) => `<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>${ADMIN_HTML_TITLE}</title>
-  <style>
-    :root {
-      color-scheme: light dark;
-      --bg: #0b1021;
-      --panel: #121a30;
-      --accent: #4fd1c5;
-      --muted: #8fa3c3;
-      --text: #e6ecff;
-      --danger: #f87171;
-    }
-    body {
-      margin: 0;
-      font-family: 'Inter', system-ui, -apple-system, sans-serif;
-      background: radial-gradient(120% 120% at 20% 20%, rgba(79,209,197,0.08), transparent 50%),
-                  radial-gradient(100% 100% at 80% 0%, rgba(79,209,197,0.06), transparent 45%),
-                  var(--bg);
-      color: var(--text);
-      min-height: 100vh;
-    }
-    .wrap {
-      max-width: 960px;
-      margin: 0 auto;
-      padding: 32px 20px 48px;
-    }
-    h1 { margin: 0 0 12px; letter-spacing: 0.3px; }
-    .card {
-      background: linear-gradient(145deg, rgba(18,26,48,0.95), rgba(18,26,48,0.75));
-      border: 1px solid rgba(79,209,197,0.16);
-      box-shadow: 0 20px 60px rgba(0,0,0,0.35);
-      border-radius: 14px;
-      padding: 18px 20px;
-      margin-top: 16px;
-    }
-    label { display: block; font-weight: 600; margin: 10px 0 6px; color: var(--muted); }
-    input, select, button, textarea {
-      width: 100%;
-      box-sizing: border-box;
-      padding: 10px 12px;
-      border-radius: 10px;
-      border: 1px solid rgba(255,255,255,0.08);
-      background: rgba(255,255,255,0.04);
-      color: var(--text);
-      font-size: 15px;
-      outline: none;
-      transition: border 0.15s ease, transform 0.1s ease;
-    }
-    input:focus, select:focus, textarea:focus { border-color: var(--accent); }
-    button {
-      cursor: pointer;
-      font-weight: 700;
-      background: linear-gradient(135deg, #4fd1c5, #3fb3a9);
-      border: none;
-      color: #0b1021;
-      margin-top: 12px;
-    }
-    button:hover { transform: translateY(-1px); }
-    button:active { transform: translateY(0); }
-    .row { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
-    pre {
-      background: rgba(0,0,0,0.35);
-      border: 1px solid rgba(255,255,255,0.08);
-      border-radius: 12px;
-      padding: 12px;
-      overflow: auto;
-      color: #e6ecff;
-      font-size: 13px;
-    }
-    .danger { color: var(--danger); }
-    .muted { color: var(--muted); }
-    .flex { display: flex; gap: 12px; align-items: center; }
-    .flex button { width: auto; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <h1>${ADMIN_HTML_TITLE}</h1>
-    <p class="muted">Search users, view/update plan, expires_at, grace_until, trial_until, and inspect payments.</p>
-    ${contentHtml}
-  </div>
-</body>
-</html>`;
-
 // Admin page (Basic Auth + IP allowlist + no cache)
 app.get('/admin', adminAuth, (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
-    const html = adminLayout(`
-      <div class="card">
-        <h3>Lookup user</h3>
-        <label>Email</label>
-        <input type="text" id="lookup-email" placeholder="user@example.com" />
-        <label>User UUID</label>
-        <input type="text" id="lookup-userUuid" placeholder="67ec8dd3-...." />
-        <label>Device UUID</label>
-        <input type="text" id="lookup-deviceUuid" placeholder="d27b8441-...." />
-        <div class="flex">
-          <button type="button" onclick="doLookup()">Lookup</button>
-          <span id="lookup-status" class="muted"></span>
-        </div>
+    const html = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>${ADMIN_HTML_TITLE}</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0a0e1a;--surface:#111827;--surface2:#1a2236;--border:#1e293b;--border2:#2d3a52;--accent:#4fd1c5;--accent2:#38b2ac;--text:#e2e8f0;--muted:#64748b;--danger:#ef4444;--warn:#f59e0b;--success:#22c55e;--info:#3b82f6;--trial:#8b5cf6;font-family:'Inter',system-ui,-apple-system,sans-serif}
+body{background:var(--bg);color:var(--text);min-height:100vh}
+.header{background:var(--surface);border-bottom:1px solid var(--border);padding:16px 24px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100;backdrop-filter:blur(12px)}
+.header h1{font-size:18px;font-weight:700;letter-spacing:-0.3px}
+.header h1 span{color:var(--accent);font-weight:400}
+.header .stats{display:flex;gap:16px;font-size:13px;color:var(--muted)}
+.header .stats b{color:var(--text);font-weight:600}
+.toolbar{padding:12px 24px;display:flex;gap:10px;align-items:center;flex-wrap:wrap;background:var(--surface);border-bottom:1px solid var(--border)}
+.search-box{flex:1;min-width:220px;max-width:480px;position:relative}
+.search-box input{width:100%;padding:9px 12px 9px 36px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px;outline:none;transition:border .15s}
+.search-box input:focus{border-color:var(--accent)}
+.search-box svg{position:absolute;left:10px;top:50%;transform:translateY(-50%);color:var(--muted);width:16px;height:16px}
+.filter-pills{display:flex;gap:6px;flex-wrap:wrap}
+.pill{padding:5px 12px;border-radius:20px;font-size:12px;font-weight:600;cursor:pointer;border:1px solid var(--border);background:transparent;color:var(--muted);transition:all .15s}
+.pill:hover{border-color:var(--accent);color:var(--text)}
+.pill.active{background:var(--accent);color:var(--bg);border-color:var(--accent)}
+.pill .count{opacity:.7;margin-left:4px}
+.table-wrap{padding:0 24px 24px;overflow-x:auto}
+table{width:100%;border-collapse:separate;border-spacing:0;margin-top:12px;font-size:13px}
+thead th{position:sticky;top:0;background:var(--surface2);color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase;letter-spacing:.5px;padding:10px 12px;text-align:left;border-bottom:2px solid var(--border);cursor:pointer;user-select:none;white-space:nowrap}
+thead th:hover{color:var(--accent)}
+thead th .sort-arrow{margin-left:4px;opacity:.4;font-size:10px}
+thead th.sorted .sort-arrow{opacity:1;color:var(--accent)}
+tbody tr{transition:background .1s}
+tbody tr:hover{background:rgba(79,209,197,.04)}
+tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis}
+.badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;letter-spacing:.3px}
+.badge-active{background:rgba(34,197,94,.15);color:#4ade80}
+.badge-trial{background:rgba(139,92,246,.15);color:#a78bfa}
+.badge-grace{background:rgba(245,158,11,.15);color:#fbbf24}
+.badge-expired,.badge-trial_expired{background:rgba(239,68,68,.15);color:#f87171}
+.badge-none,.badge-deleted{background:rgba(100,116,139,.15);color:#94a3b8}
+.email-cell{color:var(--accent);font-weight:500}
+.date-cell{color:var(--muted);font-size:12px}
+.id-cell{color:var(--muted);font-weight:600;font-size:12px}
+.plan-cell{font-weight:700}
+.actions-cell{display:flex;gap:4px}
+.btn-sm{padding:4px 10px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid var(--border);background:transparent;color:var(--text);transition:all .15s}
+.btn-sm:hover{border-color:var(--accent);color:var(--accent)}
+.btn-danger{border-color:rgba(239,68,68,.3);color:var(--danger)}
+.btn-danger:hover{background:rgba(239,68,68,.1);border-color:var(--danger)}
+.modal-overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;align-items:center;justify-content:center;backdrop-filter:blur(4px)}
+.modal-overlay.open{display:flex}
+.modal{background:var(--surface);border:1px solid var(--border2);border-radius:16px;padding:24px;width:520px;max-width:92vw;max-height:90vh;overflow-y:auto;box-shadow:0 24px 80px rgba(0,0,0,.5)}
+.modal h2{font-size:16px;margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.modal .close-btn{margin-left:auto;background:none;border:none;color:var(--muted);cursor:pointer;font-size:18px;padding:4px 8px;border-radius:6px}
+.modal .close-btn:hover{color:var(--text);background:rgba(255,255,255,.05)}
+.form-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.form-group{display:flex;flex-direction:column;gap:4px}
+.form-group.full{grid-column:1/-1}
+.form-group label{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
+.form-group input,.form-group select{padding:8px 10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:13px;outline:none}
+.form-group input:focus,.form-group select:focus{border-color:var(--accent)}
+.modal-actions{display:flex;gap:8px;margin-top:16px;justify-content:flex-end}
+.btn{padding:8px 18px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:all .15s}
+.btn-primary{background:var(--accent);color:var(--bg)}
+.btn-primary:hover{background:var(--accent2)}
+.btn-ghost{background:transparent;border:1px solid var(--border);color:var(--text)}
+.btn-ghost:hover{border-color:var(--muted)}
+.btn-red{background:var(--danger);color:#fff}
+.btn-red:hover{background:#dc2626}
+.toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:10px;font-size:13px;font-weight:600;z-index:300;animation:slideIn .3s ease;box-shadow:0 8px 32px rgba(0,0,0,.3)}
+.toast-success{background:var(--success);color:#fff}
+.toast-error{background:var(--danger);color:#fff}
+@keyframes slideIn{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}
+.empty-state{text-align:center;padding:60px 20px;color:var(--muted)}
+.empty-state svg{width:48px;height:48px;margin-bottom:12px;opacity:.3}
+.loading{text-align:center;padding:40px;color:var(--muted)}
+.payment-badge{font-size:11px;padding:2px 6px;border-radius:6px;font-weight:600}
+.payment-apple{background:rgba(255,255,255,.08);color:#e2e8f0}
+.payment-google{background:rgba(59,130,246,.15);color:#60a5fa}
+.payment-solana{background:rgba(139,92,246,.15);color:#a78bfa}
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>StealthCloud <span>Admin</span></h1>
+  <div class="stats" id="header-stats"></div>
+</div>
+<div class="toolbar">
+  <div class="search-box">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+    <input type="text" id="search" placeholder="Search by email, ID, status, plan, payment..." oninput="applyFilters()"/>
+  </div>
+  <div class="filter-pills" id="status-filters"></div>
+</div>
+<div class="table-wrap">
+  <div id="loading" class="loading">Loading users...</div>
+  <table id="users-table" style="display:none">
+    <thead><tr>
+      <th data-col="id" onclick="sortBy('id')">ID <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="email" onclick="sortBy('email')">Email <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="plan_gb" onclick="sortBy('plan_gb')">Plan <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="status" onclick="sortBy('status')">Status <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="trial_until" onclick="sortBy('trial_until')">Trial Until <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="expires_at" onclick="sortBy('expires_at')">Expires <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="created_at" onclick="sortBy('created_at')">Registered <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="payment_type" onclick="sortBy('payment_type')">Payment <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="payment_at" onclick="sortBy('payment_at')">Paid At <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="updated_at" onclick="sortBy('updated_at')">Updated <span class="sort-arrow">&#9650;</span></th>
+      <th>Actions</th>
+    </tr></thead>
+    <tbody id="tbody"></tbody>
+  </table>
+  <div id="empty" class="empty-state" style="display:none">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M15.75 6a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0ZM4.501 20.118a7.5 7.5 0 0 1 14.998 0"/></svg>
+    <p>No users match your search</p>
+  </div>
+</div>
+
+<div class="modal-overlay" id="edit-modal">
+  <div class="modal">
+    <h2>Edit User <span id="edit-title" style="color:var(--accent)"></span>
+      <button class="close-btn" onclick="closeModal()">&times;</button>
+    </h2>
+    <div class="form-grid">
+      <div class="form-group"><label>User ID</label><input id="e-id" readonly style="opacity:.6"/></div>
+      <div class="form-group"><label>Email</label><input id="e-email" readonly style="opacity:.6"/></div>
+      <div class="form-group"><label>Plan GB</label>
+        <select id="e-planGb"><option value="">unchanged</option><option value="100">100 GB</option><option value="200">200 GB</option><option value="400">400 GB</option><option value="1000">1 TB</option></select>
       </div>
-
-      <div class="card">
-        <h3>Update plan</h3>
-        <div class="row">
-          <div>
-            <label>User ID (required)</label>
-            <input type="text" id="update-userId" placeholder="numeric user_id" />
-          </div>
-          <div>
-            <label>Plan GB (100, 200, 400, 1000)</label>
-            <input type="text" id="update-planGb" placeholder="100" />
-          </div>
-        </div>
-        <div class="row">
-          <div>
-            <label>Extend Expires by (days)</label>
-            <input type="text" id="update-extendExpiresDays" placeholder="e.g., 15" />
-          </div>
-          <div>
-            <label>Extend Trial by (days)</label>
-            <input type="text" id="update-extendTrialDays" placeholder="e.g., 15" />
-          </div>
-        </div>
-        <div class="row">
-          <div>
-            <label>Expires At (ms epoch, optional)</label>
-            <input type="text" id="update-expiresAt" placeholder="absolute epoch" />
-          </div>
-          <div>
-            <label>Trial Until (ms epoch, optional)</label>
-            <input type="text" id="update-trialUntil" placeholder="absolute epoch" />
-          </div>
-        </div>
-        <div class="row">
-          <div>
-            <label>Grace Until (ms epoch)</label>
-            <input type="text" id="update-graceUntil" placeholder="optional" />
-          </div>
-          <div>
-            <label>Status</label>
-            <select id="update-status">
-              <option value="">(leave unchanged)</option>
-              <option value="active">active</option>
-              <option value="trial">trial</option>
-              <option value="grace">grace</option>
-              <option value="expired">expired</option>
-              <option value="deleted">deleted</option>
-              <option value="none">none</option>
-            </select>
-          </div>
-        </div>
-        <div class="flex">
-          <button type="button" onclick="doUpdate()">Update plan</button>
-          <span id="update-status-msg" class="muted"></span>
-        </div>
+      <div class="form-group"><label>Status</label>
+        <select id="e-status"><option value="">unchanged</option><option value="active">active</option><option value="trial">trial</option><option value="grace">grace</option><option value="expired">expired</option><option value="deleted">deleted</option><option value="none">none</option></select>
       </div>
+      <div class="form-group"><label>Extend Trial (days)</label><input id="e-extTrialDays" type="number" placeholder="e.g. 7"/></div>
+      <div class="form-group"><label>Extend Expires (days)</label><input id="e-extExpDays" type="number" placeholder="e.g. 30"/></div>
+      <div class="form-group"><label>Trial Until (epoch ms)</label><input id="e-trialUntil" placeholder="absolute epoch"/></div>
+      <div class="form-group"><label>Expires At (epoch ms)</label><input id="e-expiresAt" placeholder="absolute epoch"/></div>
+      <div class="form-group"><label>Grace Until (epoch ms)</label><input id="e-graceUntil" placeholder="absolute epoch"/></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
+      <button class="btn btn-primary" onclick="saveEdit()">Save Changes</button>
+    </div>
+  </div>
+</div>
 
-      <div class="card" style="border:2px solid #f44336;">
-        <h3 style="color:#f44336;">⚠️ Delete User (DANGER)</h3>
-        <p style="color:#888;font-size:12px;">This will permanently delete the user, their devices, plan, cloud chunks from DB, and optionally their files from disk.</p>
-        <div class="row">
-          <div>
-            <label>User ID (required)</label>
-            <input type="text" id="delete-userId" placeholder="numeric user_id" />
-          </div>
-          <div>
-            <label style="display:flex;align-items:center;gap:8px;margin-top:20px;">
-              <input type="checkbox" id="delete-files" checked style="width:auto;" />
-              Also delete files from disk
-            </label>
-          </div>
-        </div>
-        <div class="flex">
-          <button type="button" onclick="doDeleteUser()" style="background:#f44336;">Delete User</button>
-          <span id="delete-status" class="muted"></span>
-        </div>
-      </div>
+<div class="modal-overlay" id="delete-modal">
+  <div class="modal">
+    <h2 style="color:var(--danger)">Delete User <span id="del-title" style="color:var(--danger)"></span>
+      <button class="close-btn" onclick="closeDeleteModal()">&times;</button>
+    </h2>
+    <p style="color:var(--muted);font-size:13px;margin-bottom:12px">This will permanently delete the user, their devices, plan, cloud chunks from DB, and optionally files from disk. This cannot be undone.</p>
+    <input type="hidden" id="del-id"/>
+    <div class="form-group" style="flex-direction:row;align-items:center;gap:8px">
+      <input type="checkbox" id="del-files" checked style="width:auto;accent-color:var(--danger)"/>
+      <label style="font-size:13px;color:var(--text);text-transform:none;letter-spacing:0">Also delete files from disk</label>
+    </div>
+    <div class="modal-actions" style="margin-top:16px">
+      <button class="btn btn-ghost" onclick="closeDeleteModal()">Cancel</button>
+      <button class="btn btn-red" onclick="confirmDelete()">Delete Permanently</button>
+    </div>
+  </div>
+</div>
 
-      <div class="card">
-        <h3>All Users</h3>
-        <div class="flex">
-          <button type="button" onclick="loadAllUsers()">Load All Users</button>
-          <span id="users-status" class="muted"></span>
-        </div>
-        <div id="users-table-container" style="margin-top:12px;max-height:400px;overflow:auto;"></div>
-      </div>
+<script>
+var allUsers=[];var filteredUsers=[];var sortCol='id';var sortDir='desc';var activeFilter='all';
 
-      <div class="card">
-        <h3>Results</h3>
-        <pre id="results">Waiting…</pre>
-      </div>
+function fmtDate(iso){if(!iso)return'<span class="date-cell">-</span>';var d=new Date(iso);var now=new Date();var diff=d-now;var s=d.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'2-digit'})+' '+d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});if(diff<0&&diff>-86400000*3)s='<span style="color:var(--warn)">'+s+'</span>';else if(diff<0)s='<span style="color:var(--danger)">'+s+'</span>';return'<span class="date-cell">'+s+'</span>'}
 
-      <script>
-        var resultsEl = document.getElementById('results');
-        var lookupStatusEl = document.getElementById('lookup-status');
-        var updateStatusEl = document.getElementById('update-status-msg');
-        var deleteStatusEl = document.getElementById('delete-status');
-        var usersStatusEl = document.getElementById('users-status');
-        var usersTableContainer = document.getElementById('users-table-container');
+function statusBadge(st){var c='badge-'+(st||'none').replace(/\\s/g,'_');return'<span class="badge '+c+'">'+(st||'none')+'</span>'}
 
-        function formatJson(obj) { return JSON.stringify(obj, null, 2); }
+function paymentBadge(pt){if(!pt)return'<span class="date-cell">-</span>';var c='payment-'+(pt||'').toLowerCase();return'<span class="payment-badge '+c+'">'+pt+'</span>'}
 
-        function formatDate(isoStr) {
-          if (!isoStr) return '-';
-          var d = new Date(isoStr);
-          return d.toLocaleDateString() + ' ' + d.toLocaleTimeString();
-        }
+function planLabel(gb){if(!gb)return'-';return gb>=1000?(gb/1000)+'TB':gb+'GB'}
 
-        async function loadAllUsers() {
-          usersStatusEl.textContent = 'Loading...';
-          try {
-            var res = await fetch('/admin/api/users', { method: 'GET' });
-            var data = await res.json();
-            if (!res.ok) {
-              usersStatusEl.textContent = 'Error: ' + (data.error || 'Unknown') + ' - ' + (data.details || '');
-              return;
-            }
-            usersStatusEl.textContent = 'Loaded ' + data.total_users + ' users';
-            
-            var html = '<table style="width:100%;border-collapse:collapse;font-size:12px;">';
-            html += '<thead><tr style="background:#333;color:#fff;">';
-            html += '<th style="padding:6px;border:1px solid #555;">ID</th>';
-            html += '<th style="padding:6px;border:1px solid #555;">Email</th>';
-            html += '<th style="padding:6px;border:1px solid #555;">Plan (GB)</th>';
-            html += '<th style="padding:6px;border:1px solid #555;">Status</th>';
-            html += '<th style="padding:6px;border:1px solid #555;">Trial Until</th>';
-            html += '<th style="padding:6px;border:1px solid #555;">Expires</th>';
-            html += '<th style="padding:6px;border:1px solid #555;">Registered</th>';
-            html += '<th style="padding:6px;border:1px solid #555;">Payment Type</th>';
-            html += '<th style="padding:6px;border:1px solid #555;">Payment At</th>';
-            html += '<th style="padding:6px;border:1px solid #555;">Updated</th>';
-            html += '</tr></thead><tbody>';
-            
-            data.users.forEach(function(u) {
-              var statusColor = u.plan.status === 'active' ? '#4CAF50' : 
-                               u.plan.status === 'trial' ? '#2196F3' : 
-                               u.plan.status === 'expired' ? '#f44336' : '#888';
-              html += '<tr>';
-              html += '<td style="padding:4px;border:1px solid #444;">' + u.id + '</td>';
-              html += '<td style="padding:4px;border:1px solid #444;">' + (u.email || '-') + '</td>';
-              html += '<td style="padding:4px;border:1px solid #444;">' + (u.plan.plan_gb || '-') + '</td>';
-              html += '<td style="padding:4px;border:1px solid #444;color:' + statusColor + ';">' + (u.plan.status || 'none') + '</td>';
-              html += '<td style="padding:4px;border:1px solid #444;">' + formatDate(u.plan.trial_until_date) + '</td>';
-              html += '<td style="padding:4px;border:1px solid #444;">' + formatDate(u.plan.expires_at_date) + '</td>';
-              html += '<td style="padding:4px;border:1px solid #444;">' + formatDate(u.user_created_at_date) + '</td>';
-              html += '<td style="padding:4px;border:1px solid #444;">' + (u.plan.payment_type || '-') + '</td>';
-              html += '<td style="padding:4px;border:1px solid #444;">' + formatDate(u.plan.payment_at_date) + '</td>';
-              html += '<td style="padding:4px;border:1px solid #444;">' + formatDate(u.plan.updated_at_date) + '</td>';
-              html += '</tr>';
-            });
-            
-            html += '</tbody></table>';
-            usersTableContainer.innerHTML = html;
-            
-            resultsEl.textContent = formatJson(data);
-          } catch (e) {
-            usersStatusEl.textContent = 'Error: ' + e.message;
-          }
-        }
+function toast(msg,type){var el=document.createElement('div');el.className='toast toast-'+(type||'success');el.textContent=msg;document.body.appendChild(el);setTimeout(function(){el.remove()},3000)}
 
-        async function doLookup() {
-          lookupStatusEl.textContent = 'Working...';
-          try {
-            var email = document.getElementById('lookup-email').value.trim();
-            var userUuid = document.getElementById('lookup-userUuid').value.trim();
-            var deviceUuid = document.getElementById('lookup-deviceUuid').value.trim();
-            var params = new URLSearchParams({ email: email, userUuid: userUuid, deviceUuid: deviceUuid });
-            var res = await fetch('/admin/api/user?' + params.toString(), { method: 'GET' });
-            var text = await res.text();
-            var data;
-            try { data = JSON.parse(text); } catch (e) { data = text; }
-            resultsEl.textContent = formatJson({ status: res.status, data: data });
-            lookupStatusEl.textContent = res.ok ? 'OK' : 'Error';
-          } catch (e) {
-            resultsEl.textContent = formatJson({ error: e.message });
-            lookupStatusEl.textContent = 'Error';
-          }
-        }
+async function loadUsers(){
+  try{
+    var r=await fetch('/admin/api/users');var d=await r.json();
+    if(!r.ok)throw new Error(d.error||'Failed');
+    allUsers=d.users.map(function(u){return{id:u.id,email:u.email||'',user_uuid:u.user_uuid||'',plan_gb:u.plan.plan_gb||0,status:u.plan.status||'none',trial_until:u.plan.trial_until,trial_until_date:u.plan.trial_until_date,expires_at:u.plan.expires_at,expires_at_date:u.plan.expires_at_date,grace_until:u.plan.grace_until,created_at:u.user_created_at,created_at_date:u.user_created_at_date,payment_type:u.plan.payment_type||'',payment_at:u.plan.payment_at,payment_at_date:u.plan.payment_at_date,updated_at:u.plan.updated_at,updated_at_date:u.plan.updated_at_date}});
+    updateStats();buildFilters();applyFilters();
+    document.getElementById('loading').style.display='none';
+    document.getElementById('users-table').style.display='';
+  }catch(e){document.getElementById('loading').textContent='Error: '+e.message}
+}
 
-        async function doDeleteUser() {
-          var userId = document.getElementById('delete-userId').value.trim();
-          var deleteFiles = document.getElementById('delete-files').checked;
-          if (!userId) {
-            deleteStatusEl.textContent = 'User ID required';
-            return;
-          }
-          if (!confirm('Are you sure you want to DELETE user ' + userId + '? This cannot be undone!')) {
-            deleteStatusEl.textContent = 'Cancelled';
-            return;
-          }
-          deleteStatusEl.textContent = 'Deleting...';
-          try {
-            var res = await fetch('/admin/api/user/delete', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ userId: Number(userId), deleteFiles: deleteFiles })
-            });
-            var data = await res.json();
-            resultsEl.textContent = formatJson({ status: res.status, data: data });
-            deleteStatusEl.textContent = res.ok ? 'Deleted!' : 'Error';
-            if (res.ok) {
-              document.getElementById('delete-userId').value = '';
-              loadAllUsers();
-            }
-          } catch (e) {
-            resultsEl.textContent = formatJson({ error: e.message });
-            deleteStatusEl.textContent = 'Error';
-          }
-        }
+function updateStats(){
+  var total=allUsers.length;
+  var active=allUsers.filter(function(u){return u.status==='active'}).length;
+  var trial=allUsers.filter(function(u){return u.status==='trial'}).length;
+  var paying=allUsers.filter(function(u){return!!u.payment_type}).length;
+  document.getElementById('header-stats').innerHTML='<span>Total: <b>'+total+'</b></span><span>Active: <b>'+active+'</b></span><span>Trial: <b>'+trial+'</b></span><span>Paying: <b>'+paying+'</b></span>';
+}
 
-        async function doUpdate() {
-          updateStatusEl.textContent = 'Working...';
-          try {
-            var userId = document.getElementById('update-userId').value.trim();
-            var planGb = document.getElementById('update-planGb').value.trim();
-            var extendExpiresDays = document.getElementById('update-extendExpiresDays').value.trim();
-            var extendTrialDays = document.getElementById('update-extendTrialDays').value.trim();
-            var expiresAt = document.getElementById('update-expiresAt').value.trim();
-            var graceUntil = document.getElementById('update-graceUntil').value.trim();
-            var trialUntil = document.getElementById('update-trialUntil').value.trim();
-            var status = document.getElementById('update-status').value;
-            var payload = {
-              userId: userId ? Number(userId) : null,
-              planGb: planGb ? Number(planGb) : null,
-              extendExpiresDays: extendExpiresDays ? Number(extendExpiresDays) : null,
-              extendTrialDays: extendTrialDays ? Number(extendTrialDays) : null,
-              expiresAt: expiresAt ? Number(expiresAt) : null,
-              graceUntil: graceUntil ? Number(graceUntil) : null,
-              trialUntil: trialUntil ? Number(trialUntil) : null,
-              status: status || null
-            };
-            var res = await fetch('/admin/api/user/plan', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify(payload)
-            });
-            var text = await res.text();
-            var data;
-            try { data = JSON.parse(text); } catch (e) { data = text; }
-            resultsEl.textContent = formatJson({ status: res.status, data: data });
-            updateStatusEl.textContent = res.ok ? 'OK' : 'Error';
-          } catch (e) {
-            resultsEl.textContent = formatJson({ error: e.message });
-            updateStatusEl.textContent = 'Error';
-          }
-        }
-      </script>
-    `);
+function buildFilters(){
+  var counts={};allUsers.forEach(function(u){var s=u.status||'none';counts[s]=(counts[s]||0)+1});
+  var html='<button class="pill active" data-f="all" onclick="setFilter(this,\\'all\\')">All<span class="count">'+allUsers.length+'</span></button>';
+  var order=['active','trial','grace','expired','trial_expired','none','deleted'];
+  order.forEach(function(s){if(counts[s])html+='<button class="pill" data-f="'+s+'" onclick="setFilter(this,\\''+s+'\\')">'+s+'<span class="count">'+counts[s]+'</span></button>'});
+  document.getElementById('status-filters').innerHTML=html;
+}
+
+function setFilter(el,f){
+  activeFilter=f;
+  document.querySelectorAll('.pill').forEach(function(p){p.classList.remove('active')});
+  el.classList.add('active');
+  applyFilters();
+}
+
+function applyFilters(){
+  var q=(document.getElementById('search').value||'').toLowerCase().trim();
+  filteredUsers=allUsers.filter(function(u){
+    if(activeFilter!=='all'&&u.status!==activeFilter)return false;
+    if(!q)return true;
+    return(String(u.id).includes(q)||u.email.toLowerCase().includes(q)||(u.status||'').toLowerCase().includes(q)||String(u.plan_gb).includes(q)||(u.payment_type||'').toLowerCase().includes(q)||(u.user_uuid||'').toLowerCase().includes(q));
+  });
+  doSort();renderTable();
+}
+
+function sortBy(col){
+  if(sortCol===col)sortDir=sortDir==='asc'?'desc':'asc';
+  else{sortCol=col;sortDir=col==='id'?'desc':'asc'}
+  document.querySelectorAll('thead th').forEach(function(th){th.classList.remove('sorted');if(th.dataset.col===col)th.classList.add('sorted')});
+  document.querySelectorAll('.sort-arrow').forEach(function(a){a.innerHTML='&#9650;'});
+  var th=document.querySelector('th[data-col="'+col+'"]');
+  if(th)th.querySelector('.sort-arrow').innerHTML=sortDir==='asc'?'&#9650;':'&#9660;';
+  doSort();renderTable();
+}
+
+function doSort(){
+  filteredUsers.sort(function(a,b){
+    var va=a[sortCol],vb=b[sortCol];
+    if(va==null)va='';if(vb==null)vb='';
+    if(typeof va==='number'&&typeof vb==='number')return sortDir==='asc'?va-vb:vb-va;
+    va=String(va).toLowerCase();vb=String(vb).toLowerCase();
+    if(va<vb)return sortDir==='asc'?-1:1;
+    if(va>vb)return sortDir==='asc'?1:-1;
+    return 0;
+  });
+}
+
+function renderTable(){
+  var tbody=document.getElementById('tbody');
+  var empty=document.getElementById('empty');
+  if(!filteredUsers.length){tbody.innerHTML='';empty.style.display='';return}
+  empty.style.display='none';
+  var html='';
+  filteredUsers.forEach(function(u){
+    html+='<tr>';
+    html+='<td class="id-cell">#'+u.id+'</td>';
+    html+='<td class="email-cell" title="'+u.email+'">'+u.email+'</td>';
+    html+='<td class="plan-cell">'+planLabel(u.plan_gb)+'</td>';
+    html+='<td>'+statusBadge(u.status)+'</td>';
+    html+='<td>'+fmtDate(u.trial_until_date)+'</td>';
+    html+='<td>'+fmtDate(u.expires_at_date)+'</td>';
+    html+='<td>'+fmtDate(u.created_at_date)+'</td>';
+    html+='<td>'+paymentBadge(u.payment_type)+'</td>';
+    html+='<td>'+fmtDate(u.payment_at_date)+'</td>';
+    html+='<td>'+fmtDate(u.updated_at_date)+'</td>';
+    html+='<td class="actions-cell">';
+    html+='<button class="btn-sm" onclick="openEdit('+u.id+')">Edit</button>';
+    html+='<button class="btn-sm btn-danger" onclick="openDelete('+u.id+',\\''+u.email.replace(/'/g,"\\\\'")+'\\')">&times;</button>';
+    html+='</td></tr>';
+  });
+  tbody.innerHTML=html;
+}
+
+function openEdit(id){
+  var u=allUsers.find(function(x){return x.id===id});if(!u)return;
+  document.getElementById('e-id').value=u.id;
+  document.getElementById('e-email').value=u.email;
+  document.getElementById('e-planGb').value='';
+  document.getElementById('e-status').value='';
+  document.getElementById('e-extTrialDays').value='';
+  document.getElementById('e-extExpDays').value='';
+  document.getElementById('e-trialUntil').value='';
+  document.getElementById('e-expiresAt').value='';
+  document.getElementById('e-graceUntil').value='';
+  document.getElementById('edit-title').textContent='#'+u.id+' '+u.email;
+  document.getElementById('edit-modal').classList.add('open');
+}
+function closeModal(){document.getElementById('edit-modal').classList.remove('open')}
+
+async function saveEdit(){
+  var uid=Number(document.getElementById('e-id').value);
+  var payload={userId:uid};
+  var v;
+  v=document.getElementById('e-planGb').value;if(v)payload.planGb=Number(v);
+  v=document.getElementById('e-status').value;if(v)payload.status=v;
+  v=document.getElementById('e-extTrialDays').value;if(v)payload.extendTrialDays=Number(v);
+  v=document.getElementById('e-extExpDays').value;if(v)payload.extendExpiresDays=Number(v);
+  v=document.getElementById('e-trialUntil').value;if(v)payload.trialUntil=Number(v);
+  v=document.getElementById('e-expiresAt').value;if(v)payload.expiresAt=Number(v);
+  v=document.getElementById('e-graceUntil').value;if(v)payload.graceUntil=Number(v);
+  try{
+    var r=await fetch('/admin/api/user/plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    var d=await r.json();
+    if(!r.ok)throw new Error(d.error||'Failed');
+    toast('User #'+uid+' updated','success');closeModal();loadUsers();
+  }catch(e){toast('Error: '+e.message,'error')}
+}
+
+function openDelete(id,email){
+  document.getElementById('del-id').value=id;
+  document.getElementById('del-title').textContent='#'+id+' '+email;
+  document.getElementById('delete-modal').classList.add('open');
+}
+function closeDeleteModal(){document.getElementById('delete-modal').classList.remove('open')}
+
+async function confirmDelete(){
+  var uid=Number(document.getElementById('del-id').value);
+  var delFiles=document.getElementById('del-files').checked;
+  try{
+    var r=await fetch('/admin/api/user/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({userId:uid,deleteFiles:delFiles})});
+    var d=await r.json();
+    if(!r.ok)throw new Error(d.error||'Failed');
+    toast('User #'+uid+' deleted','success');closeDeleteModal();loadUsers();
+  }catch(e){toast('Error: '+e.message,'error')}
+}
+
+document.addEventListener('keydown',function(e){if(e.key==='Escape'){closeModal();closeDeleteModal()}});
+loadUsers();
+</script>
+</body>
+</html>`;
     res.send(html);
 });
 
