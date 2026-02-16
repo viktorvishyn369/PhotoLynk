@@ -2875,7 +2875,7 @@ app.get('/api/subscription/downgrade-check', authenticateToken, async (req, res)
 app.post('/api/subscription/sync', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
-        const { productId, tierGb, entitlementId, paymentType } = req.body || {};
+        const { productId, tierGb, entitlementId, paymentType, expiresAt: clientExpiresAt } = req.body || {};
         const tier = normalizeTierGb(tierGb) || normalizeTierGb(inferTierGbFromProductId(productId));
         if (!tier) return res.status(400).json({ error: 'Invalid or missing tier' });
 
@@ -2899,6 +2899,13 @@ app.post('/api/subscription/sync', authenticateToken, async (req, res) => {
         await ensurePlanRow(userId);
         const currentPlan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [userId]);
         const now = Date.now();
+
+        // Accept expires_at from app for Apple/Google subscribers (RevenueCat SDK provides it).
+        // Solana handles its own expiry in /api/solana/verify-payment — don't overwrite here.
+        const isSolana = String(paymentType).toLowerCase() === 'solana';
+        const rawExpires = clientExpiresAt != null ? Number(clientExpiresAt) : null;
+        const syncExpiresAt = (!isSolana && Number.isFinite(rawExpires) && rawExpires > 0) ? rawExpires : null;
+
         const trialUntil = currentPlan && currentPlan.trial_until ? Number(currentPlan.trial_until) : null;
         const isInTrialWindow = trialUntil && Number.isFinite(trialUntil) && trialUntil > now;
         const nextStatus = isInTrialWindow ? 'trial' : 'active';
@@ -2911,7 +2918,7 @@ app.post('/api/subscription/sync', authenticateToken, async (req, res) => {
                     rc_app_user_id = COALESCE(rc_app_user_id, ?),
                     payment_type = ?,
                     payment_at = ?,
-                    expires_at = CASE WHEN expires_at IS NOT NULL AND expires_at > ? THEN expires_at ELSE NULL END,
+                    expires_at = CASE WHEN ? IS NOT NULL AND ? > 0 THEN ? ELSE expires_at END,
                     grace_until = NULL,
                     deleted_at = NULL,
                     updated_at = ?
@@ -2924,7 +2931,7 @@ app.post('/api/subscription/sync', authenticateToken, async (req, res) => {
                 req.user.email || null,
                 paymentType || null,
                 now,
-                now,
+                syncExpiresAt, syncExpiresAt, syncExpiresAt,
                 now,
                 userId,
             ]
