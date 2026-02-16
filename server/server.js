@@ -1230,41 +1230,45 @@ const migrateUserFoldersToNewDeviceUuid = async (userId, newDeviceUuid, userEmai
     const chunksUsersRoot = CHUNKS_DIR ? path.join(CHUNKS_DIR, 'users') : null;
     const nftRoot = path.join(CLOUD_DIR, 'nft');
 
+    // Recursively remove a directory tree if all contents are empty dirs
+    const removeEmptyDirTree = (dir) => {
+        try {
+            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            for (const e of entries) {
+                if (e.isDirectory()) removeEmptyDirTree(path.join(dir, e.name));
+            }
+            // Try removing — will fail if non-empty (has files), which is fine
+            fs.rmdirSync(dir);
+        } catch (e) { /* not empty or already gone */ }
+    };
+
     const safeRename = (oldDir, newDir, label) => {
         try {
             if (!fs.existsSync(oldDir)) return false;
             if (fs.existsSync(newDir)) {
                 // New dir already exists — merge files from old into new
                 console.log(`[FolderMigrate] ${label}: new dir exists, merging from ${oldDir} -> ${newDir}`);
-                const entries = fs.readdirSync(oldDir, { withFileTypes: true });
-                for (const entry of entries) {
-                    const src = path.join(oldDir, entry.name);
-                    const dst = path.join(newDir, entry.name);
-                    if (entry.isDirectory()) {
-                        if (!fs.existsSync(dst)) {
-                            fs.renameSync(src, dst);
+                const mergeRecursive = (src, dst) => {
+                    const entries = fs.readdirSync(src, { withFileTypes: true });
+                    for (const entry of entries) {
+                        const srcPath = path.join(src, entry.name);
+                        const dstPath = path.join(dst, entry.name);
+                        if (entry.isDirectory()) {
+                            if (!fs.existsSync(dstPath)) {
+                                fs.renameSync(srcPath, dstPath);
+                            } else {
+                                mergeRecursive(srcPath, dstPath);
+                            }
                         } else {
-                            // Recurse into subdirectory
-                            const subEntries = fs.readdirSync(src);
-                            for (const sf of subEntries) {
-                                const subSrc = path.join(src, sf);
-                                const subDst = path.join(dst, sf);
-                                if (!fs.existsSync(subDst)) {
-                                    fs.renameSync(subSrc, subDst);
-                                }
+                            if (!fs.existsSync(dstPath)) {
+                                fs.renameSync(srcPath, dstPath);
                             }
                         }
-                    } else {
-                        if (!fs.existsSync(dst)) {
-                            fs.renameSync(src, dst);
-                        }
                     }
-                }
-                // Remove old dir if now empty
-                try {
-                    const remaining = fs.readdirSync(oldDir);
-                    if (remaining.length === 0) fs.rmdirSync(oldDir);
-                } catch (e) { /* ignore */ }
+                };
+                mergeRecursive(oldDir, newDir);
+                // Clean up: recursively remove empty leftover dirs
+                removeEmptyDirTree(oldDir);
                 return true;
             }
             fs.renameSync(oldDir, newDir);
@@ -2204,7 +2208,12 @@ const getUserUsedBytes = async (userId, userOrNull) => {
     let user = userOrNull;
     if (!user && userId) {
         try {
-            user = await dbGetAsync(`SELECT id, email, device_uuid FROM users WHERE id = ?`, [userId]);
+            const dbUser = await dbGetAsync(`SELECT id, email, user_uuid, storage_uuid FROM users WHERE id = ?`, [userId]);
+            if (dbUser) {
+                // Fetch the most recent device_uuid from devices table
+                const devRow = await dbGetAsync(`SELECT device_uuid FROM devices WHERE user_id = ? ORDER BY id DESC LIMIT 1`, [userId]);
+                user = { ...dbUser, device_uuid: devRow ? devRow.device_uuid : null };
+            }
         } catch (e) {}
     }
     if (user) {
