@@ -2501,16 +2501,54 @@ app.post('/api/login', authRateLimiter, async (req, res) => {
             isNewDevice = !existingDevice;
         } catch (e) { /* treat as new to be safe */ isNewDevice = true; }
 
-        // Check if the device_uuid folder exists yet (if not, data is under a legacy key)
+        // Trigger folder migration when:
+        // - device_uuid is new (password change)
+        // - OR current device_uuid folder doesn't exist yet
+        // - OR any legacy key folder exists (numeric id / storage_uuid / user_uuid / any previous device_uuid)
+        //   to prevent data splitting and to clean up leftovers.
         let needsFolderMigration = isNewDevice;
-        if (!needsFolderMigration && device_uuid) {
+        if (device_uuid) {
             const safeKey = String(device_uuid).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
             if (safeKey) {
                 const cloudUsersRoot = path.join(CLOUD_DIR, 'users');
                 const chunksUsersRoot = CHUNKS_DIR ? path.join(CHUNKS_DIR, 'users') : null;
-                const cloudExists = fs.existsSync(path.join(cloudUsersRoot, safeKey));
-                const chunksExists = chunksUsersRoot && fs.existsSync(path.join(chunksUsersRoot, safeKey));
-                if (!cloudExists && !chunksExists) {
+                const nftRoot = path.join(CLOUD_DIR, 'nft');
+
+                const keyHasAnyDir = (k) => {
+                    if (!k) return false;
+                    try {
+                        if (fs.existsSync(path.join(cloudUsersRoot, k))) return true;
+                        if (chunksUsersRoot && fs.existsSync(path.join(chunksUsersRoot, k))) return true;
+                        if (fs.existsSync(path.join(nftRoot, k))) return true;
+                    } catch (e) {}
+                    return false;
+                };
+
+                const safeExists = keyHasAnyDir(safeKey);
+
+                // Gather all possible legacy keys for this user (including all device_uuids)
+                const legacyKeys = new Set();
+                legacyKeys.add(String(user.id));
+                if (user.user_uuid) legacyKeys.add(String(user.user_uuid).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128));
+                if (user.storage_uuid) legacyKeys.add(String(user.storage_uuid).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128));
+                try {
+                    const rows = await dbAllAsync(`SELECT device_uuid FROM devices WHERE user_id = ?`, [user.id]);
+                    (rows || []).forEach(r => {
+                        const dv = r && r.device_uuid ? String(r.device_uuid).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128) : '';
+                        if (dv) legacyKeys.add(dv);
+                    });
+                } catch (e) {}
+
+                let otherLegacyExists = false;
+                for (const k of legacyKeys) {
+                    if (!k || k === safeKey) continue;
+                    if (keyHasAnyDir(k)) {
+                        otherLegacyExists = true;
+                        break;
+                    }
+                }
+
+                if (!safeExists || otherLegacyExists) {
                     needsFolderMigration = true;
                 }
             }
