@@ -1179,6 +1179,117 @@ const getUserDeviceUuids = async (user) => {
     return Array.from(new Set(uuids));
 };
 
+/**
+ * When a user changes their password, their device_uuid changes (UUIDv5 from email:password).
+ * This function finds existing storage folders under any of the user's OLD device_uuids
+ * (tracked in the devices table) and renames them to the NEW device_uuid so data follows
+ * the user seamlessly. Also renames NFT folders.
+ *
+ * Called at login time when a new device_uuid is registered for an existing user.
+ */
+const migrateUserFoldersToNewDeviceUuid = async (userId, newDeviceUuid, userEmail) => {
+    const safeNew = String(newDeviceUuid || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
+    if (!safeNew) return;
+
+    // Collect all old keys this user might have folders under
+    const oldKeys = new Set();
+
+    // 1. All previous device_uuids from devices table
+    try {
+        const rows = await dbAllAsync(`SELECT device_uuid FROM devices WHERE user_id = ?`, [userId]);
+        (rows || []).forEach(r => {
+            if (r && r.device_uuid) {
+                const safe = String(r.device_uuid).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
+                if (safe && safe !== safeNew) oldKeys.add(safe);
+            }
+        });
+    } catch (e) { /* ignore */ }
+
+    // 2. user_uuid and storage_uuid from users table
+    try {
+        const row = await dbGetAsync(`SELECT user_uuid, storage_uuid FROM users WHERE id = ?`, [userId]);
+        if (row) {
+            if (row.user_uuid) {
+                const safe = String(row.user_uuid).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
+                if (safe && safe !== safeNew) oldKeys.add(safe);
+            }
+            if (row.storage_uuid) {
+                const safe = String(row.storage_uuid).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
+                if (safe && safe !== safeNew) oldKeys.add(safe);
+            }
+        }
+    } catch (e) { /* ignore */ }
+
+    // 3. Numeric user id
+    const numericKey = String(userId);
+    if (numericKey !== safeNew) oldKeys.add(numericKey);
+
+    if (oldKeys.size === 0) return;
+
+    const cloudUsersRoot = path.join(CLOUD_DIR, 'users');
+    const chunksUsersRoot = CHUNKS_DIR ? path.join(CHUNKS_DIR, 'users') : null;
+    const nftRoot = path.join(CLOUD_DIR, 'nft');
+
+    const safeRename = (oldDir, newDir, label) => {
+        try {
+            if (!fs.existsSync(oldDir)) return false;
+            if (fs.existsSync(newDir)) {
+                // New dir already exists — merge files from old into new
+                console.log(`[FolderMigrate] ${label}: new dir exists, merging from ${oldDir} -> ${newDir}`);
+                const entries = fs.readdirSync(oldDir, { withFileTypes: true });
+                for (const entry of entries) {
+                    const src = path.join(oldDir, entry.name);
+                    const dst = path.join(newDir, entry.name);
+                    if (entry.isDirectory()) {
+                        if (!fs.existsSync(dst)) {
+                            fs.renameSync(src, dst);
+                        } else {
+                            // Recurse into subdirectory
+                            const subEntries = fs.readdirSync(src);
+                            for (const sf of subEntries) {
+                                const subSrc = path.join(src, sf);
+                                const subDst = path.join(dst, sf);
+                                if (!fs.existsSync(subDst)) {
+                                    fs.renameSync(subSrc, subDst);
+                                }
+                            }
+                        }
+                    } else {
+                        if (!fs.existsSync(dst)) {
+                            fs.renameSync(src, dst);
+                        }
+                    }
+                }
+                // Remove old dir if now empty
+                try {
+                    const remaining = fs.readdirSync(oldDir);
+                    if (remaining.length === 0) fs.rmdirSync(oldDir);
+                } catch (e) { /* ignore */ }
+                return true;
+            }
+            fs.renameSync(oldDir, newDir);
+            console.log(`[FolderMigrate] ${label}: renamed ${oldDir} -> ${newDir}`);
+            return true;
+        } catch (e) {
+            console.error(`[FolderMigrate] ${label}: failed ${oldDir} -> ${newDir}:`, e.message);
+            return false;
+        }
+    };
+
+    for (const oldKey of oldKeys) {
+        // Cloud users dir (NVMe: manifests, raw-meta)
+        safeRename(path.join(cloudUsersRoot, oldKey), path.join(cloudUsersRoot, safeNew), 'cloud');
+        // Chunks dir (RAID10: chunks, raw)
+        if (chunksUsersRoot) {
+            safeRename(path.join(chunksUsersRoot, oldKey), path.join(chunksUsersRoot, safeNew), 'chunks');
+        }
+        // NFT dir
+        safeRename(path.join(nftRoot, oldKey), path.join(nftRoot, safeNew), 'nft');
+    }
+
+    console.log(`[FolderMigrate] User ${userId} (${userEmail || '?'}): migrated folders from [${[...oldKeys].join(', ')}] -> ${safeNew}`);
+};
+
 const resolveClassicFileForUser = async (user, filename) => {
     const safeName = path.basename(filename || '').replace(/\0/g, '');
     if (!safeName) return null;
@@ -1800,8 +1911,14 @@ const authenticateToken = (req, res, next) => {
 };
 
 const getStealthCloudUserKey = (user) => {
-    // StealthCloud files are stored per USER (not per device) so all devices
-    // for the same account can access the same files.
+    // Primary key = device_uuid (UUIDv5 from email:password) — matches what
+    // the mobile app shows in the Info tab and is deterministic from credentials.
+    // This means: same email + same password = same folder, even after DB loss.
+    const deviceKey = (user && (user.device_uuid || user.deviceUuid)) ? String(user.device_uuid || user.deviceUuid) : '';
+    const safeDevice = deviceKey.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
+    if (safeDevice) return safeDevice;
+
+    // Fallback: HMAC-based storage_uuid (legacy, from earlier implementation)
     const storageKey = (user && (user.storage_uuid || user.storageUuid)) ? String(user.storage_uuid || user.storageUuid) : '';
     const safeStorage = storageKey.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
     if (safeStorage) return safeStorage;
@@ -1812,9 +1929,7 @@ const getStealthCloudUserKey = (user) => {
 
     if (user && user.id) return String(user.id);
 
-    const deviceKey = (user && (user.device_uuid || user.deviceUuid)) ? String(user.device_uuid || user.deviceUuid) : '';
-    const safeDevice = deviceKey.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
-    return safeDevice || 'unknown';
+    return 'unknown';
 };
 
 const getStealthCloudAllPossibleUserKeys = (user) => {
@@ -1837,7 +1952,7 @@ const getStealthCloudAllPossibleUserKeys = (user) => {
         addSafe(user._originalTokenId);
     }
 
-    // Legacy per-device or per-user UUID storage
+    // All possible legacy keys
     if (user && (user.device_uuid || user.deviceUuid)) {
         addSafe(user.device_uuid || user.deviceUuid);
     }
@@ -1847,35 +1962,18 @@ const getStealthCloudAllPossibleUserKeys = (user) => {
     if (user && (user.storage_uuid || user.storageUuid)) {
         addSafe(user.storage_uuid || user.storageUuid);
     }
+    // Numeric user id (legacy folder naming)
+    if (user && user.id) {
+        addSafe(user.id);
+    }
 
     return Array.from(keys);
 };
 
 const getStealthCloudStorageKey = (user) => {
-    const trySafe = (v) => {
-        if (v === undefined || v === null) return '';
-        const raw = String(v);
-        if (!raw) return '';
-        const safe = raw.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
-        return safe || '';
-    };
-
-    const storageKey = trySafe(user && (user.storage_uuid || user.storageUuid));
-    if (storageKey) return storageKey;
-
-    const computed = trySafe(user && user.email ? computeStorageUuidFromEmail(user.email) : '');
-    if (computed) return computed;
-
-    const userUuidKey = trySafe(user && (user.user_uuid || user.userUuid));
-    if (userUuidKey) return userUuidKey;
-
-    const idKey = trySafe(user && user.id);
-    if (idKey) return idKey;
-
-    const deviceKey = trySafe(user && (user.device_uuid || user.deviceUuid));
-    if (deviceKey) return deviceKey;
-
-    return 'unknown';
+    // Delegate to getStealthCloudUserKey which already has the correct priority:
+    // device_uuid (primary) → storage_uuid → user_uuid → numeric id
+    return getStealthCloudUserKey(user);
 };
 
 const ensureStealthCloudUserDirs = (user) => {
@@ -2384,11 +2482,30 @@ app.post('/api/login', authRateLimiter, async (req, res) => {
             }
         }
 
+        // Check if this device_uuid is NEW for this user (password was changed)
+        let isNewDevice = false;
+        try {
+            const existingDevice = await dbGetAsync(
+                `SELECT id FROM devices WHERE user_id = ? AND device_uuid = ?`,
+                [user.id, device_uuid]
+            );
+            isNewDevice = !existingDevice;
+        } catch (e) { /* treat as new to be safe */ isNewDevice = true; }
+
         // Register/Update Device
         db.run(`INSERT OR IGNORE INTO devices (user_id, device_uuid, device_name) VALUES (?, ?, ?)`, 
             [user.id, device_uuid, device_name || 'Unknown Device'], 
             async (devErr) => {
                 if (devErr) console.error('Device reg error:', devErr);
+
+                // If this is a new device_uuid (password changed), migrate storage folders
+                if (isNewDevice) {
+                    try {
+                        await migrateUserFoldersToNewDeviceUuid(user.id, device_uuid, normalizedEmail);
+                    } catch (migErr) {
+                        console.error(`[Login] Folder migration error for user ${user.id}:`, migErr.message);
+                    }
+                }
 
                 const now = Date.now();
                 try {
@@ -5441,8 +5558,18 @@ const resolveNftStorageKeyFromParam = async (userIdParam) => {
     if (!raw) return '';
     if (/^\d+$/.test(raw)) {
         try {
-            const row = await dbGetAsync(`SELECT storage_uuid FROM users WHERE id = ?`, [Number(raw)]);
-            const key = sanitizeUserKey(row && row.storage_uuid);
+            // Look up the user's most recent device_uuid (primary storage key)
+            const deviceRow = await dbGetAsync(
+                `SELECT device_uuid FROM devices WHERE user_id = ? ORDER BY id DESC LIMIT 1`,
+                [Number(raw)]
+            );
+            if (deviceRow && deviceRow.device_uuid) {
+                const key = sanitizeUserKey(deviceRow.device_uuid);
+                if (key) return key;
+            }
+            // Fallback to storage_uuid if no device found
+            const userRow = await dbGetAsync(`SELECT storage_uuid FROM users WHERE id = ?`, [Number(raw)]);
+            const key = sanitizeUserKey(userRow && userRow.storage_uuid);
             return key || sanitizeUserKey(raw);
         } catch (e) {
             return sanitizeUserKey(raw);
@@ -5618,10 +5745,26 @@ const serveNftImage = async (req, res) => {
         }
 
         let filePath = path.join(NFT_DIR, safeKey, safeFilename);
-        if (!fs.existsSync(filePath) && /^\d+$/.test(String(userId))) {
-            const legacyNumeric = sanitizeUserKey(userId);
-            const legacyPath = path.join(NFT_DIR, legacyNumeric, safeFilename);
-            if (fs.existsSync(legacyPath)) filePath = legacyPath;
+        if (!fs.existsSync(filePath)) {
+            // Backward compat: try the raw userId param as-is (could be old storage_uuid, device_uuid, or numeric id)
+            const rawKey = sanitizeUserKey(userId);
+            if (rawKey && rawKey !== safeKey) {
+                const legacyPath = path.join(NFT_DIR, rawKey, safeFilename);
+                if (fs.existsSync(legacyPath)) filePath = legacyPath;
+            }
+            // Also try storage_uuid if numeric
+            if (!fs.existsSync(filePath) && /^\d+$/.test(String(userId))) {
+                try {
+                    const userRow = await dbGetAsync(`SELECT storage_uuid FROM users WHERE id = ?`, [Number(userId)]);
+                    if (userRow && userRow.storage_uuid) {
+                        const suKey = sanitizeUserKey(userRow.storage_uuid);
+                        if (suKey && suKey !== safeKey) {
+                            const suPath = path.join(NFT_DIR, suKey, safeFilename);
+                            if (fs.existsSync(suPath)) filePath = suPath;
+                        }
+                    }
+                } catch (e) { /* ignore */ }
+            }
         }
         
         if (!fs.existsSync(filePath)) {
