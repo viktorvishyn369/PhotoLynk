@@ -2492,14 +2492,29 @@ app.post('/api/login', authRateLimiter, async (req, res) => {
             isNewDevice = !existingDevice;
         } catch (e) { /* treat as new to be safe */ isNewDevice = true; }
 
+        // Check if the device_uuid folder exists yet (if not, data is under a legacy key)
+        let needsFolderMigration = isNewDevice;
+        if (!needsFolderMigration && device_uuid) {
+            const safeKey = String(device_uuid).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
+            if (safeKey) {
+                const cloudUsersRoot = path.join(CLOUD_DIR, 'users');
+                const chunksUsersRoot = CHUNKS_DIR ? path.join(CHUNKS_DIR, 'users') : null;
+                const cloudExists = fs.existsSync(path.join(cloudUsersRoot, safeKey));
+                const chunksExists = chunksUsersRoot && fs.existsSync(path.join(chunksUsersRoot, safeKey));
+                if (!cloudExists && !chunksExists) {
+                    needsFolderMigration = true;
+                }
+            }
+        }
+
         // Register/Update Device
         db.run(`INSERT OR IGNORE INTO devices (user_id, device_uuid, device_name) VALUES (?, ?, ?)`, 
             [user.id, device_uuid, device_name || 'Unknown Device'], 
             async (devErr) => {
                 if (devErr) console.error('Device reg error:', devErr);
 
-                // If this is a new device_uuid (password changed), migrate storage folders
-                if (isNewDevice) {
+                // Migrate storage folders if device_uuid is new OR folder doesn't exist yet
+                if (needsFolderMigration) {
                     try {
                         await migrateUserFoldersToNewDeviceUuid(user.id, device_uuid, normalizedEmail);
                     } catch (migErr) {
