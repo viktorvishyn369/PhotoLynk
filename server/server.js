@@ -5674,11 +5674,11 @@ const nftUpload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 50 * 1024 * 1024 }, // 50MB max
     fileFilter: (req, file, cb) => {
-        const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp'];
+        const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'application/octet-stream'];
         if (allowed.includes(file.mimetype)) {
             cb(null, true);
         } else {
-            cb(new Error('Only JPEG, PNG, GIF, WebP images allowed'));
+            cb(new Error('Only JPEG, PNG, GIF, WebP images or encrypted blobs allowed'));
         }
     },
 });
@@ -5699,7 +5699,8 @@ app.post('/api/nft/upload', authenticateToken, nftUpload.single('image'), async 
         
         // Generate unique image ID
         const imageId = crypto.randomBytes(16).toString('hex');
-        const ext = req.file.mimetype.split('/')[1] === 'jpeg' ? 'jpg' : req.file.mimetype.split('/')[1];
+        const mimeToExt = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif', 'image/webp': 'webp', 'application/octet-stream': 'bin' };
+        const ext = mimeToExt[req.file.mimetype] || 'jpg';
         const filename = `${imageId}.${ext}`;
         
         // Save to user's NFT directory
