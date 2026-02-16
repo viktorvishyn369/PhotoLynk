@@ -5976,6 +5976,66 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
     }
 });
 
+// Get/sync NFT certificates (Limited Edition CoA)
+// GET /api/nft/certificates - returns all certificates for the user
+// POST /api/nft/certificates - sync certificates { action: 'add'|'backup', certificate?: {}, certificates?: [] }
+app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
+    try {
+        const userKey = resolveNftStorageKeyFromUser(req.user);
+        const certsPath = path.join(NFT_DIR, String(userKey), 'certificates.json');
+        let certs = [];
+        if (fs.existsSync(certsPath)) {
+            try { certs = JSON.parse(fs.readFileSync(certsPath, 'utf8')); } catch (_) {}
+        }
+        res.json({ success: true, certificates: certs });
+    } catch (error) {
+        console.error('[NFT] Certificates fetch error:', error);
+        res.status(500).json({ error: 'Failed to fetch certificates' });
+    }
+});
+
+app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
+    try {
+        const userKey = resolveNftStorageKeyFromUser(req.user);
+        const userNftDir = path.join(NFT_DIR, String(userKey));
+        if (!fs.existsSync(userNftDir)) fs.mkdirSync(userNftDir, { recursive: true });
+        const certsPath = path.join(userNftDir, 'certificates.json');
+        
+        let certs = [];
+        if (fs.existsSync(certsPath)) {
+            try { certs = JSON.parse(fs.readFileSync(certsPath, 'utf8')); } catch (_) {}
+        }
+        
+        const { action, certificate, certificates } = req.body;
+        const existingIds = new Set(certs.map(c => c.id));
+        
+        if (action === 'add' && certificate) {
+            if (!existingIds.has(certificate.id)) {
+                certs.push(certificate);
+                console.log(`[NFT] Certificate added: user=${req.user.id} id=${certificate.id}`);
+            }
+        } else if (action === 'backup' && Array.isArray(certificates)) {
+            let added = 0;
+            for (const c of certificates) {
+                if (!existingIds.has(c.id)) {
+                    certs.push(c);
+                    existingIds.add(c.id);
+                    added++;
+                }
+            }
+            console.log(`[NFT] Certificates backup: user=${req.user.id} added=${added} total=${certs.length}`);
+        } else {
+            return res.status(400).json({ error: 'Invalid action' });
+        }
+        
+        fs.writeFileSync(certsPath, JSON.stringify(certs, null, 2));
+        res.json({ success: true, count: certs.length });
+    } catch (error) {
+        console.error('[NFT] Certificates sync error:', error);
+        res.status(500).json({ error: 'Failed to sync certificates' });
+    }
+});
+
 // Solana RPC proxy - avoids CORS issues when calling from browser
 app.post('/solana-rpc', async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
