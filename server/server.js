@@ -5962,9 +5962,25 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
         }
         
         if (action === 'add' && nft) {
-            // Add single NFT (avoid duplicates)
-            const exists = data.nfts.some(n => n.mintAddress === nft.mintAddress);
-            if (!exists) {
+            // Add or update single NFT
+            const idx = data.nfts.findIndex(n => n.mintAddress === nft.mintAddress);
+            if (idx >= 0) {
+                // Merge new fields into existing (preserves fields the sender may not have)
+                const existing = data.nfts[idx];
+                const mergeFields = ['encryptionData','thumbnailUrl','imageUrl','edition','encrypted','watermarked','license','storageType','nftType','isCompressed','assetId','txSignature','attributes','createdAt'];
+                let updated = 0;
+                for (const f of mergeFields) {
+                    if (nft[f] !== undefined && nft[f] !== null && (existing[f] === undefined || existing[f] === null)) {
+                        existing[f] = nft[f];
+                        updated++;
+                    }
+                }
+                // Always overwrite encryptionData and thumbnailUrl if sender has them (these are critical)
+                if (nft.encryptionData) { existing.encryptionData = nft.encryptionData; updated++; }
+                if (nft.thumbnailUrl) { existing.thumbnailUrl = nft.thumbnailUrl; updated++; }
+                data.nfts[idx] = existing;
+                if (updated > 0) console.log(`[NFT] Album update: user=${userId} mint=${nft.mintAddress} fields=${updated}`);
+            } else {
                 data.nfts.push(nft);
                 console.log(`[NFT] Album add: user=${userId} mint=${nft.mintAddress}`);
             }
@@ -5974,17 +5990,34 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
             data.nfts = data.nfts.filter(n => n.mintAddress !== mintAddress);
             console.log(`[NFT] Album remove: user=${userId} mint=${mintAddress} removed=${before - data.nfts.length}`);
         } else if (action === 'backup' && Array.isArray(nfts)) {
-            // Backup: merge all NFTs (avoid duplicates)
-            const existingMints = new Set(data.nfts.map(n => n.mintAddress));
+            // Backup: merge all NFTs (add new, update existing with missing fields)
+            const existingMap = {};
+            data.nfts.forEach((n, i) => { if (n.mintAddress) existingMap[n.mintAddress] = i; });
             let added = 0;
+            let updated = 0;
+            const mergeFields = ['encryptionData','thumbnailUrl','imageUrl','edition','encrypted','watermarked','license','storageType','nftType','isCompressed','assetId','txSignature','attributes','createdAt'];
             for (const n of nfts) {
-                if (!existingMints.has(n.mintAddress)) {
+                if (!n.mintAddress) continue;
+                const idx = existingMap[n.mintAddress];
+                if (idx === undefined) {
                     data.nfts.push(n);
-                    existingMints.add(n.mintAddress);
+                    existingMap[n.mintAddress] = data.nfts.length - 1;
                     added++;
+                } else {
+                    // Merge missing fields + always overwrite critical encryption fields
+                    const existing = data.nfts[idx];
+                    for (const f of mergeFields) {
+                        if (n[f] !== undefined && n[f] !== null && (existing[f] === undefined || existing[f] === null)) {
+                            existing[f] = n[f];
+                            updated++;
+                        }
+                    }
+                    if (n.encryptionData) { existing.encryptionData = n.encryptionData; }
+                    if (n.thumbnailUrl) { existing.thumbnailUrl = n.thumbnailUrl; }
+                    data.nfts[idx] = existing;
                 }
             }
-            console.log(`[NFT] Album backup: user=${userId} added=${added} total=${data.nfts.length}`);
+            console.log(`[NFT] Album backup: user=${userId} added=${added} updated=${updated} total=${data.nfts.length}`);
         } else {
             return res.status(400).json({ error: 'Invalid action or missing data' });
         }
