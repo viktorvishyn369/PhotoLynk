@@ -21,6 +21,25 @@ let heicConvert;
 try { heicConvert = require('heic-convert'); console.log('[Server] heic-convert loaded'); } catch (e) { heicConvert = null; console.log('[Server] heic-convert failed to load:', e.message); }
 
 /**
+ * Concurrency limiter for sharp operations to prevent OOM under parallel uploads.
+ * Only N sharp calls run at a time; the rest queue up.
+ */
+const SHARP_CONCURRENCY = 2;
+let sharpRunning = 0;
+const sharpQueue = [];
+const runWithSharpLimit = (fn) => new Promise((resolve, reject) => {
+    const execute = () => {
+        sharpRunning++;
+        fn().then(resolve, reject).finally(() => {
+            sharpRunning--;
+            if (sharpQueue.length > 0) sharpQueue.shift()();
+        });
+    };
+    if (sharpRunning < SHARP_CONCURRENCY) execute();
+    else sharpQueue.push(execute);
+});
+
+/**
  * Compute perceptual hash (dHash) for an image file
  * Returns 16-character hex string (64-bit hash)
  */
@@ -30,32 +49,34 @@ const computePerceptualHash = async (filePath) => {
         // Timeout to prevent hanging on problematic files (animated GIFs on Windows)
         const timeoutMs = 5000;
         const hashPromise = (async () => {
-            // Read file into buffer to avoid Sharp holding file handle open on Windows
-            const fileBuffer = fs.readFileSync(filePath);
-            // Resize to 9x8 grayscale for dHash
-            // Use { pages: 1 } to only process first frame of animated images
-            const { data, info } = await sharp(fileBuffer, { pages: 1 })
-                .resize(9, 8, { fit: 'fill' })
-                .grayscale()
-                .raw()
-                .toBuffer({ resolveWithObject: true });
-            
-            if (info.width !== 9 || info.height !== 8) return null;
-            
-            // Compute difference hash - compare adjacent horizontal pixels
-            let hash = BigInt(0);
-            for (let y = 0; y < 8; y++) {
-                for (let x = 0; x < 8; x++) {
-                    const left = data[y * 9 + x];
-                    const right = data[y * 9 + x + 1];
-                    if (left > right) {
-                        hash |= BigInt(1) << BigInt(y * 8 + x);
+            return await runWithSharpLimit(async () => {
+                // Read file into buffer to avoid Sharp holding file handle open on Windows
+                const fileBuffer = fs.readFileSync(filePath);
+                // Resize to 9x8 grayscale for dHash
+                // Use { pages: 1 } to only process first frame of animated images
+                const { data, info } = await sharp(fileBuffer, { pages: 1 })
+                    .resize(9, 8, { fit: 'fill' })
+                    .grayscale()
+                    .raw()
+                    .toBuffer({ resolveWithObject: true });
+                
+                if (info.width !== 9 || info.height !== 8) return null;
+                
+                // Compute difference hash - compare adjacent horizontal pixels
+                let hash = BigInt(0);
+                for (let y = 0; y < 8; y++) {
+                    for (let x = 0; x < 8; x++) {
+                        const left = data[y * 9 + x];
+                        const right = data[y * 9 + x + 1];
+                        if (left > right) {
+                            hash |= BigInt(1) << BigInt(y * 8 + x);
+                        }
                     }
                 }
-            }
-            
-            // Convert to 16-char hex string
-            return hash.toString(16).padStart(16, '0');
+                
+                // Convert to 16-char hex string
+                return hash.toString(16).padStart(16, '0');
+            });
         })();
         
         const timeoutPromise = new Promise((_, reject) => 
@@ -309,7 +330,8 @@ app.use(helmet({
 }));
 app.use(cors());
 app.use(morgan('common')); // Logging
-app.use(express.json());
+// Allow larger JSON payloads (on-chain SVG data URIs for NFT payment image tokens)
+app.use(express.json({ limit: '25mb' }));
 
 // Serve static files from public directory (company website assets)
 app.use('/images', express.static(path.join(__dirname, 'public', 'images')));
@@ -3293,6 +3315,78 @@ async function verifySolanaTransaction(txSignature, expectedSolAmount) {
     };
 }
 
+// ============================================================================
+// NFT MINTING PAYMENT VERIFICATION
+// ============================================================================
+// Verifies that the NFT minting fee was actually paid to our wallet on-chain.
+// Called by the payment page after the user signs the SOL transfer.
+// Without this, someone could modify the desktop app to change the fee wallet
+// or set the fee to 0 and mint for free.
+
+// Create nft_payments table for replay protection
+db.run(`CREATE TABLE IF NOT EXISTS nft_payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tx_signature TEXT UNIQUE NOT NULL,
+    sender TEXT NOT NULL,
+    sol_amount REAL NOT NULL,
+    verified_at INTEGER NOT NULL
+)`);
+
+// NFT fee verification — no auth required (payment page is unauthenticated browser tab)
+// The payment page calls this after Phantom signs the tx, before showing success.
+app.post('/api/nft/verify-mint-payment', async (req, res) => {
+    const { txSignature, expectedAmount } = req.body || {};
+
+    if (!txSignature || typeof txSignature !== 'string') {
+        return res.status(400).json({ success: false, error: 'Missing txSignature' });
+    }
+
+    try {
+        // Check replay — same tx can't be used twice
+        const existing = await dbGetAsync(`SELECT id FROM nft_payments WHERE tx_signature = ?`, [txSignature]);
+        if (existing) {
+            // Already verified — return success (idempotent for retries)
+            return res.json({ success: true, message: 'Already verified' });
+        }
+
+        // Verify on-chain
+        const verification = await verifySolanaTransaction(txSignature, expectedAmount);
+        if (!verification.success) {
+            console.log(`[NFT-Pay] Verification failed for ${txSignature}: ${verification.error}`);
+            return res.status(400).json({ success: false, error: verification.error || 'Verification failed' });
+        }
+
+        // Check recipient is our wallet
+        if (verification.receiver !== SOLANA_PAYMENT_WALLET) {
+            console.log(`[NFT-Pay] Wrong recipient: expected ${SOLANA_PAYMENT_WALLET}, got ${verification.receiver}`);
+            return res.status(400).json({ success: false, error: 'Payment sent to wrong wallet' });
+        }
+
+        // Check amount (allow 1% tolerance for rounding)
+        const expected = parseFloat(expectedAmount) || 0;
+        if (expected > 0 && verification.receivedAmount < expected * 0.99) {
+            console.log(`[NFT-Pay] Insufficient amount: expected ${expected}, got ${verification.receivedAmount}`);
+            return res.status(400).json({ success: false, error: 'Insufficient payment amount' });
+        }
+
+        // Record payment
+        await dbRunAsync(
+            `INSERT OR IGNORE INTO nft_payments (tx_signature, sender, sol_amount, verified_at) VALUES (?, ?, ?, ?)`,
+            [txSignature, verification.sender || '', verification.receivedAmount || 0, Date.now()]
+        );
+
+        console.log(`[NFT-Pay] Verified: ${txSignature} — ${verification.receivedAmount} SOL from ${verification.sender}`);
+        return res.json({
+            success: true,
+            receivedAmount: verification.receivedAmount,
+            sender: verification.sender,
+        });
+    } catch (e) {
+        console.error('[NFT-Pay] Error:', e.message);
+        return res.status(500).json({ success: false, error: 'Server error during verification' });
+    }
+});
+
 // Create solana_payments table if not exists
 db.run(`CREATE TABLE IF NOT EXISTS solana_payments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -6043,18 +6137,26 @@ app.post('/solana-rpc', async (req, res) => {
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
     
     const rpcEndpoints = [
+        process.env.SOLANA_RPC_ENDPOINT,          // Custom RPC if configured (highest priority)
         'https://api.mainnet-beta.solana.com',
+        'https://solana-rpc.publicnode.com',       // PublicNode - reliable free tier
         'https://rpc.ankr.com/solana',
+        'https://solana.drpc.org',                 // dRPC public
+        'https://mainnet.helius-rpc.com/?api-key=15319bf2-6d8c-4e35-a99e-134b3e8b5b2e', // Helius free
         'https://solana-mainnet.g.alchemy.com/v2/demo'
-    ];
+    ].filter(Boolean);
     
     for (const rpc of rpcEndpoints) {
         try {
             const response = await axios.post(rpc, req.body, {
                 headers: { 'Content-Type': 'application/json' },
-                timeout: 10000
+                timeout: 8000
             });
-            return res.json(response.data);
+            if (response.data && !response.data.error) {
+                return res.json(response.data);
+            }
+            // RPC returned an error object — try next
+            console.log('[Solana RPC] RPC error from', rpc, ':', JSON.stringify(response.data?.error)?.slice(0, 80));
         } catch (e) {
             console.log('[Solana RPC] Failed:', rpc, e.message);
         }
@@ -6106,6 +6208,72 @@ app.get('/local-image', (req, res) => {
     fs.createReadStream(resolvedPath).pipe(res);
 });
 
+// Serve @solana/web3.js locally - avoids CDN failures on payment page
+app.get('/lib/solana-web3.js', (req, res) => {
+    const candidates = [
+        path.join(__dirname, '../server-tray/node_modules/@solana/web3.js/lib/index.iife.min.js'),
+        path.join(__dirname, 'node_modules/@solana/web3.js/lib/index.iife.min.js'),
+    ];
+    for (const p of candidates) {
+        if (fs.existsSync(p)) {
+            res.setHeader('Content-Type', 'application/javascript');
+            res.setHeader('Cache-Control', 'public, max-age=86400');
+            res.setHeader('Access-Control-Allow-Origin', '*');
+            return fs.createReadStream(p).pipe(res);
+        }
+    }
+    res.status(404).send('// solana web3 not found locally');
+});
+
+// SOL price proxy - avoids CORS when fetching from browser
+app.get('/sol-price', async (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    const sources = [
+        async () => {
+            const r = await axios.get('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT', { timeout: 5000 });
+            const p = parseFloat(r.data?.price);
+            if (p > 0) return p;
+        },
+        async () => {
+            const r = await axios.get('https://price.jup.ag/v6/price?ids=SOL', { timeout: 5000 });
+            const p = r.data?.data?.SOL?.price;
+            if (p > 0) return parseFloat(p);
+        },
+        async () => {
+            const r = await axios.get('https://api.kraken.com/0/public/Ticker?pair=SOLUSD', { timeout: 5000 });
+            const p = parseFloat(r.data?.result?.SOLUSD?.c?.[0] || r.data?.result?.SOLUSDT?.c?.[0]);
+            if (p > 0) return p;
+        },
+    ];
+    for (const src of sources) {
+        try {
+            const price = await src();
+            if (price && price > 0) return res.json({ solana: { usd: price } });
+        } catch (_) {}
+    }
+    res.status(503).json({ error: 'Price unavailable' });
+});
+
+// Temporary image token store - holds large data URIs (e.g. on-chain SVG) for the payment page
+// Avoids URL length limits when passing data: URIs as query params
+const nftImageTokens = {};
+app.post('/nft-image-token', (req, res) => {
+    const { dataUri } = req.body;
+    if (!dataUri) return res.status(400).json({ error: 'No dataUri' });
+    const token = require('crypto').randomBytes(12).toString('hex');
+    nftImageTokens[token] = { dataUri, expires: Date.now() + 10 * 60 * 1000 }; // 10 min TTL
+    // Clean up expired tokens
+    for (const k of Object.keys(nftImageTokens)) {
+        if (nftImageTokens[k].expires < Date.now()) delete nftImageTokens[k];
+    }
+    res.json({ token });
+});
+app.get('/nft-image-token/:token', (req, res) => {
+    const entry = nftImageTokens[req.params.token];
+    if (!entry || entry.expires < Date.now()) return res.status(404).json({ error: 'Token expired or not found' });
+    res.json({ dataUri: entry.dataUri });
+});
+
 // NFT Payment page - served via HTTP so Phantom extension can interact with it
 app.get('/nft-payment', (req, res) => {
     // Set permissive CSP to allow Solana CDN and IPFS gateways
@@ -6116,10 +6284,9 @@ app.get('/nft-payment', (req, res) => {
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>PhotoLynk NFT Payment</title>
-  <script src="https://bundle.run/buffer@6.0.3"></script>
-  <script>if(typeof window.Buffer==='undefined')window.Buffer=buffer.Buffer;</script>
-  <script src="https://unpkg.com/@solana/web3.js@1.87.6/lib/index.iife.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js" onerror="console.error('QRCode CDN failed, trying fallback');var s=document.createElement('script');s.src='https://unpkg.com/qrcode@1.5.3/build/qrcode.min.js';document.head.appendChild(s);"></script>
+  <script src="https://bundle.run/buffer@6.0.3" onerror="console.warn('buffer CDN failed')"></script>
+  <script>if(typeof window.Buffer==='undefined'&&typeof buffer!=='undefined')window.Buffer=buffer.Buffer;</script>
+  <script src="/lib/solana-web3.js" onerror="console.warn('[NFT] Local solana-web3 failed, trying CDN');var s=document.createElement('script');s.src='https://unpkg.com/@solana/web3.js@1.87.6/lib/index.iife.min.js';document.head.appendChild(s);"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f0f23 100%); min-height: 100vh; display: flex; align-items: center; justify-content: center; color: #fff; }
@@ -6158,18 +6325,13 @@ app.get('/nft-payment', (req, res) => {
     <div class="nft-preview"><img id="nft-image" src="" alt="NFT" onerror="this.style.display='none'"></div>
     <div class="nft-name" id="nft-name">Loading...</div>
     <div class="nft-type" id="nft-type">Compressed NFT</div>
-    <div class="amount-box">
-      <div class="amount-label">Pay now (App Fee)</div>
-      <div class="amount-value" id="amount-sol">0.000 SOL</div>
-      <div class="amount-usd" id="amount-usd">≈ $0.00 USD</div>
-    </div>
-
-    <div class="amount-box" id="estimated-box" style="display:none;">
-      <div class="amount-label">Estimated total cost</div>
+    <div class="amount-box" id="estimated-box">
+      <div class="amount-label">Estimated total</div>
       <div class="amount-value" id="estimated-sol">0.000 SOL</div>
       <div class="amount-usd" id="estimated-usd">≈ $0.00 USD</div>
+      <div style="font-size:10px;color:#666;margin-top:6px;">Solana fees are charged separately during mint</div>
     </div>
-    <button class="btn btn-phantom" id="pay-btn" onclick="connectAndPay()"><span>👻</span> Connect Phantom & Pay</button>
+    <button class="btn btn-phantom" id="pay-btn"><span>👻</span> Connect Phantom & Pay</button>
     <!-- QR code and external wallets hidden for future development -->
     <div style="display:none;margin:16px 0;color:#666;font-size:12px;">— or scan with any Solana wallet —</div>
     <div id="qr-container" style="display:none;background:#fff;padding:16px;border-radius:12px;margin-bottom:12px;min-width:180px;min-height:180px;"><canvas id="qr-code" width="180" height="180" style="display:block;"></canvas></div>
@@ -6185,6 +6347,7 @@ app.get('/nft-payment', (req, res) => {
     <h1>Payment Successful!</h1>
     <p class="subtitle">Your NFT is being minted on Solana</p>
     <div class="status success" style="display:block;" id="tx-link"></div>
+    <div id="success-amount" style="margin-top:12px;font-size:13px;color:#888;"></div>
     <button class="btn btn-phantom" onclick="window.close()" style="margin-top:24px;">Close Window</button>
   </div>
   <script>
@@ -6196,15 +6359,30 @@ app.get('/nft-payment', (req, res) => {
     const estimatedTotalUsd = parseFloat(params.get('estimatedTotalUsd')) || 0;
     const estimatedTotalSol = parseFloat(params.get('estimatedTotalSol')) || 0;
     const name = params.get('name') || 'PhotoLynk Memory';
-    const imageUrl = decodeURIComponent(params.get('imageUrl') || '');
+    const imageToken = params.get('imageToken') || '';
+    let imageUrl = params.get('imageUrl') || '';
     const nftType = params.get('nftType') || 'compressed';
     const storageOption = params.get('storageOption') || '';
     const fileSizeBytes = parseInt(params.get('fileSizeBytes') || '0', 10) || 0;
-    console.log('[NFT Payment] imageUrl:', imageUrl);
     document.getElementById('nft-name').textContent = name;
     const typeLabel = nftType === 'compressed' ? 'Compressed NFT (cNFT)' : 'Standard NFT';
-    const storageLabel = storageOption === 'cloud' ? 'StealthCloud' : (storageOption === 'ipfs' ? 'IPFS' : '');
+    const storageLabel = storageOption === 'cloud' ? 'StealthCloud' : storageOption === 'onchain' ? 'Embedded SVG' : (storageOption === 'ipfs' ? 'IPFS' : '');
     document.getElementById('nft-type').textContent = storageLabel ? (typeLabel + ' • ' + storageLabel) : typeLabel;
+    // For on-chain SVG, imageUrl is a large data URI passed via token to avoid URL length limits
+    if (imageToken) {
+      fetch('/nft-image-token/' + imageToken)
+        .then(r => r.json())
+        .then(d => {
+          if (d.dataUri) {
+            imageUrl = d.dataUri;
+            const img = document.getElementById('nft-image');
+            if (img) img.src = d.dataUri;
+          }
+        })
+        .catch(() => {});
+    } else if (imageUrl) {
+      document.getElementById('nft-image').src = imageUrl;
+    }
     function renderAmounts(extra) {
       const usdRate = solPrice > 0 ? solPrice : 200;
 
@@ -6213,26 +6391,21 @@ app.get('/nft-payment', (req, res) => {
         amount = feeUsd / usdRate;
       }
 
-      document.getElementById('amount-sol').textContent = amount.toFixed(6) + ' SOL';
-      document.getElementById('amount-usd').textContent = '≈ $' + (amount * usdRate).toFixed(2) + ' USD';
+      // Show estimated total (fall back to app fee if no estimate provided)
+      let estSol = estimatedTotalSol > 0 ? estimatedTotalSol : (estimatedTotalUsd > 0 ? estimatedTotalUsd / usdRate : amount);
+      let estUsd = estimatedTotalUsd > 0 ? estimatedTotalUsd : (estimatedTotalSol > 0 ? estimatedTotalSol * usdRate : amount * usdRate);
 
-      if (estimatedTotalUsd > 0 || estimatedTotalSol > 0) {
-        document.getElementById('estimated-box').style.display = 'block';
-        let estSol = estimatedTotalSol > 0 ? estimatedTotalSol : (estimatedTotalUsd / usdRate);
-        let estUsd = estimatedTotalUsd > 0 ? estimatedTotalUsd : (estimatedTotalSol * usdRate);
-
-        if (extra && typeof extra.estSol === 'number' && extra.estSol > 0) {
-          estSol = extra.estSol;
-          estUsd = estSol * usdRate;
-        }
-        document.getElementById('estimated-sol').textContent = estSol.toFixed(6) + ' SOL';
-        document.getElementById('estimated-usd').textContent = '≈ $' + estUsd.toFixed(2) + ' USD';
+      if (extra && typeof extra.estSol === 'number' && extra.estSol > 0) {
+        estSol = extra.estSol;
+        estUsd = estSol * usdRate;
       }
+      document.getElementById('estimated-sol').textContent = estSol.toFixed(6) + ' SOL';
+      document.getElementById('estimated-usd').textContent = '≈ $' + estUsd.toFixed(2) + ' USD';
     }
 
     async function refreshSolPrice() {
       try {
-        const res = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd', { cache: 'no-store' });
+        const res = await fetch('/sol-price', { cache: 'no-store' });
         const json = await res.json();
         const p = Number(json?.solana?.usd);
         if (Number.isFinite(p) && p > 0) {
@@ -6240,7 +6413,7 @@ app.get('/nft-payment', (req, res) => {
           renderAmounts();
         }
       } catch (e) {
-        // ignore
+        // ignore - use price passed in URL params
       }
     }
 
@@ -6260,9 +6433,10 @@ app.get('/nft-payment', (req, res) => {
       const ARWEAVE_UPLOAD_BASE_USD = 0.01;
       const ARWEAVE_PER_KB_USD = 0.00001;
       const metadataBytes = 2000;
+      const metaUsd = ARWEAVE_UPLOAD_BASE_USD + (metadataBytes / 1024) * ARWEAVE_PER_KB_USD;
+      if (storageOption === 'onchain') return metaUsd; // image is embedded in metadata, no separate upload
       const imageBytes = fileSizeBytes > 0 ? fileSizeBytes : 0;
       const imgUsd = ARWEAVE_UPLOAD_BASE_USD + (imageBytes / 1024) * ARWEAVE_PER_KB_USD;
-      const metaUsd = ARWEAVE_UPLOAD_BASE_USD + (metadataBytes / 1024) * ARWEAVE_PER_KB_USD;
       return imgUsd + metaUsd;
     }
 
@@ -6306,14 +6480,16 @@ app.get('/nft-payment', (req, res) => {
     }
 
     renderAmounts();
-    setInterval(refreshSolPrice, 15000);
+    refreshSolPrice();
+    setInterval(refreshSolPrice, 30000);
     refreshRealtimeEstimate();
-    setInterval(refreshRealtimeEstimate, 15000);
+    setInterval(refreshRealtimeEstimate, 30000);
     document.getElementById('recipient').textContent = recipient ? recipient.slice(0,4) + '...' + recipient.slice(-4) : '...';
-    if (imageUrl) {
+    // Set image: token fetch (on-chain SVG) is handled above; for regular imageUrl set it here
+    if (!imageToken && imageUrl) {
       const img = document.getElementById('nft-image');
       img.src = imageUrl;
-      img.onerror = function() { console.log('[NFT Payment] Image failed to load:', imageUrl); this.parentElement.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#666;">📷</div>'; };
+      img.onerror = function() { this.parentElement.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#666;">📷</div>'; };
     }
     
     // Generate Solana Pay QR code
@@ -6342,8 +6518,14 @@ app.get('/nft-payment', (req, res) => {
       walletLinksEl.appendChild(btn);
     });
     
+    const qrUiVisible = (function() {
+      const el = document.getElementById('qr-container');
+      return !!(el && getComputedStyle(el).display !== 'none');
+    })();
+
     let qrAttempts = 0;
     function generateQR() {
+      if (!qrUiVisible) return;
       qrAttempts++;
       console.log('[NFT Payment] QR attempt', qrAttempts, 'QRCode defined:', typeof QRCode !== 'undefined');
       if (typeof QRCode !== 'undefined' && QRCode.toCanvas) {
@@ -6365,12 +6547,12 @@ app.get('/nft-payment', (req, res) => {
         console.log('[NFT Payment] QRCode not ready, retrying in 300ms...');
         setTimeout(generateQR, 300);
       } else {
-        console.error('[NFT Payment] QRCode library failed to load after', qrAttempts, 'attempts');
+        console.warn('[NFT Payment] QRCode library failed to load after', qrAttempts, 'attempts');
         document.getElementById('qr-container').innerHTML = '<div style="width:180px;height:180px;display:flex;align-items:center;justify-content:center;color:#666;font-size:12px;">QR unavailable</div>';
       }
     }
     // Start QR generation with delay to ensure library loads
-    setTimeout(generateQR, 100);
+    if (qrUiVisible) setTimeout(generateQR, 100);
     
     // Poll for QR payment by checking recipient's recent transactions
     let qrPaymentDetected = false;
@@ -6443,14 +6625,51 @@ app.get('/nft-payment', (req, res) => {
       }
     }
     
-    // Start polling for QR payments (every 3 seconds)
-    pollInterval = setInterval(pollForQRPayment, 3000);
-    console.log('[NFT Payment] QR payment polling started for reference:', reference);
+    // Start polling for QR payments (every 3 seconds) only when QR flow is visible
+    if (qrUiVisible) {
+      pollInterval = setInterval(pollForQRPayment, 3000);
+      console.log('[NFT Payment] QR payment polling started for reference:', reference);
+    }
     
     function showStatus(msg, type) { const el = document.getElementById('status'); el.textContent = msg; el.className = 'status ' + type; }
     function setLoading(loading) { const btn = document.getElementById('pay-btn'); btn.disabled = loading; btn.innerHTML = loading ? '<div class="spinner"></div> Processing...' : '<span>👻</span> Connect Phantom & Pay'; }
     
+    async function rpcWithRetry(body, maxAttempts) {
+      maxAttempts = maxAttempts || 5;
+      let lastErr;
+      for (let i = 0; i < maxAttempts; i++) {
+        if (i > 0) await new Promise(r => setTimeout(r, 800 * i));
+        try {
+          const res = await fetch('/solana-rpc', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
+          if (res.status === 503) { lastErr = new Error('RPC unavailable (503)'); continue; }
+          const data = await res.json();
+          if (data.error && !data.result) { lastErr = new Error('RPC error: ' + (data.error.message || JSON.stringify(data.error))); continue; }
+          return data;
+        } catch (e) { lastErr = e; }
+      }
+      throw lastErr || new Error('All RPC attempts failed');
+    }
+    
+    // Wrap Phantom signing with timeout so page doesn't hang forever
+    function signWithTimeout(provider, tx, timeoutMs) {
+      timeoutMs = timeoutMs || 90000;
+      return Promise.race([
+        provider.signAndSendTransaction(tx),
+        new Promise(function(_, reject) { setTimeout(function() { reject(new Error('Phantom did not respond in time. Click the Phantom icon in your browser toolbar to approve.')); }, timeoutMs); })
+      ]);
+    }
+
+    function withTimeout(promise, timeoutMs, errorMessage) {
+      timeoutMs = timeoutMs || 30000;
+      return Promise.race([
+        promise,
+        new Promise(function(_, reject) { setTimeout(function() { reject(new Error(errorMessage || 'Operation timed out')); }, timeoutMs); })
+      ]);
+    }
+    
     async function connectAndPay() {
+      console.log('[NFT Payment] connectAndPay called, solanaWeb3:', typeof solanaWeb3);
+      if (typeof solanaWeb3 === 'undefined') { showStatus('Solana library still loading. Please wait a moment and try again.', 'error'); return; }
       const provider = window.phantom?.solana || window.solana;
       if (!provider?.isPhantom) { showStatus('Phantom wallet not found. Install it from phantom.app', 'error'); setTimeout(() => window.open('https://phantom.app/', '_blank'), 1500); return; }
       setLoading(true); showStatus('Connecting to Phantom...', 'info');
@@ -6461,31 +6680,26 @@ app.get('/nft-payment', (req, res) => {
           // Already connected
           pubkeyStr = provider.publicKey.toString();
         } else {
-          // Try connect with different approaches
+          // Connect to Phantom - no timeout here, user must approve in the popup
           try {
-            const resp = await provider.connect();
+            showStatus('Approve connection in Phantom popup...', 'info');
+            const resp = await provider.connect({ onlyIfTrusted: false });
             pubkeyStr = resp.publicKey.toString();
           } catch (connectErr) {
-            console.log('[NFT Payment] connect() failed, trying request():', connectErr.message);
-            try {
-              const resp = await provider.request({ method: 'connect' });
-              pubkeyStr = resp.publicKey.toString();
-            } catch (reqErr) {
-              console.log('[NFT Payment] request() also failed:', reqErr.message);
-              throw new Error('Could not connect to Phantom. Please unlock your wallet and try again.');
+            console.log('[NFT Payment] connect() failed:', connectErr.message);
+            const msg = (connectErr?.message || '').toLowerCase();
+            if (msg.includes('user rejected') || msg.includes('rejected')) {
+              throw new Error('Connection rejected. Click the button and approve in Phantom.');
             }
+            throw new Error('Could not connect to Phantom. Make sure Phantom is unlocked and try again.');
           }
         }
         showStatus('Connected: ' + pubkeyStr.slice(0,4) + '...' + pubkeyStr.slice(-4), 'info');
         
         // Get blockhash via local proxy (avoids CORS issues)
         showStatus('Getting blockhash...', 'info');
-        const rpcRes = await fetch('/solana-rpc', {
-          method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getLatestBlockhash', params: [{commitment:'confirmed'}] })
-        });
-        const rpcData = await rpcRes.json();
-        if (!rpcData.result?.value?.blockhash) throw new Error('Could not get blockhash');
+        const rpcData = await rpcWithRetry({ jsonrpc: '2.0', id: 1, method: 'getLatestBlockhash', params: [{commitment:'confirmed'}] });
+        if (!rpcData.result?.value?.blockhash) throw new Error('Could not get blockhash from any RPC endpoint. Please try again.');
         const blockhash = rpcData.result.value.blockhash;
         console.log('[NFT Payment] Got blockhash:', blockhash.slice(0,8) + '...');
         
@@ -6501,32 +6715,64 @@ app.get('/nft-payment', (req, res) => {
         const toPubkey = new PublicKey(recipient);
         const lamports = Math.ceil(amount * LAMPORTS_PER_SOL);
         
-        console.log('[NFT Payment] Creating transfer:', lamports, 'lamports to', recipient);
+        // Fee wallet exemption: commission wallet pays fee to itself — skip SOL transfer
+        // but keep all calculations visible (matches mobile nftOperations.js isFeeWalletExempt)
+        const isFeeWalletExempt = pubkeyStr === recipient;
+        let paymentSig = null;
         
-        const paymentTx = new Transaction().add(
-          SystemProgram.transfer({
-            fromPubkey,
-            toPubkey,
-            lamports
-          })
-        );
-        paymentTx.recentBlockhash = blockhash;
-        paymentTx.feePayer = fromPubkey;
-        
-        showStatus('Approve payment in Phantom...', 'info');
-        const { signature: paymentSig } = await provider.signAndSendTransaction(paymentTx);
-        console.log('[NFT Payment] Payment sent:', paymentSig);
+        if (isFeeWalletExempt) {
+          console.log('[NFT Payment] Fee wallet exempt — skipping commission transfer');
+          showStatus('Fee wallet detected — skipping payment...', 'info');
+          paymentSig = 'fee_wallet_exempt_' + Date.now();
+        } else {
+          console.log('[NFT Payment] Creating transfer:', lamports, 'lamports to', recipient);
+          
+          const paymentTx = new Transaction().add(
+            SystemProgram.transfer({
+              fromPubkey,
+              toPubkey,
+              lamports
+            })
+          );
+          paymentTx.recentBlockhash = blockhash;
+          paymentTx.feePayer = fromPubkey;
+          
+          showStatus('Approve payment in Phantom... (check Phantom popup)', 'info');
+          const result = await signWithTimeout(provider, paymentTx, 120000);
+          paymentSig = result.signature;
+          console.log('[NFT Payment] Payment sent:', paymentSig);
+          
+          // Verify payment on server before proceeding to mint
+          showStatus('Verifying payment...', 'info');
+          try {
+            const verifyRes = await fetch('/api/nft/verify-mint-payment', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ txSignature: paymentSig, expectedAmount: amount })
+            });
+            const verifyData = await verifyRes.json();
+            if (!verifyData.success) {
+              throw new Error('Payment verification failed: ' + (verifyData.error || 'Unknown error'));
+            }
+            console.log('[NFT Payment] Server verified payment:', verifyData.receivedAmount, 'SOL');
+          } catch (verifyErr) {
+            console.error('[NFT Payment] Verification error:', verifyErr.message);
+            // Don't block if server is unreachable (local server might be down) — only block on explicit rejection
+            if (verifyErr.message.includes('Payment verification failed') || verifyErr.message.includes('wrong wallet') || verifyErr.message.includes('Insufficient')) {
+              throw new Error(verifyErr.message);
+            }
+            console.warn('[NFT Payment] Verification skipped (server unreachable), proceeding with mint');
+          }
+        }
         
         // Now mint the NFT based on type
         showStatus('Minting your NFT...', 'info');
         const nftTypeParam = new URLSearchParams(window.location.search).get('nftType') || 'compressed';
         
         // Get fresh blockhash for mint transaction
-        const rpcRes2 = await fetch('/solana-rpc', {
-          method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getLatestBlockhash', params: [{commitment:'confirmed'}] })
-        });
-        const rpcData2 = await rpcRes2.json();
+        showStatus('Preparing mint transaction...', 'info');
+        const rpcData2 = await rpcWithRetry({ jsonrpc: '2.0', id: 1, method: 'getLatestBlockhash', params: [{commitment:'confirmed'}] });
+        if (!rpcData2.result?.value?.blockhash) throw new Error('Could not get blockhash for mint. Payment was sent. Contact support with tx: ' + paymentSig);
         const blockhash2 = rpcData2.result.value.blockhash;
         
         let mintSig;
@@ -6562,11 +6808,7 @@ app.get('/nft-payment', (req, res) => {
           );
           
           // Get rent for mint account (82 bytes)
-          const rentRes = await fetch('/solana-rpc', {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getMinimumBalanceForRentExemption', params: [82] })
-          });
-          const rentData = await rentRes.json();
+          const rentData = await rpcWithRetry({ jsonrpc: '2.0', id: 1, method: 'getMinimumBalanceForRentExemption', params: [82] });
           const mintRent = rentData.result;
           
           // 1. Create mint account
@@ -6706,24 +6948,33 @@ app.get('/nft-payment', (req, res) => {
           standardTx.feePayer = fromPubkey;
           standardTx.partialSign(mintKeypair);
           
-          showStatus('Approve standard NFT mint in Phantom...', 'info');
-          const result = await provider.signAndSendTransaction(standardTx);
+          showStatus('Approve standard NFT mint in Phantom... (check popup)', 'info');
+          const result = await signWithTimeout(provider, standardTx, 120000);
           mintSig = result.signature;
           console.log('[NFT Payment] Standard NFT minted:', mintSig, 'Mint:', mintPubkey.toBase58());
           
-          // Send success data to app
-          const imageUrlStd = new URLSearchParams(window.location.search).get('imageUrl') || '';
-          const amountStd = new URLSearchParams(window.location.search).get('amount') || '0';
+          // Send success data to app (forward all edition/hash params from URL)
+          const qsStd = new URLSearchParams(window.location.search);
           fetch('/nft-mint-success', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               paymentTx: paymentSig,
               mintTx: mintSig,
-              imageUrl: imageUrlStd,
-              amount: parseFloat(amountStd),
+              name: qsStd.get('name') || '',
+              imageUrl: qsStd.get('imageUrl') || '',
+              amount: parseFloat(qsStd.get('amount') || '0'),
               nftType: 'standard',
-              mintAddress: mintPubkey.toBase58()
+              mintAddress: mintPubkey.toBase58(),
+              metadataUrl: qsStd.get('metadataUrl') || '',
+              wallet: qsStd.get('wallet') || '',
+              edition: qsStd.get('edition') || '',
+              license: qsStd.get('license') || '',
+              watermark: qsStd.get('watermark') || 'false',
+              encrypt: qsStd.get('encrypt') || 'false',
+              storageOption: qsStd.get('storageOption') || '',
+              contentHash: qsStd.get('contentHash') || '',
+              exifHash: qsStd.get('exifHash') || '',
             })
           }).catch(e => console.log('Failed to notify app:', e));
           
@@ -6828,34 +7079,66 @@ app.get('/nft-payment', (req, res) => {
         mintTx.recentBlockhash = blockhash2;
         mintTx.feePayer = fromPubkey;
         
-        showStatus('Approve NFT mint in Phantom...', 'info');
-        const mintResult = await provider.signAndSendTransaction(mintTx);
+        showStatus('Approve NFT mint in Phantom... (check popup)', 'info');
+        const mintResult = await signWithTimeout(provider, mintTx, 120000);
         mintSig = mintResult.signature;
         console.log('[NFT Payment] NFT minted:', mintSig);
         
-        // Send success data to app
-        const imageUrl = new URLSearchParams(window.location.search).get('imageUrl') || '';
-        const amountParam = new URLSearchParams(window.location.search).get('amount') || '0';
+        // Send success data to app (forward all edition/hash params from URL)
+        const qs = new URLSearchParams(window.location.search);
         fetch('/nft-mint-success', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             paymentTx: paymentSig,
             mintTx: mintSig,
-            imageUrl: imageUrl,
-            amount: parseFloat(amountParam),
-            nftType: nftTypeParam
+            name: qs.get('name') || '',
+            imageUrl: imageUrl || qs.get('imageUrl') || '',
+            imageToken: qs.get('imageToken') || '',
+            amount: parseFloat(qs.get('amount') || '0'),
+            nftType: nftTypeParam,
+            metadataUrl: qs.get('metadataUrl') || '',
+            wallet: qs.get('wallet') || '',
+            edition: qs.get('edition') || '',
+            license: qs.get('license') || '',
+            watermark: qs.get('watermark') || 'false',
+            encrypt: qs.get('encrypt') || 'false',
+            storageOption: qs.get('storageOption') || '',
+            contentHash: qs.get('contentHash') || '',
+            exifHash: qs.get('exifHash') || '',
           })
         }).catch(e => console.log('Failed to notify app:', e));
         
         document.getElementById('main-container').style.display = 'none';
         document.getElementById('success-container').style.display = 'block';
         document.getElementById('tx-link').innerHTML = 'Payment: <a href="https://solscan.io/tx/' + paymentSig + '" target="_blank" style="color:#14F195;">' + paymentSig.slice(0,8) + '...</a><br>NFT Mint: <a href="https://solscan.io/tx/' + mintSig + '" target="_blank" style="color:#14F195;">' + mintSig.slice(0,8) + '...</a>';
+        const liveRate = solPrice > 0 ? solPrice : 200;
+        const paidSol = parseFloat(params.get('amount') || '0');
+        document.getElementById('success-amount').textContent = 'Paid: ' + paidSol.toFixed(6) + ' SOL (~$' + (paidSol * liveRate).toFixed(2) + ' USD @ $' + liveRate.toFixed(0) + '/SOL)';
         
         // Auto-close after 3 seconds
         setTimeout(() => window.close(), 3000);
-      } catch (err) { console.error('Payment error:', err); showStatus(err.message || 'Payment failed', 'error'); setLoading(false); }
+      } catch (err) {
+        console.error('Payment error:', err);
+        var errMsg = err.message || 'Payment failed';
+        if (errMsg.includes('User rejected')) errMsg = 'Transaction rejected. Click the button to try again.';
+        showStatus(errMsg, 'error');
+        setLoading(false);
+      }
     }
+
+    // Ensure click wiring is always present (more reliable than inline handlers)
+    window.connectAndPay = connectAndPay;
+    const payBtn = document.getElementById('pay-btn');
+    if (payBtn) {
+      payBtn.addEventListener('click', function(e) {
+        e.preventDefault();
+        connectAndPay();
+      });
+    }
+
+    // Reset stale UI state if page was restored from browser cache
+    setLoading(false);
   </script>
 </body>
 </html>`);
@@ -6863,15 +7146,32 @@ app.get('/nft-payment', (req, res) => {
 
 // NFT mint success callback - receives mint details from browser to show in app
 app.post('/nft-mint-success', (req, res) => {
-    const { paymentTx, mintTx, imageUrl, amount, nftType } = req.body;
-    console.log('[NFT] Mint success received:', { paymentTx, mintTx, amount, nftType });
+    const { paymentTx, mintTx, name, imageUrl, imageToken, amount, nftType, mintAddress, metadataUrl, wallet, edition, license, watermark, encrypt, storageOption, contentHash, exifHash } = req.body;
+    console.log('[NFT] Mint success received:', { paymentTx, mintTx, amount, nftType, edition, contentHash: contentHash?.substring(0, 16) });
+    // Resolve imageToken server-side so album always gets the real image URL for onchain NFTs
+    let resolvedImageUrl = imageUrl || '';
+    if (!resolvedImageUrl && imageToken && nftImageTokens[imageToken]) {
+        resolvedImageUrl = nftImageTokens[imageToken].dataUri || '';
+        console.log('[NFT] Resolved imageToken to data URI for mint success, length:', resolvedImageUrl.length);
+    }
     // Store for app to poll
     global.nftMintSuccess = {
         paymentTx,
         mintTx,
-        imageUrl,
+        name,
+        imageUrl: resolvedImageUrl,
         amount,
         nftType,
+        mintAddress,
+        metadataUrl,
+        wallet,
+        edition,
+        license,
+        watermark,
+        encrypt,
+        storageOption,
+        contentHash,
+        exifHash,
         timestamp: Date.now()
     };
     res.json({ success: true });
@@ -6989,6 +7289,7 @@ app.get('/wallet-connect', (req, res) => {
     <div class="logo">👻</div>
     <h1>Connect Phantom</h1>
     <p class="subtitle">Connect your Solana wallet to PhotoLynk</p>
+    <p style="color:#AB9FF2;font-size:12px;margin-top:4px;margin-bottom:20px;">If Phantom not opened, unlock wallet and refresh this page in browser</p>
     <button class="btn btn-phantom" id="connect-btn"><span>🔗</span> Connect Phantom Wallet</button>
     <button class="btn btn-secondary" onclick="window.close()" style="margin-top:12px;">Cancel</button>
     <div class="status" id="status"></div>
@@ -7147,34 +7448,58 @@ app.get('/wallet-connect', (req, res) => {
       }, 1000);
     });
     
-    // Wait for Phantom extension to inject (can take 1-3 seconds on some browsers)
+    // Wait for Phantom extension to inject, then keep retrying after unlock
     let phantomCheckAttempts = 0;
-    const maxPhantomChecks = 15; // Check for up to 7.5 seconds
+    const maxPhantomChecks = 20; // 10 seconds for initial detection
+    let retryConnectInterval = null;
+    
+    function startRetryLoop() {
+      if (retryConnectInterval) return;
+      showStatus('🔓 Wallet locked - unlock Phantom, then we will connect automatically...', 'info');
+      document.getElementById('unlock-steps') && (document.getElementById('unlock-steps').style.display = 'block');
+      retryConnectInterval = setInterval(async () => {
+        const p = window.phantom?.solana || window.solana;
+        if (!p) return;
+        // Try trusted first (instant if already approved this site)
+        try {
+          const resp = await p.connect({ onlyIfTrusted: true });
+          if (resp?.publicKey) { clearInterval(retryConnectInterval); retryConnectInterval = null; showSuccess(resp.publicKey.toString()); return; }
+        } catch (e) {}
+        // Try full connect (will pop up Phantom if unlocked)
+        try {
+          const resp = await p.connect({ onlyIfTrusted: false });
+          if (resp?.publicKey) { clearInterval(retryConnectInterval); retryConnectInterval = null; showSuccess(resp.publicKey.toString()); return; }
+        } catch (e) {
+          // User rejected or still locked - keep retrying silently
+        }
+      }, 1500);
+      // Stop after 3 minutes
+      setTimeout(() => { if (retryConnectInterval) { clearInterval(retryConnectInterval); retryConnectInterval = null; showStatus('Timed out. Click Connect to try again.', 'error'); } }, 180000);
+    }
     
     function waitForPhantom() {
       phantomCheckAttempts++;
       const provider = window.phantom?.solana || window.solana;
       
       if (provider?.isPhantom) {
-        // Phantom found - try eager connect
-        showStatus('Phantom detected!', 'info');
+        showStatus('Phantom detected! Connecting...', 'info');
         provider.connect({ onlyIfTrusted: true }).then(resp => {
-          if (resp?.publicKey) showSuccess(resp.publicKey.toString());
-          else showStatus('Click Connect to link your wallet', 'info');
+          if (resp?.publicKey) { showSuccess(resp.publicKey.toString()); }
+          else { startRetryLoop(); }
         }).catch(() => {
-          showStatus('Click Connect to link your wallet', 'info');
+          // Eager connect failed (not trusted yet or locked) - start retry loop
+          startRetryLoop();
         });
+      } else if (provider && !provider.isPhantom) {
+        // Provider exists but not fully ready (locked state on some versions)
+        startRetryLoop();
       } else if (phantomCheckAttempts < maxPhantomChecks) {
-        // Keep checking - extension may still be loading
-        showStatus('Looking for Phantom wallet... (' + phantomCheckAttempts + '/' + maxPhantomChecks + ')', 'info');
+        if (phantomCheckAttempts > 4) showStatus('Looking for Phantom... Click the Phantom icon in your toolbar if needed.', 'info');
         setTimeout(waitForPhantom, 500);
       } else {
-        // Phantom not found after all attempts
-        showStatus('Phantom wallet not detected. Make sure the extension is installed and enabled for this site.', 'error');
+        showStatus('Phantom not detected. Install from phantom.app or enable the extension for localhost.', 'error');
         document.getElementById('connect-btn').innerHTML = '<span>📥</span> Install Phantom';
-        document.getElementById('connect-btn').onclick = function() {
-          window.open('https://phantom.app/', '_blank');
-        };
+        document.getElementById('connect-btn').onclick = function() { window.open('https://phantom.app/', '_blank'); };
       }
     }
     
