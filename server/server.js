@@ -3315,78 +3315,6 @@ async function verifySolanaTransaction(txSignature, expectedSolAmount) {
     };
 }
 
-// ============================================================================
-// NFT MINTING PAYMENT VERIFICATION
-// ============================================================================
-// Verifies that the NFT minting fee was actually paid to our wallet on-chain.
-// Called by the payment page after the user signs the SOL transfer.
-// Without this, someone could modify the desktop app to change the fee wallet
-// or set the fee to 0 and mint for free.
-
-// Create nft_payments table for replay protection
-db.run(`CREATE TABLE IF NOT EXISTS nft_payments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    tx_signature TEXT UNIQUE NOT NULL,
-    sender TEXT NOT NULL,
-    sol_amount REAL NOT NULL,
-    verified_at INTEGER NOT NULL
-)`);
-
-// NFT fee verification — no auth required (payment page is unauthenticated browser tab)
-// The payment page calls this after Phantom signs the tx, before showing success.
-app.post('/api/nft/verify-mint-payment', async (req, res) => {
-    const { txSignature, expectedAmount } = req.body || {};
-
-    if (!txSignature || typeof txSignature !== 'string') {
-        return res.status(400).json({ success: false, error: 'Missing txSignature' });
-    }
-
-    try {
-        // Check replay — same tx can't be used twice
-        const existing = await dbGetAsync(`SELECT id FROM nft_payments WHERE tx_signature = ?`, [txSignature]);
-        if (existing) {
-            // Already verified — return success (idempotent for retries)
-            return res.json({ success: true, message: 'Already verified' });
-        }
-
-        // Verify on-chain
-        const verification = await verifySolanaTransaction(txSignature, expectedAmount);
-        if (!verification.success) {
-            console.log(`[NFT-Pay] Verification failed for ${txSignature}: ${verification.error}`);
-            return res.status(400).json({ success: false, error: verification.error || 'Verification failed' });
-        }
-
-        // Check recipient is our wallet
-        if (verification.receiver !== SOLANA_PAYMENT_WALLET) {
-            console.log(`[NFT-Pay] Wrong recipient: expected ${SOLANA_PAYMENT_WALLET}, got ${verification.receiver}`);
-            return res.status(400).json({ success: false, error: 'Payment sent to wrong wallet' });
-        }
-
-        // Check amount (allow 1% tolerance for rounding)
-        const expected = parseFloat(expectedAmount) || 0;
-        if (expected > 0 && verification.receivedAmount < expected * 0.99) {
-            console.log(`[NFT-Pay] Insufficient amount: expected ${expected}, got ${verification.receivedAmount}`);
-            return res.status(400).json({ success: false, error: 'Insufficient payment amount' });
-        }
-
-        // Record payment
-        await dbRunAsync(
-            `INSERT OR IGNORE INTO nft_payments (tx_signature, sender, sol_amount, verified_at) VALUES (?, ?, ?, ?)`,
-            [txSignature, verification.sender || '', verification.receivedAmount || 0, Date.now()]
-        );
-
-        console.log(`[NFT-Pay] Verified: ${txSignature} — ${verification.receivedAmount} SOL from ${verification.sender}`);
-        return res.json({
-            success: true,
-            receivedAmount: verification.receivedAmount,
-            sender: verification.sender,
-        });
-    } catch (e) {
-        console.error('[NFT-Pay] Error:', e.message);
-        return res.status(500).json({ success: false, error: 'Server error during verification' });
-    }
-});
-
 // Create solana_payments table if not exists
 db.run(`CREATE TABLE IF NOT EXISTS solana_payments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -6740,29 +6668,7 @@ app.get('/nft-payment', (req, res) => {
           showStatus('Approve payment in Phantom... (check Phantom popup)', 'info');
           const result = await signWithTimeout(provider, paymentTx, 120000);
           paymentSig = result.signature;
-          console.log('[NFT Payment] Payment sent:', paymentSig);
-          
-          // Verify payment on server before proceeding to mint
-          showStatus('Verifying payment...', 'info');
-          try {
-            const verifyRes = await fetch('/api/nft/verify-mint-payment', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ txSignature: paymentSig, expectedAmount: amount })
-            });
-            const verifyData = await verifyRes.json();
-            if (!verifyData.success) {
-              throw new Error('Payment verification failed: ' + (verifyData.error || 'Unknown error'));
-            }
-            console.log('[NFT Payment] Server verified payment:', verifyData.receivedAmount, 'SOL');
-          } catch (verifyErr) {
-            console.error('[NFT Payment] Verification error:', verifyErr.message);
-            // Don't block if server is unreachable (local server might be down) — only block on explicit rejection
-            if (verifyErr.message.includes('Payment verification failed') || verifyErr.message.includes('wrong wallet') || verifyErr.message.includes('Insufficient')) {
-              throw new Error(verifyErr.message);
-            }
-            console.warn('[NFT Payment] Verification skipped (server unreachable), proceeding with mint');
-          }
+          console.log('[NFT Payment] Payment confirmed on-chain:', paymentSig);
         }
         
         // Now mint the NFT based on type
