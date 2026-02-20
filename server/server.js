@@ -5992,16 +5992,45 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
         } else if (action === 'backup' && Array.isArray(nfts)) {
             // Backup: merge all NFTs (add new, update existing with missing fields)
             const existingMap = {};
-            data.nfts.forEach((n, i) => { if (n.mintAddress) existingMap[n.mintAddress] = i; });
+            const existingMetaMap = {};
+            data.nfts.forEach((n, i) => {
+                if (n.mintAddress) existingMap[n.mintAddress] = i;
+                if (n.metadataUrl) existingMetaMap[n.metadataUrl] = i;
+            });
             let added = 0;
             let updated = 0;
+            let deduped = 0;
             const mergeFields = ['encryptionData','thumbnailUrl','imageUrl','edition','encrypted','watermarked','license','storageType','nftType','isCompressed','assetId','txSignature','attributes','createdAt'];
             for (const n of nfts) {
                 if (!n.mintAddress) continue;
+                // Skip tx_ temp entries if a real entry with same metadataUrl already exists
+                if (n.mintAddress.startsWith('tx_') && n.metadataUrl && existingMetaMap[n.metadataUrl] !== undefined) {
+                    const realIdx = existingMetaMap[n.metadataUrl];
+                    if (data.nfts[realIdx] && !data.nfts[realIdx].mintAddress.startsWith('tx_')) {
+                        // Merge encryption fields from tx_ entry into real entry
+                        const real = data.nfts[realIdx];
+                        if (n.encryptionData && !real.encryptionData) real.encryptionData = n.encryptionData;
+                        if (n.thumbnailUrl && !real.thumbnailUrl) real.thumbnailUrl = n.thumbnailUrl;
+                        deduped++;
+                        continue;
+                    }
+                }
                 const idx = existingMap[n.mintAddress];
                 if (idx === undefined) {
+                    // Before adding, check if a tx_ entry exists with same metadataUrl — replace it
+                    if (n.metadataUrl && !n.mintAddress.startsWith('tx_') && existingMetaMap[n.metadataUrl] !== undefined) {
+                        const oldIdx = existingMetaMap[n.metadataUrl];
+                        if (data.nfts[oldIdx] && data.nfts[oldIdx].mintAddress.startsWith('tx_')) {
+                            const old = data.nfts[oldIdx];
+                            data.nfts[oldIdx] = { ...old, ...n };
+                            existingMap[n.mintAddress] = oldIdx;
+                            deduped++;
+                            continue;
+                        }
+                    }
                     data.nfts.push(n);
                     existingMap[n.mintAddress] = data.nfts.length - 1;
+                    if (n.metadataUrl) existingMetaMap[n.metadataUrl] = data.nfts.length - 1;
                     added++;
                 } else {
                     // Merge missing fields + always overwrite critical encryption fields
