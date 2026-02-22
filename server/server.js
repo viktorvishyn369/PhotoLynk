@@ -6099,15 +6099,36 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
                 console.log(`[NFT] Certificate added: user=${req.user.id} id=${certificate.id}`);
             }
         } else if (action === 'backup' && Array.isArray(certificates)) {
-            let added = 0;
+            let added = 0, updated = 0;
+            const existingMap = {};
+            certs.forEach((c, i) => { if (c.id) existingMap[c.id] = i; });
             for (const c of certificates) {
                 if (!existingIds.has(c.id)) {
                     certs.push(c);
                     existingIds.add(c.id);
                     added++;
+                } else {
+                    // Merge enrichment fields into existing cert (don't overwrite, only fill gaps)
+                    const idx = existingMap[c.id];
+                    if (idx !== undefined) {
+                        const ex = certs[idx];
+                        let changed = false;
+                        if (c.hasRfc3161 && !ex.hasRfc3161) { ex.hasRfc3161 = true; changed = true; }
+                        if (c.hasC2pa && !ex.hasC2pa) { ex.hasC2pa = true; changed = true; }
+                        if (c.rfc3161Token && !ex.rfc3161Token) { ex.rfc3161Token = c.rfc3161Token; changed = true; }
+                        if (c.c2paManifest && !ex.c2paManifest) { ex.c2paManifest = c.c2paManifest; changed = true; }
+                        if (c.encrypted && !ex.encrypted) { ex.encrypted = true; changed = true; }
+                        if (c.watermarked && !ex.watermarked) { ex.watermarked = true; changed = true; }
+                        if (c.license && !ex.license) { ex.license = c.license; changed = true; }
+                        if (c.storageType && !ex.storageType) { ex.storageType = c.storageType; changed = true; }
+                        if (c.contentHash && !ex.contentHash) { ex.contentHash = c.contentHash; changed = true; }
+                        if (c.exifHash && !ex.exifHash) { ex.exifHash = c.exifHash; changed = true; }
+                        if (c.cameraHash && !ex.cameraHash) { ex.cameraHash = c.cameraHash; changed = true; }
+                        if (changed) updated++;
+                    }
                 }
             }
-            console.log(`[NFT] Certificates backup: user=${req.user.id} added=${added} total=${certs.length}`);
+            console.log(`[NFT] Certificates backup: user=${req.user.id} added=${added} updated=${updated} total=${certs.length}`);
         } else {
             return res.status(400).json({ error: 'Invalid action' });
         }
@@ -6119,6 +6140,18 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
         res.status(500).json({ error: 'Failed to sync certificates' });
     }
 });
+
+// ============================================================================
+// NFT SERVICE (server-side minting for mobile-v2)
+// ============================================================================
+try {
+    const nftService = require('../nft-service');
+    nftService.initialize();
+    app.use('/api/nft-service', authenticateToken, nftService.routes);
+    console.log('[NFT Service] Mounted at /api/nft-service');
+} catch (nftServiceErr) {
+    console.log('[NFT Service] Not available:', nftServiceErr.message);
+}
 
 // Solana RPC proxy - avoids CORS issues when calling from browser
 app.post('/solana-rpc', async (req, res) => {
