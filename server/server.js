@@ -6965,6 +6965,9 @@ app.get('/nft-payment', (req, res) => {
               name: qsStd.get('name') || '',
               imageUrl: qsStd.get('imageUrl') || '',
               amount: parseFloat(qsStd.get('amount') || '0'),
+              estimatedTotalSol: parseFloat(qsStd.get('estimatedTotalSol') || '0'),
+              estimatedTotalUsd: parseFloat(qsStd.get('estimatedTotalUsd') || '0'),
+              solPrice: parseFloat(qsStd.get('solPrice') || '0'),
               nftType: 'standard',
               mintAddress: mintPubkey.toBase58(),
               metadataUrl: qsStd.get('metadataUrl') || '',
@@ -7097,6 +7100,9 @@ app.get('/nft-payment', (req, res) => {
             imageUrl: imageUrl || qs.get('imageUrl') || '',
             imageToken: qs.get('imageToken') || '',
             amount: parseFloat(qs.get('amount') || '0'),
+            estimatedTotalSol: parseFloat(qs.get('estimatedTotalSol') || '0'),
+            estimatedTotalUsd: parseFloat(qs.get('estimatedTotalUsd') || '0'),
+            solPrice: parseFloat(qs.get('solPrice') || '0'),
             nftType: nftTypeParam,
             metadataUrl: qs.get('metadataUrl') || '',
             wallet: qs.get('wallet') || '',
@@ -7114,8 +7120,9 @@ app.get('/nft-payment', (req, res) => {
         document.getElementById('success-container').style.display = 'block';
         document.getElementById('tx-link').innerHTML = 'Payment: <a href="https://solscan.io/tx/' + paymentSig + '" target="_blank" style="color:#14F195;">' + paymentSig.slice(0,8) + '...</a><br>NFT Mint: <a href="https://solscan.io/tx/' + mintSig + '" target="_blank" style="color:#14F195;">' + mintSig.slice(0,8) + '...</a>';
         const liveRate = solPrice > 0 ? solPrice : 200;
-        const paidSol = parseFloat(params.get('amount') || '0');
-        document.getElementById('success-amount').textContent = 'Paid: ' + paidSol.toFixed(6) + ' SOL (~$' + (paidSol * liveRate).toFixed(2) + ' USD @ $' + liveRate.toFixed(0) + '/SOL)';
+        const totalSol = parseFloat(params.get('estimatedTotalSol') || '0') || parseFloat(params.get('amount') || '0');
+        const totalUsd = parseFloat(params.get('estimatedTotalUsd') || '0') || (totalSol * liveRate);
+        document.getElementById('success-amount').textContent = 'Paid: ' + totalSol.toFixed(6) + ' SOL (~$' + totalUsd.toFixed(2) + ' USD @ $' + liveRate.toFixed(0) + '/SOL)';
         
         // Auto-close after 3 seconds
         setTimeout(() => window.close(), 3000);
@@ -7147,8 +7154,8 @@ app.get('/nft-payment', (req, res) => {
 
 // NFT mint success callback - receives mint details from browser to show in app
 app.post('/nft-mint-success', (req, res) => {
-    const { paymentTx, mintTx, name, imageUrl, imageToken, amount, nftType, mintAddress, metadataUrl, wallet, edition, license, watermark, encrypt, storageOption, contentHash, exifHash } = req.body;
-    console.log('[NFT] Mint success received:', { paymentTx, mintTx, amount, nftType, edition, contentHash: contentHash?.substring(0, 16) });
+    const { paymentTx, mintTx, name, imageUrl, imageToken, amount, estimatedTotalSol, estimatedTotalUsd, solPrice, nftType, mintAddress, metadataUrl, wallet, edition, license, watermark, encrypt, storageOption, contentHash, exifHash } = req.body;
+    console.log('[NFT] Mint success received:', { paymentTx, mintTx, amount, estimatedTotalSol, estimatedTotalUsd, nftType, edition, contentHash: contentHash?.substring(0, 16) });
     // Resolve imageToken server-side so album always gets the real image URL for onchain NFTs
     let resolvedImageUrl = imageUrl || '';
     if (!resolvedImageUrl && imageToken && nftImageTokens[imageToken]) {
@@ -7162,6 +7169,9 @@ app.post('/nft-mint-success', (req, res) => {
         name,
         imageUrl: resolvedImageUrl,
         amount,
+        estimatedTotalSol,
+        estimatedTotalUsd,
+        solPrice,
         nftType,
         mintAddress,
         metadataUrl,
