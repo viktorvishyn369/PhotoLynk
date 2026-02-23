@@ -3390,14 +3390,19 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
     const tmpPath = path.join(deviceDir, tmpName);
     const finalPath = path.join(deviceDir, safeName);
 
-    // Clean up any stale .uploading files for this same filename (from previous failed attempts/retries)
+    // Clean up ALL stale .uploading files in device directory (from previous failed/aborted uploads)
     try {
         const entries = fs.readdirSync(deviceDir);
         for (const entry of entries) {
-            if (entry.endsWith(`_${safeName}.uploading`)) {
+            if (entry.endsWith('.uploading')) {
+                const entryPath = path.join(deviceDir, entry);
                 try {
-                    fs.unlinkSync(path.join(deviceDir, entry));
-                    console.log(`[Upload] Cleaned up stale temp file: ${entry}`);
+                    // Only clean up files older than 30 seconds (avoid deleting active uploads)
+                    const stat = fs.statSync(entryPath);
+                    if (Date.now() - stat.mtimeMs > 30000) {
+                        fs.unlinkSync(entryPath);
+                        console.log(`[Upload] Cleaned up stale temp file: ${entry}`);
+                    }
                 } catch (e) {
                     // Ignore - file might be locked by another upload in progress
                 }
@@ -3472,6 +3477,24 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
     });
 
     out.on('finish', async () => {
+        const cleanupTmp = (delayMs) => {
+            const doClean = () => {
+                try {
+                    if (fs.existsSync(tmpPath)) {
+                        fs.unlinkSync(tmpPath);
+                        console.log(`[Upload] Cleaned up temp file: ${path.basename(tmpPath)}`);
+                    }
+                } catch (e) {
+                    // Retry once after 500ms if file is still locked
+                    setTimeout(() => {
+                        try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
+                    }, 500);
+                }
+            };
+            if (delayMs) setTimeout(doClean, delayMs);
+            else doClean();
+        };
+
         const fileHash = hasher.digest('hex');
         const mimetype = (req.headers['content-type'] || 'application/octet-stream').toString();
         const size = writtenBytes;
@@ -4335,10 +4358,26 @@ app.get('/api/files/:filename', authenticateToken, async (req, res) => {
 // --- StealthCloud (zero-knowledge) routes ---
 // Server stores encrypted chunks and encrypted manifests only.
 
-// Server uptime status (persistent and shareable)
-// Tracks: totalUptimeMs (cumulative on-time), downtimeMs (cumulative off-time), lastHeartbeat (last seen running), startedAt (anchor for lifetime history)
+// Server uptime status (honest, persistent, shared between main and Pi)
+// Tracks real uptime and downtime with a rolling event log for accurate 24h percentage.
+// Both main and Pi run the same server.js — the active instance writes heartbeats.
+// Gaps between heartbeats > HEARTBEAT_GAP_THRESHOLD_MS are counted as real downtime.
+//
+// Failover support (bidirectional):
+// Each server has PEER_SERVER_URL pointing to the other.
+// On startup with a gap, it tries to fetch the peer's uptime state:
+// - If peer responds: peer was serving during the gap → credit peer's uptime, only
+//   count two short failover transitions (~30s each) as downtime.
+// - If peer is unreachable: nobody was serving → count the full gap as downtime.
+// This works for both directions: main→pi failover and pi→main recovery.
 const UPTIME_STATE_PATH = process.env.UPTIME_STATE_PATH || path.join(DATA_DIR, 'uptime.json');
-const UPTIME_ANCHOR_START = new Date('2026-01-01T00:00:00Z').getTime();
+const SERVER_ROLE = process.env.SERVER_ROLE || 'main'; // 'main' or 'pi'
+const PEER_SERVER_URL = process.env.PEER_SERVER_URL || null; // main→pi or pi→main
+const HEARTBEAT_INTERVAL_MS = 60 * 1000; // 60s heartbeat
+const HEARTBEAT_GAP_THRESHOLD_MS = 2 * 60 * 1000; // >2 min gap = downtime
+const FAILOVER_GAP_MS = 30 * 1000; // Assume ~30s downtime per failover transition
+const EVENT_LOG_RETENTION_MS = 48 * 60 * 60 * 1000; // Keep 48h of events for 24h window calc
+
 function loadUptimeState() {
     try {
         if (!fs.existsSync(UPTIME_STATE_PATH)) return null;
@@ -4346,28 +4385,20 @@ function loadUptimeState() {
         const parsed = JSON.parse(raw);
         if (!parsed || typeof parsed !== 'object') return null;
 
-        // New format
-        if (parsed.totalUptimeMs !== undefined && parsed.downtimeMs !== undefined && parsed.lastHeartbeat !== undefined) {
+        // Current format: v2 with event log
+        if (parsed.v === 2 && Array.isArray(parsed.events)) {
             return {
+                v: 2,
                 totalUptimeMs: Math.max(0, Number(parsed.totalUptimeMs) || 0),
-                downtimeMs: Math.max(0, Number(parsed.downtimeMs) || 0),
-                lastHeartbeat: Number(parsed.lastHeartbeat) || Date.now(),
-                startedAt: Number(parsed.startedAt) || UPTIME_ANCHOR_START
+                totalDowntimeMs: Math.max(0, Number(parsed.totalDowntimeMs) || 0),
+                lastHeartbeat: Number(parsed.lastHeartbeat) || 0,
+                firstSeen: Number(parsed.firstSeen) || Date.now(),
+                lastRole: parsed.lastRole || SERVER_ROLE,
+                events: parsed.events, // [{t: timestamp, type: 'up'|'down', durationMs, role}]
             };
         }
 
-        // Old format: convert startedAt/lastSeen/downtimeMs
-        const { startedAt, lastSeen, downtimeMs } = parsed;
-        if (startedAt !== undefined && lastSeen !== undefined && downtimeMs !== undefined) {
-            const elapsed = Math.max(0, Number(lastSeen) - Number(startedAt));
-            const uptime = Math.max(0, elapsed - Number(downtimeMs));
-            return {
-                totalUptimeMs: uptime,
-                downtimeMs: Math.max(0, Number(downtimeMs) || 0),
-                lastHeartbeat: Number(lastSeen) || Date.now(),
-                startedAt: Number(startedAt) || UPTIME_ANCHOR_START
-            };
-        }
+        // Migrate from v1 (old format) — start fresh with honest counters
         return null;
     } catch (e) {
         return null;
@@ -4377,98 +4408,388 @@ function loadUptimeState() {
 function saveUptimeState(state) {
     try {
         fs.mkdirSync(path.dirname(UPTIME_STATE_PATH), { recursive: true });
-        fs.writeFileSync(UPTIME_STATE_PATH, JSON.stringify({
-            totalUptimeMs: state.totalUptimeMs,
-            downtimeMs: state.downtimeMs,
-            lastHeartbeat: state.lastHeartbeat,
-            startedAt: state.startedAt
-        }));
+        fs.writeFileSync(UPTIME_STATE_PATH, JSON.stringify(state));
     } catch (e) {
         // best effort
     }
 }
 
-// Initialize uptime state
-let uptimeState = loadUptimeState();
-const nowInit = Date.now();
-if (!uptimeState) {
-    uptimeState = {
-        // On first install, prefill uptime with elapsed time since anchor so counters start from history
-        totalUptimeMs: Math.max(0, nowInit - UPTIME_ANCHOR_START),
-        downtimeMs: 0,
-        lastHeartbeat: nowInit,
-        startedAt: UPTIME_ANCHOR_START
-    };
-    saveUptimeState(uptimeState);
-} else {
-    // Server restart - don't count restart gaps as downtime (assume server was running)
-    uptimeState.lastHeartbeat = nowInit;
-    uptimeState.startedAt = uptimeState.startedAt || UPTIME_ANCHOR_START;
-    // Ensure uptime matches elapsed time since anchor (assume 100% uptime)
-    const anchorElapsed = Math.max(0, nowInit - UPTIME_ANCHOR_START);
-    uptimeState.totalUptimeMs = anchorElapsed;
-    uptimeState.downtimeMs = 0; // Reset downtime - assume server was always up
-    saveUptimeState(uptimeState);
+function pruneOldEvents(events, now) {
+    const cutoff = now - EVENT_LOG_RETENTION_MS;
+    return events.filter(e => e && e.t >= cutoff);
 }
 
-// Heartbeat: add uptime since last heartbeat
+function computeUptimeForWindow(events, now, windowMs) {
+    const windowStart = now - windowMs;
+    let uptimeInWindow = 0;
+    let downtimeInWindow = 0;
+
+    for (const ev of events) {
+        if (!ev || !ev.t || !ev.durationMs) continue;
+        const evStart = ev.t;
+        const evEnd = ev.t + ev.durationMs;
+        // Clip to window
+        const clippedStart = Math.max(evStart, windowStart);
+        const clippedEnd = Math.min(evEnd, now);
+        if (clippedEnd <= clippedStart) continue;
+        const clippedDuration = clippedEnd - clippedStart;
+        if (ev.type === 'up') uptimeInWindow += clippedDuration;
+        else if (ev.type === 'down') downtimeInWindow += clippedDuration;
+    }
+
+    const totalTracked = uptimeInWindow + downtimeInWindow;
+    if (totalTracked === 0) return { uptimeMs: 0, downtimeMs: 0, pct: null };
+    const pct = totalTracked > 0 ? (uptimeInWindow / totalTracked) : 1;
+    return { uptimeMs: uptimeInWindow, downtimeMs: downtimeInWindow, pct };
+}
+
+// Fetch uptime state from peer server (main↔pi)
+async function fetchPeerUptimeState(url) {
+    try {
+        const http = url.startsWith('https') ? require('https') : require('http');
+        return await new Promise((resolve) => {
+            const req = http.get(`${url}/api/status/uptime/state`, { timeout: 3000 }, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                    try {
+                        const parsed = JSON.parse(data);
+                        if (parsed && parsed.ok && parsed.state && parsed.state.v === 2) {
+                            resolve(parsed.state);
+                        } else {
+                            resolve(null);
+                        }
+                    } catch (e) { resolve(null); }
+                });
+            });
+            req.on('error', () => resolve(null));
+            req.on('timeout', () => { req.destroy(); resolve(null); });
+        });
+    } catch (e) {
+        return null;
+    }
+}
+
+// Merge peer's events into local state, covering the gap period.
+// peerState = remote uptime state, gapStart = when this server went down, now = current time
+function mergeWithPeerState(localState, peerState, gapStart, now) {
+    const peerRole = peerState.lastRole || (SERVER_ROLE === 'main' ? 'pi' : 'main');
+
+    // Find peer events that overlap with our gap period
+    let peerUptimeInGap = 0;
+    let peerDowntimeInGap = 0;
+    const peerEvents = Array.isArray(peerState.events) ? peerState.events : [];
+
+    for (const ev of peerEvents) {
+        if (!ev || !ev.t || !ev.durationMs) continue;
+        const evEnd = ev.t + ev.durationMs;
+        // Clip to our gap window
+        const clippedStart = Math.max(ev.t, gapStart);
+        const clippedEnd = Math.min(evEnd, now);
+        if (clippedEnd <= clippedStart) continue;
+        const dur = clippedEnd - clippedStart;
+        if (ev.type === 'up') peerUptimeInGap += dur;
+        else if (ev.type === 'down') peerDowntimeInGap += dur;
+    }
+
+    const gapDuration = now - gapStart;
+    const peerCoverage = peerUptimeInGap + peerDowntimeInGap;
+
+    if (peerCoverage > 0) {
+        // Peer was active during (part of) the gap — credit its uptime
+        // Time not covered by peer events = failover transitions (downtime)
+        const uncoveredGap = Math.max(0, gapDuration - peerCoverage);
+        // Cap uncovered gap: at most 2 failover transitions
+        const failoverDowntime = Math.min(uncoveredGap, FAILOVER_GAP_MS * 2);
+        // Any remaining uncovered time beyond 2 transitions is ambiguous; count as downtime
+        const totalDowntimeForGap = peerDowntimeInGap + failoverDowntime + Math.max(0, uncoveredGap - FAILOVER_GAP_MS * 2);
+
+        localState.totalUptimeMs += peerUptimeInGap;
+        localState.totalDowntimeMs += totalDowntimeForGap;
+
+        // Add peer's events to our log for accurate 24h window calculation
+        for (const ev of peerEvents) {
+            if (!ev || !ev.t || !ev.durationMs) continue;
+            const evEnd = ev.t + ev.durationMs;
+            if (evEnd <= gapStart || ev.t >= now) continue; // outside gap
+            // Clip and add
+            const clippedStart = Math.max(ev.t, gapStart);
+            const clippedEnd = Math.min(evEnd, now);
+            if (clippedEnd > clippedStart) {
+                localState.events.push({
+                    t: clippedStart,
+                    type: ev.type,
+                    durationMs: clippedEnd - clippedStart,
+                    role: ev.role || peerRole,
+                });
+            }
+        }
+
+        // Add failover transition downtime events
+        if (failoverDowntime > 0) {
+            // Split into two transitions: this→peer and peer→this
+            const halfGap = Math.min(FAILOVER_GAP_MS, Math.floor(failoverDowntime / 2));
+            if (halfGap > 0) {
+                localState.events.push({
+                    t: gapStart,
+                    type: 'down',
+                    durationMs: halfGap,
+                    role: 'failover',
+                });
+                localState.events.push({
+                    t: now - halfGap,
+                    type: 'down',
+                    durationMs: halfGap,
+                    role: 'failover',
+                });
+            }
+        }
+
+        console.log(`[Uptime] Merged peer(${peerRole}) state: credited ${(peerUptimeInGap / 3600000).toFixed(2)}h uptime, ${(totalDowntimeForGap / 1000).toFixed(0)}s downtime for ${(gapDuration / 3600000).toFixed(2)}h gap`);
+        return true;
+    }
+
+    return false; // Peer had no events covering our gap
+}
+
+// Initialize uptime state
+let uptimeState = loadUptimeState();
+let uptimeReady = false; // Gate: heartbeat + endpoints wait until init completes
+const nowInit = Date.now();
+
+// Simple init: no gap or no peer configured — just detect gap as downtime
+function initUptimeSimple() {
+    if (!uptimeState) {
+        uptimeState = {
+            v: 2,
+            totalUptimeMs: 0,
+            totalDowntimeMs: 0,
+            lastHeartbeat: nowInit,
+            firstSeen: nowInit,
+            lastRole: SERVER_ROLE,
+            events: [],
+        };
+        saveUptimeState(uptimeState);
+        uptimeReady = true;
+        console.log(`[Uptime] Fresh start — tracking from now (role=${SERVER_ROLE})`);
+    } else {
+        const gap = Math.max(0, nowInit - uptimeState.lastHeartbeat);
+        if (gap > HEARTBEAT_GAP_THRESHOLD_MS && uptimeState.lastHeartbeat > 0) {
+            uptimeState.totalDowntimeMs += gap;
+            uptimeState.events.push({
+                t: uptimeState.lastHeartbeat,
+                type: 'down',
+                durationMs: gap,
+                role: uptimeState.lastRole || SERVER_ROLE,
+            });
+            console.log(`[Uptime] Detected ${(gap / 1000 / 60).toFixed(1)} min downtime gap (no peer to check)`);
+        }
+        uptimeState.lastHeartbeat = nowInit;
+        uptimeState.lastRole = SERVER_ROLE;
+        uptimeState.events = pruneOldEvents(uptimeState.events, nowInit);
+        saveUptimeState(uptimeState);
+        uptimeReady = true;
+        console.log(`[Uptime] Resumed — role=${SERVER_ROLE}, totalUp=${(uptimeState.totalUptimeMs / 3600000).toFixed(2)}h, totalDown=${(uptimeState.totalDowntimeMs / 3600000).toFixed(2)}h`);
+    }
+}
+
+// Async init: try to fetch peer's state to cover the gap
+async function initUptimeWithPeer() {
+    if (!uptimeState) {
+        // First run — no gap to merge, just start fresh
+        initUptimeSimple();
+        return;
+    }
+
+    const gap = Math.max(0, nowInit - uptimeState.lastHeartbeat);
+    if (gap <= HEARTBEAT_GAP_THRESHOLD_MS) {
+        // No significant gap — normal restart
+        uptimeState.lastHeartbeat = nowInit;
+        uptimeState.lastRole = SERVER_ROLE;
+        uptimeState.events = pruneOldEvents(uptimeState.events, nowInit);
+        saveUptimeState(uptimeState);
+        uptimeReady = true;
+        console.log(`[Uptime] Quick restart (${(gap / 1000).toFixed(0)}s gap) — role=${SERVER_ROLE}`);
+        return;
+    }
+
+    // Significant gap — try to fetch peer's state
+    const gapStart = uptimeState.lastHeartbeat;
+    console.log(`[Uptime] ${(gap / 1000 / 60).toFixed(1)} min gap detected — fetching peer state from ${PEER_SERVER_URL}...`);
+    const peerState = await fetchPeerUptimeState(PEER_SERVER_URL);
+
+    if (peerState) {
+        // Peer is reachable — merge its events covering our gap
+        const merged = mergeWithPeerState(uptimeState, peerState, gapStart, nowInit);
+        if (merged) {
+            // Also adopt peer's firstSeen if it's older
+            if (peerState.firstSeen && peerState.firstSeen < uptimeState.firstSeen) {
+                uptimeState.firstSeen = peerState.firstSeen;
+            }
+        } else {
+            // Peer responded but had no events covering our gap — count as downtime
+            uptimeState.totalDowntimeMs += gap;
+            uptimeState.events.push({
+                t: gapStart,
+                type: 'down',
+                durationMs: gap,
+                role: uptimeState.lastRole || SERVER_ROLE,
+            });
+            console.log(`[Uptime] Peer responded but had no events for gap — ${(gap / 1000 / 60).toFixed(1)} min downtime`);
+        }
+    } else {
+        // Peer unreachable — nobody was serving, count full gap as downtime
+        uptimeState.totalDowntimeMs += gap;
+        uptimeState.events.push({
+            t: gapStart,
+            type: 'down',
+            durationMs: gap,
+            role: uptimeState.lastRole || SERVER_ROLE,
+        });
+        console.log(`[Uptime] Peer unreachable — ${(gap / 1000 / 60).toFixed(1)} min downtime`);
+    }
+
+    uptimeState.lastHeartbeat = nowInit;
+    uptimeState.lastRole = SERVER_ROLE;
+    uptimeState.events = pruneOldEvents(uptimeState.events, nowInit);
+    saveUptimeState(uptimeState);
+    uptimeReady = true;
+    console.log(`[Uptime] Resumed — role=${SERVER_ROLE}, totalUp=${(uptimeState.totalUptimeMs / 3600000).toFixed(2)}h, totalDown=${(uptimeState.totalDowntimeMs / 3600000).toFixed(2)}h`);
+}
+
+// Run init
+if (PEER_SERVER_URL) {
+    initUptimeWithPeer().catch(e => {
+        console.warn('[Uptime] Peer init failed, falling back to simple init:', e?.message);
+        initUptimeSimple();
+    });
+} else {
+    initUptimeSimple();
+}
+
+// Heartbeat: record uptime tick every 60s
 setInterval(() => {
+    if (!uptimeReady || !uptimeState) return; // Wait for init to complete
     const now = Date.now();
     const gap = Math.max(0, now - uptimeState.lastHeartbeat);
-    uptimeState.totalUptimeMs += gap;
+
+    if (gap > HEARTBEAT_GAP_THRESHOLD_MS) {
+        // Unexpected large gap while running (e.g. system suspend) — count as downtime
+        uptimeState.totalDowntimeMs += gap;
+        uptimeState.events.push({
+            t: uptimeState.lastHeartbeat,
+            type: 'down',
+            durationMs: gap,
+            role: SERVER_ROLE,
+        });
+    } else {
+        // Normal heartbeat — count as uptime
+        uptimeState.totalUptimeMs += gap;
+        uptimeState.events.push({
+            t: uptimeState.lastHeartbeat,
+            type: 'up',
+            durationMs: gap,
+            role: SERVER_ROLE,
+        });
+    }
+
     uptimeState.lastHeartbeat = now;
+    uptimeState.lastRole = SERVER_ROLE;
+    uptimeState.events = pruneOldEvents(uptimeState.events, now);
     saveUptimeState(uptimeState);
-}, 60 * 1000).unref();
+}, HEARTBEAT_INTERVAL_MS).unref();
 
 app.get('/api/status/uptime', (_req, res) => {
+    if (!uptimeReady || !uptimeState) {
+        return res.json({ ok: false, error: 'Uptime system initializing', serverRole: SERVER_ROLE });
+    }
     const now = Date.now();
-    // Lifetime tracking anchored to startedAt
-    const anchor = uptimeState.startedAt || UPTIME_ANCHOR_START;
-    const totalMs = Math.max(0, uptimeState.totalUptimeMs + uptimeState.downtimeMs);
-    const anchorElapsed = Math.max(0, now - anchor);
-    // If totals drift behind wall-clock since anchor, clamp totalMs up so pct math stays valid
-    const effectiveTotalMs = Math.max(totalMs, anchorElapsed);
-    const uptimeMs = uptimeState.totalUptimeMs;
-    const uptimeSec = Math.floor(uptimeMs / 1000);
 
-    // Lifetime pct (kept for reference)
-    const pctLifetime = effectiveTotalMs > 0 ? Math.max(0, Math.min(1, uptimeMs / effectiveTotalMs)) : 1;
+    // Add current live interval (since last heartbeat) as uptime
+    const liveSinceLastHb = Math.max(0, now - uptimeState.lastHeartbeat);
+    const liveEvents = [...uptimeState.events];
+    if (liveSinceLastHb > 0 && liveSinceLastHb <= HEARTBEAT_GAP_THRESHOLD_MS) {
+        liveEvents.push({ t: uptimeState.lastHeartbeat, type: 'up', durationMs: liveSinceLastHb, role: SERVER_ROLE });
+    }
 
-    // Use anchor as lifetime start (shows history from 2026-01-01)
-    const startedAtDisplay = anchor;
+    // 24h window
+    const window24h = computeUptimeForWindow(liveEvents, now, 24 * 60 * 60 * 1000);
+    // 7d window
+    const window7d = computeUptimeForWindow(liveEvents, now, 7 * 24 * 60 * 60 * 1000);
 
-    // Reflect actual uptime ratio (adds uptime when up, downtime when down)
-    const uptimePct24h = +(pctLifetime * 100).toFixed(2);
+    // Lifetime
+    const totalUp = uptimeState.totalUptimeMs + liveSinceLastHb;
+    const totalDown = uptimeState.totalDowntimeMs;
+    const totalTracked = totalUp + totalDown;
+    const pctLifetime = totalTracked > 0 ? Math.max(0, Math.min(1, totalUp / totalTracked)) : (totalUp > 0 ? 1 : null);
+
+    // Current run duration (since this process started)
+    const currentRunMs = Math.max(0, now - nowInit);
+    const currentRunSec = Math.floor(currentRunMs / 1000);
 
     res.setHeader('Cache-Control', 'no-store');
     return res.json({
         ok: true,
-        startedAt: startedAtDisplay,
+        serverRole: SERVER_ROLE,
+        firstSeen: uptimeState.firstSeen,
         now,
-        uptimeSeconds: uptimeSec,
-        uptimeHours: +(uptimeSec / 3600).toFixed(2),
-        uptimeDays: +(uptimeSec / 86400).toFixed(3),
-        uptimePct24h,
-        pctLifetime: +(pctLifetime * 100).toFixed(2)
+        currentRunSeconds: currentRunSec,
+        currentRunHours: +(currentRunSec / 3600).toFixed(2),
+        currentRunDays: +(currentRunSec / 86400).toFixed(3),
+        uptimePct24h: window24h.pct !== null ? +(window24h.pct * 100).toFixed(2) : null,
+        uptimePct7d: window7d.pct !== null ? +(window7d.pct * 100).toFixed(2) : null,
+        pctLifetime: pctLifetime !== null ? +(pctLifetime * 100).toFixed(2) : null,
+        totalUptimeHours: +(totalUp / 3600000).toFixed(2),
+        totalDowntimeHours: +(totalDown / 3600000).toFixed(2),
     });
 });
 
-// Reset uptime to 100% (admin only - use secret param)
-app.post('/api/status/uptime/reset', (req, res) => {
-    const secret = req.query.secret || req.body?.secret;
+// Raw uptime state for Pi to fetch from main on startup (no auth — only aggregate counters)
+app.get('/api/status/uptime/state', (_req, res) => {
+    if (!uptimeReady || !uptimeState) {
+        return res.json({ ok: false, error: 'Uptime system initializing' });
+    }
+    res.setHeader('Cache-Control', 'no-store');
+    return res.json({
+        ok: true,
+        state: {
+            v: 2,
+            totalUptimeMs: uptimeState.totalUptimeMs,
+            totalDowntimeMs: uptimeState.totalDowntimeMs,
+            lastHeartbeat: uptimeState.lastHeartbeat,
+            firstSeen: uptimeState.firstSeen,
+            lastRole: uptimeState.lastRole,
+            events: uptimeState.events || [],
+        },
+    });
+});
+
+// Admin: view raw uptime state for debugging (no modification)
+app.get('/api/status/uptime/debug', (req, res) => {
+    const secret = req.query.secret;
     if (secret !== 'photolynk2026') {
         return res.status(403).json({ ok: false, error: 'Forbidden' });
     }
+    res.setHeader('Cache-Control', 'no-store');
     const now = Date.now();
-    const anchorElapsed = Math.max(0, now - UPTIME_ANCHOR_START);
-    uptimeState = {
-        totalUptimeMs: anchorElapsed,
-        downtimeMs: 0,
-        lastHeartbeat: now,
-        startedAt: UPTIME_ANCHOR_START
-    };
-    saveUptimeState(uptimeState);
-    res.json({ ok: true, message: 'Uptime reset to 100%', uptimeHours: +(anchorElapsed / 3600000).toFixed(2) });
+    const recentEvents = (uptimeState.events || []).slice(-50).map(e => ({
+        ...e,
+        ago: `${((now - e.t) / 60000).toFixed(1)}m`,
+        duration: `${(e.durationMs / 1000).toFixed(0)}s`,
+    }));
+    return res.json({
+        ok: true,
+        role: SERVER_ROLE,
+        state: {
+            totalUptimeMs: uptimeState.totalUptimeMs,
+            totalDowntimeMs: uptimeState.totalDowntimeMs,
+            lastHeartbeat: uptimeState.lastHeartbeat,
+            firstSeen: uptimeState.firstSeen,
+            lastRole: uptimeState.lastRole,
+            eventCount: (uptimeState.events || []).length,
+        },
+        recentEvents,
+    });
 });
 
 app.post('/api/cloud/purge', authenticateToken, async (req, res) => {
