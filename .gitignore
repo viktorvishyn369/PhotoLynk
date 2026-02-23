@@ -123,6 +123,7 @@ install-server-PhotoLynk*.sh
 # StealthLynk private (do not push)
 mobile-v2/
 solana-seeker/
+nft-service/
 SERVER SETUP/
 PhotoBackupSystem/server/
 server/generate-capacity-json.js

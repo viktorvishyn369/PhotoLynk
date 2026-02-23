@@ -1,7 +1,0 @@
-node_modules/
-.env
-*.pem
-keypair.json
-server-keypair.json
-wallet-keypair.json
-.DS_Store
