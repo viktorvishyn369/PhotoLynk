@@ -6392,7 +6392,14 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
         if (fs.existsSync(certsPath)) {
             try { certs = JSON.parse(fs.readFileSync(certsPath, 'utf8')); } catch (_) {}
         }
-        res.json({ success: true, certificates: certs });
+        // Strip heavy fields to prevent mobile OOM — mobile externalizes these to per-cert files
+        const slim = certs.map(c => {
+            const copy = { ...c };
+            if (copy.rfc3161Token) { copy.hasRfc3161 = true; delete copy.rfc3161Token; }
+            if (copy.c2paManifest) { copy.hasC2pa = true; delete copy.c2paManifest; }
+            return copy;
+        });
+        res.json({ success: true, certificates: slim });
     } catch (error) {
         console.error('[NFT] Certificates fetch error:', error);
         res.status(500).json({ error: 'Failed to fetch certificates' });
