@@ -6405,13 +6405,16 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
             for (const k of SLIM_KEYS) { if (c[k] !== undefined) copy[k] = c[k]; }
             if (c.rfc3161Token) copy.hasRfc3161 = true;
             if (c.c2paManifest) copy.hasC2pa = true;
+            // Strip base64 data URIs from imageUrl — these can be megabytes each
+            if (copy.imageUrl && copy.imageUrl.startsWith('data:') && copy.imageUrl.length > 5000) delete copy.imageUrl;
             return copy;
         };
         let needsRewrite = false;
         const slim = certs.map(c => {
             const copy = slimOne(c);
-            // Detect if disk has blob fields that should be stripped (metadata, encryptionData, rfc3161Token, c2paManifest, etc.)
-            if (c.metadata || c.encryptionData || c.imageData || c.rfc3161Token || c.c2paManifest) needsRewrite = true;
+            // Detect if disk has blob fields that should be stripped (metadata, encryptionData, rfc3161Token, c2paManifest, large imageUrl data URIs, etc.)
+            if (c.metadata || c.encryptionData || c.imageData || c.rfc3161Token || c.c2paManifest
+                || (c.imageUrl && c.imageUrl.startsWith('data:') && c.imageUrl.length > 5000)) needsRewrite = true;
             return copy;
         });
         // Compact on-disk file if blob fields were found (one-time migration)
@@ -6455,6 +6458,8 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
             for (const k of SLIM_KEYS) { if (c[k] !== undefined) copy[k] = c[k]; }
             if (c.rfc3161Token) copy.hasRfc3161 = true;
             if (c.c2paManifest) copy.hasC2pa = true;
+            // Strip base64 data URIs from imageUrl — these can be megabytes each
+            if (copy.imageUrl && copy.imageUrl.startsWith('data:') && copy.imageUrl.length > 5000) delete copy.imageUrl;
             return copy;
         };
         
