@@ -6393,31 +6393,31 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
             try { certs = JSON.parse(fs.readFileSync(certsPath, 'utf8')); } catch (_) {}
         }
         // Whitelist-only fields to prevent mobile OOM — full certs can be 47+MB with base64/metadata blobs
+        // IMPORTANT: Do NOT include rfc3161Token or c2paManifest here — they are large base64 blobs
+        // that bloat the disk file. Only store boolean flags (hasRfc3161/hasC2pa) for badge display.
         const SLIM_KEYS = ['id','name','mintAddress','txSignature','creatorWallet','ownerAddress',
             'issuedAt','createdAt','edition','license','contentHash','exifHash','cameraHash',
+            'exifRawHash','exifBindingHash','rfc3161Policy','mintedAt',
             'hasRfc3161','hasC2pa','encrypted','watermarked','storageType','nftType','isCompressed',
             'rfc3161Tsa','metadataUrl','description','version','type','imageUrl','certificationMode'];
-        let needsRewrite = false;
-        const slim = certs.map(c => {
+        const slimOne = (c) => {
             const copy = {};
             for (const k of SLIM_KEYS) { if (c[k] !== undefined) copy[k] = c[k]; }
-            // Preserve boolean flags from heavy fields that may still be on disk
-            if (c.rfc3161Token) { copy.hasRfc3161 = true; needsRewrite = true; }
-            if (c.c2paManifest) { copy.hasC2pa = true; needsRewrite = true; }
+            if (c.rfc3161Token) copy.hasRfc3161 = true;
+            if (c.c2paManifest) copy.hasC2pa = true;
+            return copy;
+        };
+        let needsRewrite = false;
+        const slim = certs.map(c => {
+            const copy = slimOne(c);
+            // Detect if disk has blob fields that should be stripped (metadata, encryptionData, rfc3161Token, c2paManifest, etc.)
+            if (c.metadata || c.encryptionData || c.imageData || c.rfc3161Token || c.c2paManifest) needsRewrite = true;
             return copy;
         });
-        // Compact on-disk file if heavy fields were stripped (one-time migration)
+        // Compact on-disk file if blob fields were found (one-time migration)
         if (needsRewrite) {
             try {
-                // Whitelist on disk too — prevents bloat from metadata/encryptionData/imageData
-                const diskSlim = certs.map(c => {
-                    const copy = {};
-                    for (const k of SLIM_KEYS) { if (c[k] !== undefined) copy[k] = c[k]; }
-                    if (c.rfc3161Token) copy.hasRfc3161 = true;
-                    if (c.c2paManifest) copy.hasC2pa = true;
-                    return copy;
-                });
-                fs.writeFileSync(certsPath, JSON.stringify(diskSlim, null, 2));
+                fs.writeFileSync(certsPath, JSON.stringify(slim, null, 2));
                 console.log(`[NFT] Compacted certificates.json on disk for user=${userKey} (${certs.length} certs)`);
             } catch (e) { console.warn('[NFT] Failed to compact certificates.json:', e.message); }
         }
@@ -6443,9 +6443,11 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
         const { action, certificate, certificates } = req.body;
         const existingIds = new Set(certs.map(c => c.id));
         
-        // Whitelist fields to prevent server-side bloat (same keys as GET)
+        // IMPORTANT: Do NOT include rfc3161Token or c2paManifest — they are large base64 blobs
+        // that bloat the disk file. Only store boolean flags (hasRfc3161/hasC2pa) for badge display.
         const SLIM_KEYS = ['id','name','mintAddress','txSignature','creatorWallet','ownerAddress',
             'issuedAt','createdAt','edition','license','contentHash','exifHash','cameraHash',
+            'exifRawHash','exifBindingHash','rfc3161Policy','mintedAt',
             'hasRfc3161','hasC2pa','encrypted','watermarked','storageType','nftType','isCompressed',
             'rfc3161Tsa','metadataUrl','description','version','type','imageUrl','certificationMode'];
         const slimCert = (c) => {
