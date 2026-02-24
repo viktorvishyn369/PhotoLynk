@@ -6421,7 +6421,15 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
         const { action, certificate, certificates } = req.body;
         const existingIds = new Set(certs.map(c => c.id));
         
+        // Strip heavy fields from incoming certs to prevent server-side bloat
+        const stripHeavy = (c) => {
+            if (c.rfc3161Token) { c.hasRfc3161 = true; delete c.rfc3161Token; }
+            if (c.c2paManifest) { c.hasC2pa = true; delete c.c2paManifest; }
+            return c;
+        };
+        
         if (action === 'add' && certificate) {
+            stripHeavy(certificate);
             if (!existingIds.has(certificate.id)) {
                 certs.push(certificate);
                 console.log(`[NFT] Certificate added: user=${req.user.id} id=${certificate.id}`);
@@ -6443,8 +6451,6 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
                         let changed = false;
                         if (c.hasRfc3161 && !ex.hasRfc3161) { ex.hasRfc3161 = true; changed = true; }
                         if (c.hasC2pa && !ex.hasC2pa) { ex.hasC2pa = true; changed = true; }
-                        if (c.rfc3161Token && !ex.rfc3161Token) { ex.rfc3161Token = c.rfc3161Token; changed = true; }
-                        if (c.c2paManifest && !ex.c2paManifest) { ex.c2paManifest = c.c2paManifest; changed = true; }
                         if (c.encrypted && !ex.encrypted) { ex.encrypted = true; changed = true; }
                         if (c.watermarked && !ex.watermarked) { ex.watermarked = true; changed = true; }
                         if (c.license && !ex.license) { ex.license = c.license; changed = true; }
@@ -6461,7 +6467,9 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: 'Invalid action' });
         }
         
-        fs.writeFileSync(certsPath, JSON.stringify(certs, null, 2));
+        // Ensure no heavy fields persist on disk
+        const cleanCerts = certs.map(c => stripHeavy({ ...c }));
+        fs.writeFileSync(certsPath, JSON.stringify(cleanCerts, null, 2));
         res.json({ success: true, count: certs.length });
     } catch (error) {
         console.error('[NFT] Certificates sync error:', error);
