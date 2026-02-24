@@ -6392,13 +6392,35 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
         if (fs.existsSync(certsPath)) {
             try { certs = JSON.parse(fs.readFileSync(certsPath, 'utf8')); } catch (_) {}
         }
-        // Strip heavy fields to prevent mobile OOM — mobile externalizes these to per-cert files
+        // Whitelist-only fields to prevent mobile OOM — full certs can be 47+MB with base64/metadata blobs
+        const SLIM_KEYS = ['id','name','mintAddress','txSignature','creatorWallet','ownerAddress',
+            'issuedAt','createdAt','edition','license','contentHash','exifHash','cameraHash',
+            'hasRfc3161','hasC2pa','encrypted','watermarked','storageType','nftType','isCompressed',
+            'rfc3161Tsa','metadataUrl','description','version','type','imageUrl','certificationMode'];
+        let needsRewrite = false;
         const slim = certs.map(c => {
-            const copy = { ...c };
-            if (copy.rfc3161Token) { copy.hasRfc3161 = true; delete copy.rfc3161Token; }
-            if (copy.c2paManifest) { copy.hasC2pa = true; delete copy.c2paManifest; }
+            const copy = {};
+            for (const k of SLIM_KEYS) { if (c[k] !== undefined) copy[k] = c[k]; }
+            // Preserve boolean flags from heavy fields that may still be on disk
+            if (c.rfc3161Token) { copy.hasRfc3161 = true; needsRewrite = true; }
+            if (c.c2paManifest) { copy.hasC2pa = true; needsRewrite = true; }
             return copy;
         });
+        // Compact on-disk file if heavy fields were stripped (one-time migration)
+        if (needsRewrite) {
+            try {
+                // Whitelist on disk too — prevents bloat from metadata/encryptionData/imageData
+                const diskSlim = certs.map(c => {
+                    const copy = {};
+                    for (const k of SLIM_KEYS) { if (c[k] !== undefined) copy[k] = c[k]; }
+                    if (c.rfc3161Token) copy.hasRfc3161 = true;
+                    if (c.c2paManifest) copy.hasC2pa = true;
+                    return copy;
+                });
+                fs.writeFileSync(certsPath, JSON.stringify(diskSlim, null, 2));
+                console.log(`[NFT] Compacted certificates.json on disk for user=${userKey} (${certs.length} certs)`);
+            } catch (e) { console.warn('[NFT] Failed to compact certificates.json:', e.message); }
+        }
         res.json({ success: true, certificates: slim });
     } catch (error) {
         console.error('[NFT] Certificates fetch error:', error);
@@ -6421,17 +6443,23 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
         const { action, certificate, certificates } = req.body;
         const existingIds = new Set(certs.map(c => c.id));
         
-        // Strip heavy fields from incoming certs to prevent server-side bloat
-        const stripHeavy = (c) => {
-            if (c.rfc3161Token) { c.hasRfc3161 = true; delete c.rfc3161Token; }
-            if (c.c2paManifest) { c.hasC2pa = true; delete c.c2paManifest; }
-            return c;
+        // Whitelist fields to prevent server-side bloat (same keys as GET)
+        const SLIM_KEYS = ['id','name','mintAddress','txSignature','creatorWallet','ownerAddress',
+            'issuedAt','createdAt','edition','license','contentHash','exifHash','cameraHash',
+            'hasRfc3161','hasC2pa','encrypted','watermarked','storageType','nftType','isCompressed',
+            'rfc3161Tsa','metadataUrl','description','version','type','imageUrl','certificationMode'];
+        const slimCert = (c) => {
+            const copy = {};
+            for (const k of SLIM_KEYS) { if (c[k] !== undefined) copy[k] = c[k]; }
+            if (c.rfc3161Token) copy.hasRfc3161 = true;
+            if (c.c2paManifest) copy.hasC2pa = true;
+            return copy;
         };
         
         if (action === 'add' && certificate) {
-            stripHeavy(certificate);
-            if (!existingIds.has(certificate.id)) {
-                certs.push(certificate);
+            const slimmed = slimCert(certificate);
+            if (!existingIds.has(slimmed.id)) {
+                certs.push(slimmed);
                 console.log(`[NFT] Certificate added: user=${req.user.id} id=${certificate.id}`);
             }
         } else if (action === 'backup' && Array.isArray(certificates)) {
@@ -6439,9 +6467,10 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
             const existingMap = {};
             certs.forEach((c, i) => { if (c.id) existingMap[c.id] = i; });
             for (const c of certificates) {
-                if (!existingIds.has(c.id)) {
-                    certs.push(c);
-                    existingIds.add(c.id);
+                const sc = slimCert(c);
+                if (!existingIds.has(sc.id)) {
+                    certs.push(sc);
+                    existingIds.add(sc.id);
                     added++;
                 } else {
                     // Merge enrichment fields into existing cert (don't overwrite, only fill gaps)
@@ -6467,8 +6496,8 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: 'Invalid action' });
         }
         
-        // Ensure no heavy fields persist on disk
-        const cleanCerts = certs.map(c => stripHeavy({ ...c }));
+        // Ensure only whitelisted fields persist on disk
+        const cleanCerts = certs.map(c => slimCert(c));
         fs.writeFileSync(certsPath, JSON.stringify(cleanCerts, null, 2));
         res.json({ success: true, count: certs.length });
     } catch (error) {
