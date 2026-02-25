@@ -6392,39 +6392,49 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
         if (fs.existsSync(certsPath)) {
             try { certs = JSON.parse(fs.readFileSync(certsPath, 'utf8')); } catch (_) {}
         }
-        // Whitelist-only fields to prevent mobile OOM — full certs can be 47+MB with base64/metadata blobs
-        // IMPORTANT: Do NOT include rfc3161Token or c2paManifest here — they are large base64 blobs
-        // that bloat the disk file. Only store boolean flags (hasRfc3161/hasC2pa) for badge display.
-        const SLIM_KEYS = ['id','name','mintAddress','txSignature','creatorWallet','ownerAddress',
+        const full = req.query.full === 'true';
+        // Fields safe for the API response (mobile OOM-safe — no large base64 blobs)
+        const API_SLIM_KEYS = ['id','name','mintAddress','txSignature','creatorWallet','ownerAddress',
             'issuedAt','createdAt','edition','license','contentHash','exifHash','cameraHash',
             'exifRawHash','exifBindingHash','rfc3161Policy','mintedAt',
             'hasRfc3161','hasC2pa','encrypted','watermarked','storageType','nftType','isCompressed',
             'rfc3161Tsa','metadataUrl','description','version','type','imageUrl','certificationMode'];
-        const slimOne = (c) => {
+        // Disk-safe keys: same as API + rfc3161Token + c2paManifest (these MUST survive on disk)
+        const DISK_SAFE_KEYS = [...API_SLIM_KEYS, 'rfc3161Token', 'c2paManifest'];
+        const keysToUse = full ? DISK_SAFE_KEYS : API_SLIM_KEYS;
+        const slimForApi = (c) => {
             const copy = {};
-            for (const k of SLIM_KEYS) { if (c[k] !== undefined) copy[k] = c[k]; }
+            for (const k of keysToUse) { if (c[k] !== undefined) copy[k] = c[k]; }
             if (c.rfc3161Token) copy.hasRfc3161 = true;
             if (c.c2paManifest) copy.hasC2pa = true;
             // Strip base64 data URIs from imageUrl — these can be megabytes each
             if (copy.imageUrl && copy.imageUrl.startsWith('data:') && copy.imageUrl.length > 5000) delete copy.imageUrl;
             return copy;
         };
-        let needsRewrite = false;
-        const slim = certs.map(c => {
-            const copy = slimOne(c);
-            // Detect if disk has blob fields that should be stripped (metadata, encryptionData, rfc3161Token, c2paManifest, large imageUrl data URIs, etc.)
-            if (c.metadata || c.encryptionData || c.imageData || c.rfc3161Token || c.c2paManifest
-                || (c.imageUrl && c.imageUrl.startsWith('data:') && c.imageUrl.length > 5000)) needsRewrite = true;
+        const slimForDisk = (c) => {
+            const copy = {};
+            for (const k of DISK_SAFE_KEYS) { if (c[k] !== undefined) copy[k] = c[k]; }
+            if (c.rfc3161Token) copy.hasRfc3161 = true;
+            if (c.c2paManifest) copy.hasC2pa = true;
+            if (copy.imageUrl && copy.imageUrl.startsWith('data:') && copy.imageUrl.length > 5000) delete copy.imageUrl;
             return copy;
+        };
+        let needsRewrite = false;
+        const apiSlim = certs.map(c => {
+            // Detect if disk has non-safe fields that should be stripped (metadata, encryptionData, imageData, large imageUrl data URIs)
+            if (c.metadata || c.encryptionData || c.imageData
+                || (c.imageUrl && c.imageUrl.startsWith('data:') && c.imageUrl.length > 5000)) needsRewrite = true;
+            return slimForApi(c);
         });
-        // Compact on-disk file if blob fields were found (one-time migration)
+        // Compact on-disk file: strip junk fields but PRESERVE rfc3161Token + c2paManifest
         if (needsRewrite) {
             try {
-                fs.writeFileSync(certsPath, JSON.stringify(slim, null, 2));
-                console.log(`[NFT] Compacted certificates.json on disk for user=${userKey} (${certs.length} certs)`);
+                const diskSlim = certs.map(slimForDisk);
+                fs.writeFileSync(certsPath, JSON.stringify(diskSlim, null, 2));
+                console.log(`[NFT] Compacted certificates.json on disk for user=${userKey} (${certs.length} certs, tokens preserved)`);
             } catch (e) { console.warn('[NFT] Failed to compact certificates.json:', e.message); }
         }
-        res.json({ success: true, certificates: slim });
+        res.json({ success: true, certificates: apiSlim });
     } catch (error) {
         console.error('[NFT] Certificates fetch error:', error);
         res.status(500).json({ error: 'Failed to fetch certificates' });
@@ -6446,16 +6456,16 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
         const { action, certificate, certificates } = req.body;
         const existingIds = new Set(certs.map(c => c.id));
         
-        // IMPORTANT: Do NOT include rfc3161Token or c2paManifest — they are large base64 blobs
-        // that bloat the disk file. Only store boolean flags (hasRfc3161/hasC2pa) for badge display.
-        const SLIM_KEYS = ['id','name','mintAddress','txSignature','creatorWallet','ownerAddress',
+        // Disk-safe keys: preserve rfc3161Token + c2paManifest so the desktop can recover them
+        const DISK_SAFE_KEYS = ['id','name','mintAddress','txSignature','creatorWallet','ownerAddress',
             'issuedAt','createdAt','edition','license','contentHash','exifHash','cameraHash',
             'exifRawHash','exifBindingHash','rfc3161Policy','mintedAt',
             'hasRfc3161','hasC2pa','encrypted','watermarked','storageType','nftType','isCompressed',
-            'rfc3161Tsa','metadataUrl','description','version','type','imageUrl','certificationMode'];
+            'rfc3161Tsa','metadataUrl','description','version','type','imageUrl','certificationMode',
+            'rfc3161Token','c2paManifest'];
         const slimCert = (c) => {
             const copy = {};
-            for (const k of SLIM_KEYS) { if (c[k] !== undefined) copy[k] = c[k]; }
+            for (const k of DISK_SAFE_KEYS) { if (c[k] !== undefined) copy[k] = c[k]; }
             if (c.rfc3161Token) copy.hasRfc3161 = true;
             if (c.c2paManifest) copy.hasC2pa = true;
             // Strip base64 data URIs from imageUrl — these can be megabytes each
@@ -6494,6 +6504,8 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
                         if (c.contentHash && !ex.contentHash) { ex.contentHash = c.contentHash; changed = true; }
                         if (c.exifHash && !ex.exifHash) { ex.exifHash = c.exifHash; changed = true; }
                         if (c.cameraHash && !ex.cameraHash) { ex.cameraHash = c.cameraHash; changed = true; }
+                        if (c.rfc3161Token && !ex.rfc3161Token) { ex.rfc3161Token = c.rfc3161Token; ex.hasRfc3161 = true; changed = true; }
+                        if (c.c2paManifest && !ex.c2paManifest) { ex.c2paManifest = c.c2paManifest; ex.hasC2pa = true; changed = true; }
                         if (changed) updated++;
                     }
                 }
@@ -7351,6 +7363,9 @@ app.get('/nft-payment', (req, res) => {
               storageOption: qsStd.get('storageOption') || '',
               contentHash: qsStd.get('contentHash') || '',
               exifHash: qsStd.get('exifHash') || '',
+              exifRawHash: qsStd.get('exifRawHash') || '',
+              exifBindingHash: qsStd.get('exifBindingHash') || '',
+              certificationMode: qsStd.get('certificationMode') || '',
             })
           }).catch(e => console.log('Failed to notify app:', e));
           
@@ -7460,8 +7475,56 @@ app.get('/nft-payment', (req, res) => {
         mintSig = mintResult.signature;
         console.log('[NFT Payment] NFT minted:', mintSig);
         
-        // Send success data to app (forward all edition/hash params from URL)
+        // Resolve real cNFT asset ID via DAS (same approach as mobile solana-seeker)
+        // Wait for Solana indexing, then search by metadataUrl or name
         const qs = new URLSearchParams(window.location.search);
+        let resolvedMintAddress = '';
+        if (nftTypeParam === 'compressed') {
+          showStatus('Finalizing — resolving asset ID...', 'info');
+          const walletAddr = qs.get('wallet') || '';
+          const nftName = qs.get('name') || '';
+          const metaUrl = qs.get('metadataUrl') || '';
+          
+          for (let dasAttempt = 0; dasAttempt < 5; dasAttempt++) {
+            await new Promise(r => setTimeout(r, dasAttempt === 0 ? 2000 : 3000));
+            try {
+              const dasResp = await fetch('https://api.mainnet-beta.solana.com', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  jsonrpc: '2.0',
+                  id: 'resolve-cnft',
+                  method: 'getAssetsByOwner',
+                  params: {
+                    ownerAddress: walletAddr,
+                    page: 1,
+                    limit: 10,
+                    sortBy: { sortBy: 'created', sortDirection: 'desc' },
+                  },
+                }),
+              });
+              const dasData = await dasResp.json();
+              if (dasData.result && dasData.result.items) {
+                const match = dasData.result.items.find(function(item) {
+                  return (metaUrl && item.content && item.content.json_uri === metaUrl) ||
+                    (nftName && item.content && item.content.metadata && item.content.metadata.name === nftName);
+                });
+                if (match) {
+                  resolvedMintAddress = match.id;
+                  console.log('[NFT Payment] Resolved real asset ID:', resolvedMintAddress);
+                  break;
+                }
+              }
+            } catch (dasErr) {
+              console.log('[NFT Payment] DAS attempt ' + (dasAttempt + 1) + ' failed:', dasErr.message);
+            }
+          }
+          if (!resolvedMintAddress) {
+            console.log('[NFT Payment] Could not resolve asset ID, using tx signature fallback');
+          }
+        }
+        
+        // Send success data to app (forward all edition/hash params from URL)
         fetch('/nft-mint-success', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -7476,6 +7539,7 @@ app.get('/nft-payment', (req, res) => {
             estimatedTotalUsd: parseFloat(qs.get('estimatedTotalUsd') || '0'),
             solPrice: parseFloat(qs.get('solPrice') || '0'),
             nftType: nftTypeParam,
+            mintAddress: resolvedMintAddress || '',
             metadataUrl: qs.get('metadataUrl') || '',
             wallet: qs.get('wallet') || '',
             edition: qs.get('edition') || '',
@@ -7485,6 +7549,9 @@ app.get('/nft-payment', (req, res) => {
             storageOption: qs.get('storageOption') || '',
             contentHash: qs.get('contentHash') || '',
             exifHash: qs.get('exifHash') || '',
+            exifRawHash: qs.get('exifRawHash') || '',
+            exifBindingHash: qs.get('exifBindingHash') || '',
+            certificationMode: qs.get('certificationMode') || '',
           })
         }).catch(e => console.log('Failed to notify app:', e));
         
@@ -7526,7 +7593,7 @@ app.get('/nft-payment', (req, res) => {
 
 // NFT mint success callback - receives mint details from browser to show in app
 app.post('/nft-mint-success', (req, res) => {
-    const { paymentTx, mintTx, name, imageUrl, imageToken, amount, estimatedTotalSol, estimatedTotalUsd, solPrice, nftType, mintAddress, metadataUrl, wallet, edition, license, watermark, encrypt, storageOption, contentHash, exifHash } = req.body;
+    const { paymentTx, mintTx, name, imageUrl, imageToken, amount, estimatedTotalSol, estimatedTotalUsd, solPrice, nftType, mintAddress, metadataUrl, wallet, edition, license, watermark, encrypt, storageOption, contentHash, exifHash, exifRawHash, exifBindingHash, certificationMode } = req.body;
     console.log('[NFT] Mint success received:', { paymentTx, mintTx, amount, estimatedTotalSol, estimatedTotalUsd, nftType, edition, contentHash: contentHash?.substring(0, 16) });
     // Resolve imageToken server-side so album always gets the real image URL for onchain NFTs
     let resolvedImageUrl = imageUrl || '';
@@ -7555,6 +7622,9 @@ app.post('/nft-mint-success', (req, res) => {
         storageOption,
         contentHash,
         exifHash,
+        exifRawHash,
+        exifBindingHash,
+        certificationMode,
         timestamp: Date.now()
     };
     res.json({ success: true });
