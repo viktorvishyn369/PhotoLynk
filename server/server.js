@@ -2831,6 +2831,63 @@ app.post('/api/reset-password-device', authRateLimiter, async (req, res) => {
     });
 });
 
+// Migrate credentials: update email+password on existing account (same user_id).
+// Used by wallet migration to switch from legacy email+password to wallet-derived
+// credentials while preserving all server data (cloud_chunks, user_plans, devices).
+app.post('/api/migrate-credentials', authenticateToken, async (req, res) => {
+    try {
+        const { new_email, new_password, device_uuid } = req.body || {};
+        if (!new_email || !new_password) {
+            return res.status(400).json({ error: 'new_email and new_password required' });
+        }
+
+        const normalizedNewEmail = String(new_email).toLowerCase().trim();
+        const userId = req.user.id;
+
+        // Check if new email is already taken by a DIFFERENT user
+        const existing = await dbGetAsync(`SELECT id FROM users WHERE email = ? AND id != ?`, [normalizedNewEmail, userId]);
+        if (existing) {
+            return res.status(409).json({ error: 'Email already in use by another account' });
+        }
+
+        // Hash new password
+        const hashedPassword = await bcrypt.hash(new_password, BCRYPT_ROUNDS);
+        const newStorageUuid = computeStorageUuidFromEmail(normalizedNewEmail);
+
+        // Update user record in-place (same user_id!)
+        await dbRunAsync(
+            `UPDATE users SET email = ?, password = ?, storage_uuid = COALESCE(?, storage_uuid) WHERE id = ?`,
+            [normalizedNewEmail, hashedPassword, newStorageUuid, userId]
+        );
+
+        // Update device_uuid in devices table if provided
+        const effectiveDeviceUuid = device_uuid || req.user.device_uuid;
+        if (effectiveDeviceUuid) {
+            // Insert or update device record
+            db.run(
+                `INSERT INTO devices (user_id, device_uuid, device_name, last_seen)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(user_id, device_uuid) DO UPDATE SET last_seen = ?`,
+                [userId, effectiveDeviceUuid, (req.body.device_name || 'mobile'), Date.now(), Date.now()]
+            );
+        }
+
+        // Issue new JWT with updated identity
+        const storageUuid = newStorageUuid || req.user.storage_uuid;
+        const token = jwt.sign(
+            { id: userId, user_uuid: req.user.user_uuid, storage_uuid: storageUuid, email: normalizedNewEmail, device_uuid: effectiveDeviceUuid },
+            JWT_SECRET,
+            { expiresIn: '30d' }
+        );
+
+        console.log(`[Migrate] User ${userId} credentials migrated: ${req.user.email} → ${normalizedNewEmail}`);
+        res.json({ token, userId, message: 'Credentials migrated successfully' });
+    } catch (e) {
+        console.error('[Migrate] Error:', e.message);
+        res.status(500).json({ error: e.message || 'Migration failed' });
+    }
+});
+
 app.get('/api/subscription/status', authenticateToken, async (req, res) => {
     try {
         const st = await resolveSubscriptionState(req.user.id);
