@@ -575,9 +575,9 @@ function updateStats(){
 
 function buildFilters(){
   var counts={};allUsers.forEach(function(u){var s=u.status||'none';counts[s]=(counts[s]||0)+1});
-  var html='<button class="pill active" data-f="all" onclick="setFilter(this,\\'all\\')">All<span class="count">'+allUsers.length+'</span></button>';
+  var html='<button class="pill active" data-f="all" onclick="setFilter(this,&apos;all&apos;)">All<span class="count">'+allUsers.length+'</span></button>';
   var order=['active','trial','grace','expired','trial_expired','none','deleted'];
-  order.forEach(function(s){if(counts[s])html+='<button class="pill" data-f="'+s+'" onclick="setFilter(this,\\''+s+'\\')">'+s+'<span class="count">'+counts[s]+'</span></button>'});
+  order.forEach(function(s){if(counts[s])html+='<button class="pill" data-f="'+s+'" onclick="setFilter(this,&apos;'+s+'&apos;)">'+s+'<span class="count">'+counts[s]+'</span></button>'});
   document.getElementById('status-filters').innerHTML=html;
 }
 
@@ -630,7 +630,7 @@ function renderTable(){
     html+='<tr>';
     html+='<td class="id-cell">#'+u.id+'</td>';
     html+='<td class="email-cell" title="'+u.email+'">'+u.email+'</td>';
-    html+='<td class="uuid-cell" title="'+(u.user_uuid||'')+'" onclick="copyUuid(this,\''+((u.user_uuid||'').replace(/'/g,"\\'"))+'\')">'+((u.user_uuid||'').substring(0,8)||"-")+'</td>';
+    html+='<td class="uuid-cell" title="'+(u.user_uuid||'')+'" onclick="copyUuid(this,&apos;'+((u.user_uuid||'').replace(/'/g,'&apos;'))+'&apos;)">'+((u.user_uuid||'').substring(0,8)||"-")+'</td>';
     html+='<td class="plan-cell">'+planLabel(u.plan_gb)+'</td>';
     html+='<td>'+statusBadge(u.status)+'</td>';
     html+='<td>'+fmtDate(u.trial_until_date)+'</td>';
@@ -641,7 +641,7 @@ function renderTable(){
     html+='<td>'+fmtDate(u.updated_at_date)+'</td>';
     html+='<td class="actions-cell">';
     html+='<button class="btn-sm" onclick="openEdit('+u.id+')">Edit</button>';
-    html+='<button class="btn-sm btn-danger" onclick="openDelete('+u.id+',\\''+u.email.replace(/'/g,"\\\\'")+'\\')">&times;</button>';
+    html+='<button class="btn-sm btn-danger" onclick="openDelete('+u.id+',&apos;'+u.email.replace(/'/g,'&apos;')+'&apos;)">&times;</button>';
     html+='</td></tr>';
   });
   tbody.innerHTML=html;
