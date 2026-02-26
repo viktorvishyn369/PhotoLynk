@@ -7488,7 +7488,7 @@ app.get('/nft-payment', (req, res) => {
           for (let dasAttempt = 0; dasAttempt < 5; dasAttempt++) {
             await new Promise(r => setTimeout(r, dasAttempt === 0 ? 2000 : 3000));
             try {
-              const dasResp = await fetch('https://api.mainnet-beta.solana.com', {
+              const dasResp = await fetch('https://mainnet.helius-rpc.com/?api-key=15319bf4-5b40-4958-ac8d-6313aa55eb92', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
