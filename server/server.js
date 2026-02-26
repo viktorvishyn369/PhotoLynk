@@ -1624,6 +1624,9 @@ db.serialize(() => {
         if (!names.includes('verified_countries')) {
             db.run(`ALTER TABLE users ADD COLUMN verified_countries TEXT DEFAULT '[]'`, [], () => {});
         }
+        if (!names.includes('alias_email')) {
+            db.run(`ALTER TABLE users ADD COLUMN alias_email TEXT`, [], () => {});
+        }
         if (!names.includes('storage_uuid')) {
             db.run(`ALTER TABLE users ADD COLUMN storage_uuid TEXT`, [], () => {
                 db.all(`SELECT id, email FROM users WHERE storage_uuid IS NULL OR storage_uuid = ''`, [], (e2, rows) => {
@@ -1887,7 +1890,7 @@ const authenticateToken = (req, res, next) => {
         // resolve the local user by email so all downstream queries work correctly.
         if (user.email) {
             const normalizedEmail = String(user.email).toLowerCase().trim();
-            db.get(`SELECT id, user_uuid, storage_uuid, email FROM users WHERE email = ?`, [normalizedEmail], (dbErr, localUser) => {
+            db.get(`SELECT id, user_uuid, storage_uuid, email FROM users WHERE email = ? OR alias_email = ?`, [normalizedEmail, normalizedEmail], (dbErr, localUser) => {
                 if (!dbErr && localUser) {
                     const merged = {
                         ...user,
@@ -2413,7 +2416,7 @@ app.post('/api/login', authRateLimiter, async (req, res) => {
     if (!email || !password || !device_uuid) return res.status(400).json({ error: 'Missing credentials or device ID' });
     const normalizedEmail = String(email).toLowerCase().trim();
 
-    db.get(`SELECT * FROM users WHERE email = ?`, [normalizedEmail], async (err, user) => {
+    db.get(`SELECT * FROM users WHERE email = ? OR alias_email = ?`, [normalizedEmail, normalizedEmail], async (err, user) => {
         if (err) return res.status(500).json({ error: 'Database error' });
         if (!user) return res.status(401).json({ error: 'Invalid credentials' });
 
@@ -2854,10 +2857,14 @@ app.post('/api/migrate-credentials', authenticateToken, async (req, res) => {
         const hashedPassword = await bcrypt.hash(new_password, BCRYPT_ROUNDS);
         const newStorageUuid = computeStorageUuidFromEmail(normalizedNewEmail);
 
+        // Store the old email as alias so the user can still login with legacy credentials
+        const currentUser = await dbGetAsync(`SELECT email FROM users WHERE id = ?`, [userId]);
+        const aliasEmail = currentUser ? currentUser.email : null;
+
         // Update user record in-place (same user_id!)
         await dbRunAsync(
-            `UPDATE users SET email = ?, password = ?, storage_uuid = COALESCE(?, storage_uuid) WHERE id = ?`,
-            [normalizedNewEmail, hashedPassword, newStorageUuid, userId]
+            `UPDATE users SET email = ?, password = ?, storage_uuid = COALESCE(?, storage_uuid), alias_email = COALESCE(alias_email, ?) WHERE id = ?`,
+            [normalizedNewEmail, hashedPassword, newStorageUuid, aliasEmail, userId]
         );
 
         // Update device_uuid in devices table if provided
