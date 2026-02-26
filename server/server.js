@@ -417,6 +417,8 @@ tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowr
 .email-cell{color:var(--accent);font-weight:500}
 .date-cell{color:var(--muted);font-size:12px}
 .id-cell{color:var(--muted);font-weight:600;font-size:12px}
+.uuid-cell{color:var(--muted);font-size:11px;max-width:90px;overflow:hidden;text-overflow:ellipsis;cursor:pointer;font-family:monospace;letter-spacing:-.3px}
+.uuid-cell:hover{color:var(--accent)}
 .plan-cell{font-weight:700}
 .actions-cell{display:flex;gap:4px}
 .btn-sm{padding:4px 10px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid var(--border);background:transparent;color:var(--text);transition:all .15s}
@@ -474,6 +476,7 @@ tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowr
     <thead><tr>
       <th data-col="id" onclick="sortBy('id')">ID <span class="sort-arrow">&#9650;</span></th>
       <th data-col="email" onclick="sortBy('email')">Email <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="user_uuid" onclick="sortBy('user_uuid')">UUID <span class="sort-arrow">&#9650;</span></th>
       <th data-col="plan_gb" onclick="sortBy('plan_gb')">Plan <span class="sort-arrow">&#9650;</span></th>
       <th data-col="status" onclick="sortBy('status')">Status <span class="sort-arrow">&#9650;</span></th>
       <th data-col="trial_until" onclick="sortBy('trial_until')">Trial Until <span class="sort-arrow">&#9650;</span></th>
@@ -500,6 +503,7 @@ tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowr
     <div class="form-grid">
       <div class="form-group"><label>User ID</label><input id="e-id" readonly style="opacity:.6"/></div>
       <div class="form-group"><label>Email</label><input id="e-email" readonly style="opacity:.6"/></div>
+      <div class="form-group full"><label>UUID</label><input id="e-uuid" readonly style="opacity:.6;font-family:monospace;font-size:12px" onclick="this.select();document.execCommand('copy');toast('UUID copied','success')"/></div>
       <div class="form-group"><label>Plan GB</label>
         <select id="e-planGb"><option value="">unchanged</option><option value="100">100 GB</option><option value="200">200 GB</option><option value="400">400 GB</option><option value="1000">1 TB</option></select>
       </div>
@@ -626,6 +630,7 @@ function renderTable(){
     html+='<tr>';
     html+='<td class="id-cell">#'+u.id+'</td>';
     html+='<td class="email-cell" title="'+u.email+'">'+u.email+'</td>';
+    html+='<td class="uuid-cell" title="'+(u.user_uuid||'')+'" onclick="copyUuid(this,\''+((u.user_uuid||'').replace(/'/g,"\\'"))+'\')">'+((u.user_uuid||'').substring(0,8)||"-")+'</td>';
     html+='<td class="plan-cell">'+planLabel(u.plan_gb)+'</td>';
     html+='<td>'+statusBadge(u.status)+'</td>';
     html+='<td>'+fmtDate(u.trial_until_date)+'</td>';
@@ -646,6 +651,7 @@ function openEdit(id){
   var u=allUsers.find(function(x){return x.id===id});if(!u)return;
   document.getElementById('e-id').value=u.id;
   document.getElementById('e-email').value=u.email;
+  document.getElementById('e-uuid').value=u.user_uuid||'';
   document.getElementById('e-planGb').value='';
   document.getElementById('e-status').value='';
   document.getElementById('e-extTrialDays').value='';
@@ -695,6 +701,7 @@ async function confirmDelete(){
   }catch(e){toast('Error: '+e.message,'error')}
 }
 
+function copyUuid(el,uuid){if(!uuid||uuid==='-')return;navigator.clipboard.writeText(uuid).then(function(){toast('UUID copied','success')}).catch(function(){var t=document.createElement('textarea');t.value=uuid;document.body.appendChild(t);t.select();document.execCommand('copy');document.body.removeChild(t);toast('UUID copied','success')})}
 document.addEventListener('keydown',function(e){if(e.key==='Escape'){closeModal();closeDeleteModal()}});
 loadUsers();
 </script>
