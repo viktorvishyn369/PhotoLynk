@@ -5510,6 +5510,8 @@ app.patch('/api/cloud/manifests/:manifestId', authenticateToken, (req, res) => {
         if (thumbMime && !content.meta.thumbMime) content.meta.thumbMime = thumbMime;
         
         fs.writeFileSync(manifestPath, JSON.stringify(content));
+        // Invalidate dedup cache so backfilled hashes are picked up immediately
+        try { serverDedupCache.delete(manifestsDir); } catch (e) {}
         console.log(`[SC] Updated metadata for manifest ${safeId}`);
         res.json({ ok: true, manifestId: safeId });
     } catch (e) {
@@ -5860,6 +5862,12 @@ app.delete('/api/account', authenticateToken, async (req, res) => {
             : path.join(userDir, 'chunks');
         const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid || '');
         
+        // Clear dedup cache before deleting user directories
+        try {
+            const manifestsDir = path.join(userDir, 'manifests');
+            serverDedupCache.delete(manifestsDir);
+        } catch (e) {}
+
         // Delete all user files (chunks, manifests, classic uploads)
         const dirsToDelete = [chunksDir, userDir, deviceDir].filter(d => d && d.length > 10);
         for (const dir of dirsToDelete) {
