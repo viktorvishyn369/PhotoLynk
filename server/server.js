@@ -476,7 +476,8 @@ tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowr
     <thead><tr>
       <th data-col="id" onclick="sortBy('id')">ID <span class="sort-arrow">&#9650;</span></th>
       <th data-col="email" onclick="sortBy('email')">Email <span class="sort-arrow">&#9650;</span></th>
-      <th data-col="user_uuid" onclick="sortBy('user_uuid')">UUID <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="device_uuids" onclick="sortBy('device_uuids')">Device UUID <span class="sort-arrow">&#9650;</span></th>
+      <th>Storage</th>
       <th data-col="plan_gb" onclick="sortBy('plan_gb')">Plan <span class="sort-arrow">&#9650;</span></th>
       <th data-col="status" onclick="sortBy('status')">Status <span class="sort-arrow">&#9650;</span></th>
       <th data-col="trial_until" onclick="sortBy('trial_until')">Trial Until <span class="sort-arrow">&#9650;</span></th>
@@ -558,7 +559,7 @@ async function loadUsers(){
   try{
     var r=await fetch('/admin/api/users');var d=await r.json();
     if(!r.ok)throw new Error(d.error||'Failed');
-    allUsers=d.users.map(function(u){return{id:u.id,email:u.email||'',user_uuid:u.user_uuid||'',plan_gb:u.plan.plan_gb||0,status:u.plan.status||'none',trial_until:u.plan.trial_until,trial_until_date:u.plan.trial_until_date,expires_at:u.plan.expires_at,expires_at_date:u.plan.expires_at_date,grace_until:u.plan.grace_until,created_at:u.user_created_at,created_at_date:u.user_created_at_date,payment_type:u.plan.payment_type||'',payment_at:u.plan.payment_at,payment_at_date:u.plan.payment_at_date,updated_at:u.plan.updated_at,updated_at_date:u.plan.updated_at_date}});
+    allUsers=d.users.map(function(u){return{id:u.id,email:u.email||'',user_uuid:u.user_uuid||'',device_uuids:u.device_uuids||'',plan_gb:u.plan.plan_gb||0,status:u.plan.status||'none',trial_until:u.plan.trial_until,trial_until_date:u.plan.trial_until_date,expires_at:u.plan.expires_at,expires_at_date:u.plan.expires_at_date,grace_until:u.plan.grace_until,created_at:u.user_created_at,created_at_date:u.user_created_at_date,payment_type:u.plan.payment_type||'',payment_at:u.plan.payment_at,payment_at_date:u.plan.payment_at_date,updated_at:u.plan.updated_at,updated_at_date:u.plan.updated_at_date}});
     updateStats();buildFilters();applyFilters();
     document.getElementById('loading').style.display='none';
     document.getElementById('users-table').style.display='';
@@ -593,7 +594,7 @@ function applyFilters(){
   filteredUsers=allUsers.filter(function(u){
     if(activeFilter!=='all'&&u.status!==activeFilter)return false;
     if(!q)return true;
-    return(String(u.id).includes(q)||u.email.toLowerCase().includes(q)||(u.status||'').toLowerCase().includes(q)||String(u.plan_gb).includes(q)||(u.payment_type||'').toLowerCase().includes(q)||(u.user_uuid||'').toLowerCase().includes(q));
+    return(String(u.id).includes(q)||u.email.toLowerCase().includes(q)||(u.status||'').toLowerCase().includes(q)||String(u.plan_gb).includes(q)||(u.payment_type||'').toLowerCase().includes(q)||(u.device_uuids||'').toLowerCase().includes(q)||(u.user_uuid||'').toLowerCase().includes(q));
   });
   doSort();renderTable();
 }
@@ -630,7 +631,8 @@ function renderTable(){
     html+='<tr>';
     html+='<td class="id-cell">#'+u.id+'</td>';
     html+='<td class="email-cell" title="'+u.email+'">'+u.email+'</td>';
-    html+='<td class="uuid-cell" title="'+(u.user_uuid||'')+'" onclick="copyUuid(this,&apos;'+((u.user_uuid||'').replace(/'/g,'&apos;'))+'&apos;)">'+((u.user_uuid||'').substring(0,8)||"-")+'</td>';
+    html+='<td class="uuid-cell" title="'+(u.device_uuids||'')+'" onclick="copyUuid(this,&apos;'+((u.device_uuids||'').replace(/'/g,'&apos;'))+'&apos;)">'+((u.device_uuids||'').substring(0,13)||"-")+'</td>';
+    html+='<td style="font-size:10px;">users/'+u.id+'</td>';
     html+='<td class="plan-cell">'+planLabel(u.plan_gb)+'</td>';
     html+='<td>'+statusBadge(u.status)+'</td>';
     html+='<td>'+fmtDate(u.trial_until_date)+'</td>';
@@ -865,6 +867,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 u.email,
                 u.user_uuid,
                 u.created_at AS user_created_at,
+                GROUP_CONCAT(DISTINCT d.device_uuid) AS device_uuids,
                 p.plan_gb,
                 p.status as plan_status,
                 p.trial_until,
@@ -875,6 +878,8 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 p.updated_at as plan_updated_at
             FROM users u
             LEFT JOIN user_plans p ON u.id = p.user_id
+            LEFT JOIN devices d ON u.id = d.user_id
+            GROUP BY u.id
             ORDER BY u.id DESC
         `);
 
@@ -882,6 +887,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
             id: user.id,
             email: user.email,
             user_uuid: user.user_uuid,
+            device_uuids: user.device_uuids || null,
             user_created_at: user.user_created_at,
             user_created_at_date: user.user_created_at ? new Date(user.user_created_at).toISOString() : null,
             plan: {
@@ -4248,6 +4254,7 @@ app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
             // Read file into buffer to avoid Sharp holding file handle open on Windows
             const sharpInput = inputBuffer || fs.readFileSync(filePath);
             const thumbBuffer = await sharp(sharpInput, { failOn: 'none', pages: 1 })
+                .rotate()
                 .resize(150, 150, { fit: 'cover', position: 'center' })
                 .jpeg({ quality: 70 })
                 .toBuffer();
