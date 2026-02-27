@@ -4924,6 +4924,13 @@ app.post('/api/cloud/purge', authenticateToken, async (req, res) => {
         // Recreate directories for the current (canonical) user key
         try { fs.mkdirSync(chunksDir, { recursive: true }); } catch (e) {}
         try { fs.mkdirSync(manifestsDir, { recursive: true }); } catch (e) {}
+        
+        // Clear dedup cache for this user since we just deleted their manifests
+        try {
+            if (typeof serverDedupCache !== 'undefined') {
+                serverDedupCache.delete(manifestsDir);
+            }
+        } catch (e) {}
 
         console.log(`[Purge] User ${req.user.id}: chunks=${chunksBefore}, manifests=${manifestsBefore}`);
 
