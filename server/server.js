@@ -5192,53 +5192,75 @@ function normalizeFilenameForCompare(name) {
     return trimmed.toLowerCase();
 }
 
-// Build server-side dedup sets from existing manifests
+const serverDedupCache = new Map(); // manifestsDir -> { sets, files: Set<string> }
+
+// Build server-side dedup sets from existing manifests (with incremental in-memory cache to fix O(N^2) bottleneck)
 function buildServerDedupSets(manifestsDir) {
-    const sets = {
+    const emptySets = {
         manifestIds: new Set(),
         filenames: new Set(),
         fileHashes: new Set(),
         perceptualHashes: new Set(),
-        exifFull: new Set(),      // captureTime|make|model
-        exifTimeModel: new Set(), // captureTime|model
-        exifTimeMake: new Set(),  // captureTime|make
+        exifFull: new Set(),
+        exifTimeModel: new Set(),
+        exifTimeMake: new Set(),
     };
     
-    if (!fs.existsSync(manifestsDir)) return sets;
+    if (!fs.existsSync(manifestsDir)) {
+        serverDedupCache.delete(manifestsDir);
+        return emptySets;
+    }
+    
+    let cacheEntry = serverDedupCache.get(manifestsDir);
+    if (!cacheEntry) {
+        cacheEntry = { sets: emptySets, files: new Set() };
+        serverDedupCache.set(manifestsDir, cacheEntry);
+    }
     
     try {
-        const files = fs.readdirSync(manifestsDir).filter(f => f.endsWith('.json') && !f.startsWith('.'));
-        for (const f of files) {
-            try {
-                const content = JSON.parse(fs.readFileSync(path.join(manifestsDir, f), 'utf8'));
-                const manifestId = f.replace(/\.json$/, '');
-                sets.manifestIds.add(manifestId);
-                
-                if (content.meta) {
-                    if (content.meta.filename) {
-                        const normalized = normalizeFilenameForCompare(content.meta.filename);
-                        if (normalized) sets.filenames.add(normalized);
-                    }
-                    if (content.meta.fileHash) sets.fileHashes.add(content.meta.fileHash);
-                    if (content.meta.perceptualHash) sets.perceptualHashes.add(content.meta.perceptualHash);
+        const currentFiles = fs.readdirSync(manifestsDir).filter(f => f.endsWith('.json') && !f.startsWith('.'));
+        
+        // If files were deleted (rare), easiest is to invalidate and rebuild from scratch
+        if (currentFiles.length < cacheEntry.files.size) {
+            serverDedupCache.delete(manifestsDir);
+            return buildServerDedupSets(manifestsDir);
+        }
+        
+        // Incrementally add new files
+        for (const f of currentFiles) {
+            if (!cacheEntry.files.has(f)) {
+                try {
+                    const content = JSON.parse(fs.readFileSync(path.join(manifestsDir, f), 'utf8'));
+                    const manifestId = f.replace(/\.json$/, '');
+                    cacheEntry.sets.manifestIds.add(manifestId);
                     
-                    // EXIF-based dedup keys
-                    const ct = content.meta.exifCaptureTime;
-                    const mk = content.meta.exifMake;
-                    const md = content.meta.exifModel;
-                    if (ct && mk && md) sets.exifFull.add(`${ct}|${mk}|${md}`);
-                    if (ct && md) sets.exifTimeModel.add(`${ct}|${md}`);
-                    if (ct && mk) sets.exifTimeMake.add(`${ct}|${mk}`);
+                    if (content.meta) {
+                        if (content.meta.filename) {
+                            const normalized = normalizeFilenameForCompare(content.meta.filename);
+                            if (normalized) cacheEntry.sets.filenames.add(normalized);
+                        }
+                        if (content.meta.fileHash) cacheEntry.sets.fileHashes.add(content.meta.fileHash);
+                        if (content.meta.perceptualHash) cacheEntry.sets.perceptualHashes.add(content.meta.perceptualHash);
+                        
+                        // EXIF-based dedup keys
+                        const ct = content.meta.exifCaptureTime;
+                        const mk = content.meta.exifMake;
+                        const md = content.meta.exifModel;
+                        if (ct && mk && md) cacheEntry.sets.exifFull.add(`${ct}|${mk}|${md}`);
+                        if (ct && md) cacheEntry.sets.exifTimeModel.add(`${ct}|${md}`);
+                        if (ct && mk) cacheEntry.sets.exifTimeMake.add(`${ct}|${mk}`);
+                    }
+                    cacheEntry.files.add(f);
+                } catch (e) {
+                    // Skip unreadable manifests
                 }
-            } catch (e) {
-                // Skip unreadable manifests
             }
         }
     } catch (e) {
         console.warn('[SC] Failed to build dedup sets:', e.message);
     }
     
-    return sets;
+    return cacheEntry.sets;
 }
 
 // Check if perceptual hash matches any existing hash (fuzzy matching)
