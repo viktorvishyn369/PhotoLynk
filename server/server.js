@@ -6403,7 +6403,7 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
             if (idx >= 0) {
                 // Merge new fields into existing (preserves fields the sender may not have)
                 const existing = data.nfts[idx];
-                const mergeFields = ['encryptionData','thumbnailUrl','imageUrl','edition','encrypted','watermarked','license','storageType','nftType','isCompressed','assetId','txSignature','attributes','createdAt'];
+                const mergeFields = ['encryptionData','thumbnailUrl','imageUrl','edition','encrypted','watermarked','license','storageType','nftType','isCompressed','assetId','txSignature','attributes','createdAt','mintedAt','ipfsThumbnailUrl','metadataUrl','contentHash','exifHash','exifRawHash','exifBindingHash','hasRfc3161','hasC2pa','certificationMode','mintPlatform'];
                 let updated = 0;
                 for (const f of mergeFields) {
                     if (nft[f] !== undefined && nft[f] !== null && (existing[f] === undefined || existing[f] === null)) {
@@ -6436,7 +6436,7 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
             let added = 0;
             let updated = 0;
             let deduped = 0;
-            const mergeFields = ['encryptionData','thumbnailUrl','imageUrl','edition','encrypted','watermarked','license','storageType','nftType','isCompressed','assetId','txSignature','attributes','createdAt'];
+            const mergeFields = ['encryptionData','thumbnailUrl','imageUrl','edition','encrypted','watermarked','license','storageType','nftType','isCompressed','assetId','txSignature','attributes','createdAt','mintedAt','ipfsThumbnailUrl','metadataUrl','contentHash','exifHash','exifRawHash','exifBindingHash','hasRfc3161','hasC2pa','certificationMode','mintPlatform'];
             for (const n of nfts) {
                 if (!n.mintAddress) continue;
                 // Skip tx_ temp entries if a real entry with same metadataUrl already exists
@@ -6483,6 +6483,9 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
                 }
             }
             console.log(`[NFT] Album backup: user=${userId} added=${added} updated=${updated} total=${data.nfts.length}`);
+        } else if (action === 'get') {
+            // Return all NFTs for this user (used by mobile-v2 to merge with DAS results)
+            return res.json({ success: true, nfts: data.nfts || [] });
         } else {
             return res.status(400).json({ error: 'Invalid action or missing data' });
         }
@@ -7600,39 +7603,49 @@ app.get('/nft-payment', (req, res) => {
           const nftName = qs.get('name') || '';
           const metaUrl = qs.get('metadataUrl') || '';
           
+          const dasKeys = [
+            'https://mainnet.helius-rpc.com/?api-key=8b86bd0d-4534-4ce9-a61d-ec3850cb0b62',
+            'https://mainnet.helius-rpc.com/?api-key=6b3d0180-4354-4e31-a2fc-9b6cd9e550a7',
+          ];
           for (let dasAttempt = 0; dasAttempt < 5; dasAttempt++) {
             await new Promise(r => setTimeout(r, dasAttempt === 0 ? 2000 : 3000));
-            try {
-              const dasResp = await fetch('https://mainnet.helius-rpc.com/?api-key=15319bf4-5b40-4958-ac8d-6313aa55eb92', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                  jsonrpc: '2.0',
-                  id: 'resolve-cnft',
-                  method: 'getAssetsByOwner',
-                  params: {
-                    ownerAddress: walletAddr,
-                    page: 1,
-                    limit: 10,
-                    sortBy: { sortBy: 'created', sortDirection: 'desc' },
-                  },
-                }),
-              });
-              const dasData = await dasResp.json();
-              if (dasData.result && dasData.result.items) {
-                const match = dasData.result.items.find(function(item) {
-                  return (metaUrl && item.content && item.content.json_uri === metaUrl) ||
-                    (nftName && item.content && item.content.metadata && item.content.metadata.name === nftName);
+            for (const dasUrl of dasKeys) {
+              try {
+                const dasResp = await fetch(dasUrl, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({
+                    jsonrpc: '2.0',
+                    id: 'resolve-cnft',
+                    method: 'getAssetsByOwner',
+                    params: {
+                      ownerAddress: walletAddr,
+                      page: 1,
+                      limit: 10,
+                      sortBy: { sortBy: 'created', sortDirection: 'desc' },
+                    },
+                  }),
                 });
-                if (match) {
-                  resolvedMintAddress = match.id;
-                  console.log('[NFT Payment] Resolved real asset ID:', resolvedMintAddress);
-                  break;
+                if (dasResp.status === 429) { continue; }
+                const dasData = await dasResp.json();
+                if (dasData.result && dasData.result.items) {
+                  const match = dasData.result.items.find(function(item) {
+                    return (metaUrl && item.content && item.content.json_uri === metaUrl) ||
+                      (nftName && item.content && item.content.metadata && item.content.metadata.name === nftName);
+                  });
+                  if (match) {
+                    resolvedMintAddress = match.id;
+                    console.log('[NFT Payment] Resolved real asset ID:', resolvedMintAddress);
+                    break;
+                  }
                 }
+                break; // success (even if no match), don't try next key
+              } catch (dasErr) {
+                console.log('[NFT Payment] DAS attempt ' + (dasAttempt + 1) + ' failed:', dasErr.message);
+                break;
               }
-            } catch (dasErr) {
-              console.log('[NFT Payment] DAS attempt ' + (dasAttempt + 1) + ' failed:', dasErr.message);
             }
+            if (resolvedMintAddress) break;
           }
           if (!resolvedMintAddress) {
             console.log('[NFT Payment] Could not resolve asset ID, using tx signature fallback');
