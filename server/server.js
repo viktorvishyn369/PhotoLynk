@@ -6668,7 +6668,7 @@ app.post('/solana-rpc', async (req, res) => {
         'https://solana-rpc.publicnode.com',       // PublicNode - reliable free tier
         'https://rpc.ankr.com/solana',
         'https://solana.drpc.org',                 // dRPC public
-        process.env.HELIUS_API_KEY ? `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}` : null, // Helius (env)
+        (process.env.HELIUS_RPC_KEY || process.env.HELIUS_API_KEY) ? `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_RPC_KEY || process.env.HELIUS_API_KEY}` : null, // Helius (env)
         'https://solana-mainnet.g.alchemy.com/v2/demo'
     ].filter(Boolean);
     
@@ -7605,7 +7605,7 @@ app.get('/nft-payment', (req, res) => {
           const metaUrl = qs.get('metadataUrl') || '';
           
           const dasKeys = [
-            'https://api.mainnet-beta.solana.com',
+            '${process.env.HELIUS_API_KEY ? `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}` : 'https://api.mainnet-beta.solana.com'}',
           ];
           for (let dasAttempt = 0; dasAttempt < 5; dasAttempt++) {
             await new Promise(r => setTimeout(r, dasAttempt === 0 ? 2000 : 3000));
