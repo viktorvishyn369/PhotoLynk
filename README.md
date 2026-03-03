@@ -194,10 +194,17 @@ npm start
 
 Optional configuration (environment variables):
 
+Create a `.env` file in `server/` and/or `server-tray/` with any of the following:
+
 - `PORT` (default: `3000`)
 - `PHOTOSYNC_DATA_DIR` (sets the base data folder)
 - `UPLOAD_DIR`, `DB_PATH`, `CLOUD_DIR` (advanced overrides)
 - HTTPS (TLS): `ENABLE_HTTPS=true`, `TLS_KEY_PATH`, `TLS_CERT_PATH`, `HTTPS_PORT`
+- `HELIUS_API_KEY` (Solana RPC — get free key at [helius.dev](https://helius.dev))
+- `PINATA_JWT` (IPFS uploads — get free key at [pinata.cloud](https://pinata.cloud))
+- `DEBUG_SECRET` (admin debug endpoint secret)
+
+> **Note:** `.env` files are gitignored and never included in the repository. You must create your own with your own API keys.
 
 ## Auto-Updates
 
@@ -532,7 +539,17 @@ node server.js
 
 ## License
 
-MIT — See [License](https://viktorvishyn369.github.io/PhotoLynk/license.html)
+**CC BY-NC-ND 4.0** (Creative Commons Attribution-NonCommercial-NoDerivatives)
+
+- ✅ View and study source code
+- ✅ Share repository link
+- ❌ No commercial use without written permission
+- ❌ No building/distributing applications without written permission
+- ❌ No modified versions
+
+**Commercial use requires written permission**: support@photolynk.io
+
+See [LICENSE](LICENSE) for full terms.
 
 ## Legal
 
@@ -542,7 +559,9 @@ MIT — See [License](https://viktorvishyn369.github.io/PhotoLynk/license.html)
 
 ## Contributing
 
-Issues and pull requests welcome!
+Bug reports and feature suggestions are welcome via GitHub Issues.
+
+This project is licensed under CC BY-NC-ND 4.0. Pull requests may be accepted at the maintainer's discretion, but you may not distribute modified versions independently. See [LICENSE](LICENSE).
 
 ---
 
