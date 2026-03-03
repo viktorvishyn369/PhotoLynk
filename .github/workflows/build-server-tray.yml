@@ -15,6 +15,11 @@ jobs:
       APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
       APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
       APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+      HELIUS_API_KEY_2: ${{ secrets.HELIUS_API_KEY_2 }}
+      HELIUS_RPC_KEY: ${{ secrets.HELIUS_RPC_KEY }}
+      PINATA_JWT: ${{ secrets.PINATA_JWT }}
+      DEBUG_SECRET: ${{ secrets.DEBUG_SECRET }}
     steps:
       - uses: actions/checkout@v4
       
@@ -89,6 +94,11 @@ jobs:
       APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
       APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
       APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+      HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+      HELIUS_API_KEY_2: ${{ secrets.HELIUS_API_KEY_2 }}
+      HELIUS_RPC_KEY: ${{ secrets.HELIUS_RPC_KEY }}
+      PINATA_JWT: ${{ secrets.PINATA_JWT }}
+      DEBUG_SECRET: ${{ secrets.DEBUG_SECRET }}
     steps:
       - uses: actions/checkout@v4
 
@@ -157,6 +167,12 @@ jobs:
 
   build-windows:
     runs-on: windows-2022
+    env:
+      HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+      HELIUS_API_KEY_2: ${{ secrets.HELIUS_API_KEY_2 }}
+      HELIUS_RPC_KEY: ${{ secrets.HELIUS_RPC_KEY }}
+      PINATA_JWT: ${{ secrets.PINATA_JWT }}
+      DEBUG_SECRET: ${{ secrets.DEBUG_SECRET }}
     steps:
       - uses: actions/checkout@v4
       
@@ -209,6 +225,12 @@ jobs:
 
   build-linux:
     runs-on: ubuntu-latest
+    env:
+      HELIUS_API_KEY: ${{ secrets.HELIUS_API_KEY }}
+      HELIUS_API_KEY_2: ${{ secrets.HELIUS_API_KEY_2 }}
+      HELIUS_RPC_KEY: ${{ secrets.HELIUS_RPC_KEY }}
+      PINATA_JWT: ${{ secrets.PINATA_JWT }}
+      DEBUG_SECRET: ${{ secrets.DEBUG_SECRET }}
     steps:
       - uses: actions/checkout@v4
       
