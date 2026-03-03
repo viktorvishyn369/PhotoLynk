@@ -1,0 +1,54 @@
+name: Build Desktop Apps
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact-name: PhotoLynk-Desktop-${{ github.ref_name }}-linux-x64
+            build-command: npm run build-linux
+          - os: windows-latest
+            artifact-name: PhotoLynk-Desktop-${{ github.ref_name }}-win-x64
+            build-command: npm run build-win
+          - os: macos-latest
+            artifact-name: PhotoLynk-Desktop-${{ github.ref_name }}-mac-Intel
+            build-command: npm run build-mac:x64
+          - os: macos-latest
+            artifact-name: PhotoLynk-Desktop-${{ github.ref_name }}-mac-AppleSilicon
+            build-command: npm run build-mac:arm64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies (server-tray)
+        run: npm ci
+        working-directory: server-tray
+
+      - name: Rebuild native deps
+        run: npm run rebuild-native
+        working-directory: server-tray
+
+      - name: Build app
+        run: ${{ matrix.build-command }}
+        working-directory: server-tray
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact-name }}
+          path: server-tray/dist/*
