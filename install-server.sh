@@ -152,6 +152,8 @@ if [ -d "$INSTALL_DIR" ]; then
         REPO_URL="git@github.com:viktorvishyn369/PhotoLynk-Private.git"
     fi
     git remote set-url origin "$REPO_URL" >/dev/null 2>&1 || true
+    git reset --hard HEAD >/dev/null 2>&1 || true
+    git clean -fd >/dev/null 2>&1 || true
     GIT_TERMINAL_PROMPT=0 git pull
 else
     # Private repo — use SSH (no token needed), fallback to HTTPS+token if provided
