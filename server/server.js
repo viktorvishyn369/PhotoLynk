@@ -336,6 +336,10 @@ app.use(express.json({ limit: '25mb' }));
 // Serve static files from public directory (company website assets)
 app.use('/images', express.static(path.join(__dirname, 'public', 'images')));
 
+// Desktop app downloads directory (builds uploaded here become available at /photolynk/download)
+const DOWNLOADS_DIR = process.env.DOWNLOADS_DIR || path.join(AUX_ROOT, 'downloads');
+if (!fs.existsSync(DOWNLOADS_DIR)) { try { fs.mkdirSync(DOWNLOADS_DIR, { recursive: true }); } catch (_) {} }
+
 // Serve .well-known directory for capacity JSON
 app.use('/.well-known', express.static(path.join(AUX_ROOT, '.well-known')));
 
@@ -1850,6 +1854,18 @@ db.serialize(() => {
         PRIMARY KEY(user_id, device_uuid),
         FOREIGN KEY(user_id) REFERENCES users(id)
     )`);
+
+    // Linked devices table — cross-app QR pairing (mobile-v2 ↔ solana-seeker etc.)
+    // Links two device_uuids so their NFT/certificate data is merged on read.
+    // Bidirectional: if A is linked to B, both see each other's data.
+    db.run(`CREATE TABLE IF NOT EXISTS linked_devices (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_uuid_a TEXT NOT NULL,
+        device_uuid_b TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        label TEXT,
+        UNIQUE(device_uuid_a, device_uuid_b)
+    )`);
     
     // Clean up database on startup - remove entries for files that don't exist
     setTimeout(() => {
@@ -2188,6 +2204,233 @@ app.get('/', (req, res) => {
 
 app.get('/health', (req, res) => {
     res.status(200).json({ ok: true });
+});
+
+// ============================================================================
+// PHOTOLYNK DESKTOP DOWNLOADS — Self-hosted build distribution with SHA-256
+// ============================================================================
+
+// Serve download page
+app.get('/photolynk/download', (req, res) => {
+    const dlPage = path.join(__dirname, 'public', 'photolynk-download.html');
+    if (fs.existsSync(dlPage)) return res.sendFile(dlPage);
+    res.status(404).send('Download page not found');
+});
+
+// SHA-256 checksums file (auto-generated on upload, persisted as JSON)
+const CHECKSUMS_FILE = path.join(DOWNLOADS_DIR, 'checksums.json');
+
+function loadChecksums() {
+    try {
+        if (fs.existsSync(CHECKSUMS_FILE)) return JSON.parse(fs.readFileSync(CHECKSUMS_FILE, 'utf8'));
+    } catch (_) {}
+    return {};
+}
+
+function saveChecksums(checksums) {
+    fs.writeFileSync(CHECKSUMS_FILE, JSON.stringify(checksums, null, 2));
+}
+
+// Compute SHA-256 of a file
+function computeSHA256(filePath) {
+    return new Promise((resolve, reject) => {
+        const hash = crypto.createHash('sha256');
+        const stream = fs.createReadStream(filePath);
+        stream.on('data', d => hash.update(d));
+        stream.on('end', () => resolve(hash.digest('hex')));
+        stream.on('error', reject);
+    });
+}
+
+// Parse build filename into structured info
+// Pattern: "PhotoLynk Desktop-{version}-{platform}.{ext}"
+function parseBuildFilename(filename) {
+    // Match: PhotoLynk Desktop-2.0.0-mac-arm64.dmg, PhotoLynk Desktop-2.0.0-win-x64.exe, etc.
+    const m = filename.match(/^PhotoLynk Desktop[- ](.+?)-(mac-arm64|mac-x64|win-x64|linux-x86_64)\.(dmg|exe|AppImage)$/i);
+    if (!m) return null;
+    const version = m[1];
+    let platform = m[2].toLowerCase();
+    const ext = m[3];
+    // Normalize linux platform key
+    if (platform === 'linux-x86_64') platform = 'linux-x64';
+    return { version, platform, ext, filename };
+}
+
+// GET /api/downloads/list — Public: list available builds with SHA-256 (auto-computed if missing)
+app.get('/api/downloads/list', async (req, res) => {
+    try {
+        if (!fs.existsSync(DOWNLOADS_DIR)) return res.json({ builds: [] });
+        const files = fs.readdirSync(DOWNLOADS_DIR).filter(f => {
+            const ext = path.extname(f).toLowerCase();
+            return ['.dmg', '.exe', '.appimage'].includes(ext);
+        });
+        let checksums = loadChecksums();
+        let needsSave = false;
+        const builds = [];
+        for (const f of files) {
+            const info = parseBuildFilename(f);
+            if (!info) continue;
+            const stat = fs.statSync(path.join(DOWNLOADS_DIR, f));
+            // Auto-compute SHA-256 if missing
+            if (!checksums[f]) {
+                console.log(`[Downloads] Auto-computing SHA-256 for ${f}...`);
+                checksums[f] = await computeSHA256(path.join(DOWNLOADS_DIR, f));
+                needsSave = true;
+            }
+            builds.push({
+                filename: f,
+                version: info.version,
+                platform: info.platform,
+                ext: info.ext,
+                size: stat.size,
+                sha256: checksums[f],
+                uploadedAt: stat.mtime.toISOString(),
+            });
+        }
+        // Save checksums if any were computed
+        if (needsSave) saveChecksums(checksums);
+        // Sort: latest version first, then by platform
+        builds.sort((a, b) => {
+            const vc = b.version.localeCompare(a.version, undefined, { numeric: true });
+            if (vc !== 0) return vc;
+            return a.platform.localeCompare(b.platform);
+        });
+        res.json({ builds });
+    } catch (e) {
+        console.error('[Downloads] List error:', e.message);
+        res.status(500).json({ error: 'Failed to list builds' });
+    }
+});
+
+// GET /api/downloads/file/:filename — Public: download a build file
+app.get('/api/downloads/file/:filename', (req, res) => {
+    try {
+        const filename = req.params.filename;
+        // Security: prevent path traversal
+        if (filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
+            return res.status(400).json({ error: 'Invalid filename' });
+        }
+        const filePath = path.join(DOWNLOADS_DIR, filename);
+        if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File not found' });
+        const stat = fs.statSync(filePath);
+        const ext = path.extname(filename).toLowerCase();
+        const mimeTypes = { '.dmg': 'application/x-apple-diskimage', '.exe': 'application/x-msdownload', '.appimage': 'application/octet-stream' };
+        res.setHeader('Content-Type', mimeTypes[ext] || 'application/octet-stream');
+        res.setHeader('Content-Length', stat.size);
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.setHeader('Cache-Control', 'public, max-age=86400');
+        fs.createReadStream(filePath).pipe(res);
+    } catch (e) {
+        console.error('[Downloads] File serve error:', e.message);
+        res.status(500).json({ error: 'Download failed' });
+    }
+});
+
+// POST /api/downloads/upload — Admin: upload a new build (requires auth token)
+// Use: curl -X POST -H "Authorization: Bearer <ADMIN_TOKEN>" -F "build=@file.dmg" https://stealthlynk.io/api/downloads/upload
+const downloadUpload = multer({
+    storage: multer.diskStorage({
+        destination: (req, file, cb) => cb(null, DOWNLOADS_DIR),
+        filename: (req, file, cb) => cb(null, file.originalname),
+    }),
+    limits: { fileSize: 500 * 1024 * 1024 }, // 500MB max
+    fileFilter: (req, file, cb) => {
+        const ext = path.extname(file.originalname).toLowerCase();
+        if (['.dmg', '.exe', '.appimage'].includes(ext)) return cb(null, true);
+        cb(new Error('Only .dmg, .exe, and .AppImage files are allowed'));
+    },
+});
+
+app.post('/api/downloads/upload', authenticateToken, downloadUpload.single('build'), async (req, res) => {
+    try {
+        // Only allow admin users to upload builds
+        if (!req.user || (req.user.username !== 'admin' && req.user.role !== 'admin')) {
+            // Also check if user is the server owner (userId 1)
+            if (!req.user || req.user.userId !== 1) {
+                if (req.file) try { fs.unlinkSync(req.file.path); } catch (_) {}
+                return res.status(403).json({ error: 'Admin access required' });
+            }
+        }
+        if (!req.file) return res.status(400).json({ error: 'No build file provided' });
+
+        const filename = req.file.originalname;
+        const filePath = path.join(DOWNLOADS_DIR, filename);
+        const info = parseBuildFilename(filename);
+        if (!info) {
+            try { fs.unlinkSync(filePath); } catch (_) {}
+            return res.status(400).json({ error: 'Invalid filename format. Expected: PhotoLynk Desktop-{version}-{platform}.{ext}' });
+        }
+
+        // Compute SHA-256
+        const sha256 = await computeSHA256(filePath);
+
+        // Save checksum
+        const checksums = loadChecksums();
+        checksums[filename] = sha256;
+        saveChecksums(checksums);
+
+        console.log(`[Downloads] Build uploaded: ${filename} (${(req.file.size / 1048576).toFixed(1)} MB) SHA-256: ${sha256}`);
+
+        res.json({
+            success: true,
+            filename,
+            version: info.version,
+            platform: info.platform,
+            size: req.file.size,
+            sha256,
+        });
+    } catch (e) {
+        console.error('[Downloads] Upload error:', e.message);
+        res.status(500).json({ error: 'Upload failed: ' + e.message });
+    }
+});
+
+// DELETE /api/downloads/file/:filename — Admin: remove a build
+app.delete('/api/downloads/file/:filename', authenticateToken, (req, res) => {
+    try {
+        if (!req.user || (req.user.username !== 'admin' && req.user.role !== 'admin' && req.user.userId !== 1)) {
+            return res.status(403).json({ error: 'Admin access required' });
+        }
+        const filename = req.params.filename;
+        if (filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
+            return res.status(400).json({ error: 'Invalid filename' });
+        }
+        const filePath = path.join(DOWNLOADS_DIR, filename);
+        if (!fs.existsSync(filePath)) return res.status(404).json({ error: 'File not found' });
+        fs.unlinkSync(filePath);
+        // Remove checksum
+        const checksums = loadChecksums();
+        delete checksums[filename];
+        saveChecksums(checksums);
+        console.log(`[Downloads] Build removed: ${filename}`);
+        res.json({ success: true, filename });
+    } catch (e) {
+        console.error('[Downloads] Delete error:', e.message);
+        res.status(500).json({ error: 'Delete failed' });
+    }
+});
+
+// POST /api/downloads/rehash — Admin: recompute SHA-256 for all builds
+app.post('/api/downloads/rehash', authenticateToken, async (req, res) => {
+    try {
+        if (!req.user || (req.user.username !== 'admin' && req.user.role !== 'admin' && req.user.userId !== 1)) {
+            return res.status(403).json({ error: 'Admin access required' });
+        }
+        const files = fs.readdirSync(DOWNLOADS_DIR).filter(f => {
+            const ext = path.extname(f).toLowerCase();
+            return ['.dmg', '.exe', '.appimage'].includes(ext);
+        });
+        const checksums = {};
+        for (const f of files) {
+            checksums[f] = await computeSHA256(path.join(DOWNLOADS_DIR, f));
+        }
+        saveChecksums(checksums);
+        console.log(`[Downloads] Rehashed ${files.length} builds`);
+        res.json({ success: true, count: files.length, checksums });
+    } catch (e) {
+        console.error('[Downloads] Rehash error:', e.message);
+        res.status(500).json({ error: 'Rehash failed' });
+    }
 });
 
 const readCapacityJson = () => {
@@ -6036,6 +6279,132 @@ app.post('/api/exif/batch', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
+// CROSS-APP DEVICE LINKING (QR Pairing: mobile-v2 ↔ solana-seeker etc.)
+// ============================================================================
+
+const sanitizeUserKey = (v) => {
+    const raw = String(v || '');
+    const safe = raw.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
+    return safe || '';
+};
+
+// Get all device_uuids linked to a given device_uuid (includes the device itself)
+const getLinkedDeviceUuids = (deviceUuid) => {
+    return new Promise((resolve) => {
+        const safeUuid = sanitizeUserKey(deviceUuid);
+        if (!safeUuid) return resolve([]);
+        db.all(
+            `SELECT device_uuid_a, device_uuid_b FROM linked_devices
+             WHERE device_uuid_a = ? OR device_uuid_b = ?`,
+            [safeUuid, safeUuid],
+            (err, rows) => {
+                if (err || !rows) return resolve([safeUuid]);
+                const linked = new Set([safeUuid]);
+                rows.forEach(r => {
+                    if (r.device_uuid_a) linked.add(r.device_uuid_a);
+                    if (r.device_uuid_b) linked.add(r.device_uuid_b);
+                });
+                resolve([...linked]);
+            }
+        );
+    });
+};
+
+// Link two devices — POST /api/device/link
+// Body: { target_device_uuid, label? }
+// The caller's device_uuid comes from their JWT token.
+app.post('/api/device/link', authenticateToken, async (req, res) => {
+    try {
+        const myUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
+        const targetUuid = sanitizeUserKey(req.body.target_device_uuid);
+        const label = (req.body.label || '').toString().slice(0, 200);
+
+        if (!myUuid || !targetUuid) {
+            return res.status(400).json({ error: 'Missing device UUID' });
+        }
+        if (myUuid === targetUuid) {
+            return res.status(400).json({ error: 'Cannot link device to itself' });
+        }
+
+        // Sort UUIDs to ensure consistent ordering (avoids duplicate pairs)
+        const [uuidA, uuidB] = [myUuid, targetUuid].sort();
+
+        db.run(
+            `INSERT OR IGNORE INTO linked_devices (device_uuid_a, device_uuid_b, created_at, label)
+             VALUES (?, ?, ?, ?)`,
+            [uuidA, uuidB, Date.now(), label],
+            function (err) {
+                if (err) {
+                    console.error('[DeviceLink] Error:', err);
+                    return res.status(500).json({ error: 'Failed to link devices' });
+                }
+                console.log(`[DeviceLink] Linked: ${uuidA} <-> ${uuidB} (label: ${label || 'none'})`);
+                res.json({ success: true, linked: { device_uuid_a: uuidA, device_uuid_b: uuidB } });
+            }
+        );
+    } catch (e) {
+        console.error('[DeviceLink] Error:', e);
+        res.status(500).json({ error: 'Failed to link devices' });
+    }
+});
+
+// List linked devices — GET /api/device/links
+app.get('/api/device/links', authenticateToken, async (req, res) => {
+    try {
+        const myUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
+        if (!myUuid) return res.json({ links: [] });
+
+        db.all(
+            `SELECT id, device_uuid_a, device_uuid_b, created_at, label FROM linked_devices
+             WHERE device_uuid_a = ? OR device_uuid_b = ?`,
+            [myUuid, myUuid],
+            (err, rows) => {
+                if (err) return res.status(500).json({ error: 'Failed to get links' });
+                const links = (rows || []).map(r => ({
+                    id: r.id,
+                    paired_device_uuid: r.device_uuid_a === myUuid ? r.device_uuid_b : r.device_uuid_a,
+                    created_at: r.created_at,
+                    label: r.label,
+                }));
+                res.json({ links });
+            }
+        );
+    } catch (e) {
+        res.status(500).json({ error: 'Failed to get links' });
+    }
+});
+
+// Unlink a device — DELETE /api/device/link
+// Body: { target_device_uuid }
+app.delete('/api/device/link', authenticateToken, async (req, res) => {
+    try {
+        const myUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
+        const targetUuid = sanitizeUserKey(req.body.target_device_uuid);
+
+        if (!myUuid || !targetUuid) {
+            return res.status(400).json({ error: 'Missing device UUID' });
+        }
+
+        db.run(
+            `DELETE FROM linked_devices
+             WHERE (device_uuid_a = ? AND device_uuid_b = ?)
+                OR (device_uuid_a = ? AND device_uuid_b = ?)`,
+            [myUuid, targetUuid, targetUuid, myUuid],
+            function (err) {
+                if (err) {
+                    console.error('[DeviceLink] Unlink error:', err);
+                    return res.status(500).json({ error: 'Failed to unlink' });
+                }
+                console.log(`[DeviceLink] Unlinked: ${myUuid} <-> ${targetUuid} (changes: ${this.changes})`);
+                res.json({ success: true, removed: this.changes });
+            }
+        );
+    } catch (e) {
+        res.status(500).json({ error: 'Failed to unlink' });
+    }
+});
+
+// ============================================================================
 // NFT IMAGE STORAGE (StealthCloud-based, publicly accessible)
 // ============================================================================
 
@@ -6045,12 +6414,6 @@ const NFT_DIR = path.join(CLOUD_DIR, 'nft');
 if (!fs.existsSync(NFT_DIR)) {
     fs.mkdirSync(NFT_DIR, { recursive: true });
 }
-
-const sanitizeUserKey = (v) => {
-    const raw = String(v || '');
-    const safe = raw.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
-    return safe || '';
-};
 
 const resolveNftStorageKeyFromUser = (user) => {
     return sanitizeUserKey(getStealthCloudUserKey(user));
@@ -6307,7 +6670,7 @@ app.get('/api/nft/image/:userId/:filename', serveNftImage);
 // Also handle /:userId/:filename for nft.stealthlynk.io subdomain (no /api/nft/image prefix)
 app.get('/:userId/:filename', (req, res, next) => {
     const { filename } = req.params;
-    if (/\.(jpg|jpeg|png|gif|webp)$/i.test(filename)) {
+    if (/\.(jpg|jpeg|png|gif|webp|bin|heic|heif|tiff|tif|avif|dng)$/i.test(filename)) {
         return serveNftImage(req, res);
     }
     next(); // Pass to other routes if not an NFT image request
@@ -6352,21 +6715,43 @@ app.delete('/api/nft/image/:imageId', authenticateToken, async (req, res) => {
 // NFT metadata storage file per user
 const getNftMetadataPath = (userKey) => path.join(NFT_DIR, String(userKey), 'nft-album.json');
 
-// Get user's NFT album (list of minted NFTs)
+// Helper: read NFTs from all linked device folders and merge (dedup by mintAddress)
+const readMergedNftsForDevice = async (deviceUuid) => {
+    const linkedUuids = await getLinkedDeviceUuids(deviceUuid);
+    const normalizeMint = (m) => m ? String(m).replace(/^cnft_/, '') : '';
+    const seen = new Set();
+    const merged = [];
+
+    for (const uuid of linkedUuids) {
+        const metaPath = getNftMetadataPath(uuid);
+        if (!fs.existsSync(metaPath)) continue;
+        try {
+            const data = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+            const nfts = data.nfts || [];
+            for (const nft of nfts) {
+                const key = normalizeMint(nft.mintAddress);
+                if (!key || seen.has(key)) continue;
+                seen.add(key);
+                merged.push(nft);
+            }
+        } catch (e) {
+            // Skip corrupt files
+        }
+    }
+    return merged;
+};
+
+// Get user's NFT album (list of minted NFTs) — merges linked device folders
 // GET /api/nft/list
 app.get('/api/nft/list', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
         const userKey = resolveNftStorageKeyFromUser(req.user);
-        const metadataPath = getNftMetadataPath(userKey);
-        
-        if (!fs.existsSync(metadataPath)) {
-            return res.json({ success: true, nfts: [] });
-        }
-        
-        const data = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
-        console.log(`[NFT] Album list: user=${userId} count=${data.nfts?.length || 0}`);
-        res.json({ success: true, nfts: data.nfts || [] });
+        const deviceUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
+
+        const nfts = await readMergedNftsForDevice(deviceUuid || userKey);
+        console.log(`[NFT] Album list: user=${userId} userKey=${userKey} count=${nfts.length} device_uuid=${deviceUuid || 'none'}`);
+        res.json({ success: true, nfts });
     } catch (error) {
         console.error('[NFT] List error:', error);
         res.status(500).json({ error: 'Failed to get NFT list' });
@@ -6381,6 +6766,7 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
         const userId = req.user.id;
         const userKey = resolveNftStorageKeyFromUser(req.user);
         const { action, nft, mintAddress, nfts } = req.body;
+        console.log(`[NFT] Sync request: user=${userId} userKey=${userKey} action=${action} device_uuid=${req.user.device_uuid || 'none'}`);
         
         const userNftDir = path.join(NFT_DIR, String(userKey));
         if (!fs.existsSync(userNftDir)) {
@@ -6485,8 +6871,10 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
             }
             console.log(`[NFT] Album backup: user=${userId} added=${added} updated=${updated} total=${data.nfts.length}`);
         } else if (action === 'get') {
-            // Return all NFTs for this user (used by mobile-v2 to merge with DAS results)
-            return res.json({ success: true, nfts: data.nfts || [] });
+            // Return all NFTs for this user + linked devices (used by mobile-v2 to merge with DAS results)
+            const deviceUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
+            const mergedNfts = await readMergedNftsForDevice(deviceUuid || userKey);
+            return res.json({ success: true, nfts: mergedNfts });
         } else {
             return res.status(400).json({ error: 'Invalid action or missing data' });
         }
@@ -6506,10 +6894,23 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
 app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
     try {
         const userKey = resolveNftStorageKeyFromUser(req.user);
-        const certsPath = path.join(NFT_DIR, String(userKey), 'certificates.json');
+        const deviceUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
+        // Merge certificates from all linked device folders
+        const linkedUuids = await getLinkedDeviceUuids(deviceUuid || userKey);
+        const seenIds = new Set();
         let certs = [];
-        if (fs.existsSync(certsPath)) {
-            try { certs = JSON.parse(fs.readFileSync(certsPath, 'utf8')); } catch (_) {}
+        for (const uuid of linkedUuids) {
+            const cp = path.join(NFT_DIR, String(uuid), 'certificates.json');
+            if (!fs.existsSync(cp)) continue;
+            try {
+                const parsed = JSON.parse(fs.readFileSync(cp, 'utf8'));
+                for (const c of (Array.isArray(parsed) ? parsed : [])) {
+                    const key = c.mintAddress || c.id || JSON.stringify(c);
+                    if (seenIds.has(key)) continue;
+                    seenIds.add(key);
+                    certs.push(c);
+                }
+            } catch (_) {}
         }
         const full = req.query.full === 'true';
         // Fields safe for the API response (mobile OOM-safe — no large base64 blobs)
