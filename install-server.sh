@@ -1,7 +1,7 @@
 #!/bin/bash
 # PhotoLynk Server - Headless Server Installer for Linux
 # For servers without GUI (Ubuntu Server, VPS, cloud instances)
-# Usage: curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoLynk/main/install-server.sh | bash
+# Usage: PHOTOLYNK_GITHUB_TOKEN=ghp_xxx curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoLynk-Private/main/install-server.sh | bash
 
 set -e
 
@@ -23,7 +23,7 @@ if [ "$EUID" -ne 0 ]; then
     echo -e "${YELLOW}⚠${NC}  This installer requires root privileges."
     echo -e "${BLUE}→${NC}  Switching to root user..."
     # Try sudo su first, if that fails try just sudo
-    exec sudo su -c "cd /root && bash -c 'curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoLynk/main/install-server.sh | bash'" || \
+    exec sudo su -c "cd /root && bash -c 'PHOTOLYNK_GITHUB_TOKEN=${PHOTOLYNK_GITHUB_TOKEN:-} curl -fsSL https://raw.githubusercontent.com/viktorvishyn369/PhotoLynk-Private/main/install-server.sh | bash'" || \
     exec sudo -E bash -c "cd /root && bash '$0' '$@'"
     exit $?
 fi
@@ -143,21 +143,27 @@ SERVICE_NAME="photolynk"
 if [ -d "$INSTALL_DIR" ]; then
     echo -e "${YELLOW}⚠${NC}  Existing install directory exists, updating..."
     cd "$INSTALL_DIR"
-    REPO_URL="https://github.com/viktorvishyn369/PhotoLynk.git"
-    if [ -n "${PHOTOLYNK_GITHUB_TOKEN:-}" ]; then
-        REPO_URL="https://x-access-token:${PHOTOLYNK_GITHUB_TOKEN}@github.com/viktorvishyn369/PhotoLynk.git"
-    elif [ -n "${GITHUB_TOKEN:-}" ]; then
-        REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/viktorvishyn369/PhotoLynk.git"
+    # Private repo only — a GitHub token with 'repo' scope is REQUIRED
+    GH_TOKEN="${PHOTOLYNK_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
+    if [ -z "$GH_TOKEN" ]; then
+        echo -e "${RED}✗ PHOTOLYNK_GITHUB_TOKEN (or GITHUB_TOKEN) is required to access the private repo.${NC}"
+        echo -e "${YELLOW}  Create a fine-grained PAT at: https://github.com/settings/tokens${NC}"
+        echo -e "${YELLOW}  Then run: PHOTOLYNK_GITHUB_TOKEN=ghp_xxx bash install-server.sh${NC}"
+        exit 1
     fi
+    REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/viktorvishyn369/PhotoLynk-Private.git"
     git remote set-url origin "$REPO_URL" >/dev/null 2>&1 || true
     GIT_TERMINAL_PROMPT=0 git pull
 else
-    REPO_URL="https://github.com/viktorvishyn369/PhotoLynk.git"
-    if [ -n "${PHOTOLYNK_GITHUB_TOKEN:-}" ]; then
-        REPO_URL="https://x-access-token:${PHOTOLYNK_GITHUB_TOKEN}@github.com/viktorvishyn369/PhotoLynk.git"
-    elif [ -n "${GITHUB_TOKEN:-}" ]; then
-        REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/viktorvishyn369/PhotoLynk.git"
+    # Private repo only — a GitHub token with 'repo' scope is REQUIRED
+    GH_TOKEN="${PHOTOLYNK_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
+    if [ -z "$GH_TOKEN" ]; then
+        echo -e "${RED}✗ PHOTOLYNK_GITHUB_TOKEN (or GITHUB_TOKEN) is required to access the private repo.${NC}"
+        echo -e "${YELLOW}  Create a fine-grained PAT at: https://github.com/settings/tokens${NC}"
+        echo -e "${YELLOW}  Then run: PHOTOLYNK_GITHUB_TOKEN=ghp_xxx bash install-server.sh${NC}"
+        exit 1
     fi
+    REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/viktorvishyn369/PhotoLynk-Private.git"
     GIT_TERMINAL_PROMPT=0 git clone "$REPO_URL" "$INSTALL_DIR"
     cd "$INSTALL_DIR"
 fi
