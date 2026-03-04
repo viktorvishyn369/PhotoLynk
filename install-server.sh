@@ -2,7 +2,6 @@
 # PhotoLynk Server - Headless Server Installer for Linux
 # For servers without GUI (Ubuntu Server, VPS, cloud instances)
 # Usage: bash install-server.sh
-# Requires SSH key configured on GitHub (ssh -T git@github.com must work)
 
 set -e
 
@@ -144,25 +143,13 @@ SERVICE_NAME="photolynk"
 if [ -d "$INSTALL_DIR" ]; then
     echo -e "${YELLOW}⚠${NC}  Existing install directory exists, updating..."
     cd "$INSTALL_DIR"
-    # Private repo — use SSH (no token needed), fallback to HTTPS+token if provided
-    if [ -n "${PHOTOLYNK_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
-        GH_TOKEN="${PHOTOLYNK_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
-        REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/viktorvishyn369/PhotoLynk-Private.git"
-    else
-        REPO_URL="git@github.com:viktorvishyn369/PhotoLynk-Private.git"
-    fi
+    REPO_URL="https://github.com/viktorvishyn369/PhotoLynk.git"
     git remote set-url origin "$REPO_URL" >/dev/null 2>&1 || true
     git reset --hard HEAD >/dev/null 2>&1 || true
     git clean -fd >/dev/null 2>&1 || true
     GIT_TERMINAL_PROMPT=0 git pull
 else
-    # Private repo — use SSH (no token needed), fallback to HTTPS+token if provided
-    if [ -n "${PHOTOLYNK_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}" ]; then
-        GH_TOKEN="${PHOTOLYNK_GITHUB_TOKEN:-${GITHUB_TOKEN:-}}"
-        REPO_URL="https://x-access-token:${GH_TOKEN}@github.com/viktorvishyn369/PhotoLynk-Private.git"
-    else
-        REPO_URL="git@github.com:viktorvishyn369/PhotoLynk-Private.git"
-    fi
+    REPO_URL="https://github.com/viktorvishyn369/PhotoLynk.git"
     GIT_TERMINAL_PROMPT=0 git clone "$REPO_URL" "$INSTALL_DIR"
     cd "$INSTALL_DIR"
 fi
