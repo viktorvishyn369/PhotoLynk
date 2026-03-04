@@ -288,7 +288,7 @@ jobs:
             server-tray/dist/release/*
           if-no-files-found: warn
 
-  create-release:
+  deploy-to-server:
     needs: [build-macos-x64, build-macos-arm64, build-windows, build-linux]
     runs-on: ubuntu-latest
     permissions:
@@ -297,12 +297,59 @@ jobs:
     steps:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
-      
-      - name: Create Release
+
+      - name: Delete old builds from server
+        run: |
+          SERVER_URL="${{ secrets.SERVER_URL }}"
+          DEPLOY_TOKEN="${{ secrets.DEPLOY_TOKEN }}"
+          if [ -z "$SERVER_URL" ] || [ -z "$DEPLOY_TOKEN" ]; then
+            echo "⚠ SERVER_URL or DEPLOY_TOKEN not set, skipping server cleanup"
+            exit 0
+          fi
+          # Get list of existing builds
+          EXISTING=$(curl -sf "${SERVER_URL}/api/downloads/list" || echo '{"builds":[]}')
+          echo "$EXISTING" | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          for b in data.get('builds', []):
+              print(b['filename'])
+          " | while read -r fname; do
+            echo "Deleting old build: $fname"
+            curl -sf -X DELETE -H "Authorization: Bearer ${DEPLOY_TOKEN}" "${SERVER_URL}/api/downloads/file/${fname}" || true
+          done
+
+      - name: Upload builds to server
+        run: |
+          SERVER_URL="${{ secrets.SERVER_URL }}"
+          DEPLOY_TOKEN="${{ secrets.DEPLOY_TOKEN }}"
+          if [ -z "$SERVER_URL" ] || [ -z "$DEPLOY_TOKEN" ]; then
+            echo "⚠ SERVER_URL or DEPLOY_TOKEN not set, skipping server upload"
+            exit 0
+          fi
+          for dir in macos-x64-builds macos-arm64-builds windows-builds linux-builds; do
+            [ -d "$dir" ] || continue
+            for f in "$dir"/*; do
+              [ -f "$f" ] || continue
+              fname=$(basename "$f")
+              echo "Uploading $fname to server..."
+              HTTP_CODE=$(curl -sf -o /dev/null -w "%{http_code}" \
+                -X POST \
+                -H "Authorization: Bearer ${DEPLOY_TOKEN}" \
+                -F "build=@${f}" \
+                "${SERVER_URL}/api/downloads/upload")
+              if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "201" ]; then
+                echo "✓ Uploaded $fname"
+              else
+                echo "✗ Failed to upload $fname (HTTP $HTTP_CODE)"
+              fi
+            done
+          done
+
+      - name: Create private GitHub Release (backup)
         uses: softprops/action-gh-release@v1
         with:
           name: PhotoLynk Desktop Client/Server ${{ github.ref_name }}
-          generate_release_notes: true
+          body: "Build artifacts deployed to stealthlynk.io"
           files: |
             macos-x64-builds/*
             macos-arm64-builds/*
