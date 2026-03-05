@@ -1480,6 +1480,21 @@ const resolveSubscriptionState = async (userId) => {
     const complimentaryMs = Math.max(0, TRIAL_COMPLIMENTARY_DAYS) * 24 * 60 * 60 * 1000;
     const complimentaryUntil = trialUntil ? (trialUntil + complimentaryMs) : null;
 
+    // If user has a paid active subscription (e.g. Solana/Apple/Google), return 'active'
+    // even if trial_until is still in the future (user paid during trial period)
+    if (row.status === 'active' && expiresAt && expiresAt > 0 && expiresAt > now) {
+        return {
+            allowed: true,
+            status: 'active',
+            trialUntil: trialUntil || null,
+            expiresAt,
+            graceUntil: graceUntil || null,
+            planGb: row.plan_gb || null,
+            premiumGb,
+            paymentType: row.payment_type || null,
+        };
+    }
+
     if (trialUntil && trialUntil > now) {
         return {
             allowed: true,
@@ -1886,6 +1901,23 @@ db.serialize(() => {
             }
             if (names2.includes('updated_at')) {
                 db.run(`UPDATE user_plans SET updated_at = ? WHERE updated_at IS NULL OR updated_at = 0`, [now]);
+            }
+            // Fix users who paid during trial but were left with status='trial' instead of 'active'.
+            // Only targets users where expires_at > trial_until (proves payment extended beyond trial).
+            if (names2.includes('status') && names2.includes('payment_type') && names2.includes('expires_at')) {
+                db.run(
+                    `UPDATE user_plans SET status = 'active', updated_at = ?
+                     WHERE status = 'trial'
+                       AND payment_type IS NOT NULL
+                       AND expires_at IS NOT NULL AND expires_at > ?
+                       AND (trial_until IS NULL OR expires_at > trial_until)`,
+                    [now, now],
+                    function (err) {
+                        if (!err && this.changes > 0) {
+                            console.log(`[Migration] Fixed ${this.changes} user(s) stuck in 'trial' status after payment`);
+                        }
+                    }
+                );
             }
         });
     });
@@ -3464,7 +3496,9 @@ app.post('/api/subscription/sync', authenticateToken, async (req, res) => {
 
         const trialUntil = currentPlan && currentPlan.trial_until ? Number(currentPlan.trial_until) : null;
         const isInTrialWindow = trialUntil && Number.isFinite(trialUntil) && trialUntil > now;
-        const nextStatus = isInTrialWindow ? 'trial' : 'active';
+        // If syncing a real payment (has paymentType + expiresAt), mark as 'active' even during trial
+        const hasPaidSubscription = paymentType && syncExpiresAt && syncExpiresAt > now;
+        const nextStatus = (isInTrialWindow && !hasPaidSubscription) ? 'trial' : 'active';
         await dbRunAsync(
             `UPDATE user_plans
                 SET plan_gb = ?,
@@ -3691,31 +3725,31 @@ app.post('/api/solana/verify-payment', async (req, res) => {
         }
         
         // Calculate subscription expiry
-        // If user has existing active subscription, add new term to existing expiration (early renewal)
-        // Otherwise start from now
         const now = Date.now();
         const durationMs = PLAN_DURATION_MS[duration] || PLAN_DURATION_MS.monthly;
         
         // Get current plan to check existing expiration
         const currentPlan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [user.id]);
-        let baseTime = now;
+        let expiresAt;
         
-        // If user has active subscription with future expiration, extend from that date
         if (currentPlan) {
             const currentExpires = currentPlan.expires_at;
             const currentTrial = currentPlan.trial_until;
             
-            // Check if expires_at is in the future
             if (currentExpires && currentExpires > now) {
-                baseTime = currentExpires;
+                // Renewal: extend from existing expiration date
+                expiresAt = currentExpires + durationMs;
+            } else if (currentTrial && currentTrial > now) {
+                // First payment during trial: now + remaining trial days + subscription period
+                const remainingTrialMs = currentTrial - now;
+                expiresAt = now + remainingTrialMs + durationMs;
+            } else {
+                // No active plan or trial — start fresh from now
+                expiresAt = now + durationMs;
             }
-            // Or if trial_until is in the future (user paying during trial)
-            else if (currentTrial && currentTrial > now) {
-                baseTime = currentTrial;
-            }
+        } else {
+            expiresAt = now + durationMs;
         }
-        
-        const expiresAt = baseTime + durationMs;
         
         // Record the payment
         await dbRunAsync(
