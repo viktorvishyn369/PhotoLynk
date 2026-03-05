@@ -1922,9 +1922,15 @@ db.serialize(() => {
         user_id INTEGER,
         device_uuid TEXT,
         device_name TEXT,
+        last_seen INTEGER,
         FOREIGN KEY(user_id) REFERENCES users(id),
         UNIQUE(user_id, device_uuid)
     )`);
+
+    // Self-healing: Add missing last_seen column if not present (for old DB schemas)
+    db.run(`ALTER TABLE devices ADD COLUMN last_seen INTEGER`, (err) => {
+        // Ignore error if column already exists
+    });
     
     // Files table to track metadata
     db.run(`CREATE TABLE IF NOT EXISTS files (
