@@ -384,37 +384,106 @@ Deletion behavior:
 - **iOS:** 15.0+
 - Network access to server
 
-### Supported Media Formats
+### Supported File Formats
 
-**Photos:**
-- **Standard:** JPEG, PNG, GIF, BMP, WebP, TIFF
-- **Apple:** HEIC, HEIF (iOS native, Android 10+)
-- **Professional/RAW:** DNG, CR2, CR3, NEF, ARW, ORF, RW2, RAF, PEF, SRW, NRW, 3FR, FFF, IIQ, ERF, RWL, KDC, DCR, MRW, SR2, X3F, MEF, MOS, GPR, CRW
+PhotoLynk supports a comprehensive range of image and video formats across all platforms and features. Files are always stored and transferred as **original bytes** — no re-encoding, no quality loss.
 
-**Videos:**
-- MP4, MOV, M4V, 3GP, AVI, MKV, WebM, MPEG, MPG, WMV, FLV, TS, MTS, M2TS
+#### Photos — Backup, Sync & Restore
 
-**Note:** RAW format support depends on platform capabilities. HEIC/HEIF on Android requires API 29+ (Android 10).
+All photo formats below are fully supported for backup, sync, and restore across all platforms. Files are encrypted chunk-by-chunk and reassembled byte-exact on restore.
 
-### EXIF Metadata Preservation
+| Category | Formats |
+|----------|---------|
+| **Standard** | JPEG/JPG, PNG, GIF, BMP, WebP, TIFF/TIF, AVIF |
+| **Apple** | HEIC, HEIF (iOS native, Android 10+) |
+| **Canon** | CR2, CR3, CRW |
+| **Nikon** | NEF, NRW |
+| **Sony** | ARW, SR2 |
+| **Fujifilm** | RAF |
+| **Olympus** | ORF |
+| **Panasonic** | RW2 |
+| **Pentax** | PEF |
+| **Samsung** | SRW |
+| **Adobe** | DNG |
+| **Other RAW** | 3FR (Hasselblad), FFF (Hasselblad), IIQ (Phase One), ERF (Epson), RWL (Leica), KDC (Kodak), DCR (Kodak), MRW (Minolta), X3F (Sigma), MEF (Mamiya), MOS (Leaf), GPR (GoPro) |
 
-PhotoLynk extracts and stores EXIF metadata during backup and writes it back during sync/restore. However, EXIF write support varies by platform due to OS limitations:
+#### Videos — Backup, Sync & Restore
 
-| Format | Android Write | iOS Write | Desktop Write |
-|--------|:-------------:|:---------:|:-------------:|
-| JPEG | ✅ | ✅ | ✅ |
+| Category | Formats |
+|----------|---------|
+| **Standard** | MP4, MOV, M4V, 3GP, AVI, MKV, WebM |
+| **Professional** | MPEG, MPG, WMV, FLV, TS, MTS, M2TS |
+
+#### Photos — NFT Certification (Certify Original)
+
+NFT minting supports the following formats for on-chain certification. The original file is uploaded byte-exact (when EXIF strip is OFF), and SHA-256 content hash is recorded on Solana.
+
+| Category | Formats | All Platforms |
+|----------|---------|:-------------:|
+| **Standard** | JPEG/JPG, PNG, GIF, WebP | ✅ |
+| **Apple** | HEIC, HEIF | ✅ |
+| **Modern** | AVIF, TIFF/TIF | ✅ |
+| **Canon** | CR2, CR3 | ✅ |
+| **Nikon** | NEF | ✅ |
+| **Sony** | ARW | ✅ |
+| **Fujifilm** | RAF | ✅ |
+| **Olympus** | ORF | ✅ |
+| **Panasonic** | RW2 | ✅ |
+| **Pentax** | PEF | ✅ |
+| **Samsung** | SRW | ✅ |
+| **Adobe** | DNG | ✅ |
+| **Encrypted** | .bin (NaCl secretbox) | ✅ |
+
+NFT storage options: **StealthCloud**, **IPFS** (Pinata), **Arweave**, **Embedded SVG** (on-chain data URI).
+
+### EXIF & Metadata Preservation
+
+PhotoLynk extracts, stores, and restores comprehensive metadata during backup/sync. Metadata categories:
+
+- **EXIF**: Camera settings (ISO, aperture, shutter speed, focal length, flash, metering, white balance, color space, orientation, dimensions)
+- **GPS**: Latitude, longitude, altitude (with cross-platform 4-decimal truncation for hash stability)
+- **IPTC**: Caption, copyright, keywords, creator, title, city, country, credit, source
+- **XMP**: Rating, label, subject, creator tool, rights, description, raw XML
+- **ICC**: Profile name (e.g., "Display P3", "sRGB IEC61966-2.1")
+- **MakerNote**: SHA-256 hash of proprietary camera data (too large to store raw)
+
+#### EXIF Write-Back Support (Sync/Restore)
+
+| Format | Android | iOS | Desktop |
+|--------|:-------:|:---:|:-------:|
+| JPEG/JPG | ✅ | ✅ | ✅ |
 | PNG | ✅ | ✅ | ✅ |
 | WebP | ✅ | ✅ | ✅ |
 | HEIC/HEIF | ❌ | ✅ | ⚠️ |
-| TIFF | ❌ | ✅ | ✅ |
+| TIFF/TIF | ❌ | ✅ | ✅ |
 | GIF | ❌ | ✅ | ❌ |
 | RAW (DNG, CR2, NEF, etc.) | ❌ | ❌ | ❌ |
 
 - ✅ = Full support
-- ⚠️ = Depends on system libraries
-- ❌ = Read-only (EXIF extracted but not written back)
+- ⚠️ = Depends on system libraries (exiftool)
+- ❌ = Read-only (EXIF extracted and stored on server, not written back to file)
 
-**Note:** Even when EXIF write is not supported, files sync correctly and EXIF data remains stored on the server. RAW formats are intentionally read-only to preserve original sensor data.
+Even when EXIF write is not supported, files sync byte-exact and EXIF data remains stored on the server for future restoration. RAW formats are intentionally read-only to preserve original sensor data.
+
+#### NFT EXIF Hash Proof System (Certify Original)
+
+When certifying a photo as an NFT, PhotoLynk computes a 3-hash cryptographic proof from the original EXIF data **before** any processing (strip, watermark, encrypt):
+
+| Hash | Description | Purpose |
+|------|-------------|---------|
+| **Hash 1** (Raw EXIF) | SHA-256 of raw EXIF binary bytes (thumbnails stripped) | Proves exact camera output — bit-identical to what the sensor wrote |
+| **Hash 2** (Normalized EXIF) | SHA-256 of parsed, normalized, sorted EXIF fields | Cross-platform verification — same hash regardless of EXIF library |
+| **Hash 3** (Binding) | SHA-256(Hash1 \| Hash2) | Cryptographically binds raw and normalized proofs |
+
+Additional integrity proofs recorded on-chain:
+- **Content Hash**: SHA-256 of original file bytes (before any processing)
+- **Camera Serial Hash**: SHA-256 of camera body serial number (device binding)
+- **RFC 3161 Timestamp**: Trusted third-party timestamp (FreeTSA) proving existence at mint time
+- **C2PA Manifest**: Content Authenticity Initiative provenance data
+
+If an image has no EXIF data (screenshots, downloaded images), the hash fields are omitted from the NFT metadata and displayed as "N/A" in the certificate. The content hash and blockchain proof remain fully valid.
+
+**Note:** HEIC/HEIF on Android requires API 29+ (Android 10). RAW format EXIF extraction uses platform-native APIs (CGImageSource on iOS, ExifInterface on Android, ExifReader on desktop/server).
 
 ### Build Requirements (for building from source)
 - Node.js 20 LTS
