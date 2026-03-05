@@ -4,6 +4,9 @@
 
 Back up photos/videos to your own server or StealthCloud, and restore on any phone with the same credentials.
 
+> 🎥 **[Watch the 60-Second Demo Video on YouTube](https://youtube.com/shorts/pp3TYwn68D0)**  
+> 📄 **[Read the Technical Pitch Deck](PITCH_DECK.md)**
+
 ---
 
 ## 📱 Mobile Apps
