@@ -1340,22 +1340,25 @@ const ensurePlanRow = async (userId) => {
 const resolveSubscriptionState = async (userId) => {
     const now = Date.now();
     const row = await ensurePlanRow(userId);
-    if (!row) return { allowed: false, status: 'none' };
+    if (!row) return { allowed: false, status: 'none', premiumGb: 0 };
 
     const expiresAt = typeof row.expires_at === 'number' ? row.expires_at : (row.expires_at ? Number(row.expires_at) : null);
     const graceUntil = typeof row.grace_until === 'number' ? row.grace_until : (row.grace_until ? Number(row.grace_until) : null);
     const deletedAt = typeof row.deleted_at === 'number' ? row.deleted_at : (row.deleted_at ? Number(row.deleted_at) : null);
     const trialUntil = typeof row.trial_until === 'number' ? row.trial_until : (row.trial_until ? Number(row.trial_until) : null);
     const updatedAt = typeof row.updated_at === 'number' ? row.updated_at : (row.updated_at ? Number(row.updated_at) : null);
+    const premiumGb = row.premium_gb && Number.isFinite(Number(row.premium_gb)) && Number(row.premium_gb) > 0 ? Number(row.premium_gb) : 0;
 
     if (deletedAt && deletedAt > 0) {
+        // Premium users keep access even after subscription deletion (they own 10GB permanently)
         return {
-            allowed: false,
-            status: 'deleted',
+            allowed: premiumGb > 0,
+            status: premiumGb > 0 ? 'premium_only' : 'deleted',
             expiresAt: expiresAt || null,
             graceUntil: graceUntil || null,
             deletedAt,
             planGb: row.plan_gb || null,
+            premiumGb,
             paymentType: row.payment_type || null,
         };
     }
@@ -1371,6 +1374,7 @@ const resolveSubscriptionState = async (userId) => {
             expiresAt: expiresAt || null,
             graceUntil: graceUntil || null,
             planGb: row.plan_gb || null,
+            premiumGb,
             paymentType: row.payment_type || null,
             complimentaryUntil,
         };
@@ -1378,15 +1382,16 @@ const resolveSubscriptionState = async (userId) => {
 
     // Complimentary window after trial for sync-only access
     if (row.status === 'trial' && trialUntil && trialUntil > 0 && complimentaryUntil && now <= complimentaryUntil) {
-        // Allow read/sync, block uploads via requireUploadSubscription
+        // Allow read/sync, block uploads via requireUploadSubscription (unless premium)
         return {
             allowed: true,
-            status: 'trial_complimentary',
+            status: premiumGb > 0 ? 'premium_only' : 'trial_complimentary',
             trialUntil,
             complimentaryUntil,
             expiresAt: expiresAt || null,
             graceUntil: graceUntil || null,
             planGb: row.plan_gb || null,
+            premiumGb,
             paymentType: row.payment_type || null,
         };
     }
@@ -1403,13 +1408,14 @@ const resolveSubscriptionState = async (userId) => {
             // ignore
         }
         return {
-            allowed: false,
-            status: 'trial_complimentary_expired',
+            allowed: premiumGb > 0,
+            status: premiumGb > 0 ? 'premium_only' : 'trial_complimentary_expired',
             trialUntil,
             complimentaryUntil,
             expiresAt: null,
             graceUntil: null,
             planGb: null,
+            premiumGb,
             paymentType: row.payment_type || null,
         };
     }
@@ -1432,6 +1438,7 @@ const resolveSubscriptionState = async (userId) => {
                     expiresAt: null,
                     graceUntil: null,
                     planGb: row.plan_gb || null,
+                    premiumGb,
                     paymentType: row.payment_type || null,
                 };
             }
@@ -1451,12 +1458,14 @@ const resolveSubscriptionState = async (userId) => {
             );
         }
         const allowedInGrace = gu && gu > 0 ? now <= gu : false;
+        // Premium users keep access even after subscription expires
         return {
-            allowed: allowedInGrace,
-            status: allowedInGrace ? 'grace' : 'grace_expired',
+            allowed: allowedInGrace || premiumGb > 0,
+            status: premiumGb > 0 && !allowedInGrace ? 'premium_only' : (allowedInGrace ? 'grace' : 'grace_expired'),
             expiresAt,
             graceUntil: gu,
             planGb: row.plan_gb || null,
+            premiumGb,
             paymentType: row.payment_type || null,
         };
     }
@@ -1468,17 +1477,20 @@ const resolveSubscriptionState = async (userId) => {
             expiresAt: expiresAt || null,
             graceUntil: graceUntil || null,
             planGb: row.plan_gb || null,
+            premiumGb,
             paymentType: row.payment_type || null,
         };
     }
 
+    // No active subscription — premium users still get access with their permanent 10GB
     return {
-        allowed: false,
-        status: row.status || 'none',
+        allowed: premiumGb > 0,
+        status: premiumGb > 0 ? 'premium_only' : (row.status || 'none'),
         trialUntil: trialUntil || null,
         expiresAt: expiresAt || null,
         graceUntil: graceUntil || null,
         planGb: row.plan_gb || null,
+        premiumGb,
         paymentType: row.payment_type || null,
     };
 };
@@ -1547,11 +1559,11 @@ const requireActiveSubscription = async (req, res, next) => {
 };
 
 // Uploads are more restrictive than read-only sync.
-// Policy: active + trial can upload; grace/trial_expired can only sync/restore.
+// Policy: active + trial + premium_only can upload; grace/trial_expired can only sync/restore.
 const requireUploadSubscription = async (req, res, next) => {
     try {
         const st = await resolveSubscriptionState(req.user.id);
-        if (st.status === 'active' || st.status === 'trial') return next();
+        if (st.status === 'active' || st.status === 'trial' || st.status === 'premium_only') return next();
 
         if (st.status === 'trial_complimentary') {
             return res.status(402).json({
@@ -1644,6 +1656,9 @@ db.serialize(() => {
         if (!names.includes('alias_email')) {
             db.run(`ALTER TABLE users ADD COLUMN alias_email TEXT`, [], () => {});
         }
+        if (!names.includes('wallet_address')) {
+            db.run(`ALTER TABLE users ADD COLUMN wallet_address TEXT`, [], () => {});
+        }
         if (!names.includes('storage_uuid')) {
             db.run(`ALTER TABLE users ADD COLUMN storage_uuid TEXT`, [], () => {
                 db.all(`SELECT id, email FROM users WHERE storage_uuid IS NULL OR storage_uuid = ''`, [], (e2, rows) => {
@@ -1669,6 +1684,7 @@ db.serialize(() => {
     db.run(`CREATE TABLE IF NOT EXISTS user_plans (
         user_id INTEGER PRIMARY KEY,
         plan_gb INTEGER,
+        premium_gb INTEGER,
         rc_app_user_id TEXT,
         rc_product_id TEXT,
         rc_entitlement TEXT,
@@ -1689,6 +1705,9 @@ db.serialize(() => {
         const names = Array.isArray(cols) ? cols.map(c => c && c.name).filter(Boolean) : [];
         if (!names.includes('plan_gb')) {
             db.run(`ALTER TABLE user_plans ADD COLUMN plan_gb INTEGER`, [], () => {});
+        }
+        if (!names.includes('premium_gb')) {
+            db.run(`ALTER TABLE user_plans ADD COLUMN premium_gb INTEGER`, [], () => {});
         }
         if (!names.includes('rc_app_user_id')) {
             db.run(`ALTER TABLE user_plans ADD COLUMN rc_app_user_id TEXT`, [], () => {});
@@ -2450,6 +2469,12 @@ const getUserPlanGb = async (userId) => {
     return Number.isFinite(planGb) ? planGb : null;
 };
 
+const getUserPremiumGb = async (userId) => {
+    const row = await ensurePlanRow(userId);
+    const premiumGb = row && row.premium_gb !== null && row.premium_gb !== undefined ? Number(row.premium_gb) : null;
+    return Number.isFinite(premiumGb) && premiumGb > 0 ? premiumGb : 0;
+};
+
 const getUserUsedBytes = async (userId, userOrNull) => {
     // Get encrypted chunks size from database
     const row = await dbGetAsync(
@@ -2493,9 +2518,11 @@ const getUserUsedBytes = async (userId, userOrNull) => {
 
 const getUserQuotaBytes = async (userId) => {
     const planGb = await getUserPlanGb(userId);
-    if (!planGb) return 0;
+    const premiumGb = await getUserPremiumGb(userId);
+    const totalGb = (planGb || 0) + premiumGb;
+    if (totalGb <= 0) return 0;
     const GB = 1000 * 1000 * 1000;
-    const planBytes = Math.floor(planGb * GB);
+    const planBytes = Math.floor(totalGb * GB);
     return planBytes + USER_QUOTA_MARGIN_BYTES;
 };
 
@@ -2507,9 +2534,11 @@ const getServerFreeBytes = () => {
 
 const enforceUserQuotaForIncomingBytes = async ({ userId, incomingBytes }) => {
     const planGb = await getUserPlanGb(userId);
+    const premiumGb = await getUserPremiumGb(userId);
+    const totalGb = (planGb || 0) + premiumGb;
     const GB = 1000 * 1000 * 1000;
-    const planBytes = planGb ? Math.floor(Number(planGb) * GB) : 0;
-    const quotaBytes = planBytes ? (planBytes + USER_QUOTA_MARGIN_BYTES) : 0;
+    const totalBytes = totalGb > 0 ? Math.floor(totalGb * GB) : 0;
+    const quotaBytes = totalBytes > 0 ? (totalBytes + USER_QUOTA_MARGIN_BYTES) : 0;
     const usedBytes = await getUserUsedBytes(userId);
     const inc = typeof incomingBytes === 'number' && Number.isFinite(incomingBytes) ? incomingBytes : 0;
     const allowed = quotaBytes <= 0 ? true : (usedBytes + inc + USER_QUOTA_MARGIN_BYTES) <= quotaBytes;
@@ -2517,7 +2546,7 @@ const enforceUserQuotaForIncomingBytes = async ({ userId, incomingBytes }) => {
         allowed,
         quotaBytes,
         usedBytes,
-        remainingBytes: Math.max(0, planBytes - usedBytes),
+        remainingBytes: Math.max(0, totalBytes - usedBytes),
         marginBytes: USER_QUOTA_MARGIN_BYTES,
     };
 };
@@ -2604,18 +2633,21 @@ app.get('/.well-known/photosync-capacity.json', (req, res) => {
 app.get('/api/cloud/usage', authenticateToken, async (req, res) => {
     try {
         const planGb = await getUserPlanGb(req.user.id);
+        const premiumGb = await getUserPremiumGb(req.user.id);
+        const totalGb = (planGb || 0) + premiumGb;
         const GB = 1000 * 1000 * 1000;
-        const planBytes = planGb ? Math.floor(Number(planGb) * GB) : 0;
-        const quotaBytes = planBytes ? (planBytes + USER_QUOTA_MARGIN_BYTES) : 0;
+        const totalBytes = totalGb > 0 ? Math.floor(totalGb * GB) : 0;
+        const quotaBytes = totalBytes > 0 ? (totalBytes + USER_QUOTA_MARGIN_BYTES) : 0;
         const usedBytes = await getUserUsedBytes(req.user.id, req.user);
         const subscription = await resolveSubscriptionState(req.user.id);
         const serverFreeBytes = getServerFreeBytes();
 
         return res.json({
             planGb,
+            premiumGb,
             quotaBytes,
             usedBytes,
-            remainingBytes: Math.max(0, planBytes - usedBytes),
+            remainingBytes: Math.max(0, totalBytes - usedBytes),
             marginBytes: USER_QUOTA_MARGIN_BYTES,
             subscription,
             serverFreeBytes,
@@ -3151,9 +3183,64 @@ app.post('/api/migrate-credentials', authenticateToken, async (req, res) => {
     }
 });
 
+// Save user's Solana wallet address (called after wallet connect on any platform)
+app.post('/api/save-wallet', authenticateToken, async (req, res) => {
+    try {
+        const { wallet_address } = req.body || {};
+        if (!wallet_address || typeof wallet_address !== 'string' || wallet_address.length < 32 || wallet_address.length > 50) {
+            return res.status(400).json({ error: 'Valid Solana wallet address required' });
+        }
+        await dbRunAsync(`UPDATE users SET wallet_address = ? WHERE id = ?`, [wallet_address.trim(), req.user.id]);
+        console.log(`[Wallet] Saved wallet for user ${req.user.id}: ${wallet_address.trim()}`);
+        res.json({ success: true });
+    } catch (e) {
+        console.error('[Wallet] Save error:', e.message);
+        res.status(500).json({ error: 'Failed to save wallet address' });
+    }
+});
+
+// Lookup wallet address by email (for NFT transfers by email)
+app.post('/api/lookup-wallet', authenticateToken, async (req, res) => {
+    try {
+        const { email } = req.body || {};
+        if (!email) {
+            return res.status(400).json({ error: 'Email is required' });
+        }
+        const normalizedEmail = String(email).toLowerCase().trim();
+        const row = await dbGetAsync(
+            `SELECT wallet_address FROM users WHERE (email = ? OR alias_email = ?) AND wallet_address IS NOT NULL AND wallet_address != ''`,
+            [normalizedEmail, normalizedEmail]
+        );
+        if (!row || !row.wallet_address) {
+            return res.status(404).json({ error: 'No wallet address found for this user' });
+        }
+        res.json({ address: row.wallet_address });
+    } catch (e) {
+        console.error('[Wallet] Lookup error:', e.message);
+        res.status(500).json({ error: 'Failed to lookup wallet' });
+    }
+});
+
 app.get('/api/subscription/status', authenticateToken, async (req, res) => {
     try {
-        const st = await resolveSubscriptionState(req.user.id);
+        const userId = req.user.id;
+        // Self-heal: if user is premium in nft-service but premium_gb not set in user_plans, fix it
+        try {
+            const nftService = require('../nft-service');
+            const premiumStatus = nftService.balance.getPremiumStatus(userId);
+            if (premiumStatus && premiumStatus.isPremium) {
+                const row = await dbGetAsync(`SELECT premium_gb FROM user_plans WHERE user_id = ?`, [userId]);
+                if (!row || !row.premium_gb || Number(row.premium_gb) <= 0) {
+                    await ensurePlanRow(userId);
+                    await dbRunAsync(
+                        `UPDATE user_plans SET premium_gb = 10, updated_at = ? WHERE user_id = ?`,
+                        [Date.now(), userId]
+                    );
+                    console.log(`[Premium] Self-healed premium_gb=10 for user ${userId}`);
+                }
+            }
+        } catch (_) { /* nft-service not available */ }
+        const st = await resolveSubscriptionState(userId);
         return res.json(st);
     } catch (e) {
         return res.status(500).json({ error: 'Failed to resolve subscription status' });
@@ -3163,19 +3250,23 @@ app.get('/api/subscription/status', authenticateToken, async (req, res) => {
 // Check if user can downgrade to a specific tier based on current storage usage
 const canDowngradeToTier = async (userId, targetTierGb) => {
     const usedBytes = await getUserUsedBytes(userId);
+    const premiumGb = await getUserPremiumGb(userId);
     const GB = 1000 * 1000 * 1000;
-    const targetBytes = targetTierGb * GB;
-    // Allow downgrade only if used storage is less than target tier capacity
+    const targetBytes = (targetTierGb + premiumGb) * GB;
+    // Allow downgrade only if used storage fits in target tier + permanent premium storage
     return usedBytes < targetBytes;
 };
 
-// Get minimum required tier based on current storage usage
+// Get minimum required tier based on current storage usage (accounts for permanent premium storage)
 const getMinRequiredTier = async (userId) => {
     const usedBytes = await getUserUsedBytes(userId);
+    const premiumGb = await getUserPremiumGb(userId);
     const GB = 1000 * 1000 * 1000;
+    // If premium storage alone covers usage, no subscription tier needed
+    if (premiumGb > 0 && usedBytes < premiumGb * GB) return 0;
     const tiers = [100, 200, 400, 1000];
     for (const tier of tiers) {
-        if (usedBytes < tier * GB) return tier;
+        if (usedBytes < (tier + premiumGb) * GB) return tier;
     }
     return 1000; // Max tier if usage exceeds all
 };
@@ -3186,14 +3277,15 @@ app.get('/api/subscription/downgrade-check', authenticateToken, async (req, res)
         const userId = req.user.id;
         const usedBytes = await getUserUsedBytes(userId);
         const currentPlan = await getUserPlanGb(userId);
+        const premiumGb = await getUserPremiumGb(userId);
         const minRequiredTier = await getMinRequiredTier(userId);
         const GB = 1000 * 1000 * 1000;
         
-        // Check each tier
+        // Check each tier (account for permanent premium storage)
         const tiers = [100, 200, 400, 1000];
         const tierStatus = {};
         for (const tier of tiers) {
-            const tierBytes = tier * GB;
+            const tierBytes = (tier + premiumGb) * GB;
             tierStatus[tier] = {
                 allowed: usedBytes < tierBytes,
                 tierBytes,
@@ -3204,6 +3296,7 @@ app.get('/api/subscription/downgrade-check', authenticateToken, async (req, res)
         
         return res.json({
             currentPlanGb: currentPlan,
+            premiumGb,
             usedBytes,
             minRequiredTier,
             tiers: tierStatus,
@@ -6458,7 +6551,7 @@ const ensureUserNftDir = (userKey) => {
 const checkNftStorageEligibility = async (userId, fileSizeBytes) => {
     // First check subscription status - trial users should also be eligible
     const subscriptionState = await resolveSubscriptionState(userId);
-    const isActiveSubscription = subscriptionState.status === 'active' || subscriptionState.status === 'trial';
+    const isActiveSubscription = subscriptionState.status === 'active' || subscriptionState.status === 'trial' || subscriptionState.status === 'premium_only';
     
     if (!isActiveSubscription) {
         return { eligible: false, reason: 'No active StealthCloud plan' };
@@ -7051,7 +7144,33 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
 try {
     const nftService = require('../nft-service');
     nftService.initialize();
+
     app.use('/api/nft-service', authenticateToken, nftService.routes);
+
+    // After nft-service mounts, add a dedicated endpoint for client to confirm premium storage
+    // Client calls this right after a successful /api/nft-service/upgrade-premium response
+    const PREMIUM_STORAGE_GB = 10;
+    app.post('/api/premium/activate-storage', authenticateToken, async (req, res) => {
+        try {
+            const userId = req.user.id;
+            // Verify the user actually has premium in the nft-service DB
+            const premiumStatus = nftService.balance.getPremiumStatus(userId);
+            if (!premiumStatus || !premiumStatus.isPremium) {
+                return res.status(403).json({ error: 'Not a premium user', code: 'NOT_PREMIUM' });
+            }
+            await ensurePlanRow(userId);
+            await dbRunAsync(
+                `UPDATE user_plans SET premium_gb = ?, updated_at = ? WHERE user_id = ?`,
+                [PREMIUM_STORAGE_GB, Date.now(), userId]
+            );
+            console.log(`[Premium] Set premium_gb=${PREMIUM_STORAGE_GB} for user ${userId}`);
+            const st = await resolveSubscriptionState(userId);
+            return res.json({ ok: true, premiumGb: PREMIUM_STORAGE_GB, subscription: st });
+        } catch (e) {
+            console.error('[Premium] Failed to activate storage:', e.message);
+            return res.status(500).json({ error: 'Failed to activate premium storage' });
+        }
+    });
     console.log('[NFT Service] Mounted at /api/nft-service');
 } catch (nftServiceErr) {
     console.log('[NFT Service] Not available:', nftServiceErr.message);
