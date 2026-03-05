@@ -200,25 +200,25 @@
 
 ## From Hackathon to dApp Store
 
-### Q2 2026 - Solana dApp Store Launch
+### Q1 2026 - Solana dApp Store Launch
 ✓ Publish to dApp Store  
 ✓ In-app SOL purchase (Moonpay/Ramp)  
 ✓ Social sharing (Twitter, Instagram)  
 ✓ Batch minting (photo albums)
 
-### Q3 2026 - Creator Economy
+### Q2 2026 - Creator Economy
 • NFT marketplace integration  
 • Royalty splits for collaborations  
 • Verified photographer badges  
 • Portfolio websites (auto-generated)
 
-### Q4 2026 - Enterprise
+### Q3 2026 - Enterprise
 • Press/journalism verification  
 • Legal evidence timestamping  
 • Insurance claim documentation  
 • White-label licensing
 
-### 2027+ - Scale
+### Q4 2026 - Scale
 • iOS version (React Native)  
 • Desktop sync (already built)  
 • AI detection integration  
@@ -298,7 +298,7 @@ https://github.com/viktorvishyn369/PhotoLynk-Solana-Mobile
 
 # 🔗 Links
 - **Demo Video**: Watch on YouTube
-- **Pitch Deck**: [Slides Link]
+- **Pitch Deck**: https://github.com/viktorvishyn369/PhotoLynk/blob/main/PITCH_DECK.md
 - **Solana Explorer**: View Minted NFTs
 - **FreeTSA Verification**: freetsa.org
 - **x.com**: @StealthLynkIO
