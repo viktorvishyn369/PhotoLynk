@@ -6744,16 +6744,26 @@ const nftUpload = multer({
     storage: multer.memoryStorage(),
     limits: { fileSize: 50 * 1024 * 1024 }, // 50MB max
     fileFilter: (req, file, cb) => {
-        const allowed = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'application/octet-stream'];
-        if (allowed.includes(file.mimetype)) {
+        // Accept all image formats that mobile/desktop clients can send
+        // Matches solana-seeker/nftOperations.js uploadToStealthCloud MIME map
+        const allowed = /^(image\/(jpeg|png|gif|webp|heic|heif|tiff|avif|x-adobe-dng|x-canon-cr[23]|x-nikon-nef|x-sony-arw|x-fuji-raf|x-olympus-orf|x-panasonic-rw2|x-pentax-pef|x-samsung-srw)|application\/octet-stream)$/;
+        if (allowed.test(file.mimetype)) {
             cb(null, true);
         } else {
-            cb(new Error('Only JPEG, PNG, GIF, WebP images or encrypted blobs allowed'));
+            cb(new Error(`Unsupported image format: ${file.mimetype}`));
         }
     },
 });
 
-app.post('/api/nft/upload', authenticateToken, nftUpload.single('image'), async (req, res) => {
+app.post('/api/nft/upload', authenticateToken, (req, res, next) => {
+    nftUpload.single('image')(req, res, (err) => {
+        if (err) {
+            console.error('[NFT] Upload multer error:', err.message);
+            return res.status(400).json({ error: err.message });
+        }
+        next();
+    });
+}, async (req, res) => {
     try {
         if (!req.file) {
             return res.status(400).json({ error: 'No image file provided' });
@@ -6769,7 +6779,14 @@ app.post('/api/nft/upload', authenticateToken, nftUpload.single('image'), async 
         
         // Generate unique image ID
         const imageId = crypto.randomBytes(16).toString('hex');
-        const mimeToExt = { 'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif', 'image/webp': 'webp', 'application/octet-stream': 'bin' };
+        const mimeToExt = {
+            'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif', 'image/webp': 'webp',
+            'image/heic': 'heic', 'image/heif': 'heif', 'image/tiff': 'tiff', 'image/avif': 'avif',
+            'image/x-adobe-dng': 'dng', 'image/x-canon-cr2': 'cr2', 'image/x-canon-cr3': 'cr3',
+            'image/x-nikon-nef': 'nef', 'image/x-sony-arw': 'arw', 'image/x-fuji-raf': 'raf',
+            'image/x-olympus-orf': 'orf', 'image/x-panasonic-rw2': 'rw2', 'image/x-pentax-pef': 'pef',
+            'image/x-samsung-srw': 'srw', 'application/octet-stream': 'bin',
+        };
         const ext = mimeToExt[req.file.mimetype] || 'jpg';
         const filename = `${imageId}.${ext}`;
         
@@ -6889,11 +6906,12 @@ const serveNftImage = async (req, res) => {
         // Determine content type
         const ext = path.extname(safeFilename).toLowerCase();
         const contentTypes = {
-            '.jpg': 'image/jpeg',
-            '.jpeg': 'image/jpeg',
-            '.png': 'image/png',
-            '.gif': 'image/gif',
-            '.webp': 'image/webp',
+            '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif',
+            '.webp': 'image/webp', '.heic': 'image/heic', '.heif': 'image/heif', '.tiff': 'image/tiff',
+            '.tif': 'image/tiff', '.avif': 'image/avif', '.dng': 'image/x-adobe-dng',
+            '.cr2': 'image/x-canon-cr2', '.cr3': 'image/x-canon-cr3', '.nef': 'image/x-nikon-nef',
+            '.arw': 'image/x-sony-arw', '.raf': 'image/x-fuji-raf', '.orf': 'image/x-olympus-orf',
+            '.rw2': 'image/x-panasonic-rw2', '.pef': 'image/x-pentax-pef', '.srw': 'image/x-samsung-srw',
         };
         const contentType = contentTypes[ext] || 'application/octet-stream';
         
@@ -6918,7 +6936,7 @@ app.get('/api/nft/image/:userId/:filename', serveNftImage);
 // Also handle /:userId/:filename for nft.stealthlynk.io subdomain (no /api/nft/image prefix)
 app.get('/:userId/:filename', (req, res, next) => {
     const { filename } = req.params;
-    if (/\.(jpg|jpeg|png|gif|webp|bin|heic|heif|tiff|tif|avif|dng)$/i.test(filename)) {
+    if (/\.(jpg|jpeg|png|gif|webp|bin|heic|heif|tiff|tif|avif|dng|cr2|cr3|nef|arw|raf|orf|rw2|pef|srw)$/i.test(filename)) {
         return serveNftImage(req, res);
     }
     next(); // Pass to other routes if not an NFT image request
