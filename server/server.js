@@ -460,6 +460,20 @@ tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowr
 .payment-apple{background:rgba(255,255,255,.08);color:#e2e8f0}
 .payment-google{background:rgba(59,130,246,.15);color:#60a5fa}
 .payment-solana{background:rgba(139,92,246,.15);color:#a78bfa}
+.nft-premium{background:rgba(153,69,255,.15);color:#b794f6}
+.nft-deposit{background:rgba(34,197,94,.12);color:#4ade80}
+.storage-bar{width:80px;height:6px;background:rgba(255,255,255,.06);border-radius:3px;display:inline-block;vertical-align:middle;margin-left:6px}
+.storage-fill{height:100%;border-radius:3px;background:var(--accent);transition:width .2s}
+.storage-fill.warn{background:var(--warn)}
+.storage-fill.full{background:var(--danger)}
+.money-cell{font-weight:600;font-size:12px;color:#4ade80}
+.money-cell.zero{color:var(--muted);font-weight:400}
+.nft-count{font-size:12px;font-weight:600;color:var(--accent)}
+.login-active{color:#4ade80}
+.login-stale{color:var(--warn)}
+.login-inactive{color:var(--danger)}
+.detail-row{display:flex;gap:4px;flex-wrap:wrap;margin-top:2px}
+.mini-tag{font-size:10px;padding:1px 5px;border-radius:4px;background:rgba(255,255,255,.04);color:var(--muted);white-space:nowrap}
 </style>
 </head>
 <body>
@@ -481,14 +495,15 @@ tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowr
       <th data-col="id" onclick="sortBy('id')">ID <span class="sort-arrow">&#9650;</span></th>
       <th data-col="email" onclick="sortBy('email')">Email <span class="sort-arrow">&#9650;</span></th>
       <th data-col="device_uuids" onclick="sortBy('device_uuids')">Device UUID <span class="sort-arrow">&#9650;</span></th>
-      <th>Storage</th>
+      <th data-col="last_login" onclick="sortBy('last_login')">Last Login <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="storage_used" onclick="sortBy('storage_used')">Storage <span class="sort-arrow">&#9650;</span></th>
       <th data-col="plan_gb" onclick="sortBy('plan_gb')">Plan <span class="sort-arrow">&#9650;</span></th>
       <th data-col="status" onclick="sortBy('status')">Status <span class="sort-arrow">&#9650;</span></th>
-      <th data-col="trial_until" onclick="sortBy('trial_until')">Trial Until <span class="sort-arrow">&#9650;</span></th>
-      <th data-col="expires_at" onclick="sortBy('expires_at')">Expires <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="nft_mints" onclick="sortBy('nft_mints')">NFTs <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="total_paid" onclick="sortBy('total_paid')">Total Paid <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="payment_type" onclick="sortBy('payment_type')">Pay Type <span class="sort-arrow">&#9650;</span></th>
       <th data-col="created_at" onclick="sortBy('created_at')">Registered <span class="sort-arrow">&#9650;</span></th>
-      <th data-col="payment_type" onclick="sortBy('payment_type')">Payment <span class="sort-arrow">&#9650;</span></th>
-      <th data-col="payment_at" onclick="sortBy('payment_at')">Paid At <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="expires_at" onclick="sortBy('expires_at')">Expires <span class="sort-arrow">&#9650;</span></th>
       <th data-col="updated_at" onclick="sortBy('updated_at')">Updated <span class="sort-arrow">&#9650;</span></th>
       <th>Actions</th>
     </tr></thead>
@@ -547,13 +562,21 @@ tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowr
 </div>
 
 <script>
-var allUsers=[];var filteredUsers=[];var sortCol='id';var sortDir='desc';var activeFilter='all';
+var allUsers=[];var filteredUsers=[];var sortCol='id';var sortDir='desc';var activeFilter='all';var serverTime='';
 
 function fmtDate(iso){if(!iso)return'<span class="date-cell">-</span>';var d=new Date(iso);var now=new Date();var diff=d-now;var s=d.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'2-digit'})+' '+d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});if(diff<0&&diff>-86400000*3)s='<span style="color:var(--warn)">'+s+'</span>';else if(diff<0)s='<span style="color:var(--danger)">'+s+'</span>';return'<span class="date-cell">'+s+'</span>'}
 
+function fmtLogin(iso){if(!iso)return'<span class="date-cell login-inactive">Never</span>';var d=new Date(iso);var now=new Date();var ago=now-d;var mins=Math.floor(ago/60000);var hrs=Math.floor(ago/3600000);var days=Math.floor(ago/86400000);var label='';if(mins<5)label='Just now';else if(mins<60)label=mins+'m ago';else if(hrs<24)label=hrs+'h ago';else if(days<30)label=days+'d ago';else label=d.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'2-digit'});var cls=ago<3600000?'login-active':ago<86400000*7?'login-stale':'login-inactive';return'<span class="date-cell '+cls+'" title="'+d.toLocaleString()+'">'+label+'</span>'}
+
+function fmtBytes(b){if(!b||b<=0)return'0';if(b<1048576)return(b/1024).toFixed(0)+' KB';if(b<1073741824)return(b/1048576).toFixed(1)+' MB';return(b/1073741824).toFixed(2)+' GB'}
+
+function storageCell(used,quota){var usedStr=fmtBytes(used);var quotaStr=quota>0?fmtBytes(quota):'0';var pct=quota>0?Math.min(100,Math.round(used/quota*100)):0;var cls=pct>=90?'full':pct>=70?'warn':'';return'<span style="font-size:11px">'+usedStr+' / '+quotaStr+'</span><div class="storage-bar"><div class="storage-fill '+cls+'" style="width:'+pct+'%"></div></div>'}
+
 function statusBadge(st){var c='badge-'+(st||'none').replace(/\\s/g,'_');return'<span class="badge '+c+'">'+(st||'none')+'</span>'}
 
-function paymentBadge(pt){if(!pt)return'<span class="date-cell">-</span>';var c='payment-'+(pt||'').toLowerCase();return'<span class="payment-badge '+c+'">'+pt+'</span>'}
+function paymentBadges(u){var tags=[];if(u.payment_type){tags.push('<span class="payment-badge payment-'+(u.payment_type||'').toLowerCase()+'">'+u.payment_type+'</span>')}if(u.nft_is_premium){tags.push('<span class="payment-badge nft-premium">Premium</span>')}if(u.nft_payments&&u.nft_payments.length>0){var types={};u.nft_payments.forEach(function(p){var k=(p.platform||'iap')+':'+(p.type||'');types[k]=(types[k]||0)+1});Object.keys(types).forEach(function(k){var parts=k.split(':');tags.push('<span class="mini-tag">'+parts[0]+' x'+types[k]+'</span>')})}if(u.sol_payments&&u.sol_payments.length>0){tags.push('<span class="payment-badge payment-solana">SOL x'+u.sol_payments.length+'</span>')}return tags.length?tags.join(' '):'<span class="date-cell">-</span>'}
+
+function totalPaidCell(u){var parts=[];var iap=u.nft_total_paid||0;var sol=u.sol_total_paid||0;if(iap>0)parts.push('$'+iap.toFixed(2));if(sol>0)parts.push(sol.toFixed(4)+' SOL');if(!parts.length)return'<span class="money-cell zero">-</span>';return'<span class="money-cell">'+parts.join('<br>')+'</span>'}
 
 function planLabel(gb){if(!gb)return'-';return gb>=1000?(gb/1000)+'TB':gb+'GB'}
 
@@ -563,7 +586,8 @@ async function loadUsers(){
   try{
     var r=await fetch('/admin/api/users');var d=await r.json();
     if(!r.ok)throw new Error(d.error||'Failed');
-    allUsers=d.users.map(function(u){return{id:u.id,email:u.email||'',user_uuid:u.user_uuid||'',device_uuids:u.device_uuids||'',plan_gb:u.plan.plan_gb||0,status:u.plan.status||'none',trial_until:u.plan.trial_until,trial_until_date:u.plan.trial_until_date,expires_at:u.plan.expires_at,expires_at_date:u.plan.expires_at_date,grace_until:u.plan.grace_until,created_at:u.user_created_at,created_at_date:u.user_created_at_date,payment_type:u.plan.payment_type||'',payment_at:u.plan.payment_at,payment_at_date:u.plan.payment_at_date,updated_at:u.plan.updated_at,updated_at_date:u.plan.updated_at_date}});
+    serverTime=d.server_time||'';
+    allUsers=d.users.map(function(u){return{id:u.id,email:u.email||'',user_uuid:u.user_uuid||'',device_uuids:u.device_uuids||'',last_login:u.last_login||0,last_login_date:u.last_login_date,storage_used:u.storage_used_bytes||0,storage_quota:u.storage_quota_bytes||0,file_count:u.file_count||0,plan_gb:u.plan.plan_gb||0,premium_gb:u.plan.premium_gb||0,status:u.plan.status||'none',trial_until:u.plan.trial_until,trial_until_date:u.plan.trial_until_date,expires_at:u.plan.expires_at,expires_at_date:u.plan.expires_at_date,grace_until:u.plan.grace_until,created_at:u.user_created_at,created_at_date:u.user_created_at_date,payment_type:u.plan.payment_type||'',payment_at:u.plan.payment_at,payment_at_date:u.plan.payment_at_date,updated_at:u.plan.updated_at,updated_at_date:u.plan.updated_at_date,nft_is_premium:u.nft.is_premium,nft_mints:u.nft.mint_count||0,nft_free_remaining:u.nft.free_mints_remaining||0,nft_balance:u.nft.balance_usd||0,nft_total_paid:u.nft.total_paid_usd||0,nft_total_purchased:u.nft.total_purchased_usd||0,nft_total_spent:u.nft.total_spent_usd||0,nft_payments:u.nft.payments||[],sol_payments:u.solana.payments||[],sol_total_paid:u.solana.total_paid_sol||0,total_paid:(u.nft.total_paid_usd||0)+(u.solana.total_paid_sol||0)*100}});
     updateStats();buildFilters();applyFilters();
     document.getElementById('loading').style.display='none';
     document.getElementById('users-table').style.display='';
@@ -573,16 +597,25 @@ async function loadUsers(){
 function updateStats(){
   var total=allUsers.length;
   var active=allUsers.filter(function(u){return u.status==='active'}).length;
-  var trial=allUsers.filter(function(u){return u.status==='trial'}).length;
-  var paying=allUsers.filter(function(u){return!!u.payment_type}).length;
-  document.getElementById('header-stats').innerHTML='<span>Total: <b>'+total+'</b></span><span>Active: <b>'+active+'</b></span><span>Trial: <b>'+trial+'</b></span><span>Paying: <b>'+paying+'</b></span>';
+  var trial=allUsers.filter(function(u){return u.status==='trial'||u.status==='trial_complimentary'}).length;
+  var paying=allUsers.filter(function(u){return u.total_paid>0}).length;
+  var premium=allUsers.filter(function(u){return u.nft_is_premium}).length;
+  var totalRev=allUsers.reduce(function(s,u){return s+(u.nft_total_paid||0)},0);
+  var recentLogin=allUsers.filter(function(u){return u.last_login&&(Date.now()-u.last_login)<86400000*7}).length;
+  var st=serverTime?'<span>Server: <b>'+new Date(serverTime).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+'</b></span>':'';
+  document.getElementById('header-stats').innerHTML=st+'<span>Total: <b>'+total+'</b></span><span>Active: <b>'+active+'</b></span><span>Trial: <b>'+trial+'</b></span><span>Paying: <b>'+paying+'</b></span><span>Premium: <b>'+premium+'</b></span><span>7d Active: <b>'+recentLogin+'</b></span><span>Revenue: <b>$'+totalRev.toFixed(2)+'</b></span>';
 }
 
 function buildFilters(){
   var counts={};allUsers.forEach(function(u){var s=u.status||'none';counts[s]=(counts[s]||0)+1});
   var html='<button class="pill active" data-f="all" onclick="setFilter(this,&apos;all&apos;)">All<span class="count">'+allUsers.length+'</span></button>';
-  var order=['active','trial','grace','expired','trial_expired','none','deleted'];
+  var order=['active','trial','trial_complimentary','grace','expired','trial_expired','trial_complimentary_expired','none','deleted'];
   order.forEach(function(s){if(counts[s])html+='<button class="pill" data-f="'+s+'" onclick="setFilter(this,&apos;'+s+'&apos;)">'+s+'<span class="count">'+counts[s]+'</span></button>'});
+  // Special filters
+  var premCount=allUsers.filter(function(u){return u.nft_is_premium}).length;
+  var paidCount=allUsers.filter(function(u){return u.total_paid>0}).length;
+  if(premCount)html+='<button class="pill" data-f="premium" onclick="setFilter(this,&apos;premium&apos;)">premium<span class="count">'+premCount+'</span></button>';
+  if(paidCount)html+='<button class="pill" data-f="paid" onclick="setFilter(this,&apos;paid&apos;)">paid<span class="count">'+paidCount+'</span></button>';
   document.getElementById('status-filters').innerHTML=html;
 }
 
@@ -596,6 +629,8 @@ function setFilter(el,f){
 function applyFilters(){
   var q=(document.getElementById('search').value||'').toLowerCase().trim();
   filteredUsers=allUsers.filter(function(u){
+    if(activeFilter==='premium')return u.nft_is_premium;
+    if(activeFilter==='paid')return u.total_paid>0;
     if(activeFilter!=='all'&&u.status!==activeFilter)return false;
     if(!q)return true;
     return(String(u.id).includes(q)||u.email.toLowerCase().includes(q)||(u.status||'').toLowerCase().includes(q)||String(u.plan_gb).includes(q)||(u.payment_type||'').toLowerCase().includes(q)||(u.device_uuids||'').toLowerCase().includes(q)||(u.user_uuid||'').toLowerCase().includes(q));
@@ -605,7 +640,7 @@ function applyFilters(){
 
 function sortBy(col){
   if(sortCol===col)sortDir=sortDir==='asc'?'desc':'asc';
-  else{sortCol=col;sortDir=col==='id'?'desc':'asc'}
+  else{sortCol=col;sortDir=col==='id'||col==='total_paid'||col==='nft_mints'||col==='storage_used'||col==='last_login'?'desc':'asc'}
   document.querySelectorAll('thead th').forEach(function(th){th.classList.remove('sorted');if(th.dataset.col===col)th.classList.add('sorted')});
   document.querySelectorAll('.sort-arrow').forEach(function(a){a.innerHTML='&#9650;'});
   var th=document.querySelector('th[data-col="'+col+'"]');
@@ -635,15 +670,20 @@ function renderTable(){
     html+='<tr>';
     html+='<td class="id-cell">#'+u.id+'</td>';
     html+='<td class="email-cell" title="'+u.email+'">'+u.email+'</td>';
-    html+='<td class="uuid-cell" title="'+(u.device_uuids||'')+'" onclick="copyUuid(this,&apos;'+((u.device_uuids||'').replace(/'/g,'&apos;'))+'&apos;)">'+((u.device_uuids||'').substring(0,13)||"-")+'</td>';
-    html+='<td style="font-size:10px;">users/'+u.id+'</td>';
-    html+='<td class="plan-cell">'+planLabel(u.plan_gb)+'</td>';
+    html+='<td class="uuid-cell" title="'+(u.device_uuids||'')+'" onclick="copyUuid(this,&apos;'+((u.device_uuids||'').replace(/'/g,'&apos;'))+'&apos;)">'+((u.device_uuids||'').substring(0,13)||'-')+'</td>';
+    html+='<td>'+fmtLogin(u.last_login_date)+'</td>';
+    html+='<td>'+storageCell(u.storage_used,u.storage_quota)+'</td>';
+    var planStr=planLabel(u.plan_gb);if(u.premium_gb)planStr+=' <span class="payment-badge nft-premium" style="font-size:9px">+'+u.premium_gb+'GB</span>';
+    html+='<td class="plan-cell">'+planStr+'</td>';
     html+='<td>'+statusBadge(u.status)+'</td>';
-    html+='<td>'+fmtDate(u.trial_until_date)+'</td>';
-    html+='<td>'+fmtDate(u.expires_at_date)+'</td>';
+    var nftStr=u.nft_mints>0?'<span class="nft-count">'+u.nft_mints+'</span>':'<span class="date-cell">0</span>';
+    if(u.nft_is_premium)nftStr+=' <span class="payment-badge nft-premium" style="font-size:9px">P</span>';
+    if(u.nft_free_remaining>0)nftStr+='<br><span class="mini-tag">'+u.nft_free_remaining+' free left</span>';
+    html+='<td>'+nftStr+'</td>';
+    html+='<td>'+totalPaidCell(u)+'</td>';
+    html+='<td>'+paymentBadges(u)+'</td>';
     html+='<td>'+fmtDate(u.created_at_date)+'</td>';
-    html+='<td>'+paymentBadge(u.payment_type)+'</td>';
-    html+='<td>'+fmtDate(u.payment_at_date)+'</td>';
+    html+='<td>'+fmtDate(u.expires_at_date)+'</td>';
     html+='<td>'+fmtDate(u.updated_at_date)+'</td>';
     html+='<td class="actions-cell">';
     html+='<button class="btn-sm" onclick="openEdit('+u.id+')">Edit</button>';
@@ -864,7 +904,7 @@ app.post('/admin/api/user/plan', adminAuth, async (req, res) => {
 // Admin API: list all users with plans
 app.get('/admin/api/users', adminAuth, async (req, res) => {
     try {
-        // Get all users with their plans (users table has no created_at, use plan updated_at as proxy)
+        // Get all users with their plans, last login, and storage usage
         const users = await dbAllAsync(`
             SELECT 
                 u.id,
@@ -872,46 +912,120 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 u.user_uuid,
                 u.created_at AS user_created_at,
                 GROUP_CONCAT(DISTINCT d.device_uuid) AS device_uuids,
+                MAX(d.last_seen) AS last_login,
                 p.plan_gb,
+                p.premium_gb,
                 p.status as plan_status,
                 p.trial_until,
                 p.expires_at,
                 p.grace_until,
                 p.payment_type,
                 p.payment_at,
-                p.updated_at as plan_updated_at
+                p.updated_at as plan_updated_at,
+                COALESCE(cc.storage_used, 0) AS storage_used_bytes,
+                COALESCE(fc.file_count, 0) AS file_count
             FROM users u
             LEFT JOIN user_plans p ON u.id = p.user_id
             LEFT JOIN devices d ON u.id = d.user_id
+            LEFT JOIN (SELECT user_id, SUM(size) AS storage_used FROM cloud_chunks GROUP BY user_id) cc ON u.id = cc.user_id
+            LEFT JOIN (SELECT user_id, COUNT(*) AS file_count FROM files GROUP BY user_id) fc ON u.id = fc.user_id
             GROUP BY u.id
             ORDER BY u.id DESC
         `);
 
-        const formattedUsers = users.map(user => ({
-            id: user.id,
-            email: user.email,
-            user_uuid: user.user_uuid,
-            device_uuids: user.device_uuids || null,
-            user_created_at: user.user_created_at,
-            user_created_at_date: user.user_created_at ? new Date(user.user_created_at).toISOString() : null,
-            plan: {
-                plan_gb: user.plan_gb,
-                status: user.plan_status,
-                trial_until: user.trial_until,
-                trial_until_date: user.trial_until ? new Date(user.trial_until).toISOString() : null,
-                expires_at: user.expires_at,
-                expires_at_date: user.expires_at ? new Date(user.expires_at).toISOString() : null,
-                grace_until: user.grace_until,
-                payment_type: user.payment_type,
-                payment_at: user.payment_at,
-                payment_at_date: user.payment_at ? new Date(user.payment_at).toISOString() : null,
-                updated_at: user.plan_updated_at,
-                updated_at_date: user.plan_updated_at ? new Date(user.plan_updated_at).toISOString() : null,
-            },
-        }));
+        // Try to get NFT service data (payments, premium, mint counts)
+        let nftPaymentsByUser = {};
+        let nftPremiumByUser = {};
+        let nftBalanceByUser = {};
+        let solanaPaymentsByUser = {};
+        try {
+            const nftService = require('../nft-service');
+            nftService.balance.init();
+            // Get all NFT payments
+            const allPayments = nftService.balance.getAllPayments();
+            for (const p of allPayments) {
+                if (!nftPaymentsByUser[p.user_id]) nftPaymentsByUser[p.user_id] = [];
+                nftPaymentsByUser[p.user_id].push(p);
+            }
+            // Get premium + balance for each user
+            for (const u of users) {
+                try {
+                    nftPremiumByUser[u.id] = nftService.balance.getPremiumStatus(u.id);
+                } catch (_) {}
+                try {
+                    nftBalanceByUser[u.id] = nftService.balance.getBalance(u.id);
+                } catch (_) {}
+            }
+        } catch (_) { /* nft-service not available */ }
+
+        // Get Solana payments
+        try {
+            const solPayments = await dbAllAsync(`SELECT user_id, sol_amount, tier_gb, duration, created_at, verified_at FROM solana_payments ORDER BY created_at DESC`);
+            for (const sp of solPayments) {
+                if (!solanaPaymentsByUser[sp.user_id]) solanaPaymentsByUser[sp.user_id] = [];
+                solanaPaymentsByUser[sp.user_id].push(sp);
+            }
+        } catch (_) {}
+
+        const formattedUsers = users.map(user => {
+            const nftPayments = nftPaymentsByUser[user.id] || [];
+            const premium = nftPremiumByUser[user.id] || {};
+            const balance = nftBalanceByUser[user.id] || {};
+            const solPayments = solanaPaymentsByUser[user.id] || [];
+            const totalNftPaid = nftPayments.reduce((s, p) => s + (p.amount_usd || 0), 0);
+            const totalSolPaid = solPayments.reduce((s, p) => s + (p.sol_amount || 0), 0);
+            // Compute effective storage quota in bytes
+            const planQuotaBytes = (user.plan_gb || 0) * 1073741824;
+            const premiumQuotaBytes = premium.cloudQuotaBytes || ((user.premium_gb || 0) * 1073741824);
+            const totalQuotaBytes = planQuotaBytes + premiumQuotaBytes;
+
+            return {
+                id: user.id,
+                email: user.email,
+                user_uuid: user.user_uuid,
+                device_uuids: user.device_uuids || null,
+                user_created_at: user.user_created_at,
+                user_created_at_date: user.user_created_at ? new Date(user.user_created_at).toISOString() : null,
+                last_login: user.last_login,
+                last_login_date: user.last_login ? new Date(user.last_login).toISOString() : null,
+                storage_used_bytes: user.storage_used_bytes || 0,
+                storage_quota_bytes: totalQuotaBytes,
+                file_count: user.file_count || 0,
+                plan: {
+                    plan_gb: user.plan_gb,
+                    premium_gb: user.premium_gb,
+                    status: user.plan_status,
+                    trial_until: user.trial_until,
+                    trial_until_date: user.trial_until ? new Date(user.trial_until).toISOString() : null,
+                    expires_at: user.expires_at,
+                    expires_at_date: user.expires_at ? new Date(user.expires_at).toISOString() : null,
+                    grace_until: user.grace_until,
+                    payment_type: user.payment_type,
+                    payment_at: user.payment_at,
+                    payment_at_date: user.payment_at ? new Date(user.payment_at).toISOString() : null,
+                    updated_at: user.plan_updated_at,
+                    updated_at_date: user.plan_updated_at ? new Date(user.plan_updated_at).toISOString() : null,
+                },
+                nft: {
+                    is_premium: !!(premium.isPremium),
+                    mint_count: premium.mintCount || 0,
+                    free_mints_remaining: premium.freeMintsRemaining || 0,
+                    balance_usd: balance.balance_usd || 0,
+                    total_purchased_usd: balance.total_purchased_usd || 0,
+                    total_spent_usd: balance.total_spent_usd || 0,
+                    payments: nftPayments.map(p => ({ type: p.payment_type, amount: p.amount_usd, platform: p.platform, date: p.created_at })),
+                    total_paid_usd: totalNftPaid,
+                },
+                solana: {
+                    payments: solPayments.map(sp => ({ sol: sp.sol_amount, tier_gb: sp.tier_gb, duration: sp.duration, date: sp.created_at ? new Date(sp.created_at).toISOString() : null })),
+                    total_paid_sol: totalSolPaid,
+                },
+            };
+        });
 
         return res.json({
             total_users: formattedUsers.length,
+            server_time: new Date().toISOString(),
             users: formattedUsers,
         });
     } catch (e) {
