@@ -276,7 +276,7 @@
 ### Contact
 - **Email**: support@photolynk.io
 - **GitHub**: @viktorvishyn369
-- **Twitter**: @PhotoLynk
+- **x.com**: @StealthLynkIO
 
 ---
 
@@ -297,13 +297,13 @@ https://github.com/viktorvishyn369/PhotoLynk-Solana-Mobile
 ---
 
 # 🔗 Links
-- **Demo Video**: Watch on YouTube
+- **Demo Video**: https://youtube.com/shorts/pp3TYwn68D0
 - **Pitch Deck**: https://github.com/viktorvishyn369/PhotoLynk/blob/main/PITCH_DECK.md
 - **Solana Explorer**: View Minted NFTs
 - **FreeTSA Verification**: freetsa.org
 - **x.com**: @StealthLynkIO
 - **Telegram**: @StealthLynkIO
-- **Website**: photolynk.io
+- **Website**: stealthlynk.io
 
 ---
 
