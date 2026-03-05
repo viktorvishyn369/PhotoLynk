@@ -7236,7 +7236,9 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
                         if (c.license && !ex.license) { ex.license = c.license; changed = true; }
                         if (c.storageType && !ex.storageType) { ex.storageType = c.storageType; changed = true; }
                         if (c.contentHash && !ex.contentHash) { ex.contentHash = c.contentHash; changed = true; }
+                        if (c.exifRawHash && !ex.exifRawHash) { ex.exifRawHash = c.exifRawHash; changed = true; }
                         if (c.exifHash && !ex.exifHash) { ex.exifHash = c.exifHash; changed = true; }
+                        if (c.exifBindingHash && !ex.exifBindingHash) { ex.exifBindingHash = c.exifBindingHash; changed = true; }
                         if (c.cameraHash && !ex.cameraHash) { ex.cameraHash = c.cameraHash; changed = true; }
                         if (c.rfc3161Token && !ex.rfc3161Token) { ex.rfc3161Token = c.rfc3161Token; ex.hasRfc3161 = true; changed = true; }
                         if (c.c2paManifest && !ex.c2paManifest) { ex.c2paManifest = c.c2paManifest; ex.hasC2pa = true; changed = true; }
