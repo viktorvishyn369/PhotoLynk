@@ -2962,9 +2962,10 @@ app.post('/api/login', authRateLimiter, async (req, res) => {
             }
         }
 
-        // Register/Update Device
-        db.run(`INSERT OR IGNORE INTO devices (user_id, device_uuid, device_name) VALUES (?, ?, ?)`, 
-            [user.id, device_uuid, device_name || 'Unknown Device'], 
+        // Register/Update Device (update last_seen on every login)
+        db.run(`INSERT INTO devices (user_id, device_uuid, device_name, last_seen) VALUES (?, ?, ?, ?)
+                 ON CONFLICT(user_id, device_uuid) DO UPDATE SET last_seen = ?, device_name = COALESCE(?, device_name)`, 
+            [user.id, device_uuid, device_name || 'Unknown Device', Date.now(), Date.now(), device_name || null], 
             async (devErr) => {
                 if (devErr) console.error('Device reg error:', devErr);
 
