@@ -292,15 +292,20 @@ Alternatively, download the latest APK from GitHub Releases.
 https://github.com/viktorvishyn369/PhotoLynk-Solana-Mobile  
 (Open source, CC BY-NC-ND 4.0 License)
 
-🎥 **Watch Demo Video**  
-https://youtube.com/shorts/pp3TYwn68D0  
-(60 second walkthrough)
-
-🔗 **Verify On-Chain**  
-https://explorer.solana.com  
-(See real minted NFTs)
-
 **Questions?** support@photolynk.io
+
+---
+
+# 🔗 Links
+- **Demo Video**: Watch on YouTube
+- **Pitch Deck**: [Slides Link]
+- **Solana Explorer**: View Minted NFTs
+- **FreeTSA Verification**: freetsa.org
+- **x.com**: @StealthLynkIO
+- **Telegram**: @StealthLynkIO
+- **Website**: photolynk.io
+
+---
 
 ---
 
