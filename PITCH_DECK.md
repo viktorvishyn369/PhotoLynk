@@ -284,9 +284,9 @@
 
 ## Try PhotoLynk Today
 
-📱 **Download APK**  
-`photolynk-solana-2.0.0-62.apk`  
-(Included in submission)
+📱 **Download App**  
+Available on the official Solana dApp Store.  
+Alternatively, download the latest APK from GitHub Releases.
 
 💻 **View Source Code**  
 https://github.com/viktorvishyn369/PhotoLynk-Solana-Mobile  
