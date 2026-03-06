@@ -1,5 +1,6 @@
 {
   "dependencies": {
-    "exifreader": "^4.36.2"
+    "exifreader": "^4.36.2",
+    "sharp": "^0.33.2"
   }
 }
