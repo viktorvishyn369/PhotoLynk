@@ -916,6 +916,22 @@ class DesktopBackupClient {
     return response.data;
   }
 
+  async deleteChunks(chunkIds) {
+    const ids = Array.isArray(chunkIds) ? chunkIds.filter(Boolean) : [];
+    if (ids.length === 0) return;
+    const baseUrl = this.getBaseUrl();
+    await axios.post(`${baseUrl}/api/cloud/chunks/delete-batch`, {
+      chunkIds: ids,
+    }, {
+      headers: {
+        'Authorization': `Bearer ${this.token}`,
+        'Content-Type': 'application/json',
+        'X-Device-UUID': this.deviceUuid
+      },
+      timeout: 30000
+    });
+  }
+
   // Get existing manifests to skip already backed up files (with pagination and retry)
   async getExistingManifests() {
     const baseUrl = this.getBaseUrl();
@@ -1370,6 +1386,9 @@ class DesktopBackupClient {
 
     // Check if server rejected as duplicate (server-side deduplication)
     if (manifestResponse && manifestResponse.skipped) {
+      try {
+        await this.deleteChunks([...chunkIds, thumbChunkId]);
+      } catch (e) {}
       console.log(`Server rejected ${fileName} as duplicate (reason: ${manifestResponse.reason || 'unknown'})`);
       return { skipped: true, reason: manifestResponse.reason || 'server-side-duplicate' };
     }

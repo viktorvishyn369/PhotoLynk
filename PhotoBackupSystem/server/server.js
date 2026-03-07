@@ -3555,6 +3555,41 @@ app.put('/api/cloud/device-state', authenticateToken, blockDeletedSubscription, 
     }
 });
 
+app.post('/api/cloud/chunks/delete-batch', authenticateToken, async (req, res) => {
+    try {
+        const rawChunkIds = Array.isArray(req.body?.chunkIds) ? req.body.chunkIds : [];
+        const chunkIds = Array.from(new Set(rawChunkIds
+            .map(id => (typeof id === 'string' ? id.toLowerCase() : ''))
+            .filter(id => /^[a-f0-9]{64}$/i.test(id))));
+
+        if (chunkIds.length === 0) {
+            return res.json({ ok: true, deleted: 0 });
+        }
+
+        const { chunksDir } = ensureStealthCloudUserDirs(req.user);
+        let deleted = 0;
+        for (const chunkId of chunkIds) {
+            const target = path.join(chunksDir, chunkId);
+            if (!target.startsWith(chunksDir)) continue;
+            try {
+                if (fs.existsSync(target)) {
+                    fs.unlinkSync(target);
+                    deleted++;
+                }
+            } catch (e) {}
+        }
+
+        await dbRunAsync(
+            `DELETE FROM cloud_chunks WHERE user_id = ? AND chunk_id IN (${chunkIds.map(() => '?').join(',')})`,
+            [req.user.id, ...chunkIds]
+        );
+
+        return res.json({ ok: true, deleted });
+    } catch (e) {
+        return res.status(500).json({ error: 'Failed to delete chunks' });
+    }
+});
+
 // Upload encrypted chunk blob
 app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req, res, next) => {
     const ct = (req.headers['content-type'] || '').toString().toLowerCase();
@@ -3844,13 +3879,13 @@ app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (
     // Check 1: ManifestId (filename + size hash)
     if (dedupSets.manifestIds.has(safeId)) {
         console.log(`[SC-Dedup] Skipping ${safeId} - manifestId already exists`);
-        return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'manifestId' });
+        return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'manifestId', cleanupChunkIds: [] });
     }
 
     // Check 2: Exact file hash match (videos and byte-identical files)
     if (fileHash && dedupSets.fileHashes.has(fileHash)) {
         console.log(`[SC-Dedup] Skipping ${safeId} - fileHash already exists`);
-        return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'fileHash' });
+        return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'fileHash', cleanupChunkIds: [] });
     }
 
     // Check 3: Perceptual hash match (images - fuzzy matching)
@@ -3858,7 +3893,7 @@ app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (
         const phashMatch = findPerceptualHashMatchServer(perceptualHash, dedupSets.perceptualHashes);
         if (phashMatch.match) {
             console.log(`[SC-Dedup] Skipping ${safeId} - perceptualHash match (${phashMatch.reason}${phashMatch.distance !== undefined ? ', dist=' + phashMatch.distance : ''})`);
-            return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'perceptualHash' });
+            return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'perceptualHash', cleanupChunkIds: [] });
         }
     }
 
