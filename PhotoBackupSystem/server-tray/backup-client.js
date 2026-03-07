@@ -1213,19 +1213,7 @@ class DesktopBackupClient {
       }
 
       if (exifData.captureTime) {
-        const exifKeys = this.generateExifDedupKeys(exifData);
-        if (exifKeys.full && alreadyExifFull && alreadyExifFull.has(exifKeys.full)) {
-          console.log(`Skipping ${fileName} - EXIF full match already on server (legacy fallback)`);
-          return { skipped: true, reason: 'exifFull' };
-        }
-        if (exifKeys.timeModel && alreadyExifTimeModel && alreadyExifTimeModel.has(exifKeys.timeModel)) {
-          console.log(`Skipping ${fileName} - EXIF time+model match already on server (legacy fallback)`);
-          return { skipped: true, reason: 'exifTimeModel' };
-        }
-        if (exifKeys.timeMake && alreadyExifTimeMake && alreadyExifTimeMake.has(exifKeys.timeMake)) {
-          console.log(`Skipping ${fileName} - EXIF time+make match already on server (legacy fallback)`);
-          return { skipped: true, reason: 'exifTimeMake' };
-        }
+        this.generateExifDedupKeys(exifData);
       }
     }
 
