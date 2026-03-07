@@ -4467,6 +4467,55 @@ app.delete('/api/nft/image/:imageId', authenticateToken, async (req, res) => {
 
 // NFT metadata storage file per user
 const getNftMetadataPath = (userId) => path.join(NFT_DIR, String(userId), 'nft-album.json');
+const getNftCertificatesPath = (userId) => path.join(NFT_DIR, String(userId), 'certificates.json');
+
+const NFT_CERT_API_SLIM_KEYS = ['id','name','mintAddress','txSignature','creatorWallet','ownerAddress',
+    'issuedAt','createdAt','edition','license','contentHash','exifHash','cameraHash',
+    'exifRawHash','exifBindingHash','rfc3161Policy','mintedAt',
+    'hasRfc3161','hasC2pa','encrypted','watermarked','storageType','nftType','isCompressed',
+    'rfc3161Tsa','metadataUrl','description','version','type','imageUrl','certificationMode'];
+const NFT_CERT_DISK_SAFE_KEYS = [...NFT_CERT_API_SLIM_KEYS, 'rfc3161Token', 'c2paManifest'];
+
+const slimNftCertificateForDisk = (cert) => {
+    const copy = {};
+    for (const k of NFT_CERT_DISK_SAFE_KEYS) {
+        if (cert && cert[k] !== undefined) copy[k] = cert[k];
+    }
+    if (cert?.rfc3161Token) copy.hasRfc3161 = true;
+    if (cert?.c2paManifest) copy.hasC2pa = true;
+    if (copy.imageUrl && copy.imageUrl.startsWith('data:') && copy.imageUrl.length > 5000) delete copy.imageUrl;
+    return copy;
+};
+
+const slimNftCertificateForApi = (cert) => {
+    const copy = {};
+    for (const k of NFT_CERT_API_SLIM_KEYS) {
+        if (cert && cert[k] !== undefined) copy[k] = cert[k];
+    }
+    if (cert?.rfc3161Token) copy.hasRfc3161 = true;
+    if (cert?.c2paManifest) copy.hasC2pa = true;
+    if (copy.imageUrl && copy.imageUrl.startsWith('data:') && copy.imageUrl.length > 5000) delete copy.imageUrl;
+    return copy;
+};
+
+const readNftCertificates = (userId) => {
+    const certsPath = getNftCertificatesPath(userId);
+    if (!fs.existsSync(certsPath)) return [];
+    try {
+        const parsed = JSON.parse(fs.readFileSync(certsPath, 'utf8'));
+        return Array.isArray(parsed) ? parsed : [];
+    } catch (_) {
+        return [];
+    }
+};
+
+const writeNftCertificates = (userId, certs) => {
+    const userNftDir = path.join(NFT_DIR, String(userId));
+    if (!fs.existsSync(userNftDir)) {
+        fs.mkdirSync(userNftDir, { recursive: true });
+    }
+    fs.writeFileSync(getNftCertificatesPath(userId), JSON.stringify(certs.map(slimNftCertificateForDisk), null, 2));
+};
 
 // Get user's NFT album (list of minted NFTs)
 // GET /api/nft/list
@@ -4546,6 +4595,72 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
     } catch (error) {
         console.error('[NFT] Sync error:', error);
         res.status(500).json({ error: 'Failed to sync NFT album' });
+    }
+});
+
+// Get/sync NFT certificates (keeps list payloads slim, preserves heavy fields on disk)
+app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const certs = readNftCertificates(userId);
+        const full = req.query.full === 'true';
+        const id = req.query.id ? String(req.query.id) : '';
+        const mintAddress = req.query.mintAddress ? String(req.query.mintAddress) : '';
+
+        if (full && (id || mintAddress)) {
+            const match = certs.find(c => (id && c.id === id) || (mintAddress && c.mintAddress === mintAddress));
+            if (!match) return res.status(404).json({ error: 'Certificate not found' });
+            return res.json({ success: true, certificate: slimNftCertificateForDisk(match) });
+        }
+
+        return res.json({ success: true, certificates: certs.map(slimNftCertificateForApi) });
+    } catch (error) {
+        console.error('[NFT] Certificates fetch error:', error);
+        res.status(500).json({ error: 'Failed to fetch certificates' });
+    }
+});
+
+app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { action, certificate, certificates } = req.body;
+        const existing = readNftCertificates(userId);
+        const existingMap = {};
+        existing.forEach((c, i) => { if (c.id) existingMap[c.id] = i; });
+
+        const mergeCert = (incoming) => {
+            if (!incoming?.id) return;
+            const slimmed = slimNftCertificateForDisk(incoming);
+            const idx = existingMap[slimmed.id];
+            if (idx === undefined) {
+                existingMap[slimmed.id] = existing.length;
+                existing.push(slimmed);
+                return;
+            }
+            const current = existing[idx] || {};
+            for (const key of NFT_CERT_DISK_SAFE_KEYS) {
+                if (slimmed[key] !== undefined && slimmed[key] !== null && (current[key] === undefined || current[key] === null)) {
+                    current[key] = slimmed[key];
+                }
+            }
+            if (slimmed.rfc3161Token) { current.rfc3161Token = slimmed.rfc3161Token; current.hasRfc3161 = true; }
+            if (slimmed.c2paManifest) { current.c2paManifest = slimmed.c2paManifest; current.hasC2pa = true; }
+            existing[idx] = current;
+        };
+
+        if (action === 'add' && certificate) {
+            mergeCert(certificate);
+        } else if (action === 'backup' && Array.isArray(certificates)) {
+            for (const cert of certificates) mergeCert(cert);
+        } else {
+            return res.status(400).json({ error: 'Invalid action' });
+        }
+
+        writeNftCertificates(userId, existing);
+        res.json({ success: true, count: existing.length });
+    } catch (error) {
+        console.error('[NFT] Certificates sync error:', error);
+        res.status(500).json({ error: 'Failed to sync certificates' });
     }
 });
 
