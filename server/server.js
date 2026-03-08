@@ -7027,6 +7027,15 @@ const readMergedNftsForDevice = async (deviceUuid) => {
                 const key = normalizeMint(nft.mintAddress);
                 if (!key || seen.has(key)) continue;
                 seen.add(key);
+                // Strip large data: URIs before sending to mobile (prevents OOM on Android)
+                // On-chain NFTs embed multi-MB base64 images that blow up JSON.parse on low-memory devices
+                // The client re-fetches these from DAS/metadata if needed
+                if (nft.imageUrl && nft.imageUrl.startsWith('data:') && nft.imageUrl.length > 5000) {
+                    nft.imageUrl = undefined;
+                }
+                if (nft.arweaveUrl && nft.arweaveUrl.startsWith('data:') && nft.arweaveUrl.length > 5000) {
+                    nft.arweaveUrl = undefined;
+                }
                 merged.push(nft);
             }
         } catch (e) {
@@ -7174,6 +7183,12 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: 'Invalid action or missing data' });
         }
         
+        // Strip large data: URIs before persisting (on-chain NFTs embed multi-MB base64)
+        // Prevents nft-album.json from growing to 100MB+ and causing OOM on re-read
+        for (const n of data.nfts) {
+            if (n.imageUrl && n.imageUrl.startsWith('data:') && n.imageUrl.length > 5000) n.imageUrl = undefined;
+            if (n.arweaveUrl && n.arweaveUrl.startsWith('data:') && n.arweaveUrl.length > 5000) n.arweaveUrl = undefined;
+        }
         // Save updated metadata
         fs.writeFileSync(metadataPath, JSON.stringify(data, null, 2));
         res.json({ success: true, count: data.nfts.length });
