@@ -1101,6 +1101,18 @@ const dbAllAsync = (sql, params) => new Promise((resolve, reject) => {
     });
 });
 
+const normalizePairingDeviceId = (value) => {
+    const str = value === undefined || value === null ? '' : String(value).trim();
+    if (!str) return '';
+    return str.replace(/[^a-zA-Z0-9:_\-.]/g, '').slice(0, 200);
+};
+
+const getPairingDeviceIdFromRequest = (req) => {
+    const headerValue = req.headers['x-pairing-device-id'];
+    const bodyValue = req.body && typeof req.body === 'object' ? (req.body.pairing_device_id || req.body.pairingDeviceId) : '';
+    return normalizePairingDeviceId(headerValue || bodyValue || '');
+};
+
 const ensurePlanRow = async (userId) => {
     const existing = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [userId]);
     if (existing) return existing;
@@ -1458,6 +1470,18 @@ db.serialize(() => {
         FOREIGN KEY(user_id) REFERENCES users(id),
         UNIQUE(user_id, device_uuid)
     )`);
+
+    db.run(`CREATE TABLE IF NOT EXISTS device_pair_links (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        device_a_uuid TEXT NOT NULL,
+        device_b_uuid TEXT NOT NULL,
+        label TEXT,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id),
+        UNIQUE(user_id, device_a_uuid, device_b_uuid)
+    )`);
     
     // Files table to track metadata
     db.run(`CREATE TABLE IF NOT EXISTS files (
@@ -1561,6 +1585,115 @@ const authenticateToken = (req, res, next) => {
         next();
     });
 };
+
+app.get('/api/device/links', authenticateToken, async (req, res) => {
+    try {
+        const pairingDeviceId = getPairingDeviceIdFromRequest(req);
+        if (!pairingDeviceId) {
+            return res.status(400).json({ error: 'Pairing device ID required' });
+        }
+
+        const links = await dbAllAsync(
+            `SELECT id, user_id, device_a_uuid, device_b_uuid, label, created_at, updated_at
+               FROM device_pair_links
+              WHERE device_a_uuid = ? OR device_b_uuid = ?
+              ORDER BY updated_at DESC, id DESC`,
+            [pairingDeviceId, pairingDeviceId]
+        );
+
+        const normalized = links
+            .map((row) => {
+                const pairedDeviceUuid = row.device_a_uuid === pairingDeviceId ? row.device_b_uuid : row.device_a_uuid;
+                if (!pairedDeviceUuid) return null;
+                return {
+                    id: row.id,
+                    paired_device_uuid: pairedDeviceUuid,
+                    label: row.label || null,
+                    created_at: row.created_at,
+                    updated_at: row.updated_at,
+                };
+            })
+            .filter(Boolean);
+
+        return res.json({ success: true, links: normalized });
+    } catch (e) {
+        console.error('[Pairing] Failed to get device links:', e.message);
+        return res.status(500).json({ error: 'Failed to load linked devices' });
+    }
+});
+
+app.post('/api/device/link', authenticateToken, async (req, res) => {
+    try {
+        const pairingDeviceId = getPairingDeviceIdFromRequest(req);
+        const targetDeviceUuid = normalizePairingDeviceId(req.body?.target_device_uuid);
+        const rawLabel = req.body?.label === undefined || req.body?.label === null ? '' : String(req.body.label);
+        const label = rawLabel.trim().slice(0, 120);
+
+        if (!pairingDeviceId) {
+            return res.status(400).json({ error: 'Pairing device ID required' });
+        }
+        if (!targetDeviceUuid) {
+            return res.status(400).json({ error: 'Target device UUID required' });
+        }
+        if (pairingDeviceId === targetDeviceUuid) {
+            return res.status(400).json({ error: 'Cannot pair with yourself' });
+        }
+
+        const deviceA = pairingDeviceId < targetDeviceUuid ? pairingDeviceId : targetDeviceUuid;
+        const deviceB = pairingDeviceId < targetDeviceUuid ? targetDeviceUuid : pairingDeviceId;
+        const now = Date.now();
+
+        const existingLink = await dbGetAsync(
+            `SELECT id FROM device_pair_links WHERE device_a_uuid = ? AND device_b_uuid = ?`,
+            [deviceA, deviceB]
+        );
+
+        if (existingLink) {
+            await dbRunAsync(
+                `UPDATE device_pair_links SET label = ?, updated_at = ? WHERE id = ?`,
+                [label || null, now, existingLink.id]
+            );
+        } else {
+            await dbRunAsync(
+                `INSERT INTO device_pair_links (user_id, device_a_uuid, device_b_uuid, label, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?)`,
+                [req.user.id, deviceA, deviceB, label || null, now, now]
+            );
+        }
+
+        return res.json({ success: true, paired_device_uuid: targetDeviceUuid });
+    } catch (e) {
+        console.error('[Pairing] Failed to create device link:', e.message);
+        return res.status(500).json({ error: 'Failed to link devices' });
+    }
+});
+
+app.delete('/api/device/link', authenticateToken, async (req, res) => {
+    try {
+        const pairingDeviceId = getPairingDeviceIdFromRequest(req);
+        const targetDeviceUuid = normalizePairingDeviceId(req.body?.target_device_uuid);
+
+        if (!pairingDeviceId) {
+            return res.status(400).json({ error: 'Pairing device ID required' });
+        }
+        if (!targetDeviceUuid) {
+            return res.status(400).json({ error: 'Target device UUID required' });
+        }
+
+        const deviceA = pairingDeviceId < targetDeviceUuid ? pairingDeviceId : targetDeviceUuid;
+        const deviceB = pairingDeviceId < targetDeviceUuid ? targetDeviceUuid : pairingDeviceId;
+
+        await dbRunAsync(
+            `DELETE FROM device_pair_links WHERE device_a_uuid = ? AND device_b_uuid = ?`,
+            [deviceA, deviceB]
+        );
+
+        return res.json({ success: true });
+    } catch (e) {
+        console.error('[Pairing] Failed to delete device link:', e.message);
+        return res.status(500).json({ error: 'Failed to unlink device' });
+    }
+});
 
 const getStealthCloudUserKey = (user) => {
     // StealthCloud files are stored per USER (not per device) so all devices
