@@ -7271,7 +7271,7 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
     }
 });
 
-app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
+  app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
     try {
         const userKey = resolveNftStorageKeyFromUser(req.user);
         const userNftDir = path.join(NFT_DIR, String(userKey));
@@ -7283,7 +7283,7 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
             try { certs = JSON.parse(fs.readFileSync(certsPath, 'utf8')); } catch (_) {}
         }
         
-        const { action, certificate, certificates } = req.body;
+        const { action, certificate, certificates, certId, mintAddress } = req.body;
         const existingIds = new Set(certs.map(c => c.id));
         
         // Disk-safe keys: preserve rfc3161Token + c2paManifest so the desktop can recover them
@@ -7309,6 +7309,20 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
                 certs.push(slimmed);
                 console.log(`[NFT] Certificate added: user=${req.user.id} id=${certificate.id}`);
             }
+        } else if (action === 'remove') {
+            const normalizeMint = (m) => m ? String(m).replace(/^cnft_/, '') : '';
+            const targetMint = normalizeMint(mintAddress);
+            const before = certs.length;
+            certs = certs.filter(c => {
+                if (certId && c.id === certId) return false;
+                if (targetMint) {
+                    const certMint = normalizeMint(c.mintAddress);
+                    if (certMint && certMint === targetMint) return false;
+                    if (c.id === `cert_${mintAddress}` || c.id === `cert_${targetMint}`) return false;
+                }
+                return true;
+            });
+            console.log(`[NFT] Certificate remove: user=${req.user.id} removed=${before - certs.length} mint=${mintAddress || 'none'} certId=${certId || 'none'}`);
         } else if (action === 'backup' && Array.isArray(certificates)) {
             let added = 0, updated = 0;
             const existingMap = {};
