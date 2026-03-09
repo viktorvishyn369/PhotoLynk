@@ -7049,6 +7049,36 @@ const filterCertificatesForWalletScope = (certs, walletAddress) => {
     return (Array.isArray(certs) ? certs : []).filter(cert => certificateMatchesWalletScope(cert, targetWallet));
 };
 
+// Helper: scan ALL user NFT folders for NFTs matching a specific wallet address
+// NFTs belong to wallets, not user accounts — different accounts with the same wallet should see the same NFTs
+const readNftsForWalletGlobal = (walletAddress) => {
+    const targetWallet = normalizeWalletAddress(walletAddress);
+    if (!targetWallet) return [];
+    const seen = new Set();
+    const merged = [];
+    try {
+        const dirs = fs.readdirSync(NFT_DIR, { withFileTypes: true });
+        for (const d of dirs) {
+            if (!d.isDirectory()) continue;
+            const metaPath = path.join(NFT_DIR, d.name, 'nft-album.json');
+            if (!fs.existsSync(metaPath)) continue;
+            try {
+                const data = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+                for (const nft of (data.nfts || [])) {
+                    if (normalizeWalletAddress(nft.ownerAddress) !== targetWallet) continue;
+                    const key = normalizeWalletMint(nft.mintAddress);
+                    if (!key || seen.has(key)) continue;
+                    seen.add(key);
+                    if (nft.imageUrl && nft.imageUrl.startsWith('data:') && nft.imageUrl.length > 5000) nft.imageUrl = undefined;
+                    if (nft.arweaveUrl && nft.arweaveUrl.startsWith('data:') && nft.arweaveUrl.length > 5000) nft.arweaveUrl = undefined;
+                    merged.push(nft);
+                }
+            } catch (_) {}
+        }
+    } catch (e) { console.error('[NFT] readNftsForWalletGlobal error:', e.message); }
+    return merged;
+};
+
 // Helper: read NFTs from all linked device folders and merge (dedup by mintAddress)
 const readMergedNftsForDevice = async (deviceUuid, userId) => {
     const linkedUuids = await getLinkedDeviceUuids(deviceUuid, userId);
@@ -7090,7 +7120,9 @@ app.get('/api/nft/list', authenticateToken, async (req, res) => {
         const deviceUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
         const walletAddress = req.query.walletAddress || '';
 
-        const nfts = filterNftsForWalletScope(await readMergedNftsForDevice(deviceUuid || userKey, userId), walletAddress);
+        const nfts = walletAddress
+            ? readNftsForWalletGlobal(walletAddress)
+            : await readMergedNftsForDevice(deviceUuid || userKey, userId);
         console.log(`[NFT] Album list: user=${userId} userKey=${userKey} count=${nfts.length} device_uuid=${deviceUuid || 'none'} wallet=${walletAddress || 'all'}`);
         res.json({ success: true, nfts });
     } catch (error) {
@@ -7203,7 +7235,9 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
             console.log(`[NFT] Album backup: user=${userId} added=${added} updated=${updated} total=${data.nfts.length}`);
         } else if (action === 'get') {
             const deviceUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
-            const allNfts = filterNftsForWalletScope(await readMergedNftsForDevice(deviceUuid || userKey, userId), walletAddress);
+            const allNfts = walletAddress
+                ? readNftsForWalletGlobal(walletAddress)
+                : await readMergedNftsForDevice(deviceUuid || userKey, userId);
             // Pagination: page (0-indexed), limit (default: all)
             const page = parseInt(req.body.page, 10);
             const limit = parseInt(req.body.limit, 10);
