@@ -7177,9 +7177,31 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
                 console.log(`[NFT] Album add: user=${userId} mint=${nft.mintAddress}`);
             }
         } else if (action === 'remove' && mintAddress) {
+            // Normalize cnft_ prefix so both cnft_ABC and ABC forms are removed
+            const normMintTarget = normalizeWalletMint(mintAddress);
+            const mintMatchFn = (n) => normalizeWalletMint(n.mintAddress) === normMintTarget;
             const before = data.nfts.length;
-            data.nfts = data.nfts.filter(n => n.mintAddress !== mintAddress);
+            data.nfts = data.nfts.filter(n => !mintMatchFn(n));
             console.log(`[NFT] Album remove: user=${userId} mint=${mintAddress} removed=${before - data.nfts.length}`);
+            // Also remove from ALL linked device folders so readNftsForWalletGlobal won't return it
+            const deviceUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
+            try {
+                const linkedUuids = await getLinkedDeviceUuids(deviceUuid || userKey, userId);
+                for (const uuid of linkedUuids) {
+                    if (uuid === String(userKey)) continue; // already handled above
+                    const linkedPath = getNftMetadataPath(uuid);
+                    if (!fs.existsSync(linkedPath)) continue;
+                    try {
+                        const linkedData = JSON.parse(fs.readFileSync(linkedPath, 'utf8'));
+                        const linkedBefore = (linkedData.nfts || []).length;
+                        linkedData.nfts = (linkedData.nfts || []).filter(n => !mintMatchFn(n));
+                        if (linkedData.nfts.length < linkedBefore) {
+                            fs.writeFileSync(linkedPath, JSON.stringify(linkedData, null, 2));
+                            console.log(`[NFT] Album remove (linked ${uuid}): mint=${mintAddress} removed=${linkedBefore - linkedData.nfts.length}`);
+                        }
+                    } catch (_) {}
+                }
+            } catch (linkErr) { console.warn('[NFT] Album remove linked folders error:', linkErr.message); }
         } else if (action === 'backup' && Array.isArray(nfts)) {
             const existingMap = {};
             const existingMetaMap = {};
@@ -7280,10 +7302,13 @@ const readCertsForWalletGlobal = (walletAddress) => {
             try {
                 const parsed = JSON.parse(fs.readFileSync(cp, 'utf8'));
                 for (const c of (Array.isArray(parsed) ? parsed : [])) {
-                    // Match by ownerAddress OR creatorWallet
+                    // Match by ownerAddress primarily; creatorWallet only if ownerAddress absent
+                    // After transfer, ownerAddress = newOwner so sender must NOT see it via creatorWallet
                     const owner = normalizeWalletAddress(c.ownerAddress);
                     const creator = normalizeWalletAddress(c.creatorWallet);
-                    if (owner !== targetWallet && creator !== targetWallet) continue;
+                    const ownerMatch = owner === targetWallet;
+                    const creatorMatch = creator === targetWallet && (!owner || owner === targetWallet);
+                    if (!ownerMatch && !creatorMatch) continue;
                     const key = c.mintAddress || c.id || JSON.stringify(c);
                     if (seenIds.has(key)) continue;
                     seenIds.add(key);
@@ -7522,6 +7547,30 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
                 const cleanCertsForDisk = certs.map(c => slimCert(c));
                 fs.writeFileSync(certsPath, JSON.stringify(cleanCertsForDisk, null, 2));
             }
+            // Also remove from ALL linked device folders so cert doesn't reappear
+            try {
+                const deviceUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
+                const linkedUuids = await getLinkedDeviceUuids(deviceUuid || userKey, req.user.id);
+                for (const uuid of linkedUuids) {
+                    if (uuid === String(userKey)) continue;
+                    const linkedCp = path.join(NFT_DIR, String(uuid), 'certificates.json');
+                    if (!fs.existsSync(linkedCp)) continue;
+                    try {
+                        let linkedCerts = JSON.parse(fs.readFileSync(linkedCp, 'utf8'));
+                        if (!Array.isArray(linkedCerts)) continue;
+                        const lb = linkedCerts.length;
+                        linkedCerts = linkedCerts.filter(c => {
+                            if (c.id === certificate.id) return false;
+                            if (targetMint && normMint(c.mintAddress) === targetMint) return false;
+                            return true;
+                        });
+                        if (linkedCerts.length < lb) {
+                            fs.writeFileSync(linkedCp, JSON.stringify(linkedCerts.map(c => slimCert(c)), null, 2));
+                            console.log(`[NFT] Cert transfer remove (linked ${uuid}): mint=${certificate.mintAddress}`);
+                        }
+                    } catch (_) {}
+                }
+            } catch (linkErr) { console.warn('[NFT] Cert transfer linked removal error:', linkErr.message); }
             return res.json({ success: true, transferred: true });
         } else {
             return res.status(400).json({ error: 'Invalid action' });
