@@ -6566,24 +6566,44 @@ const sanitizeUserKey = (v) => {
 };
 
 // Get all device_uuids linked to a given device_uuid (includes the device itself)
-const getLinkedDeviceUuids = (deviceUuid) => {
+const getLinkedDeviceUuids = (deviceUuid, userId) => {
     return new Promise((resolve) => {
         const safeUuid = sanitizeUserKey(deviceUuid);
         if (!safeUuid) return resolve([]);
+        const linked = new Set([safeUuid]);
+        let pending = 2;
+        const finish = () => { if (--pending === 0) resolve([...linked]); };
+
+        // 1. Explicit linked_devices table
         db.all(
             `SELECT device_uuid_a, device_uuid_b FROM linked_devices
              WHERE device_uuid_a = ? OR device_uuid_b = ?`,
             [safeUuid, safeUuid],
             (err, rows) => {
-                if (err || !rows) return resolve([safeUuid]);
-                const linked = new Set([safeUuid]);
-                rows.forEach(r => {
+                if (!err && rows) rows.forEach(r => {
                     if (r.device_uuid_a) linked.add(r.device_uuid_a);
                     if (r.device_uuid_b) linked.add(r.device_uuid_b);
                 });
-                resolve([...linked]);
+                finish();
             }
         );
+
+        // 2. All devices for same user account (same wallet = same NFTs regardless of device)
+        if (userId) {
+            db.all(
+                `SELECT device_uuid FROM devices WHERE user_id = ? AND device_uuid IS NOT NULL`,
+                [userId],
+                (err, rows) => {
+                    if (!err && rows) rows.forEach(r => {
+                        const s = sanitizeUserKey(r.device_uuid);
+                        if (s) linked.add(s);
+                    });
+                    finish();
+                }
+            );
+        } else {
+            finish();
+        }
     });
 };
 
@@ -7030,8 +7050,8 @@ const filterCertificatesForWalletScope = (certs, walletAddress) => {
 };
 
 // Helper: read NFTs from all linked device folders and merge (dedup by mintAddress)
-const readMergedNftsForDevice = async (deviceUuid) => {
-    const linkedUuids = await getLinkedDeviceUuids(deviceUuid);
+const readMergedNftsForDevice = async (deviceUuid, userId) => {
+    const linkedUuids = await getLinkedDeviceUuids(deviceUuid, userId);
     const seen = new Set();
     const merged = [];
 
@@ -7070,7 +7090,7 @@ app.get('/api/nft/list', authenticateToken, async (req, res) => {
         const deviceUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
         const walletAddress = req.query.walletAddress || '';
 
-        const nfts = filterNftsForWalletScope(await readMergedNftsForDevice(deviceUuid || userKey), walletAddress);
+        const nfts = filterNftsForWalletScope(await readMergedNftsForDevice(deviceUuid || userKey, userId), walletAddress);
         console.log(`[NFT] Album list: user=${userId} userKey=${userKey} count=${nfts.length} device_uuid=${deviceUuid || 'none'} wallet=${walletAddress || 'all'}`);
         res.json({ success: true, nfts });
     } catch (error) {
@@ -7183,7 +7203,7 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
             console.log(`[NFT] Album backup: user=${userId} added=${added} updated=${updated} total=${data.nfts.length}`);
         } else if (action === 'get') {
             const deviceUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
-            const allNfts = filterNftsForWalletScope(await readMergedNftsForDevice(deviceUuid || userKey), walletAddress);
+            const allNfts = filterNftsForWalletScope(await readMergedNftsForDevice(deviceUuid || userKey, userId), walletAddress);
             // Pagination: page (0-indexed), limit (default: all)
             const page = parseInt(req.body.page, 10);
             const limit = parseInt(req.body.limit, 10);
@@ -7221,7 +7241,7 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
         const certsPath = path.join(NFT_DIR, String(userKey), 'certificates.json');
 
         // Merge certificates from all linked device folders
-        const linkedUuids = await getLinkedDeviceUuids(deviceUuid || userKey);
+        const linkedUuids = await getLinkedDeviceUuids(deviceUuid || userKey, req.user.id);
         const seenIds = new Set();
         let certs = [];
 
