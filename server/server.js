@@ -7183,8 +7183,17 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
             console.log(`[NFT] Album backup: user=${userId} added=${added} updated=${updated} total=${data.nfts.length}`);
         } else if (action === 'get') {
             const deviceUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
-            const mergedNfts = filterNftsForWalletScope(await readMergedNftsForDevice(deviceUuid || userKey), walletAddress);
-            return res.json({ success: true, nfts: mergedNfts });
+            const allNfts = filterNftsForWalletScope(await readMergedNftsForDevice(deviceUuid || userKey), walletAddress);
+            // Pagination: page (0-indexed), limit (default: all)
+            const page = parseInt(req.body.page, 10);
+            const limit = parseInt(req.body.limit, 10);
+            if (!isNaN(page) && !isNaN(limit) && limit > 0) {
+                const start = page * limit;
+                const slice = allNfts.slice(start, start + limit);
+                console.log(`[NFT] Paginated get: page=${page} limit=${limit} returned=${slice.length} total=${allNfts.length}`);
+                return res.json({ success: true, nfts: slice, total: allNfts.length, page, hasMore: start + limit < allNfts.length });
+            }
+            return res.json({ success: true, nfts: allNfts, total: allNfts.length });
         } else {
             return res.status(400).json({ error: 'Invalid action or missing data' });
         }
