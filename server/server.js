@@ -7362,7 +7362,7 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
             'exifRawHash','exifBindingHash','rfc3161Policy','mintedAt',
             'hasRfc3161','hasC2pa','encrypted','watermarked','storageType','nftType','isCompressed',
             'rfc3161Tsa','metadataUrl','description','version','type','imageUrl','certificationMode',
-            'transferredFrom','transferredAt'];
+            'transferredFrom','transferredAt','transferNftKey'];
         const DISK_SAFE_KEYS = [...API_SLIM_KEYS, 'rfc3161Token', 'c2paManifest'];
         const keysToUse = full ? DISK_SAFE_KEYS : API_SLIM_KEYS;
         const slimForApi = (c) => {
@@ -7434,7 +7434,7 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
             'exifRawHash','exifBindingHash','rfc3161Policy','mintedAt',
             'hasRfc3161','hasC2pa','encrypted','watermarked','storageType','nftType','isCompressed',
             'rfc3161Tsa','metadataUrl','description','version','type','imageUrl','certificationMode',
-            'transferredFrom','transferredAt',
+            'transferredFrom','transferredAt','transferNftKey',
             'rfc3161Token','c2paManifest'];
         const slimCert = (c) => {
             const copy = {};
@@ -7533,6 +7533,41 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
             }
             fs.writeFileSync(inboxCertsPath, JSON.stringify(inboxCerts, null, 2));
             console.log(`[NFT] Certificate transferred: id=${certificate.id} from=${certificate.ownerAddress || 'unknown'} to=${newOwner}`);
+
+            // Also copy the NFT album entry to the inbox so readNftsForWalletGlobal finds it for new owner
+            // Without this, the new owner's app won't see the NFT (encryptionData, thumbnailUrl etc. are only in server album)
+            try {
+                const senderMint = normalizeWalletMint(certificate.mintAddress);
+                if (senderMint) {
+                    // Find the NFT album entry in sender's folder
+                    const senderMetaPath = getNftMetadataPath(userKey);
+                    if (fs.existsSync(senderMetaPath)) {
+                        const senderData = JSON.parse(fs.readFileSync(senderMetaPath, 'utf8'));
+                        const nftEntry = (senderData.nfts || []).find(n => normalizeWalletMint(n.mintAddress) === senderMint);
+                        if (nftEntry) {
+                            const transferredNft = { ...nftEntry, ownerAddress: newOwner, transferredFrom: nftEntry.ownerAddress || '', transferredAt: new Date().toISOString() };
+                            // If cert has transferNftKey, inject into NFT encryptionData so decrypt works for new owner
+                            if (certificate.transferNftKey && transferredNft.encryptionData) {
+                                transferredNft.encryptionData = { ...transferredNft.encryptionData, transferNftKey: certificate.transferNftKey };
+                            }
+                            const inboxAlbumPath = path.join(inboxDir, 'nft-album.json');
+                            let inboxAlbum = { nfts: [] };
+                            if (fs.existsSync(inboxAlbumPath)) {
+                                try { inboxAlbum = JSON.parse(fs.readFileSync(inboxAlbumPath, 'utf8')); } catch (_) {}
+                            }
+                            const inboxMints = new Set((inboxAlbum.nfts || []).map(n => normalizeWalletMint(n.mintAddress)));
+                            if (!inboxMints.has(senderMint)) {
+                                inboxAlbum.nfts.push(transferredNft);
+                            } else {
+                                const idx = inboxAlbum.nfts.findIndex(n => normalizeWalletMint(n.mintAddress) === senderMint);
+                                if (idx >= 0) inboxAlbum.nfts[idx] = transferredNft;
+                            }
+                            fs.writeFileSync(inboxAlbumPath, JSON.stringify(inboxAlbum, null, 2));
+                            console.log(`[NFT] Album entry transferred to inbox: mint=${certificate.mintAddress} to=${newOwner}`);
+                        }
+                    }
+                }
+            } catch (albumErr) { console.warn('[NFT] Album entry transfer failed (non-critical):', albumErr.message); }
 
             // Also remove the cert from sender's folder (transfer = move, not copy)
             const normMint = (m) => m ? String(m).replace(/^cnft_/, '') : '';
