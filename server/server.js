@@ -7264,6 +7264,37 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
     }
 });
 
+// Helper: scan ALL user NFT folders for certificates matching a wallet address
+// Certificates belong to wallets, not user accounts — same logic as readNftsForWalletGlobal
+const readCertsForWalletGlobal = (walletAddress) => {
+    const targetWallet = normalizeWalletAddress(walletAddress);
+    if (!targetWallet) return [];
+    const seenIds = new Set();
+    const merged = [];
+    try {
+        const dirs = fs.readdirSync(NFT_DIR, { withFileTypes: true });
+        for (const d of dirs) {
+            if (!d.isDirectory()) continue;
+            const cp = path.join(NFT_DIR, d.name, 'certificates.json');
+            if (!fs.existsSync(cp)) continue;
+            try {
+                const parsed = JSON.parse(fs.readFileSync(cp, 'utf8'));
+                for (const c of (Array.isArray(parsed) ? parsed : [])) {
+                    // Match by ownerAddress OR creatorWallet
+                    const owner = normalizeWalletAddress(c.ownerAddress);
+                    const creator = normalizeWalletAddress(c.creatorWallet);
+                    if (owner !== targetWallet && creator !== targetWallet) continue;
+                    const key = c.mintAddress || c.id || JSON.stringify(c);
+                    if (seenIds.has(key)) continue;
+                    seenIds.add(key);
+                    merged.push(c);
+                }
+            } catch (_) {}
+        }
+    } catch (e) { console.error('[NFT] readCertsForWalletGlobal error:', e.message); }
+    return merged;
+};
+
 // Get/sync NFT certificates (Limited Edition CoA)
 // GET /api/nft/certificates - returns all certificates for the user
 // POST /api/nft/certificates - sync certificates { action: 'add'|'backup', certificate?: {}, certificates?: [] }
@@ -7274,28 +7305,33 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
         const walletAddress = req.query.walletAddress || '';
         const certsPath = path.join(NFT_DIR, String(userKey), 'certificates.json');
 
-        // Merge certificates from all linked device folders
-        const linkedUuids = await getLinkedDeviceUuids(deviceUuid || userKey, req.user.id);
-        const seenIds = new Set();
+        // When walletAddress is provided, scan ALL folders globally (same wallet = same certs)
+        // Otherwise fall back to linked device folders for the current user
         let certs = [];
-
-        for (const uuid of linkedUuids) {
-            const cp = path.join(NFT_DIR, String(uuid), 'certificates.json');
-            if (!fs.existsSync(cp)) continue;
-            try {
-                const parsed = JSON.parse(fs.readFileSync(cp, 'utf8'));
-                for (const c of (Array.isArray(parsed) ? parsed : [])) {
-                    const key = c.mintAddress || c.id || JSON.stringify(c);
-                    if (seenIds.has(key)) continue;
-                    seenIds.add(key);
-                    certs.push(c);
-                }
-            } catch (_) { /* ignore */ }
+        if (walletAddress) {
+            certs = readCertsForWalletGlobal(walletAddress);
+        } else {
+            const linkedUuids = await getLinkedDeviceUuids(deviceUuid || userKey, req.user.id);
+            const seenIds = new Set();
+            for (const uuid of linkedUuids) {
+                const cp = path.join(NFT_DIR, String(uuid), 'certificates.json');
+                if (!fs.existsSync(cp)) continue;
+                try {
+                    const parsed = JSON.parse(fs.readFileSync(cp, 'utf8'));
+                    for (const c of (Array.isArray(parsed) ? parsed : [])) {
+                        const key = c.mintAddress || c.id || JSON.stringify(c);
+                        if (seenIds.has(key)) continue;
+                        seenIds.add(key);
+                        certs.push(c);
+                    }
+                } catch (_) { /* ignore */ }
+            }
         }
 
-        certs = filterCertificatesForWalletScope(certs, walletAddress);
+        console.log(`[NFT] Certificates fetch: user=${req.user.id} userKey=${userKey} wallet=${walletAddress || 'none'} count=${certs.length}`);
 
         const full = req.query.full === 'true';
+        const requestedId = req.query.id || '';
         const API_SLIM_KEYS = ['id','name','mintAddress','txSignature','creatorWallet','ownerAddress',
             'issuedAt','createdAt','edition','license','contentHash','exifHash','cameraHash',
             'exifRawHash','exifBindingHash','rfc3161Policy','mintedAt',
@@ -7308,7 +7344,6 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
             for (const k of keysToUse) { if (c[k] !== undefined) copy[k] = c[k]; }
             if (c.rfc3161Token) copy.hasRfc3161 = true;
             if (c.c2paManifest) copy.hasC2pa = true;
-            // Strip base64 data URIs from imageUrl — these can be megabytes each
             if (copy.imageUrl && copy.imageUrl.startsWith('data:') && copy.imageUrl.length > 5000) delete copy.imageUrl;
             return copy;
         };
@@ -7320,9 +7355,19 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
             if (copy.imageUrl && copy.imageUrl.startsWith('data:') && copy.imageUrl.length > 5000) delete copy.imageUrl;
             return copy;
         };
+
+        // Single cert fetch (full=true&id=cert_xxx) — returns { certificate: ... } for on-demand token loading
+        if (full && requestedId) {
+            const match = certs.find(c => c.id === requestedId);
+            if (match) {
+                console.log(`[NFT] Full cert fetch: id=${requestedId} hasToken=${!!match.rfc3161Token}`);
+                return res.json({ success: true, certificate: slimForApi(match) });
+            }
+            return res.json({ success: true, certificate: null });
+        }
+
         let needsRewrite = false;
         const apiSlim = certs.map(c => {
-            // Detect if disk has non-safe fields that should be stripped (metadata, encryptionData, imageData, large imageUrl data URIs)
             if (c.metadata || c.encryptionData || c.imageData
                 || (c.imageUrl && c.imageUrl.startsWith('data:') && c.imageUrl.length > 5000)) needsRewrite = true;
             return slimForApi(c);
