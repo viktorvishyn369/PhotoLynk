@@ -126,6 +126,7 @@ solana-seeker/
 nft-service/
 SERVER SETUP/
 PhotoBackupSystem/
+!PhotoBackupSystem/verify-exif-hash.js
 server/generate-capacity-json.js
 server/sweep-expired-users.js
 server/reconcile-cloud-usage.js
