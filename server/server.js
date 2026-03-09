@@ -7336,7 +7336,8 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
             'issuedAt','createdAt','edition','license','contentHash','exifHash','cameraHash',
             'exifRawHash','exifBindingHash','rfc3161Policy','mintedAt',
             'hasRfc3161','hasC2pa','encrypted','watermarked','storageType','nftType','isCompressed',
-            'rfc3161Tsa','metadataUrl','description','version','type','imageUrl','certificationMode'];
+            'rfc3161Tsa','metadataUrl','description','version','type','imageUrl','certificationMode',
+            'transferredFrom','transferredAt'];
         const DISK_SAFE_KEYS = [...API_SLIM_KEYS, 'rfc3161Token', 'c2paManifest'];
         const keysToUse = full ? DISK_SAFE_KEYS : API_SLIM_KEYS;
         const slimForApi = (c) => {
@@ -7408,6 +7409,7 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
             'exifRawHash','exifBindingHash','rfc3161Policy','mintedAt',
             'hasRfc3161','hasC2pa','encrypted','watermarked','storageType','nftType','isCompressed',
             'rfc3161Tsa','metadataUrl','description','version','type','imageUrl','certificationMode',
+            'transferredFrom','transferredAt',
             'rfc3161Token','c2paManifest'];
         const slimCert = (c) => {
             const copy = {};
@@ -7473,6 +7475,54 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
                 }
             }
             console.log(`[NFT] Certificates backup: user=${req.user.id} added=${added} updated=${updated} total=${certs.length}`);
+        } else if (action === 'transfer' && certificate && req.body.newOwnerAddress) {
+            // Transfer cert to new owner: write full cert (with heavy fields) into a wallet-keyed
+            // transfer-inbox folder so readCertsForWalletGlobal picks it up for the recipient.
+            const newOwner = String(req.body.newOwnerAddress).trim();
+            if (!newOwner) return res.status(400).json({ error: 'newOwnerAddress required' });
+
+            const transferredCert = slimCert({
+                ...certificate,
+                ownerAddress: newOwner,
+                // Preserve original creator — cert provenance must be immutable
+                transferredFrom: certificate.ownerAddress || certificate.creatorWallet || '',
+                transferredAt: new Date().toISOString(),
+            });
+
+            // Write to transfer-inbox folder named by wallet hash (safe filename)
+            const walletHash = require('crypto').createHash('sha256').update(newOwner).digest('hex').slice(0, 16);
+            const inboxDir = path.join(NFT_DIR, `_transfer_inbox_${walletHash}`);
+            if (!fs.existsSync(inboxDir)) fs.mkdirSync(inboxDir, { recursive: true });
+            const inboxCertsPath = path.join(inboxDir, 'certificates.json');
+            let inboxCerts = [];
+            if (fs.existsSync(inboxCertsPath)) {
+                try { inboxCerts = JSON.parse(fs.readFileSync(inboxCertsPath, 'utf8')); } catch (_) {}
+            }
+            // Deduplicate by id
+            const inboxIds = new Set(inboxCerts.map(c => c.id));
+            if (!inboxIds.has(transferredCert.id)) {
+                inboxCerts.push(transferredCert);
+            } else {
+                const idx = inboxCerts.findIndex(c => c.id === transferredCert.id);
+                if (idx >= 0) inboxCerts[idx] = transferredCert;
+            }
+            fs.writeFileSync(inboxCertsPath, JSON.stringify(inboxCerts, null, 2));
+            console.log(`[NFT] Certificate transferred: id=${certificate.id} from=${certificate.ownerAddress || 'unknown'} to=${newOwner}`);
+
+            // Also remove the cert from sender's folder (transfer = move, not copy)
+            const normMint = (m) => m ? String(m).replace(/^cnft_/, '') : '';
+            const targetMint = normMint(certificate.mintAddress);
+            const before = certs.length;
+            certs = certs.filter(c => {
+                if (c.id === certificate.id) return false;
+                if (targetMint && normMint(c.mintAddress) === targetMint) return false;
+                return true;
+            });
+            if (certs.length < before) {
+                const cleanCertsForDisk = certs.map(c => slimCert(c));
+                fs.writeFileSync(certsPath, JSON.stringify(cleanCertsForDisk, null, 2));
+            }
+            return res.json({ success: true, transferred: true });
         } else {
             return res.status(400).json({ error: 'Invalid action' });
         }
