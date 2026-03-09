@@ -6972,29 +6972,28 @@ app.get('/:userId/:filename', (req, res, next) => {
 });
 
 // Delete NFT image (authenticated, owner only)
-// DELETE /api/nft/image/:imageId
 app.delete('/api/nft/image/:imageId', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
         const userKey = resolveNftStorageKeyFromUser(req.user);
         const { imageId } = req.params;
-        
+
         const userNftDir = path.join(NFT_DIR, String(userKey));
         if (!fs.existsSync(userNftDir)) {
             return res.status(404).json({ error: 'Image not found' });
         }
-        
+
         // Find file with this imageId
         const files = fs.readdirSync(userNftDir);
         const file = files.find(f => f.startsWith(imageId));
-        
+
         if (!file) {
             return res.status(404).json({ error: 'Image not found' });
         }
-        
+
         const filePath = path.join(userNftDir, file);
         fs.unlinkSync(filePath);
-        
+
         console.log(`[NFT] Image deleted: user=${userId} id=${imageId}`);
         res.json({ success: true });
     } catch (error) {
@@ -7003,17 +7002,36 @@ app.delete('/api/nft/image/:imageId', authenticateToken, async (req, res) => {
     }
 });
 
-// ============================================================================
-// NFT ALBUM SYNC (persists NFT metadata across app reinstalls)
-// ============================================================================
-
 // NFT metadata storage file per user
 const getNftMetadataPath = (userKey) => path.join(NFT_DIR, String(userKey), 'nft-album.json');
+
+// Helper functions for wallet-scoped filtering
+const normalizeWalletAddress = (wallet) => wallet ? String(wallet).trim() : '';
+const normalizeWalletMint = (m) => m ? String(m).replace(/^cnft_/, '') : '';
+const nftMatchesWalletScope = (nft, walletAddress) => {
+    const targetWallet = normalizeWalletAddress(walletAddress);
+    if (!targetWallet || !nft) return false;
+    return normalizeWalletAddress(nft.ownerAddress) === targetWallet;
+};
+const certificateMatchesWalletScope = (cert, walletAddress) => {
+    const targetWallet = normalizeWalletAddress(walletAddress);
+    if (!targetWallet || !cert) return false;
+    return normalizeWalletAddress(cert.ownerAddress) === targetWallet;
+};
+const filterNftsForWalletScope = (nfts, walletAddress) => {
+    const targetWallet = normalizeWalletAddress(walletAddress);
+    if (!targetWallet) return Array.isArray(nfts) ? nfts : [];
+    return (Array.isArray(nfts) ? nfts : []).filter(nft => nftMatchesWalletScope(nft, targetWallet));
+};
+const filterCertificatesForWalletScope = (certs, walletAddress) => {
+    const targetWallet = normalizeWalletAddress(walletAddress);
+    if (!targetWallet) return Array.isArray(certs) ? certs : [];
+    return (Array.isArray(certs) ? certs : []).filter(cert => certificateMatchesWalletScope(cert, targetWallet));
+};
 
 // Helper: read NFTs from all linked device folders and merge (dedup by mintAddress)
 const readMergedNftsForDevice = async (deviceUuid) => {
     const linkedUuids = await getLinkedDeviceUuids(deviceUuid);
-    const normalizeMint = (m) => m ? String(m).replace(/^cnft_/, '') : '';
     const seen = new Set();
     const merged = [];
 
@@ -7024,7 +7042,7 @@ const readMergedNftsForDevice = async (deviceUuid) => {
             const data = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
             const nfts = data.nfts || [];
             for (const nft of nfts) {
-                const key = normalizeMint(nft.mintAddress);
+                const key = normalizeWalletMint(nft.mintAddress);
                 if (!key || seen.has(key)) continue;
                 seen.add(key);
                 // Strip large data: URIs before sending to mobile (prevents OOM on Android)
@@ -7038,9 +7056,7 @@ const readMergedNftsForDevice = async (deviceUuid) => {
                 }
                 merged.push(nft);
             }
-        } catch (e) {
-            // Skip corrupt files
-        }
+        } catch (e) { /* ignore */ }
     }
     return merged;
 };
@@ -7052,9 +7068,10 @@ app.get('/api/nft/list', authenticateToken, async (req, res) => {
         const userId = req.user.id;
         const userKey = resolveNftStorageKeyFromUser(req.user);
         const deviceUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
+        const walletAddress = req.query.walletAddress || '';
 
-        const nfts = await readMergedNftsForDevice(deviceUuid || userKey);
-        console.log(`[NFT] Album list: user=${userId} userKey=${userKey} count=${nfts.length} device_uuid=${deviceUuid || 'none'}`);
+        const nfts = filterNftsForWalletScope(await readMergedNftsForDevice(deviceUuid || userKey), walletAddress);
+        console.log(`[NFT] Album list: user=${userId} userKey=${userKey} count=${nfts.length} device_uuid=${deviceUuid || 'none'} wallet=${walletAddress || 'all'}`);
         res.json({ success: true, nfts });
     } catch (error) {
         console.error('[NFT] List error:', error);
@@ -7062,24 +7079,23 @@ app.get('/api/nft/list', authenticateToken, async (req, res) => {
     }
 });
 
-// Sync NFT album (add, remove, or backup NFTs)
 // POST /api/nft/sync
 // Body: { action: 'add'|'remove'|'backup', nft?: {}, mintAddress?: '', nfts?: [] }
 app.post('/api/nft/sync', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
         const userKey = resolveNftStorageKeyFromUser(req.user);
-        const { action, nft, mintAddress, nfts } = req.body;
+        const { action, nft, mintAddress, nfts, walletAddress } = req.body;
         console.log(`[NFT] Sync request: user=${userId} userKey=${userKey} action=${action} device_uuid=${req.user.device_uuid || 'none'}`);
-        
+
         const userNftDir = path.join(NFT_DIR, String(userKey));
         if (!fs.existsSync(userNftDir)) {
             fs.mkdirSync(userNftDir, { recursive: true });
         }
-        
+
         const metadataPath = getNftMetadataPath(userKey);
         let data = { nfts: [] };
-        
+
         if (fs.existsSync(metadataPath)) {
             try {
                 data = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
@@ -7087,12 +7103,10 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
                 data = { nfts: [] };
             }
         }
-        
+
         if (action === 'add' && nft) {
-            // Add or update single NFT
             const idx = data.nfts.findIndex(n => n.mintAddress === nft.mintAddress);
             if (idx >= 0) {
-                // Merge new fields into existing (preserves fields the sender may not have)
                 const existing = data.nfts[idx];
                 const mergeFields = ['encryptionData','thumbnailUrl','imageUrl','edition','encrypted','watermarked','license','storageType','nftType','isCompressed','assetId','txSignature','attributes','createdAt','mintedAt','ipfsThumbnailUrl','metadataUrl','contentHash','exifHash','exifRawHash','exifBindingHash','hasRfc3161','hasC2pa','certificationMode','mintPlatform'];
                 let updated = 0;
@@ -7102,7 +7116,6 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
                         updated++;
                     }
                 }
-                // Always overwrite encryptionData and thumbnailUrl if sender has them (these are critical)
                 if (nft.encryptionData) { existing.encryptionData = nft.encryptionData; updated++; }
                 if (nft.thumbnailUrl) { existing.thumbnailUrl = nft.thumbnailUrl; updated++; }
                 data.nfts[idx] = existing;
@@ -7112,12 +7125,10 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
                 console.log(`[NFT] Album add: user=${userId} mint=${nft.mintAddress}`);
             }
         } else if (action === 'remove' && mintAddress) {
-            // Remove NFT by mint address
             const before = data.nfts.length;
             data.nfts = data.nfts.filter(n => n.mintAddress !== mintAddress);
             console.log(`[NFT] Album remove: user=${userId} mint=${mintAddress} removed=${before - data.nfts.length}`);
         } else if (action === 'backup' && Array.isArray(nfts)) {
-            // Backup: merge all NFTs (add new, update existing with missing fields)
             const existingMap = {};
             const existingMetaMap = {};
             data.nfts.forEach((n, i) => {
@@ -7130,11 +7141,9 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
             const mergeFields = ['encryptionData','thumbnailUrl','imageUrl','edition','encrypted','watermarked','license','storageType','nftType','isCompressed','assetId','txSignature','attributes','createdAt','mintedAt','ipfsThumbnailUrl','metadataUrl','contentHash','exifHash','exifRawHash','exifBindingHash','hasRfc3161','hasC2pa','certificationMode','mintPlatform'];
             for (const n of nfts) {
                 if (!n.mintAddress) continue;
-                // Skip tx_ temp entries if a real entry with same metadataUrl already exists
                 if (n.mintAddress.startsWith('tx_') && n.metadataUrl && existingMetaMap[n.metadataUrl] !== undefined) {
                     const realIdx = existingMetaMap[n.metadataUrl];
                     if (data.nfts[realIdx] && !data.nfts[realIdx].mintAddress.startsWith('tx_')) {
-                        // Merge encryption fields from tx_ entry into real entry
                         const real = data.nfts[realIdx];
                         if (n.encryptionData && !real.encryptionData) real.encryptionData = n.encryptionData;
                         if (n.thumbnailUrl && !real.thumbnailUrl) real.thumbnailUrl = n.thumbnailUrl;
@@ -7144,7 +7153,6 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
                 }
                 const idx = existingMap[n.mintAddress];
                 if (idx === undefined) {
-                    // Before adding, check if a tx_ entry exists with same metadataUrl — replace it
                     if (n.metadataUrl && !n.mintAddress.startsWith('tx_') && existingMetaMap[n.metadataUrl] !== undefined) {
                         const oldIdx = existingMetaMap[n.metadataUrl];
                         if (data.nfts[oldIdx] && data.nfts[oldIdx].mintAddress.startsWith('tx_')) {
@@ -7160,7 +7168,6 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
                     if (n.metadataUrl) existingMetaMap[n.metadataUrl] = data.nfts.length - 1;
                     added++;
                 } else {
-                    // Merge missing fields + always overwrite critical encryption fields
                     const existing = data.nfts[idx];
                     for (const f of mergeFields) {
                         if (n[f] !== undefined && n[f] !== null && (existing[f] === undefined || existing[f] === null)) {
@@ -7175,21 +7182,17 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
             }
             console.log(`[NFT] Album backup: user=${userId} added=${added} updated=${updated} total=${data.nfts.length}`);
         } else if (action === 'get') {
-            // Return all NFTs for this user + linked devices (used by mobile-v2 to merge with DAS results)
             const deviceUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
-            const mergedNfts = await readMergedNftsForDevice(deviceUuid || userKey);
+            const mergedNfts = filterNftsForWalletScope(await readMergedNftsForDevice(deviceUuid || userKey), walletAddress);
             return res.json({ success: true, nfts: mergedNfts });
         } else {
             return res.status(400).json({ error: 'Invalid action or missing data' });
         }
-        
-        // Strip large data: URIs before persisting (on-chain NFTs embed multi-MB base64)
-        // Prevents nft-album.json from growing to 100MB+ and causing OOM on re-read
+
         for (const n of data.nfts) {
             if (n.imageUrl && n.imageUrl.startsWith('data:') && n.imageUrl.length > 5000) n.imageUrl = undefined;
             if (n.arweaveUrl && n.arweaveUrl.startsWith('data:') && n.arweaveUrl.length > 5000) n.arweaveUrl = undefined;
         }
-        // Save updated metadata
         fs.writeFileSync(metadataPath, JSON.stringify(data, null, 2));
         res.json({ success: true, count: data.nfts.length });
     } catch (error) {
@@ -7205,10 +7208,14 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
     try {
         const userKey = resolveNftStorageKeyFromUser(req.user);
         const deviceUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
+        const walletAddress = req.query.walletAddress || '';
+        const certsPath = path.join(NFT_DIR, String(userKey), 'certificates.json');
+
         // Merge certificates from all linked device folders
         const linkedUuids = await getLinkedDeviceUuids(deviceUuid || userKey);
         const seenIds = new Set();
         let certs = [];
+
         for (const uuid of linkedUuids) {
             const cp = path.join(NFT_DIR, String(uuid), 'certificates.json');
             if (!fs.existsSync(cp)) continue;
@@ -7220,16 +7227,17 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
                     seenIds.add(key);
                     certs.push(c);
                 }
-            } catch (_) {}
+            } catch (_) { /* ignore */ }
         }
+
+        certs = filterCertificatesForWalletScope(certs, walletAddress);
+
         const full = req.query.full === 'true';
-        // Fields safe for the API response (mobile OOM-safe — no large base64 blobs)
         const API_SLIM_KEYS = ['id','name','mintAddress','txSignature','creatorWallet','ownerAddress',
             'issuedAt','createdAt','edition','license','contentHash','exifHash','cameraHash',
             'exifRawHash','exifBindingHash','rfc3161Policy','mintedAt',
             'hasRfc3161','hasC2pa','encrypted','watermarked','storageType','nftType','isCompressed',
             'rfc3161Tsa','metadataUrl','description','version','type','imageUrl','certificationMode'];
-        // Disk-safe keys: same as API + rfc3161Token + c2paManifest (these MUST survive on disk)
         const DISK_SAFE_KEYS = [...API_SLIM_KEYS, 'rfc3161Token', 'c2paManifest'];
         const keysToUse = full ? DISK_SAFE_KEYS : API_SLIM_KEYS;
         const slimForApi = (c) => {
