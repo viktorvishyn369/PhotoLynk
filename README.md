@@ -17,16 +17,16 @@ Back up photos/videos to your own server or StealthCloud, and restore on any pho
 |----------|--------|----------------|
 | **iOS** | ✅ Live on App Store | In-App Purchase |
 | **Android** | ✅ Live on Google Play | In-App Purchase |
-| **Solana Mobile** | ✅ Live | Solana Wallet / On-Chain Payments |
+| **Wallet-enabled Android variant** | ✅ Available in ecosystem distribution | On-chain wallet payment flow |
 
 The PhotoLynk mobile apps feature end-to-end encryption, self-hosted or cloud backup options, and seamless cross-platform restore.
 
-**iOS, Android, and Solana Mobile are live.**
+**iOS, Android, and the wallet-enabled Android variant are live.**
 
 Store links:
 - iOS (App Store): [Download PhotoLynk](https://apps.apple.com/app/id6748285696)
 - Android (Google Play): [Download PhotoLynk](https://play.google.com/store/apps/details?id=com.photosync.app)
-- Solana Mobile: available in the Solana Mobile app ecosystem
+- Wallet-enabled Android variant: available in its ecosystem distribution channel
 
 ---
 
@@ -142,19 +142,19 @@ Each set of credentials (email + password) maps to a deterministic UUID folder, 
 **For Headless Linux Servers** (systemd service):
 ```bash
 # Check status
-sudo systemctl status photosync
+sudo systemctl status photolynk
 
 # Stop server
-sudo systemctl stop photosync
+sudo systemctl stop photolynk
 
 # Start server
-sudo systemctl start photosync
+sudo systemctl start photolynk
 
 # Restart server
-sudo systemctl restart photosync
+sudo systemctl restart photolynk
 
 # View logs
-sudo journalctl -u photosync -f
+sudo journalctl -u photolynk -f
 ```
 
 **For Desktop (Tray App):**
@@ -203,7 +203,7 @@ Optional configuration (environment variables):
 Create a `.env` file in `server/` and/or `server-tray/` with any of the following:
 
 - `PORT` (default: `3000`)
-- `PHOTOSYNC_DATA_DIR` (sets the base data folder)
+- `PHOTOLYNK_DATA_DIR` (sets the base data folder)
 - `UPLOAD_DIR`, `DB_PATH`, `CLOUD_DIR` (advanced overrides)
 - HTTPS (TLS): `ENABLE_HTTPS=true`, `TLS_KEY_PATH`, `TLS_CERT_PATH`, `HTTPS_PORT`
 - `PINATA_JWT` (IPFS uploads — get free key at [pinata.cloud](https://pinata.cloud))
@@ -440,18 +440,27 @@ EXIF extraction is format-dependent:
 - The server backfill path relies mainly on `sharp`, so some formats may remain stored byte-exact without a server-side EXIF sidecar.
 - The desktop backup and certification paths use `ExifReader` for HEIC/HEIF and major RAW camera formats where `sharp` cannot read EXIF reliably.
 
-#### 3. EXIF Write-Back on Sync/Restore
+#### 3. Metadata Write-Back on Sync/Restore
 
-PhotoLynk preserves full original files on backup. On sync/restore, metadata write-back support depends on the platform writer used for that target device:
+PhotoLynk restores the original file bytes first. Metadata write-back is a second step used only when the restored file is missing embedded metadata and the platform has a writer for that target format.
 
-- Android uses native `ExifInterface`
-- iOS uses native `CGImageSource` / `CGImageDestination`
-- Desktop uses bundled `exiftool-vendored` first, with `sharp` only as a limited fallback if `exiftool` is unavailable
+- Android uses native `androidx.exifinterface:exifinterface:1.3.7`
+- iOS uses native ImageIO (`CGImageSource` / `CGImageDestination`) plus native save-to-library paths
+- Desktop uses bundled `exiftool-vendored` first, with `sharp` only as a narrower fallback when `exiftool` is unavailable
 
-In all cases, PhotoLynk avoids rewriting files that already contain embedded metadata. If metadata is already present in the restored original, the app keeps the original bytes and skips write-back.
+PhotoLynk also avoids unnecessary rewrites:
 
-| Format | Android | iOS | Desktop |
-|--------|:-------:|:---:|:-------:|
+- If the restored file already contains metadata, the app skips write-back
+- If the platform can save the original file bytes directly to the photo library, the original container is preserved even when no rewrite is needed
+- On iOS specifically, restore uses native save paths because the generic media-library save path can re-encode JPEGs and strip metadata
+
+Because there are two different concerns, the practical behavior is:
+
+- **Byte-preserving restore:** whether the original file/container can be restored and saved back without conversion
+- **Explicit metadata rewrite:** whether PhotoLynk has an implemented writer that can inject metadata back into that format when needed
+
+| Format | Android explicit metadata rewrite | iOS explicit metadata rewrite | Desktop explicit metadata rewrite |
+|--------|:--------------------------------:|:-----------------------------:|:---------------------------------:|
 | JPEG/JPG | ✅ | ✅ | ✅ |
 | PNG | ✅ | ✅ | ✅ |
 | WebP | ✅ | ✅ | ✅ |
@@ -464,19 +473,36 @@ In all cases, PhotoLynk avoids rewriting files that already contain embedded met
 | EXR/HDR | ❌ | ❌ | ✅ |
 | RAW formats (`.raw`, `.cr2`, `.cr3`, `.nef`, `.arw`, `.dng`, `.orf`, `.rw2`, `.pef`, `.srw`, `.raf`) | ⚠️ | ⚠️ | ✅ |
 
-- ✅ = supported
-- ⚠️ = format/container support depends on the native platform metadata writer; some files can still round-trip byte-exact without needing write-back
-- ❌ = no implemented writer for that platform path
+- ✅ = implemented writer path exists in current code for that platform/format family
+- ⚠️ = depends on what the native platform metadata APIs can successfully open and finalize for that specific container; original-file restore may still work even if rewrite is not guaranteed
+- ❌ = no implemented metadata writer in the current restore path
 
-What is written back also differs by platform:
+What the restore writers actually write also differs by platform:
 
-- Desktop writes the broadest set of fields: core EXIF, GPS, lens, IPTC, and structured XMP via `exiftool-vendored`
-- iOS writes broad EXIF plus GPS and IPTC fields through ImageIO, while preserving the original file type when the platform can rewrite it
-- Android writes the subset supported by `ExifInterface`: core EXIF and a few IPTC-equivalent tags such as caption, copyright, and creator
+- **Desktop**
+  - Writes the broadest metadata set
+  - Uses `exiftool-vendored` to write core EXIF, GPS, lens fields, IPTC, and structured XMP
+  - Covers JPEG, PNG, WebP, HEIC/HEIF, TIFF/TIF, GIF, BMP, AVIF, PSD/PSB, EXR/HDR, and major RAW camera formats in the current restore code
+  - Falls back to `sharp` only for JPEG/TIFF if `exiftool` is unavailable, and that fallback re-encodes pixels
 
-Desktop support is broader than the mobile table because `exiftool-vendored` is bundled with the app and is used for HEIC/HEIF, TIFF, GIF, AVIF, PSD/PSB, EXR/HDR, and major RAW camera formats in addition to JPEG, PNG, and WebP.
+- **iOS**
+  - `writeExif` writes broad EXIF, GPS, TIFF, and IPTC fields through ImageIO
+  - Current iOS write path includes IPTC caption, copyright, keywords, creator, title, city, country, credit, and source
+  - Current iOS write path does **not** implement XMP field write-back in the native module
+  - `saveFileToLibrary` preserves original file bytes for normal file restore
+  - `saveRawToLibrary` preserves RAW/DNG originals by storing the original RAW as an alternate photo resource with a generated JPEG preview for Photos
 
-RAW on iOS is preserved in original form in the photo library, but the current iOS restore path does not claim universal native metadata rewrite for every RAW container. RAW on Android likewise depends on what `ExifInterface` can successfully open and save for the specific file.
+- **Android**
+  - `writeExif` uses `ExifInterface` and writes core EXIF/GPS fields plus IPTC-equivalent mappings through EXIF tags
+  - Current Android write path includes capture time, timezone/subsecond fields, make/model, exposure settings, focal length, orientation, GPS, software, lens make/model, plus caption/copyright/creator through `ImageDescription`, `Copyright`, and `Artist`
+  - Current Android write path does **not** implement full IPTC block write-back or XMP write-back
+  - Container support is narrower and more platform-dependent than desktop because it is limited by `ExifInterface`
+
+Important RAW caveat:
+
+- **Desktop:** implemented RAW metadata write-back is broad because restore uses bundled `exiftool`
+- **iOS:** RAW originals are preserved in the library, but the current code should be understood as **RAW-preserving restore**, not a blanket guarantee of native metadata rewrite for every RAW container
+- **Android:** RAW rewrite remains conditional on what `ExifInterface` can successfully open and save for the specific file
 
 #### 4. Certify Original
 
@@ -646,7 +672,7 @@ cd /opt/photolynk
 sudo git pull
 cd server
 sudo npm install
-sudo systemctl restart photosync
+sudo systemctl restart photolynk
 ```
 
 ## System Info

@@ -1,42 +1,47 @@
 # PhotoLynk
-## Camera-to-Blockchain Authenticity Proof
+## Camera-to-On-Chain Authenticity Proof
 
-**Solana Mobile Monolith Hackathon 2026**  
-**Team**: Viktor Vishyn  
-**Built for**: Solana Mobile Seeker Community
+**Team**: Viktor Vishyn
 
 ---
 
 # The Problem
 
-## Mobile Creators Face an Authenticity Crisis
+## Authenticity and provenance are hard to prove from mobile workflows
 
-📸 **1B+ smartphone photographers globally**  
-🚨 **Millions of photos stolen daily**  
-🤖 **Deepfakes erode trust in visual media**  
-🔒 **No mobile-first proof of ownership**
-
-### Existing NFT Tools Fall Short:
-- ❌ Require desktop computers
-- ❌ Multiple steps, technical knowledge required
-- ❌ Expensive ($5-50 per mint)
-- ❌ Not designed for photographers
+- Photos can be copied, reposted, or altered after capture
+- Metadata alone is not enough for strong provenance claims
+- Most on-chain mint flows are not designed around camera-originated photo evidence
+- Mobile users need a simpler certify flow than desktop-first mint tooling
 
 ---
 
 # The Solution
 
-## PhotoLynk: Instant Blockchain Proof on Mobile
+## PhotoLynk adds a mobile-first certification flow for original photos
 
-### Camera → Blockchain in 3 Taps
+### Camera → Certify in a short mobile flow
 
-1. 📸 **Capture** photo
-2. ✍️ **Add** title  
-3. ✅ **Certify** (biometric auth)
+1. 📸 **Capture or choose** a photo
+2. ✍️ **Add** name and details
+3. ✅ **Certify** with wallet approval
 
-**Result**: Compressed NFT with cryptographic proof  
-**Cost**: $0.0005 per photo  
-**Time**: 5 seconds
+**Result**: an on-chain certification record anchored to the photo and its proof data
+
+**Estimated cost per certification**: depends on:
+
+- current on-chain network fees
+- storage option selected
+- file size
+- PhotoLynk app commission
+
+In the current mint service code, the total estimate is calculated as:
+
+- **network fee**
+- **storage upload cost**
+- **size-based app commission**
+
+The current regular size-based app commission starts at **$0.72 USD** for files up to **3 MB**, then increases by **10% of the base per additional MB above 3 MB**. Promotional pricing may temporarily lower the displayed fee, but the product should be described as an **estimated total cost**, not as a fixed sub-cent mint.
 
 ---
 
@@ -44,236 +49,140 @@
 
 ```
 ┌─────────────────────────────────────┐
-│      PhotoLynk Android App          │
-│  Camera → EXIF → Mint → Proof       │
+│       PhotoLynk Mobile App          │
+│  Photo selection → proof → certify  │
 └─────────────────┬───────────────────┘
                   ↓
 ┌─────────────────────────────────────┐
-│   Mobile Wallet Adapter (MWA)       │
-│  Phantom/Solflare + Biometric       │
+│      Mobile wallet approval         │
+│   Secure transaction confirmation   │
 └─────────────────┬───────────────────┘
                   ↓
 ┌─────────────────────────────────────┐
-│      Solana Mainnet (cNFT)          │
-│  Metaplex Bubblegum + Merkle Tree   │
+│      On-chain certification         │
+│   Compressed mint / proof anchor    │
 └─────────────────┬───────────────────┘
                   ↓
 ┌─────────────────────────────────────┐
-│   Cryptographic Proof Stack         │
-│  RFC 3161 + C2PA + 4-Layer Hashing  │
+│    Cryptographic proof material     │
+│   RFC 3161 + C2PA + EXIF hashing    │
 └─────────────────────────────────────┘
 ```
 
-**Tech Stack**: React Native 0.76 • Solana Web3.js • Metaplex Bubblegum • Mobile Wallet Adapter
+**Current implementation includes**:
+
+- React Native mobile app code
+- mobile wallet approval flow
+- Node.js mint service
+- desktop/server code for certification and restore flows
 
 ---
 
 # Cryptographic Proof Stack
 
-## Industry-Standard Verification
+## Proof material tracked by the current codebase
 
-### 🔐 RFC 3161 Trusted Timestamps
-- Third-party proof from FreeTSA.org
-- Verifiable via OpenSSL
-- Independent of blockchain
+### 🔐 RFC 3161 timestamps
 
-### 📜 C2PA Provenance Manifests
-- Content Authenticity Initiative standard
-- Used by Adobe, Microsoft, BBC
-- Industry-recognized format
+- RFC 3161 timestamp support exists in the certification flow
+- Timestamp data is intended to provide third-party time attestation
 
-### 🔢 4-Layer EXIF Hashing
-- **Content Hash**: Image bytes (SHA-256)
-- **EXIF Raw Hash**: Camera metadata
-- **EXIF Normalized Hash**: Tamper detection
-- **Binding Hash**: Links content + EXIF
+### 📜 C2PA provenance data
 
-**All stored on-chain** • **Anyone can verify** • **No PhotoLynk account needed**
+- C2PA manifest/provenance support exists in the certification model
 
----
+### 🔢 Multi-layer image and EXIF hashing
 
-# Solana Mobile Integration
+- **Content Hash**: SHA-256 of original file bytes
+- **Raw EXIF Hash**: SHA-256 of raw EXIF bytes when present
+- **Normalized EXIF Hash**: SHA-256 of normalized EXIF fields
+- **Binding Hash**: SHA-256 binding of raw and normalized EXIF hashes
 
-## Built for the Seeker Community
-
-### ✅ Mobile Wallet Adapter
-- Seamless Phantom/Solflare integration
-- No seed phrase typing on mobile
-- Biometric auth for every transaction
-
-### ✅ Compressed NFTs (Metaplex Bubblegum)
-- **99% cheaper** than standard NFTs
-- **$0.0005** vs $5-50 per mint
-- Enables mass adoption
-
-### ✅ Solana Speed
-- **2-5 second** confirmations
-- Real-time minting experience
-- No waiting for blocks
-
-### ✅ Mobile-First Design
-- Native camera integration
-- One-handed operation
-- Optimized for Saga/Seeker devices
+These proof fields are documented in the repository and are part of the certification security model.
 
 ---
 
-# Market Opportunity
+# Cost Model
 
-## Target: Mobile-First Crypto Users
+## Use estimated totals, not fixed mint slogans
 
-### Primary Market (Seeker Community)
-- **10K+** Saga/Seeker device owners
-- Early adopters of mobile crypto
-- Value ownership + authenticity
-- Daily mobile wallet users
+The current mint estimate logic in `nft-service/solana.js` computes total cost from:
 
-### Secondary Market (Photographers)
-- **1B+** smartphone photographers globally
-- **500M+** Instagram/TikTok creators
-- Growing concern about AI/deepfakes
-- Need proof for legal/commercial use
+- **network cost**
+- **storage cost**
+- **app commission**
 
-### Tertiary Market (Professionals)
-- Journalists (Reuters, AP, BBC)
-- Insurance documentation
-- Legal evidence timestamping
-- Real estate photography
+### Current regular commission logic
 
----
+- Base app commission: **$0.72 USD**
+- Applies to files up to **3 MB**
+- Each additional MB above 3 MB adds **+10%** to the base commission
 
-# Competitive Advantage
+### Current storage estimate logic
 
-## Why PhotoLynk Wins
+- Metadata upload estimate uses a base upload cost plus a per-KB component
+- External storage options add image upload cost on top of metadata upload cost
+- On-chain storage mode estimates metadata upload cost separately
 
-### vs. Traditional NFT Platforms (OpenSea, Magic Eden)
-✅ Mobile-native (not desktop port)  
-✅ 100x cheaper (cNFTs vs standard NFTs)  
-✅ Built for photos (not art/collectibles)
+### Pricing statement that matches the code
 
-### vs. Photo Apps (Instagram, VSCO)
-✅ True ownership (blockchain)  
-✅ Cryptographic proof (not just metadata)  
-✅ Verifiable by anyone (no platform lock-in)
+PhotoLynk certifications should be described as:
 
-### vs. Other Blockchain Photo Apps
-✅ Solana speed (not Ethereum gas fees)  
-✅ RFC 3161 + C2PA (not just IPFS)  
-✅ Mobile Wallet Adapter (not custom wallet)
+> **Estimated total cost per certification, based on live on-chain fees, storage choice, file size, and PhotoLynk commission.**
 
-### Unique Moat
-→ **Only app** with camera → cNFT → RFC 3161 in one mobile flow  
-→ **Production-ready**, already deployed  
-→ **Open source**, community-driven
+That is the accurate product statement. A fixed claim like **$0.0005 per mint** is not supported by the current pricing code.
 
 ---
 
-# Traction & Metrics
+# Product Characteristics
 
-## Current Status: Production Deployed
+## What the current implementation supports
 
-> **📱 Live on Solana dApp Store**  
-> PhotoLynk is already published and available on the official Solana dApp Store for Seeker devices.
-
-### Technical Metrics
-- **Minting Cost**: $0.0005 per photo
-- **Confirmation Time**: 2-5 seconds average
-- **Storage Efficiency**: 99% smaller on-chain
-- **Verification**: 100% success rate (RFC 3161)
-
-### User Metrics
-- **dApp Store**: Live and published
-- **APK**: Production build ready
-- **Platform**: Android (Expo SDK 52)
-- **Wallet Support**: Phantom, Solflare
-- **Backend**: Node.js minting service
-
-### Code Quality
-- **Open Source**: CC BY-NC-ND 4.0 License
-- **Security**: No hardcoded secrets
-- **Documentation**: Comprehensive README
-- **Demo Video**: https://youtube.com/shorts/pp3TYwn68D0
+- Mobile certification flow with wallet approval
+- Photo metadata extraction and preservation across mobile and desktop paths
+- On-chain certification flow with compressed minting logic
+- Optional storage modes including cloud, IPFS, and on-chain modes in the certification code
+- Repository-level documentation for EXIF, IPTC, XMP, RFC 3161, and C2PA related handling
 
 ---
 
-# Roadmap
+# Current Status
 
-## From Hackathon to dApp Store
+## What can be stated directly from the repository
 
-### Q1 2026 - Solana dApp Store Launch
-✓ Publish to dApp Store  
-✓ In-app SOL purchase (Moonpay/Ramp)  
-✓ Social sharing (Twitter, Instagram)  
-✓ Batch minting (photo albums)
+- The repository contains:
+  - mobile app code
+  - desktop/server code
+  - a Node.js mint service
+  - certification pricing and estimation logic
+- Wallet-related flows are implemented in the certification code
+- Demo video and documentation are present in the repository
 
-### Q2 2026 - Creator Economy
-• NFT marketplace integration  
-• Royalty splits for collaborations  
-• Verified photographer badges  
-• Portfolio websites (auto-generated)
+## Claims intentionally removed
 
-### Q3 2026 - Enterprise
-• Press/journalism verification  
-• Legal evidence timestamping  
-• Insurance claim documentation  
-• White-label licensing
+The following claims were removed because they are not safe to present here without separate verification:
 
-### Q4 2026 - Scale
-• iOS version (React Native)  
-• Desktop sync (already built)  
-• AI detection integration  
-• Global expansion
-
----
-
-# Hackathon Evaluation Fit
-
-## Why PhotoLynk Wins Monolith
-
-### 1. Stickiness & PMF (25%)
-✅ **Daily habit**: Photographers mint like Instagram posting  
-✅ **Seeker fit**: Mobile-first crypto users  
-✅ **Network effects**: Proofs shareable/verifiable  
-✅ **Retention**: StealthCloud backup = ongoing utility
-
-### 2. User Experience (25%)
-✅ **One-tap minting**: 3 taps, 5 seconds  
-✅ **Biometric security**: No passwords  
-✅ **Clean UI**: Proof viewer is polished  
-✅ **Fast**: Solana speed = real-time feel
-
-### 3. Innovation / X-factor (25%)
-✅ **Unique**: Only mobile app with full crypto proof stack  
-✅ **Technical depth**: RFC 3161, C2PA, 4-layer hashing  
-✅ **Novel use case**: Authenticity (not just collectibles)  
-✅ **Production-ready**: Already deployed, real users
-
-### 4. Presentation & Demo (25%)
-✅ **Clear problem/solution**: Deepfakes → blockchain proof  
-✅ **Live demo**: Working APK, real mainnet transactions  
-✅ **Technical credibility**: Open source, detailed docs  
-✅ **Market opportunity**: 1B+ smartphone photographers
+- fixed sub-cent mint pricing
+- specific hackathon positioning
+- chain-specific marketing statements
+- store publication claims
+- specific confirmation-time guarantees
+- market-size and adoption-number claims
+- “100% success rate” claims
 
 ---
 
 # Team
 
 ## Viktor Vishyn
-**Full-Stack Developer & Founder**
+**Founder / Developer**
 
-### Background
-- 10+ years software engineering
-- Blockchain developer (Solana, Ethereum)
-- Mobile app development (React Native)
-- Cryptography & security focus
-
-### PhotoLynk Journey
-- **Started**: 2024 (pre-Saga launch)
-- **Iterations**: 3 major versions
-- **Codebase**: 50K+ lines (React Native + Node.js)
-- **Platforms**: Android, iOS, Desktop
+- React Native mobile development
+- Node.js backend development
+- photo backup, metadata, and certification workflows
 
 ### Contact
+
 - **Email**: support@photolynk.io
 - **GitHub**: @viktorvishyn369
 - **x.com**: @StealthLynkIO
@@ -282,43 +191,22 @@
 
 # Call to Action
 
-## Try PhotoLynk Today
+## Explore PhotoLynk
 
-📱 **Download App**  
-Available on the official Solana dApp Store.  
-Alternatively, download the latest APK from GitHub Releases.
-
-💻 **View Source Code**  
-https://github.com/viktorvishyn369/PhotoLynk-Solana-Mobile  
-(Open source, CC BY-NC-ND 4.0 License)
-
-**Questions?** support@photolynk.io
+- Review the source code in this repository
+- Review the pricing and certification logic in `nft-service/`
+- Review the product documentation in `README.md`
+- Watch the demo video: https://youtube.com/shorts/pp3TYwn68D0
 
 ---
 
-# 🔗 Links
+# Links
+
 - **Demo Video**: https://youtube.com/shorts/pp3TYwn68D0
 - **Pitch Deck**: https://github.com/viktorvishyn369/PhotoLynk/blob/main/PITCH_DECK.md
-- **Solana Explorer**: View Minted NFTs
-- **FreeTSA Verification**: freetsa.org
-- **x.com**: @StealthLynkIO
-- **Telegram**: @StealthLynkIO
-- **Website**: stealthlynk.io
+- **FreeTSA**: https://freetsa.org
+- **Website**: https://stealthlynk.io
 
 ---
 
----
-
-# PhotoLynk
-
-## Camera-to-Blockchain Authenticity Proof
-
-🏆 **Solana Mobile Monolith Hackathon 2026**
-
-> "Bringing blockchain authenticity to the mobile-first generation"
-
-**Built for Solana Mobile** • **Powered by Compressed NFTs** • **Secured by Cryptography**
-
----
-
-**Thank you!**
+**PhotoLynk**
