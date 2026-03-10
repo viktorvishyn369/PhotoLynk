@@ -1,6 +1,6 @@
 # PhotoLynk Privacy Policy
 
-**Last Updated**: January 16, 2026
+**Last Updated**: March 10, 2026
 
 **StealthLynk LLC** ("Company," "we," "us," or "our") operates the PhotoLynk application (the "Service"). This Privacy Policy explains how we collect, use, disclose, and safeguard your information when you use our Service.
 
@@ -44,7 +44,21 @@ When using StealthCloud mode, we collect and process:
 
 **Important**: All media files and metadata are encrypted on your device using industry-standard encryption (XSalsa20-Poly1305) before transmission. StealthLynk LLC stores only encrypted data and **does not possess the decryption keys**. We cannot access, view, or decrypt your files.
 
-### 2.3 Information Collected Automatically
+### 2.3 In-App Purchase Information
+
+When you make in-app purchases, we collect and process:
+
+- **Purchase Receipts**: Transaction receipts from Apple App Store or Google Play Store for verification purposes
+- **Account Balance**: Credit balance and transaction history for photo certification services
+- **Premium Status**: Whether you have purchased the Premium tier ($49.99 USD one-time) and associated feature entitlements (100 GB encrypted cloud storage for 4 years, 25 free certifications, 250 commission-free certifications)
+- **Verification Credit**: Photo Verification Credit purchases ($15.00 USD consumable) that add to your account balance for photo certification services
+- **Platform Information**: The platform (iOS or Android) where the purchase was made
+
+Purchase receipts are verified with Apple or Google to prevent fraud and ensure legitimate transactions. We do not store your payment card information — all payment processing is handled by the respective app store platforms according to their privacy policies.
+
+Transaction records, including purchase amounts, dates, and certification service usage, are retained for accounting, tax compliance, and customer support purposes.
+
+### 2.4 Information Collected Automatically
 
 The Service may automatically collect:
 

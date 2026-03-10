@@ -1,4 +1,4 @@
-# PhotoLynk — Self‑Hosted. Encrypted Cloud. iOS ↔ Android ↔ Solana.
+# PhotoLynk — Self‑Hosted. Encrypted Cloud. iOS ↔ Android ↔ Desktop.
 
 **A project by <a href="https://stealthlynk.io" target="_blank">StealthLynk LLC</a>** — Building secure, privacy-respecting infrastructure for real-world digital systems.
 
@@ -15,13 +15,12 @@ Back up photos/videos to your own server or StealthCloud, and restore on any pho
 
 | Platform | Status | Payment Method |
 |----------|--------|----------------|
-| **Solana Seeker** | ✅ Live on Solana dApp store | SOL (on-chain) |
 | **iOS** | ✅ Live on App Store | In-App Purchase |
 | **Android** | ✅ Live on Google Play | In-App Purchase |
 
-The PhotoLynk mobile apps feature end-to-end encryption, self-hosted or cloud backup options, and seamless cross-platform restore. The Solana dApp version enables crypto payments directly on the Solana blockchain — no credit cards, no middlemen.
+The PhotoLynk mobile apps feature end-to-end encryption, self-hosted or cloud backup options, and seamless cross-platform restore.
 
-**Solana dApp is live. iOS and Android are live on App Store and Google Play.**
+**iOS and Android are live on App Store and Google Play.**
 
 Store links:
 - iOS (App Store): [Download PhotoLynk](https://apps.apple.com/app/id6748285696)
@@ -205,7 +204,6 @@ Create a `.env` file in `server/` and/or `server-tray/` with any of the followin
 - `PHOTOSYNC_DATA_DIR` (sets the base data folder)
 - `UPLOAD_DIR`, `DB_PATH`, `CLOUD_DIR` (advanced overrides)
 - HTTPS (TLS): `ENABLE_HTTPS=true`, `TLS_KEY_PATH`, `TLS_CERT_PATH`, `HTTPS_PORT`
-- `HELIUS_API_KEY` (Solana RPC — get free key at [helius.dev](https://helius.dev))
 - `PINATA_JWT` (IPFS uploads — get free key at [pinata.cloud](https://pinata.cloud))
 - `DEBUG_SECRET` (admin debug endpoint secret)
 
@@ -416,9 +414,9 @@ All photo formats below are fully supported for backup, sync, and restore across
 | **Standard** | MP4, MOV, M4V, 3GP, AVI, MKV, WebM |
 | **Professional** | MPEG, MPG, WMV, FLV, TS, MTS, M2TS |
 
-#### Photos — NFT Certification (Certify Original)
+#### Photos — Certify Original (Digital Proof of Authenticity)
 
-NFT minting supports the following formats for on-chain certification. The original file is uploaded byte-exact (when EXIF strip is OFF), and SHA-256 content hash is recorded on Solana.
+The Certify Original feature supports the following formats for creating cryptographic proofs of authenticity. The original file is uploaded byte-exact (when EXIF strip is OFF), and a SHA-256 content hash is recorded as a permanent digital certificate.
 
 | Category | Formats | All Platforms |
 |----------|---------|:-------------:|
@@ -436,7 +434,7 @@ NFT minting supports the following formats for on-chain certification. The origi
 | **Adobe** | DNG | ✅ |
 | **Encrypted** | .bin (NaCl secretbox) | ✅ |
 
-NFT storage options: **StealthCloud**, **IPFS** (Pinata), **Arweave**, **Embedded SVG** (on-chain data URI).
+Certificate storage options: **StealthCloud**, **IPFS** (Pinata), **Arweave**, **Embedded SVG**.
 
 ### EXIF & Metadata Preservation
 
@@ -467,9 +465,9 @@ PhotoLynk extracts, stores, and restores comprehensive metadata during backup/sy
 
 Even when EXIF write is not supported, files sync byte-exact and EXIF data remains stored on the server for future restoration. RAW formats are intentionally read-only to preserve original sensor data.
 
-#### NFT EXIF Hash Proof System (Certify Original)
+#### EXIF Hash Proof System (Certify Original)
 
-When certifying a photo as an NFT, PhotoLynk computes a 3-hash cryptographic proof from the original EXIF data **before** any processing (strip, watermark, encrypt):
+When certifying a photo, PhotoLynk computes a 3-hash cryptographic proof from the original EXIF data **before** any processing (strip, watermark, encrypt):
 
 | Hash | Description | Purpose |
 |------|-------------|---------|
@@ -477,15 +475,34 @@ When certifying a photo as an NFT, PhotoLynk computes a 3-hash cryptographic pro
 | **Hash 2** (Normalized EXIF) | SHA-256 of parsed, normalized, sorted EXIF fields | Cross-platform verification — same hash regardless of EXIF library |
 | **Hash 3** (Binding) | SHA-256(Hash1 \| Hash2) | Cryptographically binds raw and normalized proofs |
 
-Additional integrity proofs recorded on-chain:
+Additional integrity proofs recorded in the certificate:
 - **Content Hash**: SHA-256 of original file bytes (before any processing)
 - **Camera Serial Hash**: SHA-256 of camera body serial number (device binding)
-- **RFC 3161 Timestamp**: Trusted third-party timestamp (FreeTSA) proving existence at mint time
+- **RFC 3161 Timestamp**: Trusted third-party timestamp (FreeTSA) proving existence at certification time
 - **C2PA Manifest**: Content Authenticity Initiative provenance data
 
-If an image has no EXIF data (screenshots, downloaded images), the hash fields are omitted from the NFT metadata and displayed as "N/A" in the certificate. The content hash and blockchain proof remain fully valid.
+If an image has no EXIF data (screenshots, downloaded images), the hash fields are omitted from the certificate metadata and displayed as "N/A" in the certificate viewer. The content hash and digital proof remain fully valid.
 
 **Note:** HEIC/HEIF on Android requires API 29+ (Android 10). RAW format EXIF extraction uses platform-native APIs (CGImageSource on iOS, ExifInterface on Android, ExifReader on desktop/server).
+
+## In-App Purchases
+
+PhotoLynk offers two optional in-app purchases to unlock additional features:
+
+### Photo Verification Credit — $15.00 USD (Consumable)
+- Adds $15.00 credit to your account balance
+- Credit is used to pay for photo certification services (Certify Original), which create tamper-evident digital proofs of your photographs
+- Each certification cost varies based on file size and storage method
+- Unused credit does not expire and carries forward across sessions
+- Multiple purchases are cumulative — each adds to your total balance
+
+### Premium — $49.99 USD (Non-Consumable, One-Time)
+- Unlocks 100 GB of end-to-end encrypted cloud storage for 4 years
+- Includes 25 free photo certifications and 250 commission-free certifications
+- Full access across all platforms and devices linked to your account
+- One-time payment — no recurring charges, no auto-renewal
+
+All purchases are processed through the respective platform's payment system (Apple App Store or Google Play Store). PhotoLynk does not directly handle payment card information. Both purchases are final and non-refundable except as required by applicable law.
 
 ### Build Requirements (for building from source)
 - Node.js 20 LTS

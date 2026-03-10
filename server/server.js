@@ -587,7 +587,7 @@ async function loadUsers(){
     var r=await fetch('/admin/api/users');var d=await r.json();
     if(!r.ok)throw new Error(d.error||'Failed');
     serverTime=d.server_time||'';
-    allUsers=d.users.map(function(u){return{id:u.id,email:u.email||'',user_uuid:u.user_uuid||'',device_uuids:u.device_uuids||'',last_login:u.last_login||0,last_login_date:u.last_login_date,storage_used:u.storage_used_bytes||0,storage_quota:u.storage_quota_bytes||0,file_count:u.file_count||0,plan_gb:u.plan.plan_gb||0,premium_gb:u.plan.premium_gb||0,status:u.plan.status||'none',trial_until:u.plan.trial_until,trial_until_date:u.plan.trial_until_date,expires_at:u.plan.expires_at,expires_at_date:u.plan.expires_at_date,grace_until:u.plan.grace_until,created_at:u.user_created_at,created_at_date:u.user_created_at_date,payment_type:u.plan.payment_type||'',payment_at:u.plan.payment_at,payment_at_date:u.plan.payment_at_date,updated_at:u.plan.updated_at,updated_at_date:u.plan.updated_at_date,nft_is_premium:u.nft.is_premium,nft_mints:u.nft.mint_count||0,nft_free_remaining:u.nft.free_mints_remaining||0,nft_balance:u.nft.balance_usd||0,nft_total_paid:u.nft.total_paid_usd||0,nft_total_purchased:u.nft.total_purchased_usd||0,nft_total_spent:u.nft.total_spent_usd||0,nft_payments:u.nft.payments||[],sol_payments:u.solana.payments||[],sol_total_paid:u.solana.total_paid_sol||0,total_paid:(u.nft.total_paid_usd||0)+(u.solana.total_paid_sol||0)*100}});
+    allUsers=d.users.map(function(u){return{id:u.id,email:u.email||'',user_uuid:u.user_uuid||'',device_uuids:u.device_uuids||'',last_login:u.last_login||0,last_login_date:u.last_login_date,storage_used:u.storage_used_bytes||0,storage_quota:u.storage_quota_bytes||0,file_count:u.file_count||0,plan_gb:u.plan.plan_gb||0,premium_gb:u.plan.premium_gb||0,status:u.plan.effective_status||u.plan.status||'none',trial_until:u.plan.trial_until,trial_until_date:u.plan.trial_until_date,expires_at:u.plan.expires_at,expires_at_date:u.plan.expires_at_date,grace_until:u.plan.grace_until,created_at:u.user_created_at,created_at_date:u.user_created_at_date,payment_type:u.plan.payment_type||'',payment_at:u.plan.payment_at,payment_at_date:u.plan.payment_at_date,updated_at:u.plan.updated_at,updated_at_date:u.plan.updated_at_date,nft_is_premium:u.nft.is_premium,nft_mints:u.nft.mint_count||0,nft_free_remaining:u.nft.free_mints_remaining||0,nft_balance:u.nft.balance_usd||0,nft_total_paid:u.nft.total_paid_usd||0,nft_total_purchased:u.nft.total_purchased_usd||0,nft_total_spent:u.nft.total_spent_usd||0,nft_payments:u.nft.payments||[],sol_payments:u.solana.payments||[],sol_total_paid:u.solana.total_paid_sol||0,total_paid:(u.nft.total_paid_usd||0)+(u.solana.total_paid_sol||0)*100}});
     updateStats();buildFilters();applyFilters();
     document.getElementById('loading').style.display='none';
     document.getElementById('users-table').style.display='';
@@ -967,6 +967,35 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
             }
         } catch (_) {}
 
+        // Compute effective subscription status from raw plan fields (read-only, mirrors resolveSubscriptionState)
+        const computeEffectiveStatus = (u) => {
+            const now = Date.now();
+            const dbStatus = u.plan_status || 'none';
+            const expiresAt = u.expires_at ? Number(u.expires_at) : null;
+            const graceUntil = u.grace_until ? Number(u.grace_until) : null;
+            const trialUntil = u.trial_until ? Number(u.trial_until) : null;
+            const premGb = u.premium_gb && Number(u.premium_gb) > 0 ? Number(u.premium_gb) : 0;
+            const complimentaryMs = Math.max(0, TRIAL_COMPLIMENTARY_DAYS) * 24 * 60 * 60 * 1000;
+            const complimentaryUntil = trialUntil ? (trialUntil + complimentaryMs) : null;
+            const graceMs = Math.max(0, SUBSCRIPTION_GRACE_DAYS) * 24 * 60 * 60 * 1000;
+
+            if (dbStatus === 'active' && expiresAt && expiresAt > 0 && expiresAt > now) return 'active';
+            if (trialUntil && trialUntil > now) return 'trial';
+            if (dbStatus === 'trial' && trialUntil && trialUntil > 0 && complimentaryUntil && now <= complimentaryUntil) {
+                return premGb > 0 ? 'premium_only' : 'trial_complimentary';
+            }
+            if (dbStatus === 'trial' && trialUntil && trialUntil > 0 && complimentaryUntil && complimentaryUntil < now) {
+                return premGb > 0 ? 'premium_only' : 'trial_complimentary_expired';
+            }
+            if (expiresAt && expiresAt > 0 && expiresAt <= now) {
+                const gu = graceUntil && graceUntil > 0 ? graceUntil : (expiresAt + graceMs);
+                const inGrace = gu && gu > 0 ? now <= gu : false;
+                return premGb > 0 ? 'premium_only' : (inGrace ? 'grace' : 'expired');
+            }
+            if (dbStatus === 'active') return 'active';
+            return premGb > 0 ? 'premium_only' : dbStatus;
+        };
+
         const formattedUsers = users.map(user => {
             const nftPayments = nftPaymentsByUser[user.id] || [];
             const premium = nftPremiumByUser[user.id] || {};
@@ -978,6 +1007,8 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
             const planQuotaBytes = (user.plan_gb || 0) * 1073741824;
             const premiumQuotaBytes = premium.cloudQuotaBytes || ((user.premium_gb || 0) * 1073741824);
             const totalQuotaBytes = planQuotaBytes + premiumQuotaBytes;
+
+            const effectiveStatus = computeEffectiveStatus(user);
 
             return {
                 id: user.id,
@@ -995,11 +1026,13 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                     plan_gb: user.plan_gb,
                     premium_gb: user.premium_gb,
                     status: user.plan_status,
+                    effective_status: effectiveStatus,
                     trial_until: user.trial_until,
                     trial_until_date: user.trial_until ? new Date(user.trial_until).toISOString() : null,
                     expires_at: user.expires_at,
                     expires_at_date: user.expires_at ? new Date(user.expires_at).toISOString() : null,
                     grace_until: user.grace_until,
+                    grace_until_date: user.grace_until ? new Date(user.grace_until).toISOString() : null,
                     payment_type: user.payment_type,
                     payment_at: user.payment_at,
                     payment_at_date: user.payment_at ? new Date(user.payment_at).toISOString() : null,
@@ -1464,7 +1497,7 @@ const resolveSubscriptionState = async (userId) => {
     const premiumGb = row.premium_gb && Number.isFinite(Number(row.premium_gb)) && Number(row.premium_gb) > 0 ? Number(row.premium_gb) : 0;
 
     if (deletedAt && deletedAt > 0) {
-        // Premium users keep access even after subscription deletion (they own 10GB permanently)
+        // Premium users keep access even after subscription deletion (they own 100GB permanently)
         return {
             allowed: premiumGb > 0,
             status: premiumGb > 0 ? 'premium_only' : 'deleted',
@@ -1587,10 +1620,20 @@ const resolveSubscriptionState = async (userId) => {
             );
         }
         const allowedInGrace = gu && gu > 0 ? now <= gu : false;
-        // Premium users keep access even after subscription expires
+        // Persist expired status when grace period ends
+        if (!allowedInGrace && row.status !== 'expired' && premiumGb <= 0) {
+            try {
+                const updatedAt = Date.now();
+                await dbRunAsync(
+                    `UPDATE user_plans SET status = ?, updated_at = ? WHERE user_id = ?`,
+                    ['expired', updatedAt, userId]
+                );
+            } catch (e) { /* ignore */ }
+        }
+        // Premium users keep access even after subscription expires — never show grace/expired
         return {
             allowed: allowedInGrace || premiumGb > 0,
-            status: premiumGb > 0 && !allowedInGrace ? 'premium_only' : (allowedInGrace ? 'grace' : 'grace_expired'),
+            status: premiumGb > 0 ? 'premium_only' : (allowedInGrace ? 'grace' : 'expired'),
             expiresAt,
             graceUntil: gu,
             planGb: row.plan_gb || null,
@@ -1611,7 +1654,7 @@ const resolveSubscriptionState = async (userId) => {
         };
     }
 
-    // No active subscription — premium users still get access with their permanent 10GB
+    // No active subscription — premium users still get access with their permanent 100GB
     return {
         allowed: premiumGb > 0,
         status: premiumGb > 0 ? 'premium_only' : (row.status || 'none'),
@@ -1651,7 +1694,7 @@ const requireActiveSubscription = async (req, res, next) => {
             return next(); // allow sync/read during complimentary window
         }
 
-        if (st.status === 'grace' || st.status === 'grace_expired') {
+        if (st.status === 'grace' || st.status === 'expired') {
             return res.status(402).json({
                 error: 'Subscription expired',
                 code: 'SUBSCRIPTION_EXPIRED',
@@ -1703,7 +1746,7 @@ const requireUploadSubscription = async (req, res, next) => {
             });
         }
 
-        if (st.status === 'grace' || st.status === 'grace_expired') {
+        if (st.status === 'grace' || st.status === 'expired') {
             return res.status(402).json({
                 error: 'Subscription expired (sync-only)',
                 code: 'SUBSCRIPTION_EXPIRED_SYNC_ONLY',
@@ -3383,13 +3426,13 @@ app.get('/api/subscription/status', authenticateToken, async (req, res) => {
             const premiumStatus = nftService.balance.getPremiumStatus(userId);
             if (premiumStatus && premiumStatus.isPremium) {
                 const row = await dbGetAsync(`SELECT premium_gb FROM user_plans WHERE user_id = ?`, [userId]);
-                if (!row || !row.premium_gb || Number(row.premium_gb) <= 0) {
+                if (!row || !row.premium_gb || Number(row.premium_gb) < 100) {
                     await ensurePlanRow(userId);
                     await dbRunAsync(
-                        `UPDATE user_plans SET premium_gb = 10, updated_at = ? WHERE user_id = ?`,
+                        `UPDATE user_plans SET premium_gb = 100, updated_at = ? WHERE user_id = ?`,
                         [Date.now(), userId]
                     );
-                    console.log(`[Premium] Self-healed premium_gb=10 for user ${userId}`);
+                    console.log(`[Premium] Self-healed premium_gb=100 for user ${userId}`);
                 }
             }
         } catch (_) { /* nft-service not available */ }
@@ -7255,6 +7298,14 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
                 }
             }
             console.log(`[NFT] Album backup: user=${userId} added=${added} updated=${updated} total=${data.nfts.length}`);
+        } else if (action === 'list-mints') {
+            // Lightweight: return only mint addresses for a wallet (used to detect transferred-out NFTs)
+            const deviceUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
+            const allNfts = walletAddress
+                ? readNftsForWalletGlobal(walletAddress)
+                : await readMergedNftsForDevice(deviceUuid || userKey, userId);
+            const mints = allNfts.map(n => n.mintAddress).filter(Boolean);
+            return res.json({ success: true, mints, total: mints.length });
         } else if (action === 'get') {
             const deviceUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
             const allNfts = walletAddress
@@ -7632,7 +7683,7 @@ try {
 
     // After nft-service mounts, add a dedicated endpoint for client to confirm premium storage
     // Client calls this right after a successful /api/nft-service/upgrade-premium response
-    const PREMIUM_STORAGE_GB = 10;
+    const PREMIUM_STORAGE_GB = 100;
     app.post('/api/premium/activate-storage', authenticateToken, async (req, res) => {
         try {
             const userId = req.user.id;
@@ -7642,6 +7693,42 @@ try {
                 return res.status(403).json({ error: 'Not a premium user', code: 'NOT_PREMIUM' });
             }
             await ensurePlanRow(userId);
+
+            // Check if already activated (re-activation is always allowed)
+            const existingRow = await dbGetAsync(`SELECT premium_gb FROM user_plans WHERE user_id = ?`, [userId]);
+            const alreadyAllocated = existingRow && Number(existingRow.premium_gb) > 0;
+
+            if (!alreadyAllocated) {
+                // Capacity check: SUM(plan_gb + premium_gb) across all users vs total server capacity
+                const GB = 1000 * 1000 * 1000;
+                const SAFETY_BYTES = 20 * GB;
+                const capacity = readCapacityJson();
+                const totalServerBytes = capacity && typeof capacity.totalBytes === 'number' && Number.isFinite(capacity.totalBytes) ? capacity.totalBytes : null;
+
+                if (totalServerBytes !== null) {
+                    const allocRow = await dbGetAsync(
+                        `SELECT COALESCE(SUM(CASE WHEN plan_gb IS NOT NULL AND plan_gb > 0 AND (deleted_at IS NULL OR deleted_at = 0) AND status IN ('active','grace') THEN plan_gb ELSE 0 END), 0) AS totalPlanGb,
+                                COALESCE(SUM(CASE WHEN premium_gb IS NOT NULL AND premium_gb > 0 AND (deleted_at IS NULL OR deleted_at = 0) THEN premium_gb ELSE 0 END), 0) AS totalPremiumGb
+                           FROM user_plans`
+                    );
+                    const totalPlanGb = allocRow ? Number(allocRow.totalPlanGb) : 0;
+                    const totalPremiumGb = allocRow ? Number(allocRow.totalPremiumGb) : 0;
+                    const currentAllocatedBytes = (totalPlanGb + totalPremiumGb) * GB;
+                    const newAllocationBytes = PREMIUM_STORAGE_GB * GB;
+                    const availableBytes = totalServerBytes - currentAllocatedBytes - SAFETY_BYTES;
+
+                    if (newAllocationBytes > availableBytes) {
+                        console.log(`[Premium] Capacity check failed: need ${newAllocationBytes} bytes, available ${availableBytes} bytes (total=${totalServerBytes}, allocated=${currentAllocatedBytes}, safety=${SAFETY_BYTES})`);
+                        return res.status(507).json({
+                            error: 'Insufficient server capacity for premium storage',
+                            code: 'CAPACITY_EXCEEDED',
+                            requiredBytes: newAllocationBytes,
+                            availableBytes: Math.max(0, availableBytes),
+                        });
+                    }
+                }
+            }
+
             await dbRunAsync(
                 `UPDATE user_plans SET premium_gb = ?, updated_at = ? WHERE user_id = ?`,
                 [PREMIUM_STORAGE_GB, Date.now(), userId]
@@ -7654,6 +7741,134 @@ try {
             return res.status(500).json({ error: 'Failed to activate premium storage' });
         }
     });
+    // Verify Solana premium payment — one-time $49.99 purchase paid in SOL
+    app.post('/api/solana/verify-premium-payment', async (req, res) => {
+        const { txSignature, solAmount, paymentWallet } = req.body;
+
+        // Extract user from JWT token
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return res.status(401).json({ error: 'Authorization token required' });
+        }
+        const token = authHeader.substring(7);
+        let decoded;
+        try {
+            decoded = jwt.verify(token, JWT_SECRET);
+        } catch (e) {
+            return res.status(401).json({ error: 'Invalid or expired token' });
+        }
+
+        if (!txSignature) {
+            return res.status(400).json({ error: 'Missing required field: txSignature' });
+        }
+        if (paymentWallet && paymentWallet !== SOLANA_PAYMENT_WALLET) {
+            return res.status(400).json({ error: 'Invalid payment wallet' });
+        }
+
+        try {
+            const user = await dbGetAsync(`SELECT id, email FROM users WHERE id = ?`, [decoded.id]);
+            if (!user) {
+                return res.status(404).json({ error: 'User not found' });
+            }
+
+            // Check if already premium
+            const existingPremium = nftService.balance.getPremiumStatus(user.id);
+            if (existingPremium && existingPremium.isPremium) {
+                return res.status(409).json({ error: 'Already premium', isPremium: true });
+            }
+
+            // Verify transaction on Solana blockchain
+            const txVerification = await verifySolanaTransaction(txSignature, solAmount);
+            if (!txVerification.success) {
+                return res.status(400).json({ error: txVerification.error || 'Transaction verification failed' });
+            }
+
+            // Check if this transaction was already processed
+            const existingTx = await dbGetAsync(
+                `SELECT * FROM solana_payments WHERE tx_signature = ?`,
+                [txSignature]
+            );
+            if (existingTx) {
+                return res.status(409).json({ error: 'Transaction already processed' });
+            }
+
+            // Record the payment in solana_payments table
+            const now = Date.now();
+            await dbRunAsync(
+                `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, tier_gb, duration, created_at, verified_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                [user.id, txSignature, solAmount || 0, 0, 'premium', now, now]
+            );
+
+            // Activate premium in nft-service DB
+            const premiumResult = nftService.balance.setPremium(user.id, txSignature, 'solana');
+            const bal = nftService.balance.getBalance(user.id);
+
+            // Record payment for IRS tax tracking
+            if (!premiumResult.isDuplicate) {
+                nftService.balance.recordPayment(user.id, 'premium_49', 49.99, txSignature, 'solana');
+            }
+
+            // Activate 100GB permanent storage in main server DB (same as /api/premium/activate-storage)
+            await ensurePlanRow(user.id);
+
+            // Capacity check before allocating
+            const existingRow = await dbGetAsync(`SELECT premium_gb FROM user_plans WHERE user_id = ?`, [user.id]);
+            const alreadyAllocated = existingRow && Number(existingRow.premium_gb) > 0;
+
+            if (!alreadyAllocated) {
+                const GB = 1000 * 1000 * 1000;
+                const SAFETY_BYTES = 20 * GB;
+                const capacity = readCapacityJson();
+                const totalServerBytes = capacity && typeof capacity.totalBytes === 'number' && Number.isFinite(capacity.totalBytes) ? capacity.totalBytes : null;
+
+                if (totalServerBytes !== null) {
+                    const allocRow = await dbGetAsync(
+                        `SELECT COALESCE(SUM(CASE WHEN plan_gb IS NOT NULL AND plan_gb > 0 AND (deleted_at IS NULL OR deleted_at = 0) AND status IN ('active','grace') THEN plan_gb ELSE 0 END), 0) AS totalPlanGb,
+                                COALESCE(SUM(CASE WHEN premium_gb IS NOT NULL AND premium_gb > 0 AND (deleted_at IS NULL OR deleted_at = 0) THEN premium_gb ELSE 0 END), 0) AS totalPremiumGb
+                           FROM user_plans`
+                    );
+                    const totalPlanGb = allocRow ? Number(allocRow.totalPlanGb) : 0;
+                    const totalPremiumGb = allocRow ? Number(allocRow.totalPremiumGb) : 0;
+                    const currentAllocatedBytes = (totalPlanGb + totalPremiumGb) * GB;
+                    const newAllocationBytes = PREMIUM_STORAGE_GB * GB;
+                    const availableBytes = totalServerBytes - currentAllocatedBytes - SAFETY_BYTES;
+
+                    if (newAllocationBytes > availableBytes) {
+                        // Payment succeeded but no capacity — still mark premium but warn
+                        console.log(`[Solana Premium] Capacity check failed but payment already accepted. User ${user.id} will get premium without storage allocation.`);
+                    } else {
+                        await dbRunAsync(
+                            `UPDATE user_plans SET premium_gb = ?, updated_at = ? WHERE user_id = ?`,
+                            [PREMIUM_STORAGE_GB, now, user.id]
+                        );
+                    }
+                } else {
+                    // No capacity data — allocate anyway
+                    await dbRunAsync(
+                        `UPDATE user_plans SET premium_gb = ?, updated_at = ? WHERE user_id = ?`,
+                        [PREMIUM_STORAGE_GB, now, user.id]
+                    );
+                }
+            }
+
+            console.log(`[Solana Premium] Payment verified: ${txSignature} - User ${user.email}`);
+
+            const st = await resolveSubscriptionState(user.id);
+            return res.json({
+                success: true,
+                isPremium: premiumResult.isPremium,
+                cloudQuotaBytes: premiumResult.cloudQuotaBytes,
+                balanceUsd: bal.balanceUsd,
+                premiumGb: PREMIUM_STORAGE_GB,
+                subscription: st,
+            });
+        } catch (e) {
+            console.error('[Solana Premium] Payment verification error:', e);
+            return res.status(500).json({ error: 'Premium payment verification failed' });
+        }
+    });
+
     console.log('[NFT Service] Mounted at /api/nft-service');
 } catch (nftServiceErr) {
     console.log('[NFT Service] Not available:', nftServiceErr.message);

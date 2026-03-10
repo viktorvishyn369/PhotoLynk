@@ -38,10 +38,10 @@ const getDfTotalBytes = (p) => getDfValueBytes(p, 'size');
 
 const getAllocatedBytesFromDb = (dbPath) => {
   return new Promise((resolve) => {
-    if (!dbPath || !fs.existsSync(dbPath)) return resolve([]);
+    if (!dbPath || !fs.existsSync(dbPath)) return resolve({ planRows: [], premiumRows: [] });
 
     const db = new sqlite3.Database(dbPath, sqlite3.OPEN_READONLY, (err) => {
-      if (err) return resolve([]);
+      if (err) return resolve({ planRows: [], premiumRows: [] });
     });
 
     db.serialize(() => {
@@ -53,14 +53,28 @@ const getAllocatedBytesFromDb = (dbPath) => {
             AND status IN ('active','grace')
           GROUP BY plan_gb`,
         [],
-        (err, rows) => {
-          try {
-            db.close();
-          } catch (e) {
+        (err, planRows) => {
+          if (err) {
+            try { db.close(); } catch (e) {}
+            return resolve({ planRows: [], premiumRows: [] });
           }
-          if (err) return resolve([]);
-          const list = Array.isArray(rows) ? rows : [];
-          return resolve(list);
+          // Also sum premium_gb allocations (permanent, not tied to subscription status)
+          db.all(
+            `SELECT premium_gb, COUNT(*) AS cnt
+               FROM user_plans
+              WHERE premium_gb IS NOT NULL AND premium_gb > 0
+                AND (deleted_at IS NULL OR deleted_at = 0)
+              GROUP BY premium_gb`,
+            [],
+            (err2, premiumRows) => {
+              try { db.close(); } catch (e) {}
+              if (err2) return resolve({ planRows: Array.isArray(planRows) ? planRows : [], premiumRows: [] });
+              return resolve({
+                planRows: Array.isArray(planRows) ? planRows : [],
+                premiumRows: Array.isArray(premiumRows) ? premiumRows : [],
+              });
+            }
+          );
         }
       );
     });
@@ -116,8 +130,8 @@ const main = async () => {
   const freeBytes = getDfAvailBytes(CAPACITY_CHECK_DIR);
   const totalBytes = getDfTotalBytes(CAPACITY_CHECK_DIR);
 
-  const planRows = await getAllocatedBytesFromDb(DB_PATH);
-  const allocatedBytes = (Array.isArray(planRows) ? planRows : []).reduce((sum, r) => {
+  const { planRows, premiumRows } = await getAllocatedBytesFromDb(DB_PATH);
+  const planAllocatedBytes = (Array.isArray(planRows) ? planRows : []).reduce((sum, r) => {
     const gb = r && r.plan_gb !== undefined && r.plan_gb !== null ? Number(r.plan_gb) : 0;
     const cnt = r && r.cnt !== undefined && r.cnt !== null ? Number(r.cnt) : 0;
     if (!Number.isFinite(gb) || gb <= 0) return sum;
@@ -130,6 +144,20 @@ const main = async () => {
     });
     return sum + (required * cnt);
   }, 0);
+  const premiumAllocatedBytes = (Array.isArray(premiumRows) ? premiumRows : []).reduce((sum, r) => {
+    const gb = r && r.premium_gb !== undefined && r.premium_gb !== null ? Number(r.premium_gb) : 0;
+    const cnt = r && r.cnt !== undefined && r.cnt !== null ? Number(r.cnt) : 0;
+    if (!Number.isFinite(gb) || gb <= 0) return sum;
+    if (!Number.isFinite(cnt) || cnt <= 0) return sum;
+    const required = computeRequiredBytesForTier({
+      tierGb: gb,
+      reservePct: RESERVE_PCT,
+      reserveMinBytes: RESERVE_MIN_BYTES,
+      reserveMaxBytes: RESERVE_MAX_BYTES,
+    });
+    return sum + (required * cnt);
+  }, 0);
+  const allocatedBytes = planAllocatedBytes + premiumAllocatedBytes;
 
   let canCreate = computeCanCreate({
     freeBytes,
