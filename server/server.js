@@ -307,6 +307,7 @@ const CAPACITY_JSON_PATH = process.env.CAPACITY_JSON_PATH || path.join(AUX_ROOT,
 const SUBSCRIPTION_GRACE_DAYS = Number.parseInt(process.env.SUBSCRIPTION_GRACE_DAYS || '3', 10);
 const TRIAL_DAYS = Number.parseInt(process.env.TRIAL_DAYS || '7', 10);
 const TRIAL_COMPLIMENTARY_DAYS = Number.parseInt(process.env.TRIAL_COMPLIMENTARY_DAYS || '3', 10);
+const COMPLIMENTARY_PURGE_INTERVAL_MS = Number.parseInt(process.env.COMPLIMENTARY_PURGE_INTERVAL_MS || String(6 * 60 * 60 * 1000), 10);
 const REVENUECAT_WEBHOOK_SECRET = process.env.REVENUECAT_WEBHOOK_SECRET || '';
 const USER_QUOTA_MARGIN_BYTES = Number.parseInt(process.env.USER_QUOTA_MARGIN_BYTES || String(50 * 1024 * 1024), 10);
 const ENABLE_CLOUD_UPLOAD_LOCK = String(process.env.ENABLE_CLOUD_UPLOAD_LOCK || 'true').toLowerCase() !== 'false';
@@ -562,7 +563,7 @@ tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowr
 </div>
 
 <script>
-var allUsers=[];var filteredUsers=[];var sortCol='id';var sortDir='desc';var activeFilter='all';var serverTime='';
+var allUsers=[];var filteredUsers=[];var sortCol='id';var sortDir='desc';var activeFilter='all';var serverTime='';var adminStats={photolynk_nfts_minted:0,photolynk_paid_nfts_minted:0,photolynk_free_premium_nfts_minted:0,photolynk_premium_users:0};
 
 function fmtDate(iso){if(!iso)return'<span class="date-cell">-</span>';var d=new Date(iso);var now=new Date();var diff=d-now;var s=d.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'2-digit'})+' '+d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});if(diff<0&&diff>-86400000*3)s='<span style="color:var(--warn)">'+s+'</span>';else if(diff<0)s='<span style="color:var(--danger)">'+s+'</span>';return'<span class="date-cell">'+s+'</span>'}
 
@@ -587,7 +588,8 @@ async function loadUsers(){
     var r=await fetch('/admin/api/users');var d=await r.json();
     if(!r.ok)throw new Error(d.error||'Failed');
     serverTime=d.server_time||'';
-    allUsers=d.users.map(function(u){return{id:u.id,email:u.email||'',user_uuid:u.user_uuid||'',device_uuids:u.device_uuids||'',last_login:u.last_login||0,last_login_date:u.last_login_date,storage_used:u.storage_used_bytes||0,storage_quota:u.storage_quota_bytes||0,file_count:u.file_count||0,plan_gb:u.plan.plan_gb||0,premium_gb:u.plan.premium_gb||0,status:u.plan.effective_status||u.plan.status||'none',trial_until:u.plan.trial_until,trial_until_date:u.plan.trial_until_date,expires_at:u.plan.expires_at,expires_at_date:u.plan.expires_at_date,grace_until:u.plan.grace_until,created_at:u.user_created_at,created_at_date:u.user_created_at_date,payment_type:u.plan.payment_type||'',payment_at:u.plan.payment_at,payment_at_date:u.plan.payment_at_date,updated_at:u.plan.updated_at,updated_at_date:u.plan.updated_at_date,nft_is_premium:u.nft.is_premium,nft_mints:u.nft.mint_count||0,nft_free_remaining:u.nft.free_mints_remaining||0,nft_balance:u.nft.balance_usd||0,nft_total_paid:u.nft.total_paid_usd||0,nft_total_purchased:u.nft.total_purchased_usd||0,nft_total_spent:u.nft.total_spent_usd||0,nft_payments:u.nft.payments||[],sol_payments:u.solana.payments||[],sol_total_paid:u.solana.total_paid_sol||0,total_paid:(u.nft.total_paid_usd||0)+(u.solana.total_paid_sol||0)*100}});
+    adminStats=d.admin_stats||adminStats;
+    allUsers=d.users.map(function(u){return{id:u.id,email:u.email||'',user_uuid:u.user_uuid||'',device_uuids:u.device_uuids||'',last_login:u.last_login||0,last_login_date:u.last_login_date,storage_used:u.storage_used_bytes||0,storage_quota:u.storage_quota_bytes||0,file_count:u.file_count||0,plan_gb:u.plan.plan_gb||0,premium_gb:u.plan.premium_gb||0,status:u.plan.effective_status||u.plan.status||'none',trial_until:u.plan.trial_until,trial_until_date:u.plan.trial_until_date,expires_at:u.plan.expires_at,expires_at_date:u.plan.expires_at_date,grace_until:u.plan.grace_until,created_at:u.user_created_at,created_at_date:u.user_created_at_date,payment_type:u.plan.payment_type||'',payment_at:u.plan.payment_at,payment_at_date:u.plan.payment_at_date,updated_at:u.plan.updated_at,updated_at_date:u.plan.updated_at_date,nft_is_premium:u.nft.is_premium,nft_mints:u.nft.mint_count||0,nft_paid_mints:u.nft.paid_mint_count||0,nft_free_premium_mints:u.nft.free_premium_mint_count||0,nft_premium_total_mints:u.nft.premium_mint_count||0,nft_free_remaining:u.nft.free_mints_remaining||0,nft_balance:u.nft.balance_usd||0,nft_total_paid:u.nft.total_paid_usd||0,nft_total_purchased:u.nft.total_purchased_usd||0,nft_total_spent:u.nft.total_spent_usd||0,nft_payments:u.nft.payments||[],sol_payments:u.solana.payments||[],sol_total_paid:u.solana.total_paid_sol||0,total_paid:(u.nft.total_paid_usd||0)+(u.solana.total_paid_sol||0)*100}});
     updateStats();buildFilters();applyFilters();
     document.getElementById('loading').style.display='none';
     document.getElementById('users-table').style.display='';
@@ -603,7 +605,7 @@ function updateStats(){
   var totalRev=allUsers.reduce(function(s,u){return s+(u.nft_total_paid||0)},0);
   var recentLogin=allUsers.filter(function(u){return u.last_login&&(Date.now()-u.last_login)<86400000*7}).length;
   var st=serverTime?'<span>Server: <b>'+new Date(serverTime).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+'</b></span>':'';
-  document.getElementById('header-stats').innerHTML=st+'<span>Total: <b>'+total+'</b></span><span>Active: <b>'+active+'</b></span><span>Trial: <b>'+trial+'</b></span><span>Paying: <b>'+paying+'</b></span><span>Premium: <b>'+premium+'</b></span><span>7d Active: <b>'+recentLogin+'</b></span><span>Revenue: <b>$'+totalRev.toFixed(2)+'</b></span>';
+  document.getElementById('header-stats').innerHTML=st+'<span>Total: <b>'+total+'</b></span><span>Active: <b>'+active+'</b></span><span>Trial: <b>'+trial+'</b></span><span>Paying: <b>'+paying+'</b></span><span>Premium: <b>'+premium+'</b></span><span>PhotoLynk NFTs: <b>'+(adminStats.photolynk_nfts_minted||0)+'</b></span><span>7d Active: <b>'+recentLogin+'</b></span><span>Revenue: <b>$'+totalRev.toFixed(2)+'</b></span>';
 }
 
 function buildFilters(){
@@ -938,6 +940,8 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
         let nftPremiumByUser = {};
         let nftBalanceByUser = {};
         let solanaPaymentsByUser = {};
+        let nftMintStatsByUser = {};
+        let nftAdminStats = null;
         try {
             const nftService = require('../nft-service');
             nftService.balance.init();
@@ -947,10 +951,16 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 if (!nftPaymentsByUser[p.user_id]) nftPaymentsByUser[p.user_id] = [];
                 nftPaymentsByUser[p.user_id].push(p);
             }
+            try {
+                nftAdminStats = nftService.balance.getAdminStats();
+            } catch (_) {}
             // Get premium + balance for each user
             for (const u of users) {
                 try {
                     nftPremiumByUser[u.id] = nftService.balance.getPremiumStatus(u.id);
+                } catch (_) {}
+                try {
+                    nftMintStatsByUser[u.id] = nftService.balance.getUserMintStats(u.id);
                 } catch (_) {}
                 try {
                     nftBalanceByUser[u.id] = nftService.balance.getBalance(u.id);
@@ -999,6 +1009,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
         const formattedUsers = users.map(user => {
             const nftPayments = nftPaymentsByUser[user.id] || [];
             const premium = nftPremiumByUser[user.id] || {};
+            const nftMintStats = nftMintStatsByUser[user.id] || {};
             const balance = nftBalanceByUser[user.id] || {};
             const solPayments = solanaPaymentsByUser[user.id] || [];
             const totalNftPaid = nftPayments.reduce((s, p) => s + (p.amount_usd || 0), 0);
@@ -1041,11 +1052,14 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 },
                 nft: {
                     is_premium: !!(premium.isPremium),
-                    mint_count: premium.mintCount || 0,
+                    mint_count: nftMintStats.totalMintCount || 0,
+                    paid_mint_count: nftMintStats.paidMintCount || 0,
+                    free_premium_mint_count: nftMintStats.freePremiumMintCount || 0,
+                    premium_mint_count: nftMintStats.premiumMintCount || 0,
                     free_mints_remaining: premium.freeMintsRemaining || 0,
-                    balance_usd: balance.balance_usd || 0,
-                    total_purchased_usd: balance.total_purchased_usd || 0,
-                    total_spent_usd: balance.total_spent_usd || 0,
+                    balance_usd: balance.balanceUsd || 0,
+                    total_purchased_usd: balance.totalPurchased || 0,
+                    total_spent_usd: balance.totalSpent || 0,
                     payments: nftPayments.map(p => ({ type: p.payment_type, amount: p.amount_usd, platform: p.platform, date: p.created_at })),
                     total_paid_usd: totalNftPaid,
                 },
@@ -1059,6 +1073,12 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
         return res.json({
             total_users: formattedUsers.length,
             server_time: new Date().toISOString(),
+            admin_stats: {
+                photolynk_nfts_minted: Number(nftAdminStats?.totalMintCount || 0),
+                photolynk_paid_nfts_minted: Number(nftAdminStats?.paidMintCount || 0),
+                photolynk_free_premium_nfts_minted: Number(nftAdminStats?.freePremiumMintCount || 0),
+                photolynk_premium_users: Number(nftAdminStats?.premiumUserCount || 0),
+            },
             users: formattedUsers,
         });
     } catch (e) {
@@ -1075,98 +1095,20 @@ app.post('/admin/api/user/delete', adminAuth, async (req, res) => {
         if (!userId || typeof userId !== 'number') {
             return res.status(400).json({ error: 'userId (number) required' });
         }
-
-        // Get user info first
-        const user = await dbGetAsync(`SELECT * FROM users WHERE id = ?`, [userId]);
-        if (!user) {
+        const existing = await dbGetAsync(`SELECT id FROM users WHERE id = ?`, [userId]);
+        if (!existing) {
             return res.status(404).json({ error: 'User not found' });
         }
 
-        // Get all devices for this user
-        const devices = await dbAllAsync(`SELECT * FROM devices WHERE user_id = ?`, [userId]);
-        
-        // Get user key for file deletion
-        const userKey = user.user_uuid || String(userId);
-        
-        const deletedItems = {
-            user: user.email || user.user_uuid,
-            userId: userId,
-            devices: devices.length,
-            filesDeleted: false,
-            directories: []
-        };
-
-        // Delete files from disk if requested
-        if (deleteFiles) {
-            const dirsToDelete = new Set();
-            
-            // Collect all possible user keys (old uuid folders + new numeric id folders)
-            const possibleKeys = new Set();
-            possibleKeys.add(String(userId)); // numeric user id
-            if (user.user_uuid) possibleKeys.add(user.user_uuid); // user_uuid
-            
-            // Also add device UUIDs as they may have been used as folder keys
-            for (const device of devices) {
-                if (device.device_uuid) {
-                    possibleKeys.add(device.device_uuid);
-                }
-            }
-            
-            // Check all possible keys in CLOUD_DIR/users/
-            for (const key of possibleKeys) {
-                const cloudDir = path.join(CLOUD_DIR, 'users', key);
-                if (fs.existsSync(cloudDir)) {
-                    dirsToDelete.add(cloudDir);
-                }
-            }
-            
-            // Check all possible keys in CHUNKS_DIR/users/ (if separate)
-            if (CHUNKS_DIR) {
-                for (const key of possibleKeys) {
-                    const chunksDir = path.join(CHUNKS_DIR, 'users', key);
-                    if (fs.existsSync(chunksDir)) {
-                        dirsToDelete.add(chunksDir);
-                    }
-                }
-            }
-            
-            // Device upload directories in UPLOAD_DIR
-            for (const device of devices) {
-                if (device.device_uuid) {
-                    const deviceDir = path.join(UPLOAD_DIR, device.device_uuid);
-                    if (fs.existsSync(deviceDir)) {
-                        dirsToDelete.add(deviceDir);
-                    }
-                }
-            }
-            
-            // Delete all found directories
-            for (const dir of dirsToDelete) {
-                try {
-                    fs.rmSync(dir, { recursive: true, force: true });
-                    deletedItems.directories.push(dir);
-                    console.log(`[Admin Delete] Removed directory: ${dir}`);
-                } catch (e) {
-                    console.error(`[Admin Delete] Failed to remove ${dir}:`, e.message);
-                }
-            }
-            
-            deletedItems.filesDeleted = dirsToDelete.size > 0;
-            deletedItems.keysChecked = Array.from(possibleKeys);
-        }
-
-        // Delete from database (order matters due to foreign keys)
-        await dbRunAsync(`DELETE FROM cloud_chunks WHERE user_id = ?`, [userId]);
-        await dbRunAsync(`DELETE FROM user_plans WHERE user_id = ?`, [userId]);
-        await dbRunAsync(`DELETE FROM devices WHERE user_id = ?`, [userId]);
-        await dbRunAsync(`DELETE FROM users WHERE id = ?`, [userId]);
-
-        console.log(`[Admin Delete] User ${userId} (${user.email || user.user_uuid}) deleted completely`);
+        const result = await purgeUserEverywhere(userId, {
+            deleteFiles: !!deleteFiles,
+            reason: 'admin_delete',
+        });
         
         return res.json({ 
             ok: true, 
             message: `User ${userId} deleted successfully`,
-            deleted: deletedItems
+            deleted: result.deleted
         });
     } catch (e) {
         console.error('[Admin] delete user error', e);
@@ -1312,6 +1254,20 @@ const dbAllAsync = (sql, params) => new Promise((resolve, reject) => {
         resolve(Array.isArray(rows) ? rows : []);
     });
 });
+
+const dbTableExists = async (tableName) => {
+    const row = await dbGetAsync(
+        `SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?`,
+        [tableName]
+    );
+    return !!row;
+};
+
+const safeDeleteFromTable = async (tableName, whereClause, params) => {
+    if (!(await dbTableExists(tableName))) return 0;
+    const result = await dbRunAsync(`DELETE FROM ${tableName} WHERE ${whereClause}`, params);
+    return result.changes || 0;
+};
 
 const getUserDeviceUuids = async (user) => {
     const current = (user && (user.device_uuid || user.deviceUuid)) ? String(user.device_uuid || user.deviceUuid) : '';
@@ -2108,6 +2064,20 @@ db.serialize(() => {
             }
         });
     }, 1000); // Wait 1 second after startup
+
+    setTimeout(() => {
+        purgeExpiredComplimentaryUsers().catch((e) => {
+            console.error('[ComplimentaryCleanup] Startup purge failed:', e.message);
+        });
+    }, 1500);
+
+    if (COMPLIMENTARY_PURGE_INTERVAL_MS > 0) {
+        setInterval(() => {
+            purgeExpiredComplimentaryUsers().catch((e) => {
+                console.error('[ComplimentaryCleanup] Scheduled purge failed:', e.message);
+            });
+        }, COMPLIMENTARY_PURGE_INTERVAL_MS);
+    }
 });
 
 // Middleware: Verify Token & Device Binding
@@ -2215,6 +2185,183 @@ const getStealthCloudAllPossibleUserKeys = (user) => {
     }
 
     return Array.from(keys);
+};
+
+const getWalletTransferInboxDir = (walletAddress) => {
+    const raw = String(walletAddress || '').trim();
+    if (!raw) return null;
+    const walletHash = crypto.createHash('sha256').update(raw).digest('hex').slice(0, 16);
+    return path.join(NFT_DIR, `_transfer_inbox_${walletHash}`);
+};
+
+const clearStealthCloudDedupCachesForKeys = (keys) => {
+    if (!Array.isArray(keys) || keys.length === 0) return;
+    for (const key of keys) {
+        if (!key) continue;
+        try {
+            serverDedupCache.delete(path.join(CLOUD_DIR, 'users', key, 'manifests'));
+        } catch (_) {}
+    }
+};
+
+const purgeUserEverywhere = async (userId, options = {}) => {
+    const { deleteFiles = true, reason = 'manual' } = options || {};
+    const uid = Number(userId);
+    if (!Number.isFinite(uid) || uid <= 0) {
+        throw new Error('Invalid userId');
+    }
+
+    const user = await dbGetAsync(`SELECT * FROM users WHERE id = ?`, [uid]);
+    if (!user) {
+        return { ok: true, userId: uid, alreadyDeleted: true, reason };
+    }
+
+    const devices = await dbAllAsync(`SELECT * FROM devices WHERE user_id = ?`, [uid]);
+    const possibleKeys = new Set(getStealthCloudAllPossibleUserKeys(user));
+    possibleKeys.add(String(uid));
+    for (const device of devices) {
+        if (device && device.device_uuid) {
+            const safe = sanitizeUserKey(device.device_uuid);
+            if (safe) possibleKeys.add(safe);
+        }
+    }
+
+    const deleted = {
+        reason,
+        user: user.email || user.user_uuid || String(uid),
+        userId: uid,
+        devices: devices.length,
+        filesDeleted: false,
+        directories: [],
+        keysChecked: Array.from(possibleKeys),
+        db: {
+            cloud_chunks: 0,
+            cloud_device_state: 0,
+            files: 0,
+            platform_hashes: 0,
+            linked_devices: 0,
+            solana_payments: 0,
+            user_plans: 0,
+            devices: 0,
+            users: 0,
+        },
+        nftDb: null,
+    };
+
+    if (deleteFiles) {
+        const dirsToDelete = new Set();
+
+        for (const key of possibleKeys) {
+            if (!key) continue;
+            const cloudDir = path.join(CLOUD_DIR, 'users', key);
+            if (fs.existsSync(cloudDir)) dirsToDelete.add(cloudDir);
+            if (CHUNKS_DIR) {
+                const chunksDir = path.join(CHUNKS_DIR, 'users', key);
+                if (fs.existsSync(chunksDir)) dirsToDelete.add(chunksDir);
+            }
+            const nftDir = path.join(NFT_DIR, key);
+            if (fs.existsSync(nftDir)) dirsToDelete.add(nftDir);
+        }
+
+        for (const device of devices) {
+            if (!device || !device.device_uuid) continue;
+            const deviceDir = path.join(UPLOAD_DIR, device.device_uuid);
+            if (fs.existsSync(deviceDir)) dirsToDelete.add(deviceDir);
+        }
+
+        const walletInboxDir = getWalletTransferInboxDir(user.wallet_address);
+        if (walletInboxDir && fs.existsSync(walletInboxDir)) {
+            dirsToDelete.add(walletInboxDir);
+        }
+
+        clearStealthCloudDedupCachesForKeys(Array.from(possibleKeys));
+
+        for (const dir of dirsToDelete) {
+            try {
+                fs.rmSync(dir, { recursive: true, force: true });
+                deleted.directories.push(dir);
+            } catch (e) {
+                console.error(`[UserPurge] Failed to remove ${dir}:`, e.message);
+            }
+        }
+
+        deleted.filesDeleted = deleted.directories.length > 0;
+    }
+
+    try {
+        const nftService = require('../nft-service');
+        if (nftService?.balance?.deleteUserData) {
+            deleted.nftDb = nftService.balance.deleteUserData(uid);
+        }
+    } catch (e) {
+        console.warn('[UserPurge] NFT DB cleanup skipped:', e.message);
+    }
+
+    deleted.db.cloud_chunks = await safeDeleteFromTable('cloud_chunks', 'user_id = ?', [uid]);
+    deleted.db.cloud_device_state = await safeDeleteFromTable('cloud_device_state', 'user_id = ?', [uid]);
+    deleted.db.files = await safeDeleteFromTable('files', 'user_id = ?', [uid]);
+    deleted.db.platform_hashes = await safeDeleteFromTable('platform_hashes', 'user_id = ?', [uid]);
+    deleted.db.solana_payments = await safeDeleteFromTable('solana_payments', 'user_id = ?', [uid]);
+
+    const deviceUuids = devices.map(d => d && d.device_uuid ? String(d.device_uuid) : '').filter(Boolean);
+    let linkedDeleted = 0;
+    for (const deviceUuid of deviceUuids) {
+        linkedDeleted += await safeDeleteFromTable(
+            'linked_devices',
+            'device_uuid_a = ? OR device_uuid_b = ?',
+            [deviceUuid, deviceUuid]
+        );
+    }
+    deleted.db.linked_devices = linkedDeleted;
+
+    deleted.db.user_plans = await safeDeleteFromTable('user_plans', 'user_id = ?', [uid]);
+    deleted.db.devices = await safeDeleteFromTable('devices', 'user_id = ?', [uid]);
+    deleted.db.users = await safeDeleteFromTable('users', 'id = ?', [uid]);
+
+    console.log(`[UserPurge] Completed user=${uid} reason=${reason} files=${deleteFiles ? 'yes' : 'no'}`);
+    return { ok: true, deleted };
+};
+
+const purgeExpiredComplimentaryUsers = async () => {
+    const complimentaryMs = Math.max(0, TRIAL_COMPLIMENTARY_DAYS) * 24 * 60 * 60 * 1000;
+    if (complimentaryMs <= 0) return { scanned: 0, purged: 0 };
+
+    const now = Date.now();
+    const expiredUsers = await dbAllAsync(
+        `SELECT u.id
+           FROM users u
+           JOIN user_plans p ON p.user_id = u.id
+          WHERE p.trial_until IS NOT NULL
+            AND p.trial_until > 0
+            AND (p.premium_gb IS NULL OR p.premium_gb <= 0)
+            AND (
+                p.status = 'trial_complimentary_expired'
+                OR (
+                    p.status = 'trial'
+                    AND (p.trial_until + ?) < ?
+                )
+            )`,
+        [complimentaryMs, now]
+    );
+
+    let purged = 0;
+    for (const row of expiredUsers) {
+        try {
+            const result = await purgeUserEverywhere(row.id, {
+                deleteFiles: true,
+                reason: 'expired_complimentary',
+            });
+            if (!result.alreadyDeleted) purged++;
+        } catch (e) {
+            console.error(`[ComplimentaryCleanup] Failed for user ${row.id}:`, e.message);
+        }
+    }
+
+    if (purged > 0) {
+        console.log(`[ComplimentaryCleanup] Purged ${purged} expired complimentary user(s)`);
+    }
+
+    return { scanned: expiredUsers.length, purged };
 };
 
 const getStealthCloudStorageKey = (user) => {

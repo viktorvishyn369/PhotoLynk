@@ -502,7 +502,7 @@ PhotoLynk offers two optional in-app purchases to unlock additional features:
 - Full access across all platforms and devices linked to your account
 - One-time payment — no recurring charges, no auto-renewal
 
-All purchases are processed through the respective platform's payment system (Apple App Store or Google Play Store). PhotoLynk does not directly handle payment card information. Both purchases are final and non-refundable except as required by applicable law.
+All purchases are processed through the respective platform's payment system (Apple App Store or Google Play Store). Listed prices are base prices; Apple or Google may automatically add applicable taxes, fees, or regional price adjustments at checkout for one-time purchases and subscriptions. PhotoLynk does not directly handle payment card information. Both purchases are final and non-refundable except as required by applicable law.
 
 ### Build Requirements (for building from source)
 - Node.js 20 LTS
