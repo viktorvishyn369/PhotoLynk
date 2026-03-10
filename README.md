@@ -17,14 +17,16 @@ Back up photos/videos to your own server or StealthCloud, and restore on any pho
 |----------|--------|----------------|
 | **iOS** | ✅ Live on App Store | In-App Purchase |
 | **Android** | ✅ Live on Google Play | In-App Purchase |
+| **Solana Mobile** | ✅ Live | Solana Wallet / On-Chain Payments |
 
 The PhotoLynk mobile apps feature end-to-end encryption, self-hosted or cloud backup options, and seamless cross-platform restore.
 
-**iOS and Android are live on App Store and Google Play.**
+**iOS, Android, and Solana Mobile are live.**
 
 Store links:
 - iOS (App Store): [Download PhotoLynk](https://apps.apple.com/app/id6748285696)
 - Android (Google Play): [Download PhotoLynk](https://play.google.com/store/apps/details?id=com.photosync.app)
+- Solana Mobile: available in the Solana Mobile app ecosystem
 
 ---
 
@@ -440,23 +442,41 @@ EXIF extraction is format-dependent:
 
 #### 3. EXIF Write-Back on Sync/Restore
 
-PhotoLynk does **not** promise universal metadata write-back for every format. Backup remains byte-exact even when write-back is unavailable.
+PhotoLynk preserves full original files on backup. On sync/restore, metadata write-back support depends on the platform writer used for that target device:
+
+- Android uses native `ExifInterface`
+- iOS uses native `CGImageSource` / `CGImageDestination`
+- Desktop uses bundled `exiftool-vendored` first, with `sharp` only as a limited fallback if `exiftool` is unavailable
+
+In all cases, PhotoLynk avoids rewriting files that already contain embedded metadata. If metadata is already present in the restored original, the app keeps the original bytes and skips write-back.
 
 | Format | Android | iOS | Desktop |
 |--------|:-------:|:---:|:-------:|
 | JPEG/JPG | ✅ | ✅ | ✅ |
 | PNG | ✅ | ✅ | ✅ |
 | WebP | ✅ | ✅ | ✅ |
-| HEIC/HEIF | ❌ | ✅ | ⚠️ |
-| TIFF/TIF | ❌ | ✅ | ✅ |
-| GIF | ❌ | ✅ | ❌ |
-| RAW formats | ❌ | ❌ | ⚠️ |
+| HEIC/HEIF | ⚠️ | ✅ | ✅ |
+| TIFF/TIF | ⚠️ | ✅ | ✅ |
+| GIF | ⚠️ | ✅ | ✅ |
+| BMP | ⚠️ | ⚠️ | ✅ |
+| AVIF | ⚠️ | ⚠️ | ✅ |
+| PSD/PSB | ❌ | ❌ | ✅ |
+| EXR/HDR | ❌ | ❌ | ✅ |
+| RAW formats (`.raw`, `.cr2`, `.cr3`, `.nef`, `.arw`, `.dng`, `.orf`, `.rw2`, `.pef`, `.srw`, `.raf`) | ⚠️ | ⚠️ | ✅ |
 
 - ✅ = supported
-- ⚠️ = depends on platform tooling such as `exiftool`
-- ❌ = read-only in practice; metadata may still be preserved separately
+- ⚠️ = format/container support depends on the native platform metadata writer; some files can still round-trip byte-exact without needing write-back
+- ❌ = no implemented writer for that platform path
 
-RAW formats are intentionally conservative. The system can extract metadata from many of them, but write-back is not treated as a universal cross-platform guarantee.
+What is written back also differs by platform:
+
+- Desktop writes the broadest set of fields: core EXIF, GPS, lens, IPTC, and structured XMP via `exiftool-vendored`
+- iOS writes broad EXIF plus GPS and IPTC fields through ImageIO, while preserving the original file type when the platform can rewrite it
+- Android writes the subset supported by `ExifInterface`: core EXIF and a few IPTC-equivalent tags such as caption, copyright, and creator
+
+Desktop support is broader than the mobile table because `exiftool-vendored` is bundled with the app and is used for HEIC/HEIF, TIFF, GIF, AVIF, PSD/PSB, EXR/HDR, and major RAW camera formats in addition to JPEG, PNG, and WebP.
+
+RAW on iOS is preserved in original form in the photo library, but the current iOS restore path does not claim universal native metadata rewrite for every RAW container. RAW on Android likewise depends on what `ExifInterface` can successfully open and save for the specific file.
 
 #### 4. Certify Original
 
