@@ -3572,8 +3572,26 @@ app.get('/api/subscription/status', authenticateToken, async (req, res) => {
             const nftService = require('../nft-service');
             const premiumStatus = nftService.balance.getPremiumStatus(userId);
             if (premiumStatus && premiumStatus.isPremium) {
-                const row = await dbGetAsync(`SELECT premium_gb FROM user_plans WHERE user_id = ?`, [userId]);
-                if (!row || !row.premium_gb || Number(row.premium_gb) < 100) {
+                const row = await dbGetAsync(`SELECT premium_gb, status, expires_at, payment_type FROM user_plans WHERE user_id = ?`, [userId]);
+                const latestSolanaPremium = await dbGetAsync(
+                    `SELECT created_at
+                       FROM solana_payments
+                      WHERE user_id = ? AND duration = 'premium'
+                   ORDER BY created_at DESC
+                      LIMIT 1`,
+                    [userId]
+                );
+                if (latestSolanaPremium && (
+                    !row ||
+                    !row.premium_gb ||
+                    Number(row.premium_gb) < 100 ||
+                    row.status !== 'active' ||
+                    row.payment_type !== 'solana' ||
+                    !Number(row.expires_at)
+                )) {
+                    const healed = await activateSolanaPremiumPlan(userId, Number(latestSolanaPremium.created_at) || Date.now(), { now: Date.now() });
+                    console.log(`[Premium] Self-healed Solana premium plan for user ${userId} (storageAllocated=${healed.storageAllocated})`);
+                } else if (!latestSolanaPremium && (!row || !row.premium_gb || Number(row.premium_gb) < 100)) {
                     await ensurePlanRow(userId);
                     await dbRunAsync(
                         `UPDATE user_plans SET premium_gb = 100, updated_at = ? WHERE user_id = ?`,
@@ -7831,6 +7849,77 @@ try {
     // After nft-service mounts, add a dedicated endpoint for client to confirm premium storage
     // Client calls this right after a successful /api/nft-service/upgrade-premium response
     const PREMIUM_STORAGE_GB = 100;
+    const SOLANA_PREMIUM_DURATION_MS = 4 * 365 * 24 * 60 * 60 * 1000;
+    const ensurePremiumStorageCapacity = async (userId, now) => {
+        await ensurePlanRow(userId);
+        const existingRow = await dbGetAsync(`SELECT premium_gb FROM user_plans WHERE user_id = ?`, [userId]);
+        const alreadyAllocated = existingRow && Number(existingRow.premium_gb) > 0;
+        if (alreadyAllocated) return { premiumGb: PREMIUM_STORAGE_GB, allocated: true };
+
+        const GB = 1000 * 1000 * 1000;
+        const SAFETY_BYTES = 20 * GB;
+        const capacity = readCapacityJson();
+        const totalServerBytes = capacity && typeof capacity.totalBytes === 'number' && Number.isFinite(capacity.totalBytes) ? capacity.totalBytes : null;
+
+        if (totalServerBytes !== null) {
+            const allocRow = await dbGetAsync(
+                `SELECT COALESCE(SUM(CASE WHEN plan_gb IS NOT NULL AND plan_gb > 0 AND (deleted_at IS NULL OR deleted_at = 0) AND status IN ('active','grace') THEN plan_gb ELSE 0 END), 0) AS totalPlanGb,
+                        COALESCE(SUM(CASE WHEN premium_gb IS NOT NULL AND premium_gb > 0 AND (deleted_at IS NULL OR deleted_at = 0) THEN premium_gb ELSE 0 END), 0) AS totalPremiumGb
+                   FROM user_plans`
+            );
+            const totalPlanGb = allocRow ? Number(allocRow.totalPlanGb) : 0;
+            const totalPremiumGb = allocRow ? Number(allocRow.totalPremiumGb) : 0;
+            const currentAllocatedBytes = (totalPlanGb + totalPremiumGb) * GB;
+            const newAllocationBytes = PREMIUM_STORAGE_GB * GB;
+            const availableBytes = totalServerBytes - currentAllocatedBytes - SAFETY_BYTES;
+
+            if (newAllocationBytes > availableBytes) {
+                return {
+                    premiumGb: 0,
+                    allocated: false,
+                    capacityExceeded: true,
+                    requiredBytes: newAllocationBytes,
+                    availableBytes: Math.max(0, availableBytes),
+                };
+            }
+        }
+
+        await dbRunAsync(
+            `UPDATE user_plans SET premium_gb = ?, updated_at = ? WHERE user_id = ?`,
+            [PREMIUM_STORAGE_GB, now, userId]
+        );
+        return { premiumGb: PREMIUM_STORAGE_GB, allocated: true };
+    };
+    const activateSolanaPremiumPlan = async (userId, purchaseTimestamp, options = {}) => {
+        const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
+        const purchasedAt = Number.isFinite(Number(purchaseTimestamp)) && Number(purchaseTimestamp) > 0 ? Number(purchaseTimestamp) : now;
+        const targetExpiresAt = purchasedAt + SOLANA_PREMIUM_DURATION_MS;
+
+        const storageResult = await ensurePremiumStorageCapacity(userId, now);
+        await ensurePlanRow(userId);
+
+        await dbRunAsync(
+            `UPDATE user_plans
+                SET status = ?,
+                    expires_at = ?,
+                    payment_type = ?,
+                    payment_at = ?,
+                    grace_until = NULL,
+                    deleted_at = NULL,
+                    updated_at = ?
+              WHERE user_id = ?`,
+            ['active', targetExpiresAt, 'solana', purchasedAt, now, userId]
+        );
+
+        return {
+            premiumGb: storageResult.allocated ? PREMIUM_STORAGE_GB : 0,
+            expiresAt: targetExpiresAt,
+            storageAllocated: !!storageResult.allocated,
+            capacityExceeded: !!storageResult.capacityExceeded,
+            requiredBytes: storageResult.requiredBytes || null,
+            availableBytes: storageResult.availableBytes || null,
+        };
+    };
     app.post('/api/premium/activate-storage', authenticateToken, async (req, res) => {
         try {
             const userId = req.user.id;
@@ -7956,47 +8045,9 @@ try {
                 nftService.balance.recordPayment(user.id, 'premium_49', 49.99, txSignature, 'solana');
             }
 
-            // Activate 100GB permanent storage in main server DB (same as /api/premium/activate-storage)
-            await ensurePlanRow(user.id);
-
-            // Capacity check before allocating
-            const existingRow = await dbGetAsync(`SELECT premium_gb FROM user_plans WHERE user_id = ?`, [user.id]);
-            const alreadyAllocated = existingRow && Number(existingRow.premium_gb) > 0;
-
-            if (!alreadyAllocated) {
-                const GB = 1000 * 1000 * 1000;
-                const SAFETY_BYTES = 20 * GB;
-                const capacity = readCapacityJson();
-                const totalServerBytes = capacity && typeof capacity.totalBytes === 'number' && Number.isFinite(capacity.totalBytes) ? capacity.totalBytes : null;
-
-                if (totalServerBytes !== null) {
-                    const allocRow = await dbGetAsync(
-                        `SELECT COALESCE(SUM(CASE WHEN plan_gb IS NOT NULL AND plan_gb > 0 AND (deleted_at IS NULL OR deleted_at = 0) AND status IN ('active','grace') THEN plan_gb ELSE 0 END), 0) AS totalPlanGb,
-                                COALESCE(SUM(CASE WHEN premium_gb IS NOT NULL AND premium_gb > 0 AND (deleted_at IS NULL OR deleted_at = 0) THEN premium_gb ELSE 0 END), 0) AS totalPremiumGb
-                           FROM user_plans`
-                    );
-                    const totalPlanGb = allocRow ? Number(allocRow.totalPlanGb) : 0;
-                    const totalPremiumGb = allocRow ? Number(allocRow.totalPremiumGb) : 0;
-                    const currentAllocatedBytes = (totalPlanGb + totalPremiumGb) * GB;
-                    const newAllocationBytes = PREMIUM_STORAGE_GB * GB;
-                    const availableBytes = totalServerBytes - currentAllocatedBytes - SAFETY_BYTES;
-
-                    if (newAllocationBytes > availableBytes) {
-                        // Payment succeeded but no capacity — still mark premium but warn
-                        console.log(`[Solana Premium] Capacity check failed but payment already accepted. User ${user.id} will get premium without storage allocation.`);
-                    } else {
-                        await dbRunAsync(
-                            `UPDATE user_plans SET premium_gb = ?, updated_at = ? WHERE user_id = ?`,
-                            [PREMIUM_STORAGE_GB, now, user.id]
-                        );
-                    }
-                } else {
-                    // No capacity data — allocate anyway
-                    await dbRunAsync(
-                        `UPDATE user_plans SET premium_gb = ?, updated_at = ? WHERE user_id = ?`,
-                        [PREMIUM_STORAGE_GB, now, user.id]
-                    );
-                }
+            const planActivation = await activateSolanaPremiumPlan(user.id, now, { now });
+            if (planActivation.capacityExceeded) {
+                console.log(`[Solana Premium] Capacity check failed but payment already accepted. User ${user.id} will get premium entitlement without storage allocation.`);
             }
 
             console.log(`[Solana Premium] Payment verified: ${txSignature} - User ${user.email}`);
@@ -8007,7 +8058,8 @@ try {
                 isPremium: premiumResult.isPremium,
                 cloudQuotaBytes: premiumResult.cloudQuotaBytes,
                 balanceUsd: bal.balanceUsd,
-                premiumGb: PREMIUM_STORAGE_GB,
+                premiumGb: planActivation.premiumGb,
+                expiresAt: new Date(planActivation.expiresAt).toISOString(),
                 subscription: st,
             });
         } catch (e) {
