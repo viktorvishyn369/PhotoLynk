@@ -386,68 +386,61 @@ Deletion behavior:
 
 ### Supported File Formats
 
-PhotoLynk supports a comprehensive range of image and video formats across all platforms and features. Files are always stored and transferred as **original bytes** — no re-encoding, no quality loss.
+PhotoLynk handles file formats in three distinct ways:
 
-#### Photos — Backup, Sync & Restore
+- **Backup, sync, and restore** store the original file bytes and return the same bytes on restore.
+- **Metadata preservation** depends on whether the platform can read or write EXIF for that format.
+- **Certify Original** supports a narrower set of image formats that the certification pipeline can hash and package consistently.
 
-All photo formats below are fully supported for backup, sync, and restore across all platforms. Files are encrypted chunk-by-chunk and reassembled byte-exact on restore.
+This section reflects the formats actually handled by the current server, desktop, and certification code paths.
 
-| Category | Formats |
-|----------|---------|
-| **Standard** | JPEG/JPG, PNG, GIF, BMP, WebP, TIFF/TIF, AVIF |
-| **Apple** | HEIC, HEIF (iOS native, Android 10+) |
-| **Canon** | CR2, CR3, CRW |
-| **Nikon** | NEF, NRW |
-| **Sony** | ARW, SR2 |
-| **Fujifilm** | RAF |
-| **Olympus** | ORF |
-| **Panasonic** | RW2 |
-| **Pentax** | PEF |
-| **Samsung** | SRW |
-| **Adobe** | DNG |
-| **Other RAW** | 3FR (Hasselblad), FFF (Hasselblad), IIQ (Phase One), ERF (Epson), RWL (Leica), KDC (Kodak), DCR (Kodak), MRW (Minolta), X3F (Sigma), MEF (Mamiya), MOS (Leaf), GPR (GoPro) |
+#### 1. Backup, Sync & Restore
 
-#### Videos — Backup, Sync & Restore
+For backup and StealthCloud sync, PhotoLynk preserves the original file bytes. No re-encoding or quality reduction is required for normal backup/restore flows.
 
-| Category | Formats |
-|----------|---------|
-| **Standard** | MP4, MOV, M4V, 3GP, AVI, MKV, WebM |
-| **Professional** | MPEG, MPG, WMV, FLV, TS, MTS, M2TS |
+**Images explicitly handled by current upload and metadata paths:**
 
-#### Photos — Certify Original (Digital Proof of Authenticity)
+- **Standard images:** JPEG/JPG, PNG, GIF, BMP, WebP, TIFF/TIF, AVIF
+- **Apple formats:** HEIC, HEIF
+- **Camera RAW formats:** RAW, CR2, CR3, NEF, ARW, DNG, ORF, RW2, PEF, SRW, RAF
+- **Additional image-like formats seen in upload handling:** PSD, PSB, EXR, HDR
 
-The Certify Original feature supports the following formats for creating cryptographic proofs of authenticity. The original file is uploaded byte-exact (when EXIF strip is OFF), and a SHA-256 content hash is recorded as a permanent digital certificate.
+**Videos documented for backup/restore:**
 
-| Category | Formats | All Platforms |
-|----------|---------|:-------------:|
-| **Standard** | JPEG/JPG, PNG, GIF, WebP | ✅ |
-| **Apple** | HEIC, HEIF | ✅ |
-| **Modern** | AVIF, TIFF/TIF | ✅ |
-| **Canon** | CR2, CR3 | ✅ |
-| **Nikon** | NEF | ✅ |
-| **Sony** | ARW | ✅ |
-| **Fujifilm** | RAF | ✅ |
-| **Olympus** | ORF | ✅ |
-| **Panasonic** | RW2 | ✅ |
-| **Pentax** | PEF | ✅ |
-| **Samsung** | SRW | ✅ |
-| **Adobe** | DNG | ✅ |
-| **Encrypted** | .bin (NaCl secretbox) | ✅ |
+- MP4, MOV, M4V, 3GP, AVI, MKV, WebM
+- MPEG, MPG, WMV, FLV, TS, MTS, M2TS
 
-Certificate storage options: **StealthCloud**, **IPFS** (Pinata), **Arweave**, **Embedded SVG**.
+#### 2. Metadata Preservation
 
-### EXIF & Metadata Preservation
+When metadata is available, PhotoLynk stores a structured metadata record that can include:
 
-PhotoLynk extracts, stores, and restores comprehensive metadata during backup/sync. Metadata categories:
+- **EXIF:** camera settings, orientation, dimensions, timestamps
+- **GPS:** latitude, longitude, altitude, GPS timestamp
+- **IPTC:** caption, copyright, keywords, creator, title, city, country, credit, source
+- **XMP:** rating, label, subject, creator tool, rights, description, raw XML
+- **ICC:** profile name
+- **MakerNote:** SHA-256 hash of proprietary maker data
 
-- **EXIF**: Camera settings (ISO, aperture, shutter speed, focal length, flash, metering, white balance, color space, orientation, dimensions)
-- **GPS**: Latitude, longitude, altitude (with cross-platform 4-decimal truncation for hash stability)
-- **IPTC**: Caption, copyright, keywords, creator, title, city, country, credit, source
-- **XMP**: Rating, label, subject, creator tool, rights, description, raw XML
-- **ICC**: Profile name (e.g., "Display P3", "sRGB IEC61966-2.1")
-- **MakerNote**: SHA-256 hash of proprietary camera data (too large to store raw)
+**Formats with active EXIF extraction in current code:**
 
-#### EXIF Write-Back Support (Sync/Restore)
+- JPEG/JPG
+- PNG
+- GIF
+- BMP
+- WebP
+- TIFF/TIF
+- HEIC/HEIF
+- AVIF
+- RAW, CR2, CR3, NEF, ARW, DNG, ORF, RW2, PEF, SRW, RAF
+
+EXIF extraction is format-dependent:
+
+- The server backfill path relies mainly on `sharp`, so some formats may remain stored byte-exact without a server-side EXIF sidecar.
+- The desktop backup and certification paths use `ExifReader` for HEIC/HEIF and major RAW camera formats where `sharp` cannot read EXIF reliably.
+
+#### 3. EXIF Write-Back on Sync/Restore
+
+PhotoLynk does **not** promise universal metadata write-back for every format. Backup remains byte-exact even when write-back is unavailable.
 
 | Format | Android | iOS | Desktop |
 |--------|:-------:|:---:|:-------:|
@@ -457,33 +450,66 @@ PhotoLynk extracts, stores, and restores comprehensive metadata during backup/sy
 | HEIC/HEIF | ❌ | ✅ | ⚠️ |
 | TIFF/TIF | ❌ | ✅ | ✅ |
 | GIF | ❌ | ✅ | ❌ |
-| RAW (DNG, CR2, NEF, etc.) | ❌ | ❌ | ❌ |
+| RAW formats | ❌ | ❌ | ⚠️ |
 
-- ✅ = Full support
-- ⚠️ = Depends on system libraries (exiftool)
-- ❌ = Read-only (EXIF extracted and stored on server, not written back to file)
+- ✅ = supported
+- ⚠️ = depends on platform tooling such as `exiftool`
+- ❌ = read-only in practice; metadata may still be preserved separately
 
-Even when EXIF write is not supported, files sync byte-exact and EXIF data remains stored on the server for future restoration. RAW formats are intentionally read-only to preserve original sensor data.
+RAW formats are intentionally conservative. The system can extract metadata from many of them, but write-back is not treated as a universal cross-platform guarantee.
 
-#### EXIF Hash Proof System (Certify Original)
+#### 4. Certify Original
 
-When certifying a photo, PhotoLynk computes a 3-hash cryptographic proof from the original EXIF data **before** any processing (strip, watermark, encrypt):
+Certify Original supports a narrower image set than general backup. The current certification pipeline explicitly handles:
 
-| Hash | Description | Purpose |
+- JPEG/JPG
+- PNG
+- GIF
+- WebP
+- HEIC
+- HEIF
+- AVIF
+- TIFF/TIF
+- DNG
+- CR2
+- CR3
+- NEF
+- ARW
+- RAF
+- ORF
+- RW2
+- PEF
+- SRW
+- Encrypted `.bin` payloads
+
+Certificate storage options: **StealthCloud**, **IPFS** (Pinata), **Arweave**, **Embedded SVG**.
+
+#### 5. Certification Security Model
+
+When certifying a supported image, PhotoLynk records integrity proofs from the original file before later processing steps such as stripping, watermarking, or encryption.
+
+| Proof | Description | Purpose |
 |------|-------------|---------|
-| **Hash 1** (Raw EXIF) | SHA-256 of raw EXIF binary bytes (thumbnails stripped) | Proves exact camera output — bit-identical to what the sensor wrote |
-| **Hash 2** (Normalized EXIF) | SHA-256 of parsed, normalized, sorted EXIF fields | Cross-platform verification — same hash regardless of EXIF library |
-| **Hash 3** (Binding) | SHA-256(Hash1 \| Hash2) | Cryptographically binds raw and normalized proofs |
+| **Content Hash** | SHA-256 of original file bytes | Proves byte-exact file identity |
+| **Raw EXIF Hash** | SHA-256 of raw EXIF bytes when EXIF exists | Preserves the camera-written EXIF payload |
+| **Normalized EXIF Hash** | SHA-256 of normalized EXIF fields | Enables stable cross-platform verification |
+| **Binding Hash** | SHA-256 of the raw and normalized EXIF hashes together | Binds both EXIF proofs into one record |
 
-Additional integrity proofs recorded in the certificate:
-- **Content Hash**: SHA-256 of original file bytes (before any processing)
-- **Camera Serial Hash**: SHA-256 of camera body serial number (device binding)
-- **RFC 3161 Timestamp**: Trusted third-party timestamp (FreeTSA) proving existence at certification time
-- **C2PA Manifest**: Content Authenticity Initiative provenance data
+Additional certificate fields can include:
 
-If an image has no EXIF data (screenshots, downloaded images), the hash fields are omitted from the certificate metadata and displayed as "N/A" in the certificate viewer. The content hash and digital proof remain fully valid.
+- **Camera Serial Hash**
+- **RFC 3161 timestamp**
+- **C2PA manifest/provenance data**
 
-**Note:** HEIC/HEIF on Android requires API 29+ (Android 10). RAW format EXIF extraction uses platform-native APIs (CGImageSource on iOS, ExifInterface on Android, ExifReader on desktop/server).
+If a file has no EXIF data, the EXIF-based proof fields are omitted or shown as unavailable. The content hash certificate is still valid.
+
+#### 6. Security Summary by Storage Mode
+
+| Mode | How files are stored | Who can read them |
+|------|----------------------|-------------------|
+| **Local** | Original files on your own machine | You and anyone with access to that machine |
+| **Remote** | Original files on your server, protected by HTTPS and authentication | You and your server |
+| **StealthCloud** | Encrypted chunks and encrypted manifests | Only you, with your keys |
 
 ## In-App Purchases
 
