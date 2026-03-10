@@ -1,7 +1,7 @@
 # PhotoLynk
 ## Camera-to-On-Chain Authenticity Proof
 
-**Team**: Viktor Vishyn
+**Team**: Viktor Pavlyshyn
 
 ---
 
@@ -71,10 +71,10 @@ The current regular size-based app commission starts at **$0.72 USD** for files 
 
 **Current implementation includes**:
 
-- React Native mobile app code
+- the base mobile Solana app code used across the mobile variants
 - mobile wallet approval flow
-- Node.js mint service
-- desktop/server code for certification and restore flows
+- `server/` backend code
+- `server-tray/` desktop/server code for certification and restore flows
 
 ---
 
@@ -106,7 +106,7 @@ These proof fields are documented in the repository and are part of the certific
 
 ## Use estimated totals, not fixed mint slogans
 
-The current mint estimate logic in `nft-service/solana.js` computes total cost from:
+The current certification pricing logic computes total cost from:
 
 - **network cost**
 - **storage cost**
@@ -130,8 +130,6 @@ PhotoLynk certifications should be described as:
 
 > **Estimated total cost per certification, based on live on-chain fees, storage choice, file size, and PhotoLynk commission.**
 
-That is the accurate product statement. A fixed claim like **$0.0005 per mint** is not supported by the current pricing code.
-
 ---
 
 # Product Characteristics
@@ -141,7 +139,7 @@ That is the accurate product statement. A fixed claim like **$0.0005 per mint** 
 - Mobile certification flow with wallet approval
 - Photo metadata extraction and preservation across mobile and desktop paths
 - On-chain certification flow with compressed minting logic
-- Optional storage modes including cloud, IPFS, and on-chain modes in the certification code
+- Redundant certificate storage across StealthCloud and IPFS to improve resilience, availability, and faster asset loading
 - Repository-level documentation for EXIF, IPTC, XMP, RFC 3161, and C2PA related handling
 
 ---
@@ -151,30 +149,18 @@ That is the accurate product statement. A fixed claim like **$0.0005 per mint** 
 ## What can be stated directly from the repository
 
 - The repository contains:
-  - mobile app code
-  - desktop/server code
-  - a Node.js mint service
-  - certification pricing and estimation logic
-- Wallet-related flows are implemented in the certification code
+  - `server/` backend code
+  - `server-tray/` desktop/server app code
+  - the base mobile Solana app code that the mobile variants are built from
+- Additional mobile source is not included here due to licensing restrictions
+- Wallet-related certification flows are implemented in the mobile base app
 - Demo video and documentation are present in the repository
-
-## Claims intentionally removed
-
-The following claims were removed because they are not safe to present here without separate verification:
-
-- fixed sub-cent mint pricing
-- specific hackathon positioning
-- chain-specific marketing statements
-- store publication claims
-- specific confirmation-time guarantees
-- market-size and adoption-number claims
-- “100% success rate” claims
 
 ---
 
 # Team
 
-## Viktor Vishyn
+## Viktor Pavlyshyn
 **Founder / Developer**
 
 - React Native mobile development
@@ -186,6 +172,7 @@ The following claims were removed because they are not safe to present here with
 - **Email**: support@photolynk.io
 - **GitHub**: @viktorvishyn369
 - **x.com**: @StealthLynkIO
+- **Telegram**: @StealthLynkIO
 
 ---
 
@@ -194,7 +181,6 @@ The following claims were removed because they are not safe to present here with
 ## Explore PhotoLynk
 
 - Review the source code in this repository
-- Review the pricing and certification logic in `nft-service/`
 - Review the product documentation in `README.md`
 - Watch the demo video: https://youtube.com/shorts/pp3TYwn68D0
 
