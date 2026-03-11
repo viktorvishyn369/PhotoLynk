@@ -7257,12 +7257,240 @@ const filterCertificatesForWalletScope = (certs, walletAddress) => {
     return (Array.isArray(certs) ? certs : []).filter(cert => certificateMatchesWalletScope(cert, targetWallet));
 };
 
+const normalizeNftBadgeValue = (value) => {
+    if (value === undefined || value === null) return null;
+    const normalized = String(value).trim().toLowerCase();
+    return normalized || null;
+};
+
+const pickImmutableBoolBadge = (current, incoming) => {
+    if (incoming === undefined || incoming === null) return current;
+    if (current === undefined || current === null) return incoming;
+    return !!current || !!incoming;
+};
+
+const pickCertificationMode = (current, incoming) => {
+    const curr = normalizeNftBadgeValue(current);
+    const next = normalizeNftBadgeValue(incoming);
+    if (!next) return current;
+    if (!curr) return incoming;
+    if (curr === next) return current;
+    if (curr === 'private' || next === 'private') return 'private';
+    if (curr === 'public' || next === 'public') return 'public';
+    return incoming;
+};
+
+const pickEditionValue = (current, incoming) => {
+    const curr = normalizeNftBadgeValue(current);
+    const next = normalizeNftBadgeValue(incoming);
+    if (!next) return current;
+    if (!curr) return incoming;
+    if (curr === next) return current;
+    if (curr === 'limited' || next === 'limited') return 'limited';
+    if (curr === 'open' || next === 'open') return 'open';
+    return incoming;
+};
+
+const STORAGE_TYPE_PRIORITY = { cloud: 4, arweave: 3, onchain: 3, ipfs: 1 };
+
+const pickStorageTypeValue = (current, incoming) => {
+    const curr = normalizeNftBadgeValue(current);
+    const next = normalizeNftBadgeValue(incoming);
+    if (!next) return current;
+    if (!curr) return incoming;
+    if (curr === next) return current;
+    return (STORAGE_TYPE_PRIORITY[next] || 0) > (STORAGE_TYPE_PRIORITY[curr] || 0) ? incoming : current;
+};
+
+const mergeEncryptionDataValue = (current, incoming) => {
+    if (!incoming) return current;
+    if (!current) return incoming;
+    const merged = { ...current };
+    const incomingHasTransferKey = !!incoming.transferNftKey;
+    for (const [key, value] of Object.entries(incoming)) {
+        if (value === undefined || value === null || value === '') continue;
+        if (key === 'transferNftKey' || (incomingHasTransferKey && (key === 'nonce' || key === 'thumbnailNonce' || key === 'thumbnailUrl'))) {
+            merged[key] = value;
+            continue;
+        }
+        if (merged[key] === undefined || merged[key] === null || merged[key] === '') {
+            merged[key] = value;
+        }
+    }
+    return merged;
+};
+
+const sameJsonValue = (a, b) => {
+    try { return JSON.stringify(a) === JSON.stringify(b); } catch (_) { return a === b; }
+};
+
+const pickLatestIsoValue = (current, incoming) => {
+    if (!incoming) return current;
+    if (!current) return incoming;
+    const currentTs = new Date(current).getTime();
+    const incomingTs = new Date(incoming).getTime();
+    if (Number.isFinite(currentTs) && Number.isFinite(incomingTs)) {
+        return incomingTs >= currentTs ? incoming : current;
+    }
+    return incoming || current;
+};
+
+const mergeStoredNft = (existing, incoming) => {
+    if (!existing || !incoming) return 0;
+    let updated = 0;
+    const setField = (field, value) => {
+        if (value === undefined || value === null) return;
+        if (!sameJsonValue(existing[field], value)) {
+            existing[field] = value;
+            updated++;
+        }
+    };
+    const fillGapFields = ['thumbnailUrl','imageUrl','license','nftType','assetId','txSignature','attributes','createdAt','mintedAt','ipfsThumbnailUrl','metadataUrl','contentHash','exifHash','exifRawHash','exifBindingHash','hasRfc3161','hasC2pa','mintPlatform','ownerAddress','creatorWallet','name','description','discoveredAt','arweaveUrl'];
+    for (const field of fillGapFields) {
+        if (incoming[field] !== undefined && incoming[field] !== null && (existing[field] === undefined || existing[field] === null || existing[field] === '')) {
+            existing[field] = incoming[field];
+            updated++;
+        }
+    }
+    const mergedEncryptionData = mergeEncryptionDataValue(existing.encryptionData, incoming.encryptionData);
+    if (mergedEncryptionData !== undefined && !sameJsonValue(existing.encryptionData, mergedEncryptionData)) {
+        existing.encryptionData = mergedEncryptionData;
+        updated++;
+    }
+    const certificationMode = pickCertificationMode(existing.certificationMode, incoming.certificationMode);
+    if (certificationMode !== undefined && certificationMode !== null && existing.certificationMode !== certificationMode) {
+        existing.certificationMode = certificationMode;
+        updated++;
+    }
+    const encrypted = pickImmutableBoolBadge(existing.encrypted, incoming.encrypted);
+    if (encrypted !== undefined && existing.encrypted !== encrypted) {
+        existing.encrypted = encrypted;
+        updated++;
+    }
+    const watermarked = pickImmutableBoolBadge(existing.watermarked, incoming.watermarked);
+    if (watermarked !== undefined && existing.watermarked !== watermarked) {
+        existing.watermarked = watermarked;
+        updated++;
+    }
+    const isCompressed = pickImmutableBoolBadge(existing.isCompressed, incoming.isCompressed);
+    if (isCompressed !== undefined && existing.isCompressed !== isCompressed) {
+        existing.isCompressed = isCompressed;
+        updated++;
+    }
+    const storageType = pickStorageTypeValue(existing.storageType, incoming.storageType);
+    if (storageType !== undefined && storageType !== null && existing.storageType !== storageType) {
+        existing.storageType = storageType;
+        updated++;
+    }
+    const edition = pickEditionValue(existing.edition, incoming.edition);
+    if (edition !== undefined && edition !== null && existing.edition !== edition) {
+        existing.edition = edition;
+        updated++;
+    }
+    const transferredAt = pickLatestIsoValue(existing.transferredAt, incoming.transferredAt);
+    if (transferredAt !== undefined && transferredAt !== null && existing.transferredAt !== transferredAt) {
+        existing.transferredAt = transferredAt;
+        updated++;
+    }
+    if (incoming.transferredFrom && (!existing.transferredFrom || transferredAt === incoming.transferredAt || !existing.transferredAt)) {
+        setField('transferredFrom', incoming.transferredFrom);
+    }
+    return updated;
+};
+
+const mergeStoredCertificate = (existing, incoming) => {
+    if (!existing || !incoming) return 0;
+    let updated = 0;
+    const setField = (field, value) => {
+        if (value === undefined || value === null) return;
+        if (!sameJsonValue(existing[field], value)) {
+            existing[field] = value;
+            updated++;
+        }
+    };
+    const fillGapFields = ['name','txSignature','license','nftType','metadataUrl','description','version','type','imageUrl',
+        'issuedAt','createdAt','mintedAt','contentHash','exifHash','cameraHash','exifRawHash','exifBindingHash',
+        'rfc3161Policy','rfc3161Tsa'];
+    for (const field of fillGapFields) {
+        if (incoming[field] !== undefined && incoming[field] !== null && (existing[field] === undefined || existing[field] === null || existing[field] === '')) {
+            existing[field] = incoming[field];
+            updated++;
+        }
+    }
+    const edition = pickEditionValue(existing.edition, incoming.edition);
+    if (edition !== undefined && edition !== null && existing.edition !== edition) {
+        existing.edition = edition;
+        updated++;
+    }
+    const certificationMode = pickCertificationMode(existing.certificationMode, incoming.certificationMode);
+    if (certificationMode !== undefined && certificationMode !== null && existing.certificationMode !== certificationMode) {
+        existing.certificationMode = certificationMode;
+        updated++;
+    }
+    const encrypted = pickImmutableBoolBadge(existing.encrypted, incoming.encrypted);
+    if (encrypted !== undefined && existing.encrypted !== encrypted) {
+        existing.encrypted = encrypted;
+        updated++;
+    }
+    const watermarked = pickImmutableBoolBadge(existing.watermarked, incoming.watermarked);
+    if (watermarked !== undefined && existing.watermarked !== watermarked) {
+        existing.watermarked = watermarked;
+        updated++;
+    }
+    const isCompressed = pickImmutableBoolBadge(existing.isCompressed, incoming.isCompressed);
+    if (isCompressed !== undefined && existing.isCompressed !== isCompressed) {
+        existing.isCompressed = isCompressed;
+        updated++;
+    }
+    const storageType = pickStorageTypeValue(existing.storageType, incoming.storageType);
+    if (storageType !== undefined && storageType !== null && existing.storageType !== storageType) {
+        existing.storageType = storageType;
+        updated++;
+    }
+    if (incoming.hasRfc3161 && !existing.hasRfc3161) {
+        existing.hasRfc3161 = true;
+        updated++;
+    }
+    if (incoming.hasC2pa && !existing.hasC2pa) {
+        existing.hasC2pa = true;
+        updated++;
+    }
+    if (incoming.rfc3161Token && !existing.rfc3161Token) {
+        existing.rfc3161Token = incoming.rfc3161Token;
+        if (!existing.hasRfc3161) existing.hasRfc3161 = true;
+        updated++;
+    }
+    if (incoming.c2paManifest && !existing.c2paManifest) {
+        existing.c2paManifest = incoming.c2paManifest;
+        if (!existing.hasC2pa) existing.hasC2pa = true;
+        updated++;
+    }
+    const transferredAt = pickLatestIsoValue(existing.transferredAt, incoming.transferredAt);
+    if (transferredAt !== undefined && transferredAt !== null && existing.transferredAt !== transferredAt) {
+        existing.transferredAt = transferredAt;
+        updated++;
+    }
+    if (incoming.transferredFrom && (!existing.transferredFrom || transferredAt === incoming.transferredAt || !existing.transferredAt)) {
+        setField('transferredFrom', incoming.transferredFrom);
+    }
+    if (incoming.transferNftKey) setField('transferNftKey', incoming.transferNftKey);
+    if (incoming.transferNonce) setField('transferNonce', incoming.transferNonce);
+    if (incoming.transferThumbnailNonce) setField('transferThumbnailNonce', incoming.transferThumbnailNonce);
+    if (incoming.ownerAddress && (!existing.ownerAddress || transferredAt === incoming.transferredAt)) {
+        setField('ownerAddress', incoming.ownerAddress);
+    }
+    if (incoming.creatorWallet && !existing.creatorWallet) setField('creatorWallet', incoming.creatorWallet);
+    if (incoming.mintAddress && !existing.mintAddress) setField('mintAddress', incoming.mintAddress);
+    if (incoming.id && !existing.id) setField('id', incoming.id);
+    return updated;
+};
+
 // Helper: scan ALL user NFT folders for NFTs matching a specific wallet address
 // NFTs belong to wallets, not user accounts — different accounts with the same wallet should see the same NFTs
 const readNftsForWalletGlobal = (walletAddress) => {
     const targetWallet = normalizeWalletAddress(walletAddress);
     if (!targetWallet) return [];
-    const seen = new Set();
+    const seenIdx = {};
     const merged = [];
     try {
         const dirs = fs.readdirSync(NFT_DIR, { withFileTypes: true });
@@ -7275,10 +7503,15 @@ const readNftsForWalletGlobal = (walletAddress) => {
                 for (const nft of (data.nfts || [])) {
                     if (normalizeWalletAddress(nft.ownerAddress) !== targetWallet) continue;
                     const key = normalizeWalletMint(nft.mintAddress);
-                    if (!key || seen.has(key)) continue;
-                    seen.add(key);
+                    if (!key) continue;
                     if (nft.imageUrl && nft.imageUrl.startsWith('data:') && nft.imageUrl.length > 5000) nft.imageUrl = undefined;
                     if (nft.arweaveUrl && nft.arweaveUrl.startsWith('data:') && nft.arweaveUrl.length > 5000) nft.arweaveUrl = undefined;
+                    if (seenIdx[key] !== undefined) {
+                        const existing = merged[seenIdx[key]];
+                        mergeStoredNft(existing, nft);
+                        continue;
+                    }
+                    seenIdx[key] = merged.length;
                     merged.push(nft);
                 }
             } catch (_) {}
@@ -7365,19 +7598,11 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
         }
 
         if (action === 'add' && nft) {
-            const idx = data.nfts.findIndex(n => n.mintAddress === nft.mintAddress);
+            const targetMint = normalizeWalletMint(nft.mintAddress);
+            const idx = data.nfts.findIndex(n => normalizeWalletMint(n.mintAddress) === targetMint);
             if (idx >= 0) {
                 const existing = data.nfts[idx];
-                const mergeFields = ['encryptionData','thumbnailUrl','imageUrl','edition','encrypted','watermarked','license','storageType','nftType','isCompressed','assetId','txSignature','attributes','createdAt','mintedAt','ipfsThumbnailUrl','metadataUrl','contentHash','exifHash','exifRawHash','exifBindingHash','hasRfc3161','hasC2pa','certificationMode','mintPlatform'];
-                let updated = 0;
-                for (const f of mergeFields) {
-                    if (nft[f] !== undefined && nft[f] !== null && (existing[f] === undefined || existing[f] === null)) {
-                        existing[f] = nft[f];
-                        updated++;
-                    }
-                }
-                if (nft.encryptionData) { existing.encryptionData = nft.encryptionData; updated++; }
-                if (nft.thumbnailUrl) { existing.thumbnailUrl = nft.thumbnailUrl; updated++; }
+                const updated = mergeStoredNft(existing, nft);
                 data.nfts[idx] = existing;
                 if (updated > 0) console.log(`[NFT] Album update: user=${userId} mint=${nft.mintAddress} fields=${updated}`);
             } else {
@@ -7414,51 +7639,48 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
             const existingMap = {};
             const existingMetaMap = {};
             data.nfts.forEach((n, i) => {
-                if (n.mintAddress) existingMap[n.mintAddress] = i;
+                const normMint = normalizeWalletMint(n.mintAddress);
+                if (normMint) existingMap[normMint] = i;
                 if (n.metadataUrl) existingMetaMap[n.metadataUrl] = i;
             });
             let added = 0;
             let updated = 0;
             let deduped = 0;
-            const mergeFields = ['encryptionData','thumbnailUrl','imageUrl','edition','encrypted','watermarked','license','storageType','nftType','isCompressed','assetId','txSignature','attributes','createdAt','mintedAt','ipfsThumbnailUrl','metadataUrl','contentHash','exifHash','exifRawHash','exifBindingHash','hasRfc3161','hasC2pa','certificationMode','mintPlatform'];
             for (const n of nfts) {
-                if (!n.mintAddress) continue;
+                const normMint = normalizeWalletMint(n.mintAddress);
+                if (!normMint) continue;
                 if (n.mintAddress.startsWith('tx_') && n.metadataUrl && existingMetaMap[n.metadataUrl] !== undefined) {
                     const realIdx = existingMetaMap[n.metadataUrl];
                     if (data.nfts[realIdx] && !data.nfts[realIdx].mintAddress.startsWith('tx_')) {
                         const real = data.nfts[realIdx];
-                        if (n.encryptionData && !real.encryptionData) real.encryptionData = n.encryptionData;
-                        if (n.thumbnailUrl && !real.thumbnailUrl) real.thumbnailUrl = n.thumbnailUrl;
+                        updated += mergeStoredNft(real, n);
                         deduped++;
                         continue;
                     }
                 }
-                const idx = existingMap[n.mintAddress];
+                const idx = existingMap[normMint];
                 if (idx === undefined) {
                     if (n.metadataUrl && !n.mintAddress.startsWith('tx_') && existingMetaMap[n.metadataUrl] !== undefined) {
                         const oldIdx = existingMetaMap[n.metadataUrl];
                         if (data.nfts[oldIdx] && data.nfts[oldIdx].mintAddress.startsWith('tx_')) {
                             const old = data.nfts[oldIdx];
-                            data.nfts[oldIdx] = { ...old, ...n };
-                            existingMap[n.mintAddress] = oldIdx;
+                            const mergedNft = { ...old, mintAddress: n.mintAddress };
+                            if (n.assetId) mergedNft.assetId = n.assetId;
+                            if (n.metadataUrl) mergedNft.metadataUrl = n.metadataUrl;
+                            updated += mergeStoredNft(mergedNft, n);
+                            data.nfts[oldIdx] = mergedNft;
+                            existingMap[normMint] = oldIdx;
                             deduped++;
                             continue;
                         }
                     }
                     data.nfts.push(n);
-                    existingMap[n.mintAddress] = data.nfts.length - 1;
+                    existingMap[normMint] = data.nfts.length - 1;
                     if (n.metadataUrl) existingMetaMap[n.metadataUrl] = data.nfts.length - 1;
                     added++;
                 } else {
                     const existing = data.nfts[idx];
-                    for (const f of mergeFields) {
-                        if (n[f] !== undefined && n[f] !== null && (existing[f] === undefined || existing[f] === null)) {
-                            existing[f] = n[f];
-                            updated++;
-                        }
-                    }
-                    if (n.encryptionData) { existing.encryptionData = n.encryptionData; }
-                    if (n.thumbnailUrl) { existing.thumbnailUrl = n.thumbnailUrl; }
+                    updated += mergeStoredNft(existing, n);
                     data.nfts[idx] = existing;
                 }
             }
@@ -7507,7 +7729,7 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
 const readCertsForWalletGlobal = (walletAddress) => {
     const targetWallet = normalizeWalletAddress(walletAddress);
     if (!targetWallet) return [];
-    const seenIds = new Set();
+    const seenIdx = {};
     const merged = [];
     try {
         const dirs = fs.readdirSync(NFT_DIR, { withFileTypes: true });
@@ -7526,9 +7748,12 @@ const readCertsForWalletGlobal = (walletAddress) => {
                     const creatorMatch = creator === targetWallet && (!owner || owner === targetWallet);
                     if (!ownerMatch && !creatorMatch) continue;
                     const key = c.mintAddress || c.id || JSON.stringify(c);
-                    if (seenIds.has(key)) continue;
-                    seenIds.add(key);
-                    merged.push(c);
+                    if (seenIdx[key] !== undefined) {
+                        mergeStoredCertificate(merged[seenIdx[key]], c);
+                        continue;
+                    }
+                    seenIdx[key] = merged.length;
+                    merged.push({ ...c });
                 }
             } catch (_) {}
         }
@@ -7604,7 +7829,7 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
             'exifRawHash','exifBindingHash','rfc3161Policy','mintedAt',
             'hasRfc3161','hasC2pa','encrypted','watermarked','storageType','nftType','isCompressed',
             'rfc3161Tsa','metadataUrl','description','version','type','imageUrl','certificationMode',
-            'transferredFrom','transferredAt','transferNftKey'];
+            'transferredFrom','transferredAt','transferNftKey','transferNonce','transferThumbnailNonce'];
         const DISK_SAFE_KEYS = [...API_SLIM_KEYS, 'rfc3161Token', 'c2paManifest'];
         const keysToUse = full ? DISK_SAFE_KEYS : API_SLIM_KEYS;
         const slimForApi = (c) => {
@@ -7676,7 +7901,7 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
             'exifRawHash','exifBindingHash','rfc3161Policy','mintedAt',
             'hasRfc3161','hasC2pa','encrypted','watermarked','storageType','nftType','isCompressed',
             'rfc3161Tsa','metadataUrl','description','version','type','imageUrl','certificationMode',
-            'transferredFrom','transferredAt','transferNftKey',
+            'transferredFrom','transferredAt','transferNftKey','transferNonce','transferThumbnailNonce',
             'rfc3161Token','c2paManifest'];
         const slimCert = (c) => {
             const copy = {};
@@ -7717,27 +7942,13 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
                 if (!existingIds.has(sc.id)) {
                     certs.push(sc);
                     existingIds.add(sc.id);
+                    existingMap[sc.id] = certs.length - 1;
                     added++;
                 } else {
-                    // Merge enrichment fields into existing cert (don't overwrite, only fill gaps)
                     const idx = existingMap[c.id];
                     if (idx !== undefined) {
                         const ex = certs[idx];
-                        let changed = false;
-                        if (c.hasRfc3161 && !ex.hasRfc3161) { ex.hasRfc3161 = true; changed = true; }
-                        if (c.hasC2pa && !ex.hasC2pa) { ex.hasC2pa = true; changed = true; }
-                        if (c.encrypted && !ex.encrypted) { ex.encrypted = true; changed = true; }
-                        if (c.watermarked && !ex.watermarked) { ex.watermarked = true; changed = true; }
-                        if (c.license && !ex.license) { ex.license = c.license; changed = true; }
-                        if (c.storageType && !ex.storageType) { ex.storageType = c.storageType; changed = true; }
-                        if (c.contentHash && !ex.contentHash) { ex.contentHash = c.contentHash; changed = true; }
-                        if (c.exifRawHash && !ex.exifRawHash) { ex.exifRawHash = c.exifRawHash; changed = true; }
-                        if (c.exifHash && !ex.exifHash) { ex.exifHash = c.exifHash; changed = true; }
-                        if (c.exifBindingHash && !ex.exifBindingHash) { ex.exifBindingHash = c.exifBindingHash; changed = true; }
-                        if (c.cameraHash && !ex.cameraHash) { ex.cameraHash = c.cameraHash; changed = true; }
-                        if (c.rfc3161Token && !ex.rfc3161Token) { ex.rfc3161Token = c.rfc3161Token; ex.hasRfc3161 = true; changed = true; }
-                        if (c.c2paManifest && !ex.c2paManifest) { ex.c2paManifest = c.c2paManifest; ex.hasC2pa = true; changed = true; }
-                        if (changed) updated++;
+                        updated += mergeStoredCertificate(ex, sc) > 0 ? 1 : 0;
                     }
                 }
             }
@@ -7748,12 +7959,13 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
             const newOwner = String(req.body.newOwnerAddress).trim();
             if (!newOwner) return res.status(400).json({ error: 'newOwnerAddress required' });
 
+            const transferredAt = new Date().toISOString();
+            const transferredFrom = certificate.ownerAddress || certificate.creatorWallet || '';
             const transferredCert = slimCert({
                 ...certificate,
                 ownerAddress: newOwner,
-                // Preserve original creator — cert provenance must be immutable
-                transferredFrom: certificate.ownerAddress || certificate.creatorWallet || '',
-                transferredAt: new Date().toISOString(),
+                transferredFrom,
+                transferredAt,
             });
 
             // Write to transfer-inbox folder named by wallet hash (safe filename)
@@ -7781,33 +7993,78 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
             try {
                 const senderMint = normalizeWalletMint(certificate.mintAddress);
                 if (senderMint) {
-                    // Find the NFT album entry in sender's folder
-                    const senderMetaPath = getNftMetadataPath(userKey);
-                    if (fs.existsSync(senderMetaPath)) {
-                        const senderData = JSON.parse(fs.readFileSync(senderMetaPath, 'utf8'));
-                        const nftEntry = (senderData.nfts || []).find(n => normalizeWalletMint(n.mintAddress) === senderMint);
-                        if (nftEntry) {
-                            const transferredNft = { ...nftEntry, ownerAddress: newOwner, transferredFrom: nftEntry.ownerAddress || '', transferredAt: new Date().toISOString() };
-                            // If cert has transferNftKey, inject into NFT encryptionData so decrypt works for new owner
-                            if (certificate.transferNftKey && transferredNft.encryptionData) {
-                                transferredNft.encryptionData = { ...transferredNft.encryptionData, transferNftKey: certificate.transferNftKey };
-                            }
-                            const inboxAlbumPath = path.join(inboxDir, 'nft-album.json');
-                            let inboxAlbum = { nfts: [] };
-                            if (fs.existsSync(inboxAlbumPath)) {
-                                try { inboxAlbum = JSON.parse(fs.readFileSync(inboxAlbumPath, 'utf8')); } catch (_) {}
-                            }
-                            const inboxMints = new Set((inboxAlbum.nfts || []).map(n => normalizeWalletMint(n.mintAddress)));
-                            if (!inboxMints.has(senderMint)) {
-                                inboxAlbum.nfts.push(transferredNft);
-                            } else {
-                                const idx = inboxAlbum.nfts.findIndex(n => normalizeWalletMint(n.mintAddress) === senderMint);
-                                if (idx >= 0) inboxAlbum.nfts[idx] = transferredNft;
-                            }
-                            fs.writeFileSync(inboxAlbumPath, JSON.stringify(inboxAlbum, null, 2));
-                            console.log(`[NFT] Album entry transferred to inbox: mint=${certificate.mintAddress} to=${newOwner}`);
+                    let nftEntry = null;
+                    const senderWallet = normalizeWalletAddress(certificate.ownerAddress);
+                    if (senderWallet) {
+                        nftEntry = readNftsForWalletGlobal(senderWallet).find(n => normalizeWalletMint(n.mintAddress) === senderMint) || null;
+                    }
+                    if (!nftEntry) {
+                        const senderMetaPath = getNftMetadataPath(userKey);
+                        if (fs.existsSync(senderMetaPath)) {
+                            const senderData = JSON.parse(fs.readFileSync(senderMetaPath, 'utf8'));
+                            nftEntry = (senderData.nfts || []).find(n => normalizeWalletMint(n.mintAddress) === senderMint) || null;
                         }
                     }
+                    const transferredNft = nftEntry ? { ...nftEntry } : {
+                        mintAddress: certificate.mintAddress,
+                        name: certificate.name || 'NFT',
+                        description: certificate.description || '',
+                        imageUrl: certificate.imageUrl,
+                        metadataUrl: certificate.metadataUrl,
+                        creatorWallet: certificate.creatorWallet,
+                        createdAt: certificate.createdAt || certificate.issuedAt,
+                        mintedAt: certificate.mintedAt || certificate.createdAt || certificate.issuedAt,
+                        license: certificate.license,
+                        nftType: certificate.nftType,
+                    };
+                    mergeStoredNft(transferredNft, {
+                        mintAddress: certificate.mintAddress,
+                        imageUrl: certificate.imageUrl,
+                        metadataUrl: certificate.metadataUrl,
+                        description: certificate.description,
+                        creatorWallet: certificate.creatorWallet,
+                        mintedAt: certificate.mintedAt,
+                        edition: certificate.edition,
+                        certificationMode: certificate.certificationMode,
+                        encrypted: certificate.encrypted,
+                        watermarked: certificate.watermarked,
+                        storageType: certificate.storageType,
+                        isCompressed: certificate.isCompressed,
+                        license: certificate.license,
+                        contentHash: certificate.contentHash,
+                        exifHash: certificate.exifHash,
+                        exifRawHash: certificate.exifRawHash,
+                        exifBindingHash: certificate.exifBindingHash,
+                    });
+                    transferredNft.ownerAddress = newOwner;
+                    transferredNft.transferredFrom = transferredFrom;
+                    transferredNft.transferredAt = transferredAt;
+                    if (certificate.transferNftKey || certificate.transferNonce || certificate.transferThumbnailNonce) {
+                        transferredNft.encryptionData = {
+                            ...(transferredNft.encryptionData || {}),
+                            ...(certificate.transferNftKey ? { transferNftKey: certificate.transferNftKey } : {}),
+                            ...(certificate.transferNonce ? { nonce: certificate.transferNonce } : {}),
+                            ...(certificate.transferThumbnailNonce ? { thumbnailNonce: certificate.transferThumbnailNonce } : {}),
+                        };
+                        transferredNft.encrypted = true;
+                        if (!transferredNft.certificationMode || transferredNft.certificationMode === 'public') {
+                            transferredNft.certificationMode = 'private';
+                        }
+                    }
+                    const inboxAlbumPath = path.join(inboxDir, 'nft-album.json');
+                    let inboxAlbum = { nfts: [] };
+                    if (fs.existsSync(inboxAlbumPath)) {
+                        try { inboxAlbum = JSON.parse(fs.readFileSync(inboxAlbumPath, 'utf8')); } catch (_) {}
+                    }
+                    const inboxMints = new Set((inboxAlbum.nfts || []).map(n => normalizeWalletMint(n.mintAddress)));
+                    if (!inboxMints.has(senderMint)) {
+                        inboxAlbum.nfts.push(transferredNft);
+                    } else {
+                        const idx = inboxAlbum.nfts.findIndex(n => normalizeWalletMint(n.mintAddress) === senderMint);
+                        if (idx >= 0) inboxAlbum.nfts[idx] = transferredNft;
+                    }
+                    fs.writeFileSync(inboxAlbumPath, JSON.stringify(inboxAlbum, null, 2));
+                    console.log(`[NFT] Album entry transferred to inbox: mint=${certificate.mintAddress} to=${newOwner}`);
                 }
             } catch (albumErr) { console.warn('[NFT] Album entry transfer failed (non-critical):', albumErr.message); }
 
@@ -7824,30 +8081,60 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
                 const cleanCertsForDisk = certs.map(c => slimCert(c));
                 fs.writeFileSync(certsPath, JSON.stringify(cleanCertsForDisk, null, 2));
             }
-            // Also remove from ALL linked device folders so cert doesn't reappear
+
+            // Remove the NFT from sender's album so it doesn't reappear on sync
+            try {
+                const senderMetaPath = getNftMetadataPath(userKey);
+                if (fs.existsSync(senderMetaPath)) {
+                    const senderData = JSON.parse(fs.readFileSync(senderMetaPath, 'utf8'));
+                    const beforeNfts = (senderData.nfts || []).length;
+                    senderData.nfts = (senderData.nfts || []).filter(n => normalizeWalletMint(n.mintAddress) !== targetMint);
+                    if (senderData.nfts.length < beforeNfts) {
+                        fs.writeFileSync(senderMetaPath, JSON.stringify(senderData, null, 2));
+                        console.log(`[NFT] Removed transferred NFT from sender's album: mint=${certificate.mintAddress}`);
+                    }
+                }
+            } catch (removeErr) { console.warn('[NFT] Failed to remove NFT from sender album:', removeErr.message); }
+            // Also remove from ALL linked device folders so cert and NFT don't reappear
             try {
                 const deviceUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
                 const linkedUuids = await getLinkedDeviceUuids(deviceUuid || userKey, req.user.id);
                 for (const uuid of linkedUuids) {
                     if (uuid === String(userKey)) continue;
+                    // Remove certificate
                     const linkedCp = path.join(NFT_DIR, String(uuid), 'certificates.json');
-                    if (!fs.existsSync(linkedCp)) continue;
-                    try {
-                        let linkedCerts = JSON.parse(fs.readFileSync(linkedCp, 'utf8'));
-                        if (!Array.isArray(linkedCerts)) continue;
-                        const lb = linkedCerts.length;
-                        linkedCerts = linkedCerts.filter(c => {
-                            if (c.id === certificate.id) return false;
-                            if (targetMint && normMint(c.mintAddress) === targetMint) return false;
-                            return true;
-                        });
-                        if (linkedCerts.length < lb) {
-                            fs.writeFileSync(linkedCp, JSON.stringify(linkedCerts.map(c => slimCert(c)), null, 2));
-                            console.log(`[NFT] Cert transfer remove (linked ${uuid}): mint=${certificate.mintAddress}`);
-                        }
-                    } catch (_) {}
+                    if (fs.existsSync(linkedCp)) {
+                        try {
+                            let linkedCerts = JSON.parse(fs.readFileSync(linkedCp, 'utf8'));
+                            if (Array.isArray(linkedCerts)) {
+                                const lb = linkedCerts.length;
+                                linkedCerts = linkedCerts.filter(c => {
+                                    if (c.id === certificate.id) return false;
+                                    if (targetMint && normMint(c.mintAddress) === targetMint) return false;
+                                    return true;
+                                });
+                                if (linkedCerts.length < lb) {
+                                    fs.writeFileSync(linkedCp, JSON.stringify(linkedCerts.map(c => slimCert(c)), null, 2));
+                                    console.log(`[NFT] Cert transfer remove (linked ${uuid}): mint=${certificate.mintAddress}`);
+                                }
+                            }
+                        } catch (_) {}
+                    }
+                    // Remove NFT album entry
+                    const linkedAlbumPath = getNftMetadataPath(uuid);
+                    if (fs.existsSync(linkedAlbumPath)) {
+                        try {
+                            const linkedAlbum = JSON.parse(fs.readFileSync(linkedAlbumPath, 'utf8'));
+                            const beforeNfts = (linkedAlbum.nfts || []).length;
+                            linkedAlbum.nfts = (linkedAlbum.nfts || []).filter(n => normalizeWalletMint(n.mintAddress) !== targetMint);
+                            if (linkedAlbum.nfts.length < beforeNfts) {
+                                fs.writeFileSync(linkedAlbumPath, JSON.stringify(linkedAlbum, null, 2));
+                                console.log(`[NFT] NFT transfer remove (linked ${uuid}): mint=${certificate.mintAddress}`);
+                            }
+                        } catch (_) {}
+                    }
                 }
-            } catch (linkErr) { console.warn('[NFT] Cert transfer linked removal error:', linkErr.message); }
+            } catch (linkErr) { console.warn('[NFT] Transfer linked removal error:', linkErr.message); }
             return res.json({ success: true, transferred: true });
         } else {
             return res.status(400).json({ error: 'Invalid action' });
