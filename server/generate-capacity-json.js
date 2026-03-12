@@ -50,7 +50,7 @@ const getAllocatedBytesFromDb = (dbPath) => {
            FROM user_plans
           WHERE plan_gb IS NOT NULL
             AND (deleted_at IS NULL OR deleted_at = 0)
-            AND status IN ('active','grace')
+            AND status IN ('active','grace','trial')
           GROUP BY plan_gb`,
         [],
         (err, planRows) => {

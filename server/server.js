@@ -310,6 +310,8 @@ const TRIAL_COMPLIMENTARY_DAYS = Number.parseInt(process.env.TRIAL_COMPLIMENTARY
 const COMPLIMENTARY_PURGE_INTERVAL_MS = Number.parseInt(process.env.COMPLIMENTARY_PURGE_INTERVAL_MS || String(6 * 60 * 60 * 1000), 10);
 const REVENUECAT_WEBHOOK_SECRET = process.env.REVENUECAT_WEBHOOK_SECRET || '';
 const USER_QUOTA_MARGIN_BYTES = Number.parseInt(process.env.USER_QUOTA_MARGIN_BYTES || String(50 * 1024 * 1024), 10);
+const GB_BYTES = 1000 * 1000 * 1000;
+const PREMIUM_STORAGE_GB = 20;
 const ENABLE_CLOUD_UPLOAD_LOCK = String(process.env.ENABLE_CLOUD_UPLOAD_LOCK || 'true').toLowerCase() !== 'false';
 const ADMIN_USER = process.env.ADMIN_USER || '';
 const ADMIN_PASSWORD_BCRYPT = process.env.ADMIN_PASSWORD_BCRYPT || '';
@@ -1440,94 +1442,141 @@ const ensurePlanRow = async (userId) => {
     return await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [userId]);
 };
 
+const getUserQuotaProfileFromRow = (row, now = Date.now()) => {
+    const status = row && row.status ? String(row.status) : 'none';
+    const planGbRaw = row && row.plan_gb !== null && row.plan_gb !== undefined ? Number(row.plan_gb) : 0;
+    const premiumGbRaw = row && row.premium_gb !== null && row.premium_gb !== undefined ? Number(row.premium_gb) : 0;
+    const expiresAt = row && row.expires_at ? Number(row.expires_at) : null;
+    const graceUntilRaw = row && row.grace_until ? Number(row.grace_until) : null;
+    const trialUntil = row && row.trial_until ? Number(row.trial_until) : null;
+    const deletedAt = row && row.deleted_at ? Number(row.deleted_at) : null;
+    const updatedAt = row && row.updated_at ? Number(row.updated_at) : null;
+    const complimentaryMs = Math.max(0, TRIAL_COMPLIMENTARY_DAYS) * 24 * 60 * 60 * 1000;
+    const complimentaryUntil = trialUntil ? (trialUntil + complimentaryMs) : null;
+    const graceMs = Math.max(0, SUBSCRIPTION_GRACE_DAYS) * 24 * 60 * 60 * 1000;
+    const graceUntil = graceUntilRaw && graceUntilRaw > 0 ? graceUntilRaw : (expiresAt && expiresAt > 0 ? (expiresAt + graceMs) : null);
+    const planGb = Number.isFinite(planGbRaw) && planGbRaw > 0 ? planGbRaw : 0;
+    const premiumGb = Number.isFinite(premiumGbRaw) && premiumGbRaw > 0 ? premiumGbRaw : 0;
+    const paidPlanActive = status === 'active' && !!(expiresAt && expiresAt > now);
+    const trialActive = !!(trialUntil && trialUntil > now) && !paidPlanActive;
+    const graceActive = !paidPlanActive && !!(expiresAt && expiresAt > 0 && expiresAt <= now && graceUntil && graceUntil > now);
+    const effectivePlanGb = paidPlanActive || graceActive ? planGb : (trialActive ? Math.max(0, planGb - premiumGb) : 0);
+    const displayedPlanGb = paidPlanActive || graceActive || trialActive ? planGb : 0;
+    return {
+        status,
+        planGb,
+        premiumGb,
+        effectivePlanGb,
+        displayedPlanGb,
+        totalQuotaGb: effectivePlanGb + premiumGb,
+        expiresAt,
+        graceUntil,
+        trialUntil,
+        complimentaryUntil,
+        deletedAt,
+        updatedAt,
+        paidPlanActive,
+        trialActive,
+        graceActive,
+    };
+};
+
 const resolveSubscriptionState = async (userId) => {
     const now = Date.now();
     const row = await ensurePlanRow(userId);
     if (!row) return { allowed: false, status: 'none', premiumGb: 0 };
+    const planInfo = getUserQuotaProfileFromRow(row, now);
+    const { planGb, premiumGb, expiresAt, graceUntil, trialUntil, complimentaryUntil, deletedAt, updatedAt, paidPlanActive, trialActive } = planInfo;
 
-    const expiresAt = typeof row.expires_at === 'number' ? row.expires_at : (row.expires_at ? Number(row.expires_at) : null);
-    const graceUntil = typeof row.grace_until === 'number' ? row.grace_until : (row.grace_until ? Number(row.grace_until) : null);
-    const deletedAt = typeof row.deleted_at === 'number' ? row.deleted_at : (row.deleted_at ? Number(row.deleted_at) : null);
-    const trialUntil = typeof row.trial_until === 'number' ? row.trial_until : (row.trial_until ? Number(row.trial_until) : null);
-    const updatedAt = typeof row.updated_at === 'number' ? row.updated_at : (row.updated_at ? Number(row.updated_at) : null);
-    const premiumGb = row.premium_gb && Number.isFinite(Number(row.premium_gb)) && Number(row.premium_gb) > 0 ? Number(row.premium_gb) : 0;
-
-    if (deletedAt && deletedAt > 0) {
-        // Premium users keep access even after subscription deletion (they own 100GB permanently)
+    const resolvePremiumState = async (overflowStatus, extra = {}) => {
+        const premiumQuotaBytes = premiumGb > 0 ? Math.floor(premiumGb * GB_BYTES) : 0;
+        const usedBytes = premiumGb > 0 ? await getUserUsedBytes(userId) : 0;
+        const overPremiumCapacity = premiumQuotaBytes > 0 && usedBytes > premiumQuotaBytes;
         return {
             allowed: premiumGb > 0,
-            status: premiumGb > 0 ? 'premium_only' : 'deleted',
+            status: overPremiumCapacity ? overflowStatus : 'premium_only',
+            trialUntil: trialUntil || null,
+            complimentaryUntil: extra.complimentaryUntil !== undefined ? extra.complimentaryUntil : null,
+            expiresAt: extra.expiresAt !== undefined ? extra.expiresAt : (expiresAt || null),
+            graceUntil: extra.graceUntil !== undefined ? extra.graceUntil : (graceUntil || null),
+            deletedAt: extra.deletedAt !== undefined ? extra.deletedAt : null,
+            planGb: extra.planGb !== undefined ? extra.planGb : null,
+            premiumGb,
+            paymentType: row.payment_type || null,
+            overPremiumCapacity,
+            premiumQuotaBytes,
+            overflowBytes: overPremiumCapacity ? (usedBytes - premiumQuotaBytes) : 0,
+        };
+    };
+
+    if (deletedAt && deletedAt > 0) {
+        if (premiumGb > 0) return await resolvePremiumState('premium_over_capacity', { deletedAt });
+        return {
+            allowed: false,
+            status: 'deleted',
             expiresAt: expiresAt || null,
             graceUntil: graceUntil || null,
             deletedAt,
-            planGb: row.plan_gb || null,
+            planGb: null,
             premiumGb,
             paymentType: row.payment_type || null,
         };
     }
 
-    const complimentaryMs = Math.max(0, TRIAL_COMPLIMENTARY_DAYS) * 24 * 60 * 60 * 1000;
-    const complimentaryUntil = trialUntil ? (trialUntil + complimentaryMs) : null;
-
-    // If user has a paid active subscription (e.g. Solana/Apple/Google), return 'active'
-    // even if trial_until is still in the future (user paid during trial period)
-    if (row.status === 'active' && expiresAt && expiresAt > 0 && expiresAt > now) {
+    if (paidPlanActive) {
         return {
             allowed: true,
             status: 'active',
             trialUntil: trialUntil || null,
             expiresAt,
             graceUntil: graceUntil || null,
-            planGb: row.plan_gb || null,
+            planGb: planGb || null,
             premiumGb,
             paymentType: row.payment_type || null,
         };
     }
 
-    if (trialUntil && trialUntil > now) {
+    if (trialActive) {
         return {
             allowed: true,
             status: 'trial',
             trialUntil,
             expiresAt: expiresAt || null,
             graceUntil: graceUntil || null,
-            planGb: row.plan_gb || null,
+            planGb: planGb || null,
             premiumGb,
             paymentType: row.payment_type || null,
             complimentaryUntil,
         };
     }
 
-    // Complimentary window after trial for sync-only access
     if (row.status === 'trial' && trialUntil && trialUntil > 0 && complimentaryUntil && now <= complimentaryUntil) {
-        // Allow read/sync, block uploads via requireUploadSubscription (unless premium)
+        if (premiumGb > 0) return await resolvePremiumState('premium_trial_complimentary', { complimentaryUntil });
         return {
             allowed: true,
-            status: premiumGb > 0 ? 'premium_only' : 'trial_complimentary',
+            status: 'trial_complimentary',
             trialUntil,
             complimentaryUntil,
             expiresAt: expiresAt || null,
             graceUntil: graceUntil || null,
-            planGb: row.plan_gb || null,
+            planGb: null,
             premiumGb,
             paymentType: row.payment_type || null,
         };
     }
 
-    // Complimentary ended – clear plan selection to free it up
     if (row.status === 'trial' && trialUntil && trialUntil > 0 && complimentaryUntil && complimentaryUntil < now) {
         try {
-            const updatedAt = Date.now();
+            const nextUpdatedAt = Date.now();
             await dbRunAsync(
                 `UPDATE user_plans SET status = ?, plan_gb = NULL, trial_until = NULL, grace_until = NULL, expires_at = NULL, updated_at = ? WHERE user_id = ?`,
-                ['trial_complimentary_expired', updatedAt, userId]
+                ['trial_complimentary_expired', nextUpdatedAt, userId]
             );
-        } catch (e) {
-            // ignore
-        }
+        } catch (e) {}
+        if (premiumGb > 0) return await resolvePremiumState('premium_over_capacity', { complimentaryUntil });
         return {
-            allowed: premiumGb > 0,
-            status: premiumGb > 0 ? 'premium_only' : 'trial_complimentary_expired',
+            allowed: false,
+            status: 'trial_complimentary_expired',
             trialUntil,
             complimentaryUntil,
             expiresAt: null,
@@ -1538,12 +1587,8 @@ const resolveSubscriptionState = async (userId) => {
         };
     }
 
-    // Self-heal: if client/server marked the plan as active but a stale past expires_at remains,
-    // don't immediately force grace/expired popups.
     if (row.status === 'active' && expiresAt && expiresAt > 0 && expiresAt <= now) {
         try {
-            // Only clear if this row has been updated after the expiration timestamp.
-            // This indicates expires_at is stale from a previous plan.
             if (updatedAt && updatedAt > expiresAt) {
                 const now2 = Date.now();
                 await dbRunAsync(
@@ -1555,44 +1600,53 @@ const resolveSubscriptionState = async (userId) => {
                     status: 'active',
                     expiresAt: null,
                     graceUntil: null,
-                    planGb: row.plan_gb || null,
+                    planGb: planGb || null,
                     premiumGb,
                     paymentType: row.payment_type || null,
                 };
             }
-        } catch (e) {
-            // ignore
-        }
+        } catch (e) {}
     }
 
     if (expiresAt && expiresAt > 0 && expiresAt <= now) {
-        const graceMs = Math.max(0, SUBSCRIPTION_GRACE_DAYS) * 24 * 60 * 60 * 1000;
-        const gu = graceUntil && graceUntil > 0 ? graceUntil : (expiresAt + graceMs);
-        if (!graceUntil || graceUntil <= 0) {
-            const updatedAt = Date.now();
+        const gu = graceUntil;
+        if (!row.grace_until || Number(row.grace_until) <= 0) {
+            const nextUpdatedAt = Date.now();
             await dbRunAsync(
                 `UPDATE user_plans SET status = ?, grace_until = ?, updated_at = ? WHERE user_id = ?`,
-                ['grace', gu, updatedAt, userId]
+                ['grace', gu, nextUpdatedAt, userId]
             );
         }
-        const allowedInGrace = gu && gu > 0 ? now <= gu : false;
-        // Persist expired status when grace period ends
+        const allowedInGrace = !!(gu && gu > 0 && now <= gu);
         if (!allowedInGrace && row.status !== 'expired' && premiumGb <= 0) {
             try {
-                const updatedAt = Date.now();
+                const nextUpdatedAt = Date.now();
                 await dbRunAsync(
                     `UPDATE user_plans SET status = ?, updated_at = ? WHERE user_id = ?`,
-                    ['expired', updatedAt, userId]
+                    ['expired', nextUpdatedAt, userId]
                 );
-            } catch (e) { /* ignore */ }
+            } catch (e) {}
         }
-        // Premium users keep access even after subscription expires — never show grace/expired
+        if (premiumGb > 0) {
+            if (allowedInGrace) {
+                return {
+                    allowed: true,
+                    status: 'grace',
+                    expiresAt,
+                    graceUntil: gu,
+                    planGb: planGb || null,
+                    premiumGb,
+                    paymentType: row.payment_type || null,
+                };
+            }
+            return await resolvePremiumState('premium_over_capacity');
+        }
         return {
-            allowed: allowedInGrace || premiumGb > 0,
-            status: premiumGb > 0 ? 'premium_only' : (allowedInGrace ? 'grace' : 'expired'),
+            allowed: allowedInGrace,
+            status: allowedInGrace ? 'grace' : 'expired',
             expiresAt,
             graceUntil: gu,
-            planGb: row.plan_gb || null,
+            planGb: allowedInGrace ? (planGb || null) : null,
             premiumGb,
             paymentType: row.payment_type || null,
         };
@@ -1604,20 +1658,21 @@ const resolveSubscriptionState = async (userId) => {
             status: 'active',
             expiresAt: expiresAt || null,
             graceUntil: graceUntil || null,
-            planGb: row.plan_gb || null,
+            planGb: planGb || null,
             premiumGb,
             paymentType: row.payment_type || null,
         };
     }
 
-    // No active subscription — premium users still get access with their permanent 100GB
+    if (premiumGb > 0) return await resolvePremiumState('premium_over_capacity');
+
     return {
-        allowed: premiumGb > 0,
-        status: premiumGb > 0 ? 'premium_only' : (row.status || 'none'),
+        allowed: false,
+        status: row.status || 'none',
         trialUntil: trialUntil || null,
         expiresAt: expiresAt || null,
         graceUntil: graceUntil || null,
-        planGb: row.plan_gb || null,
+        planGb: null,
         premiumGb,
         paymentType: row.payment_type || null,
     };
@@ -2859,12 +2914,11 @@ const getUserUsedBytes = async (userId, userOrNull) => {
 };
 
 const getUserQuotaBytes = async (userId) => {
-    const planGb = await getUserPlanGb(userId);
-    const premiumGb = await getUserPremiumGb(userId);
-    const totalGb = (planGb || 0) + premiumGb;
+    const row = await ensurePlanRow(userId);
+    const quotaProfile = getUserQuotaProfileFromRow(row, Date.now());
+    const totalGb = quotaProfile.totalQuotaGb;
     if (totalGb <= 0) return 0;
-    const GB = 1000 * 1000 * 1000;
-    const planBytes = Math.floor(totalGb * GB);
+    const planBytes = Math.floor(totalGb * GB_BYTES);
     return planBytes + USER_QUOTA_MARGIN_BYTES;
 };
 
@@ -2875,11 +2929,10 @@ const getServerFreeBytes = () => {
 };
 
 const enforceUserQuotaForIncomingBytes = async ({ userId, incomingBytes }) => {
-    const planGb = await getUserPlanGb(userId);
-    const premiumGb = await getUserPremiumGb(userId);
-    const totalGb = (planGb || 0) + premiumGb;
-    const GB = 1000 * 1000 * 1000;
-    const totalBytes = totalGb > 0 ? Math.floor(totalGb * GB) : 0;
+    const row = await ensurePlanRow(userId);
+    const quotaProfile = getUserQuotaProfileFromRow(row, Date.now());
+    const totalGb = quotaProfile.totalQuotaGb;
+    const totalBytes = totalGb > 0 ? Math.floor(totalGb * GB_BYTES) : 0;
     const quotaBytes = totalBytes > 0 ? (totalBytes + USER_QUOTA_MARGIN_BYTES) : 0;
     const usedBytes = await getUserUsedBytes(userId);
     const inc = typeof incomingBytes === 'number' && Number.isFinite(incomingBytes) ? incomingBytes : 0;
@@ -2974,11 +3027,12 @@ app.get('/.well-known/photosync-capacity.json', (req, res) => {
 
 app.get('/api/cloud/usage', authenticateToken, async (req, res) => {
     try {
-        const planGb = await getUserPlanGb(req.user.id);
-        const premiumGb = await getUserPremiumGb(req.user.id);
-        const totalGb = (planGb || 0) + premiumGb;
-        const GB = 1000 * 1000 * 1000;
-        const totalBytes = totalGb > 0 ? Math.floor(totalGb * GB) : 0;
+        const row = await ensurePlanRow(req.user.id);
+        const quotaProfile = getUserQuotaProfileFromRow(row, Date.now());
+        const planGb = quotaProfile.displayedPlanGb || 0;
+        const premiumGb = quotaProfile.premiumGb || 0;
+        const totalGb = quotaProfile.totalQuotaGb;
+        const totalBytes = totalGb > 0 ? Math.floor(totalGb * GB_BYTES) : 0;
         const quotaBytes = totalBytes > 0 ? (totalBytes + USER_QUOTA_MARGIN_BYTES) : 0;
         const usedBytes = await getUserUsedBytes(req.user.id, req.user);
         const subscription = await resolveSubscriptionState(req.user.id);
@@ -3584,20 +3638,17 @@ app.get('/api/subscription/status', authenticateToken, async (req, res) => {
                 if (latestSolanaPremium && (
                     !row ||
                     !row.premium_gb ||
-                    Number(row.premium_gb) < 100 ||
-                    row.status !== 'active' ||
-                    row.payment_type !== 'solana' ||
-                    !Number(row.expires_at)
+                    Number(row.premium_gb) !== PREMIUM_STORAGE_GB
                 )) {
                     const healed = await activateSolanaPremiumPlan(userId, Number(latestSolanaPremium.created_at) || Date.now(), { now: Date.now() });
                     console.log(`[Premium] Self-healed Solana premium plan for user ${userId} (storageAllocated=${healed.storageAllocated})`);
-                } else if (!latestSolanaPremium && (!row || !row.premium_gb || Number(row.premium_gb) < 100)) {
+                } else if (!latestSolanaPremium && (!row || !row.premium_gb || Number(row.premium_gb) !== PREMIUM_STORAGE_GB)) {
                     await ensurePlanRow(userId);
                     await dbRunAsync(
-                        `UPDATE user_plans SET premium_gb = 100, updated_at = ? WHERE user_id = ?`,
-                        [Date.now(), userId]
+                        `UPDATE user_plans SET premium_gb = ?, updated_at = ? WHERE user_id = ?`,
+                        [PREMIUM_STORAGE_GB, Date.now(), userId]
                     );
-                    console.log(`[Premium] Self-healed premium_gb=100 for user ${userId}`);
+                    console.log(`[Premium] Self-healed premium_gb=${PREMIUM_STORAGE_GB} for user ${userId}`);
                 }
             }
         } catch (_) { /* nft-service not available */ }
@@ -8161,30 +8212,37 @@ try {
 
     // After nft-service mounts, add a dedicated endpoint for client to confirm premium storage
     // Client calls this right after a successful /api/nft-service/upgrade-premium response
-    const PREMIUM_STORAGE_GB = 100;
-    const SOLANA_PREMIUM_DURATION_MS = 4 * 365 * 24 * 60 * 60 * 1000;
     const ensurePremiumStorageCapacity = async (userId, now) => {
         await ensurePlanRow(userId);
-        const existingRow = await dbGetAsync(`SELECT premium_gb FROM user_plans WHERE user_id = ?`, [userId]);
-        const alreadyAllocated = existingRow && Number(existingRow.premium_gb) > 0;
-        if (alreadyAllocated) return { premiumGb: PREMIUM_STORAGE_GB, allocated: true };
+        const existingRow = await dbGetAsync(`SELECT plan_gb, premium_gb, status, trial_until FROM user_plans WHERE user_id = ?`, [userId]);
+        const existingPremiumGb = existingRow && existingRow.premium_gb !== null && existingRow.premium_gb !== undefined ? Number(existingRow.premium_gb) : 0;
+        if (existingPremiumGb === PREMIUM_STORAGE_GB) return { premiumGb: PREMIUM_STORAGE_GB, allocated: true };
+        if (existingPremiumGb > 0) {
+            await dbRunAsync(
+                `UPDATE user_plans SET premium_gb = ?, updated_at = ? WHERE user_id = ?`,
+                [PREMIUM_STORAGE_GB, now, userId]
+            );
+            return { premiumGb: PREMIUM_STORAGE_GB, allocated: true };
+        }
 
-        const GB = 1000 * 1000 * 1000;
-        const SAFETY_BYTES = 20 * GB;
+        const SAFETY_BYTES = 20 * GB_BYTES;
         const capacity = readCapacityJson();
         const totalServerBytes = capacity && typeof capacity.totalBytes === 'number' && Number.isFinite(capacity.totalBytes) ? capacity.totalBytes : null;
 
         if (totalServerBytes !== null) {
             const allocRow = await dbGetAsync(
-                `SELECT COALESCE(SUM(CASE WHEN plan_gb IS NOT NULL AND plan_gb > 0 AND (deleted_at IS NULL OR deleted_at = 0) AND status IN ('active','grace') THEN plan_gb ELSE 0 END), 0) AS totalPlanGb,
+                `SELECT COALESCE(SUM(CASE WHEN plan_gb IS NOT NULL AND plan_gb > 0 AND (deleted_at IS NULL OR deleted_at = 0) AND status IN ('active','grace','trial') THEN plan_gb ELSE 0 END), 0) AS totalPlanGb,
                         COALESCE(SUM(CASE WHEN premium_gb IS NOT NULL AND premium_gb > 0 AND (deleted_at IS NULL OR deleted_at = 0) THEN premium_gb ELSE 0 END), 0) AS totalPremiumGb
                    FROM user_plans`
             );
             const totalPlanGb = allocRow ? Number(allocRow.totalPlanGb) : 0;
             const totalPremiumGb = allocRow ? Number(allocRow.totalPremiumGb) : 0;
-            const currentAllocatedBytes = (totalPlanGb + totalPremiumGb) * GB;
-            const newAllocationBytes = PREMIUM_STORAGE_GB * GB;
-            const availableBytes = totalServerBytes - currentAllocatedBytes - SAFETY_BYTES;
+            const trialPlanGb = existingRow && String(existingRow.status || '') === 'trial' && Number(existingRow.trial_until) > now
+                ? Math.max(0, Number(existingRow.plan_gb) || 0)
+                : 0;
+            const currentAllocatedBytes = (totalPlanGb + totalPremiumGb) * GB_BYTES;
+            const newAllocationBytes = PREMIUM_STORAGE_GB * GB_BYTES;
+            const availableBytes = totalServerBytes - currentAllocatedBytes + (trialPlanGb * GB_BYTES) - SAFETY_BYTES;
 
             if (newAllocationBytes > availableBytes) {
                 return {
@@ -8206,27 +8264,21 @@ try {
     const activateSolanaPremiumPlan = async (userId, purchaseTimestamp, options = {}) => {
         const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
         const purchasedAt = Number.isFinite(Number(purchaseTimestamp)) && Number(purchaseTimestamp) > 0 ? Number(purchaseTimestamp) : now;
-        const targetExpiresAt = purchasedAt + SOLANA_PREMIUM_DURATION_MS;
-
         const storageResult = await ensurePremiumStorageCapacity(userId, now);
         await ensurePlanRow(userId);
 
         await dbRunAsync(
             `UPDATE user_plans
-                SET status = ?,
-                    expires_at = ?,
-                    payment_type = ?,
-                    payment_at = ?,
-                    grace_until = NULL,
+                SET payment_at = COALESCE(payment_at, ?),
                     deleted_at = NULL,
                     updated_at = ?
               WHERE user_id = ?`,
-            ['active', targetExpiresAt, 'solana', purchasedAt, now, userId]
+            [purchasedAt, now, userId]
         );
 
         return {
             premiumGb: storageResult.allocated ? PREMIUM_STORAGE_GB : 0,
-            expiresAt: targetExpiresAt,
+            purchasedAt,
             storageAllocated: !!storageResult.allocated,
             capacityExceeded: !!storageResult.capacityExceeded,
             requiredBytes: storageResult.requiredBytes || null,
@@ -8248,33 +8300,15 @@ try {
             const alreadyAllocated = existingRow && Number(existingRow.premium_gb) > 0;
 
             if (!alreadyAllocated) {
-                // Capacity check: SUM(plan_gb + premium_gb) across all users vs total server capacity
-                const GB = 1000 * 1000 * 1000;
-                const SAFETY_BYTES = 20 * GB;
-                const capacity = readCapacityJson();
-                const totalServerBytes = capacity && typeof capacity.totalBytes === 'number' && Number.isFinite(capacity.totalBytes) ? capacity.totalBytes : null;
-
-                if (totalServerBytes !== null) {
-                    const allocRow = await dbGetAsync(
-                        `SELECT COALESCE(SUM(CASE WHEN plan_gb IS NOT NULL AND plan_gb > 0 AND (deleted_at IS NULL OR deleted_at = 0) AND status IN ('active','grace') THEN plan_gb ELSE 0 END), 0) AS totalPlanGb,
-                                COALESCE(SUM(CASE WHEN premium_gb IS NOT NULL AND premium_gb > 0 AND (deleted_at IS NULL OR deleted_at = 0) THEN premium_gb ELSE 0 END), 0) AS totalPremiumGb
-                           FROM user_plans`
-                    );
-                    const totalPlanGb = allocRow ? Number(allocRow.totalPlanGb) : 0;
-                    const totalPremiumGb = allocRow ? Number(allocRow.totalPremiumGb) : 0;
-                    const currentAllocatedBytes = (totalPlanGb + totalPremiumGb) * GB;
-                    const newAllocationBytes = PREMIUM_STORAGE_GB * GB;
-                    const availableBytes = totalServerBytes - currentAllocatedBytes - SAFETY_BYTES;
-
-                    if (newAllocationBytes > availableBytes) {
-                        console.log(`[Premium] Capacity check failed: need ${newAllocationBytes} bytes, available ${availableBytes} bytes (total=${totalServerBytes}, allocated=${currentAllocatedBytes}, safety=${SAFETY_BYTES})`);
-                        return res.status(507).json({
-                            error: 'Insufficient server capacity for premium storage',
-                            code: 'CAPACITY_EXCEEDED',
-                            requiredBytes: newAllocationBytes,
-                            availableBytes: Math.max(0, availableBytes),
-                        });
-                    }
+                const storageResult = await ensurePremiumStorageCapacity(userId, Date.now());
+                if (!storageResult.allocated && storageResult.capacityExceeded) {
+                    console.log(`[Premium] Capacity check failed: need ${storageResult.requiredBytes} bytes, available ${storageResult.availableBytes} bytes`);
+                    return res.status(507).json({
+                        error: 'Insufficient server capacity for premium storage',
+                        code: 'CAPACITY_EXCEEDED',
+                        requiredBytes: storageResult.requiredBytes,
+                        availableBytes: storageResult.availableBytes,
+                    });
                 }
             }
 
