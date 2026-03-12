@@ -7629,7 +7629,7 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
         const userKey = resolveNftStorageKeyFromUser(req.user);
-        const { action, nft, mintAddress, nfts, walletAddress } = req.body;
+        const { action, nft, mintAddress, nfts, walletAddress, ownerAddress } = req.body;
         console.log(`[NFT] Sync request: user=${userId} userKey=${userKey} action=${action} device_uuid=${req.user.device_uuid || 'none'}`);
 
         const userNftDir = path.join(NFT_DIR, String(userKey));
@@ -7664,6 +7664,7 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
             // Normalize cnft_ prefix so both cnft_ABC and ABC forms are removed
             const normMintTarget = normalizeWalletMint(mintAddress);
             const mintMatchFn = (n) => normalizeWalletMint(n.mintAddress) === normMintTarget;
+            const senderWallet = normalizeWalletAddress(ownerAddress);
             const before = data.nfts.length;
             data.nfts = data.nfts.filter(n => !mintMatchFn(n));
             console.log(`[NFT] Album remove: user=${userId} mint=${mintAddress} removed=${before - data.nfts.length}`);
@@ -7686,6 +7687,36 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
                     } catch (_) {}
                 }
             } catch (linkErr) { console.warn('[NFT] Album remove linked folders error:', linkErr.message); }
+            if (senderWallet) {
+                let globalRemoved = 0;
+                try {
+                    const dirs = fs.readdirSync(NFT_DIR, { withFileTypes: true });
+                    for (const d of dirs) {
+                        if (!d.isDirectory()) continue;
+                        const folderKey = String(d.name);
+                        const globalPath = getNftMetadataPath(folderKey);
+                        if (!fs.existsSync(globalPath)) continue;
+                        try {
+                            const globalData = JSON.parse(fs.readFileSync(globalPath, 'utf8'));
+                            const globalBefore = (globalData.nfts || []).length;
+                            globalData.nfts = (globalData.nfts || []).filter(n => {
+                                if (!mintMatchFn(n)) return true;
+                                return normalizeWalletAddress(n.ownerAddress) !== senderWallet;
+                            });
+                            const removedHere = globalBefore - globalData.nfts.length;
+                            if (removedHere > 0) {
+                                fs.writeFileSync(globalPath, JSON.stringify(globalData, null, 2));
+                                globalRemoved += removedHere;
+                            }
+                        } catch (_) {}
+                    }
+                } catch (globalErr) {
+                    console.warn('[NFT] Album remove global wallet purge error:', globalErr.message);
+                }
+                if (globalRemoved > 0) {
+                    console.log(`[NFT] Album remove global sender purge: wallet=${senderWallet} mint=${mintAddress} removed=${globalRemoved}`);
+                }
+            }
         } else if (action === 'backup' && Array.isArray(nfts)) {
             const existingMap = {};
             const existingMetaMap = {};
