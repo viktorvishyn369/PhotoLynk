@@ -426,19 +426,24 @@ When metadata is available, PhotoLynk stores a structured metadata record that c
 **Formats with active EXIF extraction in current code:**
 
 - JPEG/JPG
-- PNG
-- GIF
-- BMP
+- PNG (eXIf chunk, where present)
 - WebP
 - TIFF/TIF
 - HEIC/HEIF
 - AVIF
 - RAW, CR2, CR3, NEF, ARW, DNG, ORF, RW2, PEF, SRW, RAF
 
+Formats included in the extraction code path but that **do not carry EXIF** in their native container:
+
+- GIF — no embedded EXIF; on mobile, the photo library may provide creation-time metadata separately
+- BMP — no embedded EXIF; same library-level metadata note as GIF
+- PSD — may contain TIFF-style EXIF in IRB resources; `sharp` can sometimes extract it on desktop/server, but results are inconsistent
+- PSB, EXR, HDR — no standard EXIF; these formats use their own metadata systems (PSB: IRB, EXR: OpenEXR attributes, HDR: Radiance text header). Extraction will produce empty results.
+
 EXIF extraction is format-dependent:
 
 - The server backfill path relies mainly on `sharp`, so some formats may remain stored byte-exact without a server-side EXIF sidecar.
-- The desktop backup and certification paths use `ExifReader` for HEIC/HEIF and major RAW camera formats where `sharp` cannot read EXIF reliably.
+- The desktop backup path uses `ExifReader` for HEIC/HEIF where `sharp` cannot read EXIF reliably, and `sharp` + `exif-reader` for all other supported formats.
 
 #### 3. Metadata Write-Back on Sync/Restore
 
@@ -481,9 +486,10 @@ What the restore writers actually write also differs by platform:
 
 - **Desktop**
   - Writes the broadest metadata set
-  - Uses `exiftool-vendored` to write core EXIF, GPS, lens fields, IPTC, and structured XMP
+  - Uses `exiftool-vendored` to write core EXIF, GPS, lens fields, IPTC, and structured XMP in-place without re-encoding pixel data
   - Covers JPEG, PNG, WebP, HEIC/HEIF, TIFF/TIF, GIF, BMP, AVIF, PSD/PSB, EXR/HDR, and major RAW camera formats in the current restore code
   - Falls back to `sharp` only for JPEG/TIFF if `exiftool` is unavailable, and that fallback re-encodes pixels
+  - Only writes EXIF when the restored file is missing embedded metadata (checks via `exiftool` read first)
 
 - **iOS**
   - `writeExif` writes broad EXIF, GPS, TIFF, and IPTC fields through ImageIO
@@ -500,8 +506,8 @@ What the restore writers actually write also differs by platform:
 
 Important RAW caveat:
 
-- **Desktop:** implemented RAW metadata write-back is broad because restore uses bundled `exiftool`
-- **iOS:** RAW originals are preserved in the library, but the current code should be understood as **RAW-preserving restore**, not a blanket guarantee of native metadata rewrite for every RAW container
+- **Desktop:** implemented RAW metadata write-back is broad because restore uses bundled `exiftool-vendored` which writes in-place without re-encoding
+- **iOS:** RAW originals are preserved in the library via `saveRawToLibrary`, but the current code should be understood as **RAW-preserving restore**, not a blanket guarantee of native metadata rewrite for every RAW container
 - **Android:** RAW rewrite remains conditional on what `ExifInterface` can successfully open and save for the specific file
 
 #### 4. Certify Original

@@ -6702,6 +6702,8 @@ app.post('/api/exif/store', authenticateToken, async (req, res) => {
         }
         
         // Don't overwrite existing EXIF (first upload wins) — atomic via O_EXCL
+        // Exception: upgrade=true allows overwrite when new EXIF has more non-null fields
+        const { upgrade } = req.body || {};
         const exifData = {
             fileHash: fileHash.slice(0, 64),
             platform: String(platform || 'unknown').slice(0, 20),
@@ -6709,6 +6711,7 @@ app.post('/api/exif/store', authenticateToken, async (req, res) => {
             userId: req.user.id,
             exif: exif,
         };
+        const countMeaningful = (obj) => Object.values(obj || {}).filter(v => v != null && v !== '' && v !== false).length;
         
         let fd;
         try {
@@ -6716,6 +6719,20 @@ app.post('/api/exif/store', authenticateToken, async (req, res) => {
             fs.writeSync(fd, JSON.stringify(exifData, null, 2), 0, 'utf8');
         } catch (excl) {
             if (excl.code === 'EEXIST') {
+                // Upgrade mode: overwrite if new EXIF has strictly more meaningful fields
+                if (upgrade) {
+                    try {
+                        const existing = JSON.parse(fs.readFileSync(exifPath, 'utf8'));
+                        const oldCount = countMeaningful(existing?.exif);
+                        const newCount = countMeaningful(exif);
+                        if (newCount > oldCount) {
+                            exifData.upgradedFrom = { platform: existing?.platform, fields: oldCount, storedAt: existing?.storedAt };
+                            fs.writeFileSync(exifPath, JSON.stringify(exifData, null, 2), 'utf8');
+                            console.log(`[EXIF] Upgraded EXIF for hash ${fileHash.slice(0, 16)}... (${oldCount}→${newCount} fields)`);
+                            return res.json({ ok: true, upgraded: true, oldFields: oldCount, newFields: newCount });
+                        }
+                    } catch (_) {}
+                }
                 return res.json({ ok: true, exists: true, message: 'EXIF already stored' });
             }
             throw excl;
@@ -6793,21 +6810,34 @@ app.post('/api/exif/batch', authenticateToken, async (req, res) => {
 });
 
 // Batch check which fileHashes are missing EXIF sidecar (for backfill module)
+// When checkShort=true, also returns hashes where existing EXIF has fewer than
+// SHORT_THRESHOLD meaningful (non-null, non-empty) fields — these can be upgraded.
 app.post('/api/exif/check-missing', authenticateToken, async (req, res) => {
     try {
-        const { fileHashes } = req.body || {};
+        const { fileHashes, checkShort } = req.body || {};
         if (!Array.isArray(fileHashes)) {
             return res.status(400).json({ error: 'fileHashes must be an array' });
         }
+        const SHORT_THRESHOLD = 5; // minimum meaningful non-null fields to be "complete"
         const limited = fileHashes.slice(0, 500);
         const missing = [];
+        const short = [];
         for (const hash of limited) {
             if (!hash || typeof hash !== 'string') continue;
             const exifPath = getExifPath(hash);
             if (!exifPath) continue;
-            if (!fs.existsSync(exifPath)) missing.push(hash);
+            if (!fs.existsSync(exifPath)) {
+                missing.push(hash);
+            } else if (checkShort) {
+                try {
+                    const data = JSON.parse(fs.readFileSync(exifPath, 'utf8'));
+                    const exif = data?.exif || {};
+                    const meaningful = Object.values(exif).filter(v => v != null && v !== '' && v !== false).length;
+                    if (meaningful < SHORT_THRESHOLD) short.push(hash);
+                } catch (_) { /* corrupt file — treat as missing */ missing.push(hash); }
+            }
         }
-        return res.json({ missing, checked: limited.length });
+        return res.json({ missing, short, checked: limited.length });
     } catch (e) {
         console.error('[EXIF] check-missing error:', e.message);
         return res.status(500).json({ error: 'Failed to check EXIF' });
@@ -10072,13 +10102,17 @@ const startUpdateChecker = () => {
 };
 
 // ============================================================================
-// EXIF BACKFILL (temporary — fills missing EXIF sidecars for old uploads)
-// Runs once at startup, resumes from cursor, self-disables when complete.
+// EXIF BACKFILL (fills missing / short EXIF sidecars for all uploaded files)
+// Runs on every startup, resumes from cursor, upgrades short EXIF (<5 fields).
+// Covers ALL platforms: files uploaded from mobile-v2, solana-seeker, desktop.
 // ============================================================================
 const EXIF_BACKFILL_CURSOR_PATH = path.join(CLOUD_DIR, '.exif_backfill_cursor.json');
-const EXIF_BACKFILL_IMAGE_EXTS = /\.(jpg|jpeg|png|heic|heif|gif|bmp|webp|tiff?|raw|cr2|cr3|nef|arw|dng|orf|rw2|pef|srw|raf|avif)$/i;
+const EXIF_BACKFILL_IMAGE_EXTS = /\.(jpg|jpeg|png|heic|heif|gif|bmp|webp|tiff?|raw|cr2|cr3|nef|arw|dng|orf|rw2|pef|srw|raf|avif|psd|psb|exr|hdr)$/i;
+const EXIF_SHORT_THRESHOLD = 5; // minimum meaningful non-null fields to be "complete"
 
 let _exifBackfillRunning = false;
+const countMeaningfulFields = (obj) => Object.values(obj || {}).filter(v => v != null && v !== '' && v !== false).length;
+
 const startExifBackfill = async () => {
     if (_exifBackfillRunning) {
         console.log('[ExifBackfill] Already running, skipping');
@@ -10091,23 +10125,18 @@ const startExifBackfill = async () => {
     _exifBackfillRunning = true;
 
     try {
-    // Load cursor
-    let cursor = { completedAt: null, processedFiles: [] };
+    // Load cursor — never permanently complete; always re-scan for new files
+    let cursor = { processedFiles: [] };
     try {
         if (fs.existsSync(EXIF_BACKFILL_CURSOR_PATH)) {
             cursor = JSON.parse(fs.readFileSync(EXIF_BACKFILL_CURSOR_PATH, 'utf8'));
         }
     } catch (_) {}
 
-    if (cursor.completedAt) {
-        console.log(`[ExifBackfill] Already completed at ${cursor.completedAt}`);
-        return;
-    }
-
     const processedSet = new Set(cursor.processedFiles || []);
     console.log(`[ExifBackfill] Starting server-side backfill (${processedSet.size} previously processed)`);
 
-    // Collect all uploaded files across all device directories
+    // Collect all uploaded files across all device directories (UUID folders)
     let allFiles = [];
     try {
         const deviceDirs = fs.readdirSync(UPLOAD_DIR).filter(d => {
@@ -10128,18 +10157,125 @@ const startExifBackfill = async () => {
         return;
     }
 
-    // Filter out already-processed
+    // Filter out already-processed (files where we already stored rich EXIF)
     allFiles = allFiles.filter(f => !processedSet.has(f.key));
     console.log(`[ExifBackfill] ${allFiles.length} files to check`);
 
     if (allFiles.length === 0) {
-        cursor.completedAt = new Date().toISOString();
-        try { fs.writeFileSync(EXIF_BACKFILL_CURSOR_PATH, JSON.stringify(cursor)); } catch (_) {}
-        console.log('[ExifBackfill] Nothing to backfill — marking complete');
+        console.log('[ExifBackfill] Nothing new to backfill');
         return;
     }
 
-    let stored = 0, skipped = 0, errors = 0;
+    let stored = 0, upgraded = 0, skipped = 0, errors = 0;
+
+    // Helper: extract EXIF from file using sharp + exif-reader
+    const extractExifFromFile = async (filePath, meta) => {
+        const r4 = (v) => {
+            const n = Number(v);
+            if (n == null || isNaN(n)) return null;
+            return Number.isInteger(n) ? n : Math.round(n * 1e4) / 1e4;
+        };
+        const t4 = (v) => {
+            const n = Number(v);
+            if (n == null || isNaN(n)) return null;
+            return Math.trunc(n * 1e4) / 1e4;
+        };
+
+        let exifTags = {};
+        if (meta.exif) {
+            try {
+                const exifReader = require('exif-reader');
+                exifTags = exifReader(meta.exif) || {};
+                const flat = {};
+                if (exifTags.image) Object.assign(flat, exifTags.image);
+                if (exifTags.exif) Object.assign(flat, exifTags.exif);
+                if (exifTags.gps) {
+                    if (exifTags.gps.GPSLatitude) flat.GPSLatitude = exifTags.gps.GPSLatitude;
+                    if (exifTags.gps.GPSLongitude) flat.GPSLongitude = exifTags.gps.GPSLongitude;
+                    if (exifTags.gps.GPSAltitude) flat.GPSAltitude = exifTags.gps.GPSAltitude;
+                    if (exifTags.gps.GPSLatitudeRef) flat.GPSLatitudeRef = exifTags.gps.GPSLatitudeRef;
+                    if (exifTags.gps.GPSLongitudeRef) flat.GPSLongitudeRef = exifTags.gps.GPSLongitudeRef;
+                    if (exifTags.gps.GPSAltitudeRef) flat.GPSAltitudeRef = exifTags.gps.GPSAltitudeRef;
+                }
+                exifTags = flat;
+            } catch (e) {
+                exifTags = {};
+            }
+        }
+
+        const exif = {
+            captureTime: null, make: null, model: null,
+            offsetTimeOriginal: null, subSecTimeOriginal: null,
+            exposureTime: null, fNumber: null, iso: null,
+            focalLength: null, focalLengthIn35mm: null,
+            flash: null, whiteBalance: null, meteringMode: null,
+            exposureProgram: null, exposureBias: null,
+            width: null, height: null, orientation: null, colorSpace: null,
+            gpsLatitude: null, gpsLongitude: null, gpsAltitude: null,
+            software: null, lensMake: null, lensModel: null,
+        };
+
+        let dto = exifTags.DateTimeOriginal || exifTags.DateTimeDigitized;
+        if (dto instanceof Date) {
+            exif.captureTime = dto.toISOString().slice(0, 19);
+        } else if (typeof dto === 'string') {
+            const normalized = dto.replace(/^(\d{4}):(\d{2}):(\d{2})/, '$1-$2-$3').replace(' ', 'T');
+            if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(normalized)) exif.captureTime = normalized.slice(0, 19);
+        }
+
+        if (exifTags.Make) exif.make = String(exifTags.Make).replace(/\0/g, '').trim().toLowerCase() || null;
+        if (exifTags.Model) exif.model = String(exifTags.Model).replace(/\0/g, '').trim().toLowerCase() || null;
+        if (exifTags.OffsetTimeOriginal) exif.offsetTimeOriginal = String(exifTags.OffsetTimeOriginal).trim();
+        if (exifTags.SubSecTimeOriginal != null) exif.subSecTimeOriginal = String(exifTags.SubSecTimeOriginal);
+        if (exifTags.ExposureTime != null) exif.exposureTime = r4(exifTags.ExposureTime);
+        if (exifTags.FNumber != null) exif.fNumber = r4(exifTags.FNumber);
+        if (exifTags.ISO != null) exif.iso = Number(exifTags.ISO);
+        else if (exifTags.ISOSpeedRatings != null) exif.iso = Array.isArray(exifTags.ISOSpeedRatings) ? exifTags.ISOSpeedRatings[0] : Number(exifTags.ISOSpeedRatings);
+        if (exifTags.FocalLength != null) exif.focalLength = r4(exifTags.FocalLength);
+        if (exifTags.FocalLengthIn35mmFormat != null) exif.focalLengthIn35mm = r4(exifTags.FocalLengthIn35mmFormat);
+        if (exifTags.Flash != null) exif.flash = typeof exifTags.Flash === 'number' ? exifTags.Flash : null;
+        if (exifTags.WhiteBalance != null) exif.whiteBalance = Number(exifTags.WhiteBalance);
+        if (exifTags.MeteringMode != null) exif.meteringMode = Number(exifTags.MeteringMode);
+        if (exifTags.ExposureProgram != null) exif.exposureProgram = Number(exifTags.ExposureProgram);
+        if (exifTags.ExposureBiasValue != null) exif.exposureBias = r4(exifTags.ExposureBiasValue);
+        exif.width = meta.width || null;
+        exif.height = meta.height || null;
+        if (exifTags.Orientation != null) exif.orientation = Number(exifTags.Orientation);
+        else if (meta.orientation) exif.orientation = meta.orientation;
+        if (exifTags.ColorSpace != null) exif.colorSpace = Number(exifTags.ColorSpace);
+        if (exifTags.Software) exif.software = String(exifTags.Software).replace(/\0/g, '').trim() || null;
+        if (exifTags.LensMake) exif.lensMake = String(exifTags.LensMake).replace(/\0/g, '').trim() || null;
+        if (exifTags.LensModel) exif.lensModel = String(exifTags.LensModel).replace(/\0/g, '').trim() || null;
+
+        // GPS — convert DMS arrays to decimal, then truncate to 4dp
+        if (Array.isArray(exifTags.GPSLatitude) && exifTags.GPSLatitude.length === 3) {
+            const [d, m, s] = exifTags.GPSLatitude;
+            let lat = d + m / 60 + s / 3600;
+            if (exifTags.GPSLatitudeRef === 'S') lat = -lat;
+            exif.gpsLatitude = t4(lat);
+        } else if (typeof exifTags.GPSLatitude === 'number') {
+            let lat = exifTags.GPSLatitude;
+            if (exifTags.GPSLatitudeRef === 'S' && lat > 0) lat = -lat;
+            exif.gpsLatitude = t4(lat);
+        }
+        if (Array.isArray(exifTags.GPSLongitude) && exifTags.GPSLongitude.length === 3) {
+            const [d, m, s] = exifTags.GPSLongitude;
+            let lon = d + m / 60 + s / 3600;
+            if (exifTags.GPSLongitudeRef === 'W') lon = -lon;
+            exif.gpsLongitude = t4(lon);
+        } else if (typeof exifTags.GPSLongitude === 'number') {
+            let lon = exifTags.GPSLongitude;
+            if (exifTags.GPSLongitudeRef === 'W' && lon > 0) lon = -lon;
+            exif.gpsLongitude = t4(lon);
+        }
+        if (exifTags.GPSAltitude != null) {
+            let alt = Number(exifTags.GPSAltitude);
+            if (exifTags.GPSAltitudeRef === 1 && alt > 0) alt = -alt;
+            exif.gpsAltitude = t4(alt);
+        }
+
+        return exif;
+    };
 
     for (let i = 0; i < allFiles.length; i++) {
         const { dir, filename, key } = allFiles[i];
@@ -10155,12 +10291,24 @@ const startExifBackfill = async () => {
                 stream.on('error', reject);
             });
 
-            // Check if EXIF sidecar already exists
             const exifPath = getExifPath(fileHash);
-            if (exifPath && fs.existsSync(exifPath)) {
-                skipped++;
-                processedSet.add(key);
-                continue;
+            if (!exifPath) { processedSet.add(key); continue; }
+
+            // Check if EXIF sidecar exists and whether it's "short" (incomplete)
+            let existingCount = 0;
+            let exifExists = false;
+            if (fs.existsSync(exifPath)) {
+                exifExists = true;
+                try {
+                    const existing = JSON.parse(fs.readFileSync(exifPath, 'utf8'));
+                    existingCount = countMeaningfulFields(existing?.exif);
+                } catch (_) { existingCount = 0; /* corrupt file — rewrite */ exifExists = false; }
+                if (existingCount >= EXIF_SHORT_THRESHOLD) {
+                    // Already rich — skip
+                    skipped++;
+                    processedSet.add(key);
+                    continue;
+                }
             }
 
             // Extract EXIF using sharp
@@ -10168,7 +10316,6 @@ const startExifBackfill = async () => {
             try {
                 meta = await sharp(filePath).metadata();
             } catch (e) {
-                // sharp can't read this format — skip
                 processedSet.add(key);
                 continue;
             }
@@ -10178,114 +10325,7 @@ const startExifBackfill = async () => {
                 continue;
             }
 
-            // Build EXIF sidecar object (same structure as mobile extractFullExif)
-            const r4 = (v) => {
-                const n = Number(v);
-                if (n == null || isNaN(n)) return null;
-                return Number.isInteger(n) ? n : Math.round(n * 1e4) / 1e4;
-            };
-            const t4 = (v) => {
-                const n = Number(v);
-                if (n == null || isNaN(n)) return null;
-                return Math.trunc(n * 1e4) / 1e4;
-            };
-
-            // Parse EXIF from sharp's raw exif buffer using exif-reader (bundled with sharp)
-            let exifTags = {};
-            if (meta.exif) {
-                try {
-                    const exifReader = require('exif-reader');
-                    exifTags = exifReader(meta.exif) || {};
-                    // Flatten nested structure: { image: {}, exif: {}, gps: {} }
-                    const flat = {};
-                    if (exifTags.image) Object.assign(flat, exifTags.image);
-                    if (exifTags.exif) Object.assign(flat, exifTags.exif);
-                    if (exifTags.gps) {
-                        // Map GPS fields with proper names
-                        if (exifTags.gps.GPSLatitude) flat.GPSLatitude = exifTags.gps.GPSLatitude;
-                        if (exifTags.gps.GPSLongitude) flat.GPSLongitude = exifTags.gps.GPSLongitude;
-                        if (exifTags.gps.GPSAltitude) flat.GPSAltitude = exifTags.gps.GPSAltitude;
-                        if (exifTags.gps.GPSLatitudeRef) flat.GPSLatitudeRef = exifTags.gps.GPSLatitudeRef;
-                        if (exifTags.gps.GPSLongitudeRef) flat.GPSLongitudeRef = exifTags.gps.GPSLongitudeRef;
-                        if (exifTags.gps.GPSAltitudeRef) flat.GPSAltitudeRef = exifTags.gps.GPSAltitudeRef;
-                    }
-                    exifTags = flat;
-                } catch (e) {
-                    exifTags = {};
-                }
-            }
-
-            const exif = {
-                captureTime: null, make: null, model: null,
-                offsetTimeOriginal: null, subSecTimeOriginal: null,
-                exposureTime: null, fNumber: null, iso: null,
-                focalLength: null, focalLengthIn35mm: null,
-                flash: null, whiteBalance: null, meteringMode: null,
-                exposureProgram: null, exposureBias: null,
-                width: null, height: null, orientation: null, colorSpace: null,
-                gpsLatitude: null, gpsLongitude: null, gpsAltitude: null,
-                software: null, lensMake: null, lensModel: null,
-            };
-
-            // DateTimeOriginal
-            let dto = exifTags.DateTimeOriginal || exifTags.DateTimeDigitized;
-            if (dto instanceof Date) {
-                exif.captureTime = dto.toISOString().slice(0, 19);
-            } else if (typeof dto === 'string') {
-                const normalized = dto.replace(/^(\d{4}):(\d{2}):(\d{2})/, '$1-$2-$3').replace(' ', 'T');
-                if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(normalized)) exif.captureTime = normalized.slice(0, 19);
-            }
-
-            if (exifTags.Make) exif.make = String(exifTags.Make).replace(/\0/g, '').trim().toLowerCase() || null;
-            if (exifTags.Model) exif.model = String(exifTags.Model).replace(/\0/g, '').trim().toLowerCase() || null;
-            if (exifTags.OffsetTimeOriginal) exif.offsetTimeOriginal = String(exifTags.OffsetTimeOriginal).trim();
-            if (exifTags.SubSecTimeOriginal != null) exif.subSecTimeOriginal = String(exifTags.SubSecTimeOriginal);
-            if (exifTags.ExposureTime != null) exif.exposureTime = r4(exifTags.ExposureTime);
-            if (exifTags.FNumber != null) exif.fNumber = r4(exifTags.FNumber);
-            if (exifTags.ISO != null) exif.iso = Number(exifTags.ISO);
-            else if (exifTags.ISOSpeedRatings != null) exif.iso = Array.isArray(exifTags.ISOSpeedRatings) ? exifTags.ISOSpeedRatings[0] : Number(exifTags.ISOSpeedRatings);
-            if (exifTags.FocalLength != null) exif.focalLength = r4(exifTags.FocalLength);
-            if (exifTags.FocalLengthIn35mmFormat != null) exif.focalLengthIn35mm = r4(exifTags.FocalLengthIn35mmFormat);
-            if (exifTags.Flash != null) exif.flash = typeof exifTags.Flash === 'number' ? exifTags.Flash : null;
-            if (exifTags.WhiteBalance != null) exif.whiteBalance = Number(exifTags.WhiteBalance);
-            if (exifTags.MeteringMode != null) exif.meteringMode = Number(exifTags.MeteringMode);
-            if (exifTags.ExposureProgram != null) exif.exposureProgram = Number(exifTags.ExposureProgram);
-            if (exifTags.ExposureBiasValue != null) exif.exposureBias = r4(exifTags.ExposureBiasValue);
-            exif.width = meta.width || null;
-            exif.height = meta.height || null;
-            if (exifTags.Orientation != null) exif.orientation = Number(exifTags.Orientation);
-            else if (meta.orientation) exif.orientation = meta.orientation;
-            if (exifTags.ColorSpace != null) exif.colorSpace = Number(exifTags.ColorSpace);
-            if (exifTags.Software) exif.software = String(exifTags.Software).replace(/\0/g, '').trim() || null;
-            if (exifTags.LensMake) exif.lensMake = String(exifTags.LensMake).replace(/\0/g, '').trim() || null;
-            if (exifTags.LensModel) exif.lensModel = String(exifTags.LensModel).replace(/\0/g, '').trim() || null;
-
-            // GPS — convert DMS arrays to decimal, then truncate to 4dp
-            if (Array.isArray(exifTags.GPSLatitude) && exifTags.GPSLatitude.length === 3) {
-                const [d, m, s] = exifTags.GPSLatitude;
-                let lat = d + m / 60 + s / 3600;
-                if (exifTags.GPSLatitudeRef === 'S') lat = -lat;
-                exif.gpsLatitude = t4(lat);
-            } else if (typeof exifTags.GPSLatitude === 'number') {
-                let lat = exifTags.GPSLatitude;
-                if (exifTags.GPSLatitudeRef === 'S' && lat > 0) lat = -lat;
-                exif.gpsLatitude = t4(lat);
-            }
-            if (Array.isArray(exifTags.GPSLongitude) && exifTags.GPSLongitude.length === 3) {
-                const [d, m, s] = exifTags.GPSLongitude;
-                let lon = d + m / 60 + s / 3600;
-                if (exifTags.GPSLongitudeRef === 'W') lon = -lon;
-                exif.gpsLongitude = t4(lon);
-            } else if (typeof exifTags.GPSLongitude === 'number') {
-                let lon = exifTags.GPSLongitude;
-                if (exifTags.GPSLongitudeRef === 'W' && lon > 0) lon = -lon;
-                exif.gpsLongitude = t4(lon);
-            }
-            if (exifTags.GPSAltitude != null) {
-                let alt = Number(exifTags.GPSAltitude);
-                if (exifTags.GPSAltitudeRef === 1 && alt > 0) alt = -alt;
-                exif.gpsAltitude = t4(alt);
-            }
+            const exif = await extractExifFromFile(filePath, meta);
 
             // Only store if we have meaningful data
             if (!exif.captureTime && !exif.make && exif.gpsLatitude == null) {
@@ -10293,7 +10333,15 @@ const startExifBackfill = async () => {
                 continue;
             }
 
-            // Write EXIF sidecar
+            const newCount = countMeaningfulFields(exif);
+
+            // Skip if new extraction isn't richer than existing
+            if (exifExists && newCount <= existingCount) {
+                processedSet.add(key);
+                continue;
+            }
+
+            // Write EXIF sidecar (new or upgrade)
             const exifData = {
                 fileHash: fileHash.slice(0, 64),
                 platform: 'server',
@@ -10301,19 +10349,24 @@ const startExifBackfill = async () => {
                 userId: 'backfill',
                 exif,
             };
-            if (exifPath) {
-                fs.writeFileSync(exifPath, JSON.stringify(exifData, null, 2), 'utf8');
+            if (exifExists) {
+                exifData.upgradedFrom = { fields: existingCount, storedAt: new Date().toISOString() };
+            }
+            fs.writeFileSync(exifPath, JSON.stringify(exifData, null, 2), 'utf8');
+            if (exifExists) {
+                upgraded++;
+            } else {
                 stored++;
             }
 
             processedSet.add(key);
 
-            if (stored % 50 === 0 || (i + 1) % 200 === 0) {
-                console.log(`[ExifBackfill] Progress: ${i + 1}/${allFiles.length}, stored=${stored}, skipped=${skipped}, errors=${errors}`);
+            if ((stored + upgraded) % 50 === 0 || (i + 1) % 200 === 0) {
+                console.log(`[ExifBackfill] Progress: ${i + 1}/${allFiles.length}, stored=${stored}, upgraded=${upgraded}, skipped=${skipped}, errors=${errors}`);
             }
 
-            // Save cursor every 100 stored
-            if (stored % 100 === 0) {
+            // Save cursor every 100 writes
+            if ((stored + upgraded) % 100 === 0) {
                 try {
                     fs.writeFileSync(EXIF_BACKFILL_CURSOR_PATH, JSON.stringify({
                         processedFiles: [...processedSet].slice(-10000),
@@ -10332,13 +10385,86 @@ const startExifBackfill = async () => {
         }
     }
 
-    // Save final cursor
-    const finalCursor = {
-        processedFiles: [...processedSet].slice(-10000),
-        completedAt: new Date().toISOString(),
-    };
-    try { fs.writeFileSync(EXIF_BACKFILL_CURSOR_PATH, JSON.stringify(finalCursor)); } catch (_) {}
-    console.log(`[ExifBackfill] Complete. stored=${stored}, skipped=${skipped}, errors=${errors}, total=${allFiles.length}`);
+    // Save cursor after Phase 1 (legacy uploads)
+    try {
+        fs.writeFileSync(EXIF_BACKFILL_CURSOR_PATH, JSON.stringify({
+            processedFiles: [...processedSet].slice(-10000),
+            updatedAt: new Date().toISOString(),
+        }));
+    } catch (_) {}
+    console.log(`[ExifBackfill] Phase 1 (legacy uploads) complete. stored=${stored}, upgraded=${upgraded}, skipped=${skipped}, errors=${errors}, total=${allFiles.length}`);
+
+    // ── Phase 2: Mine StealthCloud manifest metadata for E2EE files ──
+    // StealthCloud chunks are encrypted — server CANNOT extract EXIF from them.
+    // But manifests store basic EXIF in plaintext: exifCaptureTime, exifMake, exifModel.
+    // Create minimal EXIF sidecars for files that have NO sidecar at all.
+    // This ensures old-app users who never update still get at least basic EXIF preserved.
+    const cloudUsersRoot = path.join(CLOUD_DIR, 'users');
+    let manifestStored = 0, manifestSkipped = 0, manifestErrors = 0;
+    try {
+        if (fs.existsSync(cloudUsersRoot)) {
+            const userDirs = fs.readdirSync(cloudUsersRoot).filter(d => {
+                if (d.startsWith('.')) return false;
+                try { return fs.statSync(path.join(cloudUsersRoot, d)).isDirectory(); } catch (_) { return false; }
+            });
+            for (const ud of userDirs) {
+                const manifestsDir = path.join(cloudUsersRoot, ud, 'manifests');
+                if (!fs.existsSync(manifestsDir)) continue;
+                let manifestFiles;
+                try { manifestFiles = fs.readdirSync(manifestsDir).filter(f => f.endsWith('.json') && !f.startsWith('.')); } catch (_) { continue; }
+
+                for (const mf of manifestFiles) {
+                    try {
+                        const content = JSON.parse(fs.readFileSync(path.join(manifestsDir, mf), 'utf8'));
+                        const meta = content?.meta;
+                        if (!meta?.fileHash) continue; // no fileHash → can't create sidecar
+
+                        const exifPath = getExifPath(meta.fileHash);
+                        if (!exifPath) continue;
+                        if (fs.existsSync(exifPath)) { manifestSkipped++; continue; } // already has sidecar
+
+                        // Build minimal EXIF from manifest metadata
+                        const exif = {};
+                        if (meta.exifCaptureTime) exif.captureTime = String(meta.exifCaptureTime).slice(0, 30);
+                        if (meta.exifMake) exif.make = String(meta.exifMake).replace(/\0/g, '').trim().toLowerCase() || null;
+                        if (meta.exifModel) exif.model = String(meta.exifModel).replace(/\0/g, '').trim().toLowerCase() || null;
+                        if (meta.originalSize) exif.originalSize = meta.originalSize;
+
+                        if (!exif.captureTime && !exif.make) continue; // no meaningful data
+
+                        const exifData = {
+                            fileHash: meta.fileHash.slice(0, 64),
+                            platform: 'manifest-backfill',
+                            storedAt: new Date().toISOString(),
+                            userId: ud,
+                            exif,
+                        };
+
+                        // Use O_EXCL to not race with client-side backfill
+                        let fd;
+                        try {
+                            fd = fs.openSync(exifPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL);
+                            fs.writeSync(fd, JSON.stringify(exifData, null, 2), 0, 'utf8');
+                            manifestStored++;
+                        } catch (excl) {
+                            if (excl.code === 'EEXIST') { manifestSkipped++; continue; }
+                            throw excl;
+                        } finally {
+                            if (fd !== undefined) try { fs.closeSync(fd); } catch (_) {}
+                        }
+                    } catch (_) { manifestErrors++; }
+
+                    // Yield every file
+                    await new Promise(r => setImmediate(r));
+                }
+            }
+        }
+    } catch (e) {
+        console.error('[ExifBackfill] Phase 2 manifest scan error:', e.message);
+    }
+    if (manifestStored > 0 || manifestErrors > 0) {
+        console.log(`[ExifBackfill] Phase 2 (manifest metadata) complete. stored=${manifestStored}, skipped=${manifestSkipped}, errors=${manifestErrors}`);
+    }
 
     } finally {
         _exifBackfillRunning = false;
