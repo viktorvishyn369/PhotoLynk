@@ -132,7 +132,7 @@ class Updater {
 
       // Install dependencies
       console.log('Installing dependencies...');
-      execSync('npm install', { 
+      execSync('npm install --omit=dev', { 
         cwd: path.join(projectRoot, 'server'),
         stdio: 'inherit'
       });

@@ -159,7 +159,7 @@ echo -e "${GREEN}✓${NC} Downloaded to $INSTALL_DIR"
 echo ""
 echo -e "${BLUE}[4/7]${NC} Installing server dependencies..."
 cd server
-npm install --production
+npm install --omit=dev
 echo -e "${GREEN}✓${NC} Server dependencies installed"
 
 # Create systemd service
