@@ -8070,11 +8070,16 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
             // transfer-inbox folder so readCertsForWalletGlobal picks it up for the recipient.
             const newOwner = String(req.body.newOwnerAddress).trim();
             if (!newOwner) return res.status(400).json({ error: 'newOwnerAddress required' });
+            const requestedNewMintAddress = req.body.newMintAddress ? String(req.body.newMintAddress).trim() : '';
+            const senderMint = normalizeWalletMint(certificate.mintAddress);
+            const recipientMint = normalizeWalletMint(requestedNewMintAddress) || senderMint;
+            const recipientMintAddress = recipientMint ? `cnft_${recipientMint}` : (requestedNewMintAddress || certificate.mintAddress);
 
             const transferredAt = new Date().toISOString();
             const transferredFrom = certificate.ownerAddress || certificate.creatorWallet || '';
             const transferredCert = slimCert({
                 ...certificate,
+                mintAddress: recipientMintAddress,
                 ownerAddress: newOwner,
                 transferredFrom,
                 transferredAt,
@@ -8103,7 +8108,6 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
             // Also copy the NFT album entry to the inbox so readNftsForWalletGlobal finds it for new owner
             // Without this, the new owner's app won't see the NFT (encryptionData, thumbnailUrl etc. are only in server album)
             try {
-                const senderMint = normalizeWalletMint(certificate.mintAddress);
                 if (senderMint) {
                     let nftEntry = null;
                     const senderWallet = normalizeWalletAddress(certificate.ownerAddress);
@@ -8118,7 +8122,7 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
                         }
                     }
                     const transferredNft = nftEntry ? { ...nftEntry } : {
-                        mintAddress: certificate.mintAddress,
+                        mintAddress: recipientMintAddress,
                         name: certificate.name || 'NFT',
                         description: certificate.description || '',
                         imageUrl: certificate.imageUrl,
@@ -8130,7 +8134,8 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
                         nftType: certificate.nftType,
                     };
                     mergeStoredNft(transferredNft, {
-                        mintAddress: certificate.mintAddress,
+                        mintAddress: recipientMintAddress,
+                        assetId: recipientMint || undefined,
                         imageUrl: certificate.imageUrl,
                         metadataUrl: certificate.metadataUrl,
                         description: certificate.description,
@@ -8148,6 +8153,8 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
                         exifRawHash: certificate.exifRawHash,
                         exifBindingHash: certificate.exifBindingHash,
                     });
+                    if (recipientMintAddress) transferredNft.mintAddress = recipientMintAddress;
+                    if (recipientMint && !recipientMint.startsWith('tx_')) transferredNft.assetId = recipientMint;
                     transferredNft.ownerAddress = newOwner;
                     transferredNft.transferredFrom = transferredFrom;
                     transferredNft.transferredAt = transferredAt;
@@ -8169,14 +8176,14 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
                         try { inboxAlbum = JSON.parse(fs.readFileSync(inboxAlbumPath, 'utf8')); } catch (_) {}
                     }
                     const inboxMints = new Set((inboxAlbum.nfts || []).map(n => normalizeWalletMint(n.mintAddress)));
-                    if (!inboxMints.has(senderMint)) {
+                    if (!inboxMints.has(recipientMint)) {
                         inboxAlbum.nfts.push(transferredNft);
                     } else {
-                        const idx = inboxAlbum.nfts.findIndex(n => normalizeWalletMint(n.mintAddress) === senderMint);
+                        const idx = inboxAlbum.nfts.findIndex(n => normalizeWalletMint(n.mintAddress) === recipientMint);
                         if (idx >= 0) inboxAlbum.nfts[idx] = transferredNft;
                     }
                     fs.writeFileSync(inboxAlbumPath, JSON.stringify(inboxAlbum, null, 2));
-                    console.log(`[NFT] Album entry transferred to inbox: mint=${certificate.mintAddress} to=${newOwner}`);
+                    console.log(`[NFT] Album entry transferred to inbox: oldMint=${certificate.mintAddress} newMint=${recipientMintAddress} to=${newOwner}`);
                 }
             } catch (albumErr) { console.warn('[NFT] Album entry transfer failed (non-critical):', albumErr.message); }
 
