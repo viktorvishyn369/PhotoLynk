@@ -1875,6 +1875,8 @@ db.serialize(() => {
         expires_at INTEGER,
         grace_until INTEGER,
         trial_until INTEGER,
+        trial_carryover_applied_at INTEGER,
+        last_store_purchase_at INTEGER,
         deleted_at INTEGER,
         payment_type TEXT,
         payment_at INTEGER,
@@ -1912,6 +1914,12 @@ db.serialize(() => {
         }
         if (!names.includes('trial_until')) {
             db.run(`ALTER TABLE user_plans ADD COLUMN trial_until INTEGER`, [], () => {});
+        }
+        if (!names.includes('trial_carryover_applied_at')) {
+            db.run(`ALTER TABLE user_plans ADD COLUMN trial_carryover_applied_at INTEGER`, [], () => {});
+        }
+        if (!names.includes('last_store_purchase_at')) {
+            db.run(`ALTER TABLE user_plans ADD COLUMN last_store_purchase_at INTEGER`, [], () => {});
         }
         if (!names.includes('deleted_at')) {
             db.run(`ALTER TABLE user_plans ADD COLUMN deleted_at INTEGER`, [], () => {});
@@ -3683,6 +3691,110 @@ const getMinRequiredTier = async (userId) => {
     return 1000; // Max tier if usage exceeds all
 };
 
+const inferMobileSubscriptionDurationMs = (productId) => {
+    const id = String(productId || '').toLowerCase();
+    if (!id) return null;
+    if (/(yearly|annual|year)(?:\b|$)/.test(id)) return 365 * 24 * 60 * 60 * 1000;
+    if (/(monthly|month)(?:\b|$)/.test(id)) return 30 * 24 * 60 * 60 * 1000;
+    return null;
+};
+
+const normalizePositiveTimestamp = (value) => {
+    const n = Number(value);
+    return Number.isFinite(n) && n > 0 ? n : null;
+};
+
+const computeTrialCarryoverMs = (currentPlan, purchaseAt) => {
+    const trialUntil = normalizePositiveTimestamp(currentPlan?.trial_until);
+    const trialCarryoverAppliedAt = normalizePositiveTimestamp(currentPlan?.trial_carryover_applied_at);
+    if (trialCarryoverAppliedAt || !trialUntil || !purchaseAt || trialUntil <= purchaseAt) return 0;
+    return Math.max(0, trialUntil - purchaseAt);
+};
+
+const computePaidSubscriptionExpiry = ({
+    currentPlan,
+    purchaseAt,
+    durationMs,
+}) => {
+    const paymentAt = normalizePositiveTimestamp(purchaseAt) || Date.now();
+    const currentExpires = normalizePositiveTimestamp(currentPlan?.expires_at);
+    const carryoverMs = computeTrialCarryoverMs(currentPlan, paymentAt);
+    if (currentExpires && currentExpires > paymentAt) {
+        return {
+            expiresAt: currentExpires + durationMs,
+            paymentAt,
+            trialCarryoverAppliedAt: normalizePositiveTimestamp(currentPlan?.trial_carryover_applied_at),
+        };
+    }
+    return {
+        expiresAt: paymentAt + durationMs + carryoverMs,
+        paymentAt,
+        trialCarryoverAppliedAt: carryoverMs > 0 ? paymentAt : normalizePositiveTimestamp(currentPlan?.trial_carryover_applied_at),
+    };
+};
+
+const resolveStoreSubscriptionUpdate = ({
+    currentPlan,
+    productId,
+    latestPurchaseAt,
+    rawExpiresAt,
+    now = Date.now(),
+}) => {
+    const durationMs = inferMobileSubscriptionDurationMs(productId);
+    const purchaseAt = normalizePositiveTimestamp(latestPurchaseAt)
+        || (() => {
+            const expiresAt = normalizePositiveTimestamp(rawExpiresAt);
+            return (expiresAt && durationMs) ? Math.max(now, expiresAt - durationMs) : now;
+        })();
+    const currentExpires = normalizePositiveTimestamp(currentPlan?.expires_at);
+    const lastStorePurchaseAt = normalizePositiveTimestamp(currentPlan?.last_store_purchase_at);
+
+    if (!durationMs) {
+        return {
+            expiresAt: normalizePositiveTimestamp(rawExpiresAt) || currentExpires,
+            paymentAt: purchaseAt,
+            lastStorePurchaseAt,
+            trialCarryoverAppliedAt: normalizePositiveTimestamp(currentPlan?.trial_carryover_applied_at),
+        };
+    }
+
+    const currentCycle = computePaidSubscriptionExpiry({
+        currentPlan: { ...currentPlan, expires_at: null },
+        purchaseAt,
+        durationMs,
+    });
+
+    if (lastStorePurchaseAt && purchaseAt && lastStorePurchaseAt >= purchaseAt) {
+        return {
+            expiresAt: Math.max(currentExpires || 0, currentCycle.expiresAt || 0) || null,
+            paymentAt: normalizePositiveTimestamp(currentPlan?.payment_at) || purchaseAt,
+            lastStorePurchaseAt,
+            trialCarryoverAppliedAt: currentCycle.trialCarryoverAppliedAt,
+        };
+    }
+
+    if (!lastStorePurchaseAt && currentExpires && currentExpires > purchaseAt) {
+        return {
+            expiresAt: Math.max(currentExpires, currentCycle.expiresAt),
+            paymentAt: purchaseAt,
+            lastStorePurchaseAt: purchaseAt,
+            trialCarryoverAppliedAt: currentCycle.trialCarryoverAppliedAt,
+        };
+    }
+
+    const nextCycle = computePaidSubscriptionExpiry({
+        currentPlan,
+        purchaseAt,
+        durationMs,
+    });
+    return {
+        expiresAt: nextCycle.expiresAt,
+        paymentAt: nextCycle.paymentAt,
+        lastStorePurchaseAt: purchaseAt,
+        trialCarryoverAppliedAt: nextCycle.trialCarryoverAppliedAt,
+    };
+};
+
 // API endpoint to check downgrade eligibility
 app.get('/api/subscription/downgrade-check', authenticateToken, async (req, res) => {
     try {
@@ -3722,7 +3834,14 @@ app.get('/api/subscription/downgrade-check', authenticateToken, async (req, res)
 app.post('/api/subscription/sync', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
-        const { productId, tierGb, entitlementId, paymentType, expiresAt: clientExpiresAt } = req.body || {};
+        const {
+            productId,
+            tierGb,
+            entitlementId,
+            paymentType,
+            expiresAt: clientExpiresAt,
+            latestPurchaseAt: clientLatestPurchaseAt,
+        } = req.body || {};
         const tier = normalizeTierGb(tierGb) || normalizeTierGb(inferTierGbFromProductId(productId));
         if (!tier) return res.status(400).json({ error: 'Invalid or missing tier' });
 
@@ -3750,8 +3869,18 @@ app.post('/api/subscription/sync', authenticateToken, async (req, res) => {
         // Accept expires_at from app for Apple/Google subscribers (RevenueCat SDK provides it).
         // Solana handles its own expiry in /api/solana/verify-payment — don't overwrite here.
         const isSolana = String(paymentType).toLowerCase() === 'solana';
-        const rawExpires = clientExpiresAt != null ? Number(clientExpiresAt) : null;
-        const syncExpiresAt = (!isSolana && Number.isFinite(rawExpires) && rawExpires > 0) ? rawExpires : null;
+        const rawExpires = normalizePositiveTimestamp(clientExpiresAt);
+        const storeUpdate = isSolana ? null : resolveStoreSubscriptionUpdate({
+            currentPlan,
+            productId,
+            latestPurchaseAt: clientLatestPurchaseAt,
+            rawExpiresAt: rawExpires,
+            now,
+        });
+        const syncExpiresAt = isSolana ? null : storeUpdate?.expiresAt;
+        const syncPaymentAt = isSolana ? now : (storeUpdate?.paymentAt || normalizePositiveTimestamp(currentPlan?.payment_at) || now);
+        const syncLastStorePurchaseAt = isSolana ? null : storeUpdate?.lastStorePurchaseAt;
+        const syncTrialCarryoverAppliedAt = isSolana ? normalizePositiveTimestamp(currentPlan?.trial_carryover_applied_at) : storeUpdate?.trialCarryoverAppliedAt;
 
         const trialUntil = currentPlan && currentPlan.trial_until ? Number(currentPlan.trial_until) : null;
         const isInTrialWindow = trialUntil && Number.isFinite(trialUntil) && trialUntil > now;
@@ -3768,6 +3897,8 @@ app.post('/api/subscription/sync', authenticateToken, async (req, res) => {
                     payment_type = ?,
                     payment_at = ?,
                     expires_at = CASE WHEN ? IS NOT NULL AND ? > 0 THEN ? ELSE expires_at END,
+                    trial_carryover_applied_at = CASE WHEN ? IS NOT NULL AND ? > 0 THEN ? ELSE trial_carryover_applied_at END,
+                    last_store_purchase_at = CASE WHEN ? IS NOT NULL AND ? > 0 THEN ? ELSE last_store_purchase_at END,
                     grace_until = NULL,
                     deleted_at = NULL,
                     updated_at = ?
@@ -3779,8 +3910,10 @@ app.post('/api/subscription/sync', authenticateToken, async (req, res) => {
                 entitlementId || null,
                 req.user.email || null,
                 paymentType || null,
-                now,
+                syncPaymentAt,
                 syncExpiresAt, syncExpiresAt, syncExpiresAt,
+                syncTrialCarryoverAppliedAt, syncTrialCarryoverAppliedAt, syncTrialCarryoverAppliedAt,
+                syncLastStorePurchaseAt, syncLastStorePurchaseAt, syncLastStorePurchaseAt,
                 now,
                 userId,
             ]
@@ -3808,6 +3941,7 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
         if (!appUserId) return res.status(400).json({ error: 'Missing app_user_id' });
 
         const expiresAtMs = event && (event.expiration_at_ms || event.expirationAtMs) ? Number(event.expiration_at_ms || event.expirationAtMs) : null;
+        const latestPurchaseAtMs = event && (event.purchased_at_ms || event.purchasedAtMs) ? Number(event.purchased_at_ms || event.purchasedAtMs) : null;
         const productId = event && (event.product_id || event.productId) ? String(event.product_id || event.productId) : null;
         const entitlementId = event && (event.entitlement_id || event.entitlementId) ? String(event.entitlement_id || event.entitlementId) : null;
         const tierGbFromEvent = normalizeTierGb(event && (event.plan_gb || event.planGb || event.tier_gb || event.tierGb));
@@ -3828,6 +3962,7 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
             async (err, row) => {
                 if (err) return res.status(500).json({ error: 'Database error' });
                 if (!row || !row.user_id) return res.status(404).json({ error: 'User not found' });
+                const currentPlan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [row.user_id]);
 
                 // DOWNGRADE GUARD: Reject if user's storage exceeds target tier
                 if (tierGb) {
@@ -3850,7 +3985,14 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
                 }
 
                 const now = Date.now();
-                const expiresMs = Number.isFinite(expiresAtMs) ? expiresAtMs : null;
+                const storeUpdate = resolveStoreSubscriptionUpdate({
+                    currentPlan,
+                    productId,
+                    latestPurchaseAt: latestPurchaseAtMs,
+                    rawExpiresAt: expiresAtMs,
+                    now,
+                });
+                const expiresMs = storeUpdate?.expiresAt;
                 const isActive = expiresMs && expiresMs > now;
 
                 if (isActive) {
@@ -3864,10 +4006,24 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
                                 rc_entitlement = ?,
                                 payment_type = ?,
                                 payment_at = ?,
+                                trial_carryover_applied_at = CASE WHEN ? IS NOT NULL AND ? > 0 THEN ? ELSE trial_carryover_applied_at END,
+                                last_store_purchase_at = CASE WHEN ? IS NOT NULL AND ? > 0 THEN ? ELSE last_store_purchase_at END,
                                 plan_gb = COALESCE(?, plan_gb),
                                 updated_at = ?
                           WHERE user_id = ?`,
-                        ['active', expiresMs, productId, entitlementId, paymentType, now, tierGb, now, row.user_id]
+                        [
+                            'active',
+                            expiresMs,
+                            productId,
+                            entitlementId,
+                            paymentType,
+                            storeUpdate?.paymentAt || now,
+                            storeUpdate?.trialCarryoverAppliedAt, storeUpdate?.trialCarryoverAppliedAt, storeUpdate?.trialCarryoverAppliedAt,
+                            storeUpdate?.lastStorePurchaseAt, storeUpdate?.lastStorePurchaseAt, storeUpdate?.lastStorePurchaseAt,
+                            tierGb,
+                            now,
+                            row.user_id,
+                        ]
                     );
                     return res.json({ ok: true });
                 }
@@ -3883,9 +4039,23 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
                             rc_entitlement = ?,
                             payment_type = ?,
                             payment_at = ?,
+                            trial_carryover_applied_at = CASE WHEN ? IS NOT NULL AND ? > 0 THEN ? ELSE trial_carryover_applied_at END,
+                            last_store_purchase_at = CASE WHEN ? IS NOT NULL AND ? > 0 THEN ? ELSE last_store_purchase_at END,
                             updated_at = ?
                       WHERE user_id = ?`,
-                    ['grace', expiresMs, graceUntil, productId, entitlementId, paymentType, now, now, row.user_id]
+                    [
+                        'grace',
+                        expiresMs,
+                        graceUntil,
+                        productId,
+                        entitlementId,
+                        paymentType,
+                        storeUpdate?.paymentAt || now,
+                        storeUpdate?.trialCarryoverAppliedAt, storeUpdate?.trialCarryoverAppliedAt, storeUpdate?.trialCarryoverAppliedAt,
+                        storeUpdate?.lastStorePurchaseAt, storeUpdate?.lastStorePurchaseAt, storeUpdate?.lastStorePurchaseAt,
+                        now,
+                        row.user_id,
+                    ]
                 );
                 return res.json({ ok: true });
             }
@@ -3989,26 +4159,12 @@ app.post('/api/solana/verify-payment', async (req, res) => {
         
         // Get current plan to check existing expiration
         const currentPlan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [user.id]);
-        let expiresAt;
-        
-        if (currentPlan) {
-            const currentExpires = currentPlan.expires_at;
-            const currentTrial = currentPlan.trial_until;
-            
-            if (currentExpires && currentExpires > now) {
-                // Renewal: extend from existing expiration date
-                expiresAt = currentExpires + durationMs;
-            } else if (currentTrial && currentTrial > now) {
-                // First payment during trial: now + remaining trial days + subscription period
-                const remainingTrialMs = currentTrial - now;
-                expiresAt = now + remainingTrialMs + durationMs;
-            } else {
-                // No active plan or trial — start fresh from now
-                expiresAt = now + durationMs;
-            }
-        } else {
-            expiresAt = now + durationMs;
-        }
+        const solanaExpiry = computePaidSubscriptionExpiry({
+            currentPlan,
+            purchaseAt: now,
+            durationMs,
+        });
+        const expiresAt = solanaExpiry.expiresAt;
         
         // Record the payment
         await dbRunAsync(
@@ -4019,17 +4175,18 @@ app.post('/api/solana/verify-payment', async (req, res) => {
         
         // Activate subscription
         await dbRunAsync(
-            `INSERT INTO user_plans (user_id, plan_gb, status, expires_at, updated_at)
-             VALUES (?, ?, 'active', ?, ?)
+            `INSERT INTO user_plans (user_id, plan_gb, status, expires_at, trial_carryover_applied_at, updated_at)
+             VALUES (?, ?, 'active', ?, ?, ?)
              ON CONFLICT(user_id) DO UPDATE SET
                 plan_gb = excluded.plan_gb,
                 status = 'active',
                 expires_at = excluded.expires_at,
+                trial_carryover_applied_at = COALESCE(excluded.trial_carryover_applied_at, user_plans.trial_carryover_applied_at),
                 payment_type = 'solana',
                 payment_at = excluded.updated_at,
                 grace_until = NULL,
                 updated_at = excluded.updated_at`,
-            [user.id, normalizedTier, expiresAt, now]
+            [user.id, normalizedTier, expiresAt, solanaExpiry.trialCarryoverAppliedAt, now]
         );
         
         console.log(`[Solana] Payment verified: ${txSignature} - User ${user.email} - ${normalizedTier}GB ${duration}`);
