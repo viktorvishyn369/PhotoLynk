@@ -3066,14 +3066,14 @@ app.post('/api/register', authRateLimiter, async (req, res) => {
         const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
         const u = (crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex'));
         const storageUuid = computeStorageUuidFromEmail(normalizedEmail);
-        db.run(`INSERT INTO users (user_uuid, storage_uuid, email, password, hardware_device_id) VALUES (?, ?, ?, ?, ?)`, [u, storageUuid, normalizedEmail, hashedPassword, hwDeviceId], function(err) {
+        const now = Date.now();
+        db.run(`INSERT INTO users (user_uuid, storage_uuid, email, password, hardware_device_id, created_at) VALUES (?, ?, ?, ?, ?, ?)`, [u, storageUuid, normalizedEmail, hashedPassword, hwDeviceId, now], function(err) {
             if (err) {
                 if (err.message.includes('UNIQUE constraint failed')) return res.status(409).json({ error: 'Email already exists' });
                 return res.status(500).json({ error: err.message });
             }
 
             const newUserId = this.lastID;
-            const now = Date.now();
             const trialMs = Math.max(0, TRIAL_DAYS) * 24 * 60 * 60 * 1000;
             const trialUntil = (normalizedPlanGb && trialMs > 0) ? (now + trialMs) : null;
             const initialStatus = trialUntil ? 'trial' : 'none';
