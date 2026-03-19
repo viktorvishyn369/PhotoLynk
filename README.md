@@ -4,7 +4,7 @@
 
 Back up photos/videos to your own server or StealthCloud, and restore on any phone with the same credentials.
 
-> 🎥 **[Watch the 60-Second Demo Video on YouTube](https://youtube.com/shorts/pp3TYwn68D0)**  
+> 🎥 **[Watch the 60-Second Demo Video on YouTube](https://youtu.be/FNTu4fUd6y8)**  
 > 📄 **[Read the Technical Pitch Deck](PITCH_DECK.md)**
 
 > ⚠️ **Security Notice**: The `PhotoBackupSystem` folder (mobile apps) has been moved to a private repository for security. Install scripts automatically pull it during server setup. [Read more](PHOTOBACKUP_REMOVAL_NOTICE.md)

@@ -182,13 +182,13 @@ PhotoLynk certifications should be described as:
 
 - Review the source code in this repository
 - Review the product documentation in `README.md`
-- Watch the demo video: https://youtube.com/shorts/pp3TYwn68D0
+- Watch the demo video: https://youtu.be/FNTu4fUd6y8
 
 ---
 
 # Links
 
-- **Demo Video**: https://youtube.com/shorts/pp3TYwn68D0
+- **Demo Video**: https://youtu.be/FNTu4fUd6y8
 - **Pitch Deck**: https://github.com/viktorvishyn369/PhotoLynk/blob/main/PITCH_DECK.md
 - **FreeTSA**: https://freetsa.org
 - **Website**: https://stealthlynk.io
