@@ -487,7 +487,7 @@ tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowr
 <div class="toolbar">
   <div class="search-box">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
-    <input type="text" id="search" placeholder="Search by email, ID, status, plan, payment..." oninput="applyFilters()"/>
+    <input type="text" id="search" placeholder="Search by user, .skr, email, ID, status, plan..." oninput="applyFilters()"/>
   </div>
   <div class="filter-pills" id="status-filters"></div>
 </div>
@@ -496,7 +496,7 @@ tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowr
   <table id="users-table" style="display:none">
     <thead><tr>
       <th data-col="id" onclick="sortBy('id')">ID <span class="sort-arrow">&#9650;</span></th>
-      <th data-col="email" onclick="sortBy('email')">Email <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="display_handle" onclick="sortBy('display_handle')">User <span class="sort-arrow">&#9650;</span></th>
       <th data-col="device_uuids" onclick="sortBy('device_uuids')">Device UUID <span class="sort-arrow">&#9650;</span></th>
       <th data-col="last_login" onclick="sortBy('last_login')">Last Login <span class="sort-arrow">&#9650;</span></th>
       <th data-col="storage_used" onclick="sortBy('storage_used')">Storage <span class="sort-arrow">&#9650;</span></th>
@@ -591,7 +591,7 @@ async function loadUsers(){
     if(!r.ok)throw new Error(d.error||'Failed');
     serverTime=d.server_time||'';
     adminStats=d.admin_stats||adminStats;
-    allUsers=d.users.map(function(u){return{id:u.id,email:u.email||'',user_uuid:u.user_uuid||'',device_uuids:u.device_uuids||'',last_login:u.last_login||0,last_login_date:u.last_login_date,storage_used:u.storage_used_bytes||0,storage_quota:u.storage_quota_bytes||0,file_count:u.file_count||0,plan_gb:u.plan.plan_gb||0,premium_gb:u.plan.premium_gb||0,status:u.plan.effective_status||u.plan.status||'none',trial_until:u.plan.trial_until,trial_until_date:u.plan.trial_until_date,expires_at:u.plan.expires_at,expires_at_date:u.plan.expires_at_date,grace_until:u.plan.grace_until,created_at:u.user_created_at,created_at_date:u.user_created_at_date,payment_type:u.plan.payment_type||'',payment_at:u.plan.payment_at,payment_at_date:u.plan.payment_at_date,updated_at:u.plan.updated_at,updated_at_date:u.plan.updated_at_date,nft_is_premium:u.nft.is_premium,nft_mints:u.nft.mint_count||0,nft_paid_mints:u.nft.paid_mint_count||0,nft_free_premium_mints:u.nft.free_premium_mint_count||0,nft_premium_total_mints:u.nft.premium_mint_count||0,nft_free_remaining:u.nft.free_mints_remaining||0,nft_balance:u.nft.balance_usd||0,nft_total_paid:u.nft.total_paid_usd||0,nft_total_purchased:u.nft.total_purchased_usd||0,nft_total_spent:u.nft.total_spent_usd||0,nft_payments:u.nft.payments||[],sol_payments:u.solana.payments||[],sol_total_paid:u.solana.total_paid_sol||0,total_paid:(u.nft.total_paid_usd||0)+(u.solana.total_paid_sol||0)*100}});
+    allUsers=d.users.map(function(u){return{id:u.id,email:u.email||'',alias_email:u.alias_email||'',display_handle:u.display_handle||'',user_uuid:u.user_uuid||'',device_uuids:u.device_uuids||'',last_login:u.last_login||0,last_login_date:u.last_login_date,storage_used:u.storage_used_bytes||0,storage_quota:u.storage_quota_bytes||0,file_count:u.file_count||0,plan_gb:u.plan.plan_gb||0,premium_gb:u.plan.premium_gb||0,status:u.plan.effective_status||u.plan.status||'none',trial_until:u.plan.trial_until,trial_until_date:u.plan.trial_until_date,expires_at:u.plan.expires_at,expires_at_date:u.plan.expires_at_date,grace_until:u.plan.grace_until,created_at:u.user_created_at,created_at_date:u.user_created_at_date,payment_type:u.plan.payment_type||'',payment_at:u.plan.payment_at,payment_at_date:u.plan.payment_at_date,updated_at:u.plan.updated_at,updated_at_date:u.plan.updated_at_date,nft_is_premium:u.nft.is_premium,nft_mints:u.nft.mint_count||0,nft_paid_mints:u.nft.paid_mint_count||0,nft_free_premium_mints:u.nft.free_premium_mint_count||0,nft_premium_total_mints:u.nft.premium_mint_count||0,nft_free_remaining:u.nft.free_mints_remaining||0,nft_balance:u.nft.balance_usd||0,nft_total_paid:u.nft.total_paid_usd||0,nft_total_purchased:u.nft.total_purchased_usd||0,nft_total_spent:u.nft.total_spent_usd||0,nft_payments:u.nft.payments||[],sol_payments:u.solana.payments||[],sol_total_paid:u.solana.total_paid_sol||0,total_paid:(u.nft.total_paid_usd||0)+(u.solana.total_paid_sol||0)*100}});
     updateStats();buildFilters();applyFilters();
     document.getElementById('loading').style.display='none';
     document.getElementById('users-table').style.display='';
@@ -637,7 +637,7 @@ function applyFilters(){
     if(activeFilter==='paid')return u.total_paid>0;
     if(activeFilter!=='all'&&u.status!==activeFilter)return false;
     if(!q)return true;
-    return(String(u.id).includes(q)||u.email.toLowerCase().includes(q)||(u.status||'').toLowerCase().includes(q)||String(u.plan_gb).includes(q)||(u.payment_type||'').toLowerCase().includes(q)||(u.device_uuids||'').toLowerCase().includes(q)||(u.user_uuid||'').toLowerCase().includes(q));
+    return(String(u.id).includes(q)||(u.display_handle||'').toLowerCase().includes(q)||u.email.toLowerCase().includes(q)||(u.alias_email||'').toLowerCase().includes(q)||(u.status||'').toLowerCase().includes(q)||String(u.plan_gb).includes(q)||(u.payment_type||'').toLowerCase().includes(q)||(u.device_uuids||'').toLowerCase().includes(q)||(u.user_uuid||'').toLowerCase().includes(q));
   });
   doSort();renderTable();
 }
@@ -671,9 +671,10 @@ function renderTable(){
   empty.style.display='none';
   var html='';
   filteredUsers.forEach(function(u){
+    var userLabel=u.display_handle||u.email||'-';
     html+='<tr>';
     html+='<td class="id-cell">#'+u.id+'</td>';
-    html+='<td class="email-cell" title="'+u.email+'">'+u.email+'</td>';
+    html+='<td class="email-cell" title="'+(u.email||userLabel)+'">'+userLabel+'</td>';
     html+='<td class="uuid-cell" title="'+(u.device_uuids||'')+'" onclick="copyUuid(this,&apos;'+((u.device_uuids||'').replace(/'/g,'&apos;'))+'&apos;)">'+((u.device_uuids||'').substring(0,13)||'-')+'</td>';
     html+='<td>'+fmtLogin(u.last_login_date)+'</td>';
     html+='<td>'+storageCell(u.storage_used,u.storage_quota)+'</td>';
@@ -691,7 +692,7 @@ function renderTable(){
     html+='<td>'+fmtDate(u.updated_at_date)+'</td>';
     html+='<td class="actions-cell">';
     html+='<button class="btn-sm" onclick="openEdit('+u.id+')">Edit</button>';
-    html+='<button class="btn-sm btn-danger" onclick="openDelete('+u.id+',&apos;'+u.email.replace(/'/g,'&apos;')+'&apos;)">&times;</button>';
+    html+='<button class="btn-sm btn-danger" onclick="openDelete('+u.id+',&apos;'+(userLabel||'').replace(/'/g,'&apos;')+'&apos;)">&times;</button>';
     html+='</td></tr>';
   });
   tbody.innerHTML=html;
@@ -709,7 +710,7 @@ function openEdit(id){
   document.getElementById('e-trialUntil').value='';
   document.getElementById('e-expiresAt').value='';
   document.getElementById('e-graceUntil').value='';
-  document.getElementById('edit-title').textContent='#'+u.id+' '+u.email;
+  document.getElementById('edit-title').textContent='#'+u.id+' '+(u.display_handle||u.email);
   document.getElementById('edit-modal').classList.add('open');
 }
 function closeModal(){document.getElementById('edit-modal').classList.remove('open')}
@@ -905,6 +906,25 @@ app.post('/admin/api/user/plan', adminAuth, async (req, res) => {
     }
 });
 
+const ADMIN_BASE58_WALLET_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+
+const deriveAdminDisplayHandle = (...values) => {
+    for (const value of values) {
+        const raw = String(value || '').trim().toLowerCase();
+        if (!raw) continue;
+        if (raw.endsWith('.skr')) return raw;
+        if (raw.endsWith('@photolynk.local')) {
+            const local = raw.slice(0, -'@photolynk.local'.length);
+            if (local && !ADMIN_BASE58_WALLET_RE.test(local)) return `${local}.skr`;
+            continue;
+        }
+        if (!raw.includes('@') && !ADMIN_BASE58_WALLET_RE.test(raw)) {
+            return `${raw}.skr`;
+        }
+    }
+    return null;
+};
+
 // Admin API: list all users with plans
 app.get('/admin/api/users', adminAuth, async (req, res) => {
     try {
@@ -913,6 +933,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
             SELECT 
                 u.id,
                 u.email,
+                u.alias_email,
                 u.user_uuid,
                 u.created_at AS user_created_at,
                 GROUP_CONCAT(DISTINCT d.device_uuid) AS device_uuids,
@@ -1022,10 +1043,13 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
             const totalQuotaBytes = planQuotaBytes + premiumQuotaBytes;
 
             const effectiveStatus = computeEffectiveStatus(user);
+            const displayHandle = deriveAdminDisplayHandle(user.alias_email, user.email);
 
             return {
                 id: user.id,
                 email: user.email,
+                alias_email: user.alias_email,
+                display_handle: displayHandle,
                 user_uuid: user.user_uuid,
                 device_uuids: user.device_uuids || null,
                 user_created_at: user.user_created_at,
