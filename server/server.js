@@ -908,19 +908,30 @@ app.post('/admin/api/user/plan', adminAuth, async (req, res) => {
 
 const ADMIN_BASE58_WALLET_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
+const normalizeStoredSeekerId = (value) => {
+    const raw = String(value || '').trim().toLowerCase();
+    if (!raw) return null;
+    if (raw.endsWith('.skr')) return raw;
+    if (raw.endsWith('@photolynk.local')) {
+        const local = raw.slice(0, -'@photolynk.local'.length);
+        if (local && !ADMIN_BASE58_WALLET_RE.test(local)) return `${local}.skr`;
+        return null;
+    }
+    if (raw.endsWith('@seeker.photolynk.local')) {
+        const local = raw.slice(0, -'@seeker.photolynk.local'.length);
+        if (local && !ADMIN_BASE58_WALLET_RE.test(local)) return `${local}.skr`;
+        return null;
+    }
+    if (!raw.includes('@') && !ADMIN_BASE58_WALLET_RE.test(raw)) {
+        return `${raw}.skr`;
+    }
+    return null;
+};
+
 const deriveAdminDisplayHandle = (...values) => {
     for (const value of values) {
-        const raw = String(value || '').trim().toLowerCase();
-        if (!raw) continue;
-        if (raw.endsWith('.skr')) return raw;
-        if (raw.endsWith('@photolynk.local')) {
-            const local = raw.slice(0, -'@photolynk.local'.length);
-            if (local && !ADMIN_BASE58_WALLET_RE.test(local)) return `${local}.skr`;
-            continue;
-        }
-        if (!raw.includes('@') && !ADMIN_BASE58_WALLET_RE.test(raw)) {
-            return `${raw}.skr`;
-        }
+        const normalized = normalizeStoredSeekerId(value);
+        if (normalized) return normalized;
     }
     return null;
 };
@@ -934,6 +945,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 u.id,
                 u.email,
                 u.alias_email,
+                u.seeker_id,
                 u.user_uuid,
                 u.created_at AS user_created_at,
                 GROUP_CONCAT(DISTINCT d.device_uuid) AS device_uuids,
@@ -1043,12 +1055,13 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
             const totalQuotaBytes = planQuotaBytes + premiumQuotaBytes;
 
             const effectiveStatus = computeEffectiveStatus(user);
-            const displayHandle = deriveAdminDisplayHandle(user.alias_email, user.email);
+            const displayHandle = deriveAdminDisplayHandle(user.seeker_id, user.alias_email, user.email);
 
             return {
                 id: user.id,
                 email: user.email,
                 alias_email: user.alias_email,
+                seeker_id: user.seeker_id,
                 display_handle: displayHandle,
                 user_uuid: user.user_uuid,
                 device_uuids: user.device_uuids || null,
@@ -1865,6 +1878,25 @@ db.serialize(() => {
         }
         if (!names.includes('wallet_address')) {
             db.run(`ALTER TABLE users ADD COLUMN wallet_address TEXT`, [], () => {});
+        }
+        if (!names.includes('seeker_id')) {
+            db.run(`ALTER TABLE users ADD COLUMN seeker_id TEXT`, [], () => {
+                db.all(`SELECT id, email, alias_email FROM users WHERE seeker_id IS NULL OR seeker_id = ''`, [], (e2, rows) => {
+                    if (e2) return;
+                    (rows || []).forEach(r => {
+                        const seekerId = deriveAdminDisplayHandle(r.alias_email, r.email);
+                        if (seekerId) db.run(`UPDATE users SET seeker_id = ? WHERE id = ?`, [seekerId, r.id]);
+                    });
+                });
+            });
+        } else {
+            db.all(`SELECT id, email, alias_email FROM users WHERE seeker_id IS NULL OR seeker_id = ''`, [], (e2, rows) => {
+                if (e2) return;
+                (rows || []).forEach(r => {
+                    const seekerId = deriveAdminDisplayHandle(r.alias_email, r.email);
+                    if (seekerId) db.run(`UPDATE users SET seeker_id = ? WHERE id = ?`, [seekerId, r.id]);
+                });
+            });
         }
         if (!names.includes('storage_uuid')) {
             db.run(`ALTER TABLE users ADD COLUMN storage_uuid TEXT`, [], () => {
@@ -3615,16 +3647,36 @@ app.post('/api/migrate-credentials', authenticateToken, async (req, res) => {
 // Save user's Solana wallet address (called after wallet connect on any platform)
 app.post('/api/save-wallet', authenticateToken, async (req, res) => {
     try {
-        const { wallet_address } = req.body || {};
-        if (!wallet_address || typeof wallet_address !== 'string' || wallet_address.length < 32 || wallet_address.length > 50) {
+        const { wallet_address, seeker_id } = req.body || {};
+        const rawWalletAddress = typeof wallet_address === 'string' ? wallet_address.trim() : '';
+        const rawSeekerId = typeof seeker_id === 'string' ? seeker_id.trim() : '';
+        if (rawWalletAddress && (rawWalletAddress.length < 32 || rawWalletAddress.length > 50)) {
             return res.status(400).json({ error: 'Valid Solana wallet address required' });
         }
-        await dbRunAsync(`UPDATE users SET wallet_address = ? WHERE id = ?`, [wallet_address.trim(), req.user.id]);
-        console.log(`[Wallet] Saved wallet for user ${req.user.id}: ${wallet_address.trim()}`);
+        const normalizedSeekerId = rawSeekerId ? normalizeStoredSeekerId(rawSeekerId) : null;
+        if (rawSeekerId && !normalizedSeekerId) {
+            return res.status(400).json({ error: 'Valid .skr or Seeker ID required' });
+        }
+        const updates = [];
+        const params = [];
+        if (rawWalletAddress) {
+            updates.push(`wallet_address = ?`);
+            params.push(rawWalletAddress);
+        }
+        if (normalizedSeekerId) {
+            updates.push(`seeker_id = ?`);
+            params.push(normalizedSeekerId);
+        }
+        if (!updates.length) {
+            return res.status(400).json({ error: 'wallet_address or seeker_id required' });
+        }
+        params.push(req.user.id);
+        await dbRunAsync(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`, params);
+        console.log(`[Wallet] Saved wallet profile for user ${req.user.id}: wallet=${rawWalletAddress || '-'} seeker=${normalizedSeekerId || '-'}`);
         res.json({ success: true });
     } catch (e) {
         console.error('[Wallet] Save error:', e.message);
-        res.status(500).json({ error: 'Failed to save wallet address' });
+        res.status(500).json({ error: 'Failed to save wallet profile' });
     }
 });
 

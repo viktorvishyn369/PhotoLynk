@@ -223,4 +223,5 @@ server-tray/node_modules/
 !server-tray/build/entitlements.mac.plist
 !server-tray/build/entitlements.mac.inherit.plist
 server/sync/
+The_Carters/
 .windsurf
