@@ -5432,7 +5432,7 @@ app.get('/api/files/:filename', authenticateToken, async (req, res) => {
 // - If peer is unreachable: nobody was serving → count the full gap as downtime.
 // This works for both directions: main→pi failover and pi→main recovery.
 const UPTIME_STATE_PATH = process.env.UPTIME_STATE_PATH || path.join(DATA_DIR, 'uptime.json');
-const SERVER_ROLE = process.env.SERVER_ROLE || 'main'; // 'main' or 'pi'
+const SERVER_ROLE = process.env.SERVER_ROLE || 'main'; // 'main' or 'backup'
 const PEER_SERVER_URL = process.env.PEER_SERVER_URL || null; // main→pi or pi→main
 const HEARTBEAT_INTERVAL_MS = 60 * 1000; // 60s heartbeat
 const HEARTBEAT_GAP_THRESHOLD_MS = 2 * 60 * 1000; // >2 min gap = downtime
@@ -5534,7 +5534,7 @@ async function fetchPeerUptimeState(url) {
 // Merge peer's events into local state, covering the gap period.
 // peerState = remote uptime state, gapStart = when this server went down, now = current time
 function mergeWithPeerState(localState, peerState, gapStart, now) {
-    const peerRole = peerState.lastRole || (SERVER_ROLE === 'main' ? 'pi' : 'main');
+    const peerRole = peerState.lastRole || (SERVER_ROLE === 'main' ? 'backup' : 'main');
 
     // Find peer events that overlap with our gap period
     let peerUptimeInGap = 0;
