@@ -3,11 +3,12 @@
 # Usage: sudo bash pull-from-backup.sh
 #
 # This script:
-#   1. Stops photolynk + all background timers on main
-#   2. Backs up both DBs to /root/ before touching anything
-#   3. Pulls missing files from Pi (--ignore-existing: never overwrites)
-#   4. Optionally replaces main DBs with Pi's (if main DB is empty/missing)
-#   5. Restarts all services
+#   1. Stops photolynk + all background timers on BOTH main and Pi
+#   2. Backs up both main DBs (+ WAL/SHM) to /root/ before touching anything
+#   3. Replaces main DBs with Pi's SQLite .backup snapshots (Pi is authoritative
+#      after serving during main's downtime)
+#   4. Pulls missing files from Pi (--ignore-existing: never overwrites existing)
+#   5. Restarts all services on both sides
 #
 # Run manually — not automated.
 
@@ -86,11 +87,13 @@ ssh $SSH_OPTS "root@${PI_IP}" "
 
 echo ""
 echo -e "${YELLOW}╔══════════════════════════════════════════════════════════╗${NC}"
-echo -e "${YELLOW}║  This will STOP all PhotoLynk services on main server   ║${NC}"
-echo -e "${YELLOW}║  and pull missing data from the Pi backup server.       ║${NC}"
+echo -e "${YELLOW}║  This will STOP all PhotoLynk services on BOTH servers  ║${NC}"
+echo -e "${YELLOW}║  and pull data + DBs from the Pi backup server.         ║${NC}"
 echo -e "${YELLOW}║                                                         ║${NC}"
-echo -e "${YELLOW}║  Files that already exist on main will NOT be touched.  ║${NC}"
-echo -e "${YELLOW}║  Both DBs will be backed up to /root/ first.            ║${NC}"
+echo -e "${YELLOW}║  DATABASES: Replaced with Pi's (Pi is authoritative     ║${NC}"
+echo -e "${YELLOW}║             after serving during main's downtime).       ║${NC}"
+echo -e "${YELLOW}║             Main's old DBs backed up to /root/ first.   ║${NC}"
+echo -e "${YELLOW}║  FILES:     Only missing files pulled (existing kept).  ║${NC}"
 echo -e "${YELLOW}╚══════════════════════════════════════════════════════════╝${NC}"
 echo ""
 echo -n "Continue? [y/N] "
@@ -179,47 +182,35 @@ else
   warn "Pi has no nft-service.db"
 fi
 
-# ── Step 4: Pull DBs from Pi (only if main is empty/missing) ──────────
+# ── Step 4: Replace main DBs with Pi's (Pi is authoritative) ──────────
 log ""
-log "═══ Step 4: DB sync ═══"
-
-MAIN_DB_SIZE=0
-if [ -f "$MAIN_DB" ]; then
-  MAIN_DB_SIZE=$(stat -c %s "$MAIN_DB" 2>/dev/null || echo 0)
-fi
+log "═══ Step 4: Replacing main DBs with Pi's snapshots ═══"
+log "  (Pi served users during main downtime — its DB has the latest state)"
+log "  (Main's old DBs are safe in ${DB_BACKUP_DIR}/)"
 
 if [ "$PI_HAS_DB" -eq 1 ]; then
-  if [ "$MAIN_DB_SIZE" -le 0 ] || [ ! -f "$MAIN_DB" ]; then
-    log "Main backup.db is empty/missing — pulling from Pi..."
-    mkdir -p "$(dirname "$MAIN_DB")"
-    RSYNC_RSH="ssh $SSH_OPTS" rsync -avz "root@${PI_IP}:/tmp/backup.db.pull-snapshot" "${MAIN_DB}"
-    rm -f "${MAIN_DB}-wal" "${MAIN_DB}-shm" 2>/dev/null || true
-    ok "backup.db pulled from Pi"
-  else
-    log "Main backup.db exists ($(ls -lh "$MAIN_DB" | awk '{print $5}')) — keeping main copy"
-    log "  (To force-replace, delete ${MAIN_DB} and re-run)"
-  fi
-fi
-
-MAIN_NFT_DB_SIZE=0
-if [ -f "$MAIN_NFT_DB" ]; then
-  MAIN_NFT_DB_SIZE=$(stat -c %s "$MAIN_NFT_DB" 2>/dev/null || echo 0)
+  log "Pulling backup.db from Pi..."
+  mkdir -p "$(dirname "$MAIN_DB")"
+  RSYNC_RSH="ssh $SSH_OPTS" rsync -avz "root@${PI_IP}:/tmp/backup.db.pull-snapshot" "${MAIN_DB}"
+  rm -f "${MAIN_DB}-wal" "${MAIN_DB}-shm" 2>/dev/null || true
+  ok "backup.db replaced with Pi's snapshot ($(ls -lh "$MAIN_DB" | awk '{print $5}'))"
+else
+  warn "Pi has no valid backup.db — main's existing DB kept"
 fi
 
 if [ "$PI_HAS_NFT_DB" -eq 1 ]; then
-  if [ "$MAIN_NFT_DB_SIZE" -le 0 ] || [ ! -f "$MAIN_NFT_DB" ]; then
-    log "Main nft-service.db is empty/missing — pulling from Pi..."
-    mkdir -p "$(dirname "$MAIN_NFT_DB")"
-    RSYNC_RSH="ssh $SSH_OPTS" rsync -avz "root@${PI_IP}:/tmp/nft-service.db.pull-snapshot" "${MAIN_NFT_DB}"
-    rm -f "${MAIN_NFT_DB}-wal" "${MAIN_NFT_DB}-shm" 2>/dev/null || true
-    ok "nft-service.db pulled from Pi"
-  else
-    log "Main nft-service.db exists ($(ls -lh "$MAIN_NFT_DB" | awk '{print $5}')) — keeping main copy"
-  fi
+  log "Pulling nft-service.db from Pi..."
+  mkdir -p "$(dirname "$MAIN_NFT_DB")"
+  RSYNC_RSH="ssh $SSH_OPTS" rsync -avz "root@${PI_IP}:/tmp/nft-service.db.pull-snapshot" "${MAIN_NFT_DB}"
+  rm -f "${MAIN_NFT_DB}-wal" "${MAIN_NFT_DB}-shm" 2>/dev/null || true
+  ok "nft-service.db replaced with Pi's snapshot ($(ls -lh "$MAIN_NFT_DB" | awk '{print $5}'))"
+else
+  warn "Pi has no valid nft-service.db — main's existing DB kept"
 fi
 
-# Clean up Pi snapshots
-ssh $SSH_OPTS "root@${PI_IP}" "rm -f /tmp/backup.db.pull-snapshot /tmp/nft-service.db.pull-snapshot" 2>/dev/null || true
+# Clean up Pi snapshots and clear the "served traffic" flag so periodic sync resumes
+ssh $SSH_OPTS "root@${PI_IP}" "rm -f /tmp/backup.db.pull-snapshot /tmp/nft-service.db.pull-snapshot /tmp/photolynk_pi_served_traffic" 2>/dev/null || true
+ok "Cleared Pi sync-block flag — periodic sync from main will resume"
 
 # ── Step 5: Pull missing files (--ignore-existing) ────────────────────
 log ""
