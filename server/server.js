@@ -4290,6 +4290,126 @@ app.post('/api/solana/verify-payment', async (req, res) => {
     }
 });
 
+app.post('/api/solana/verify-skr-payment', async (req, res) => {
+    const { txSignature, tierGb, duration, skrAmount, paymentWallet, tokenMint, tokenSymbol } = req.body;
+
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ error: 'Authorization token required' });
+    }
+
+    const token = authHeader.substring(7);
+    let decoded;
+    try {
+        decoded = jwt.verify(token, JWT_SECRET);
+    } catch (e) {
+        return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    if (!txSignature || !tierGb) {
+        return res.status(400).json({ error: 'Missing required fields: txSignature, tierGb' });
+    }
+
+    if (paymentWallet && paymentWallet !== SOLANA_PAYMENT_WALLET) {
+        return res.status(400).json({ error: 'Invalid payment wallet' });
+    }
+
+    if (tokenMint && tokenMint !== SKR_TOKEN_MINT) {
+        return res.status(400).json({ error: 'Invalid token mint' });
+    }
+
+    if (tokenSymbol && tokenSymbol !== SKR_TOKEN_SYMBOL) {
+        return res.status(400).json({ error: 'Invalid token symbol' });
+    }
+
+    const normalizedTier = normalizeTierGb(tierGb);
+    if (!normalizedTier) {
+        return res.status(400).json({ error: 'Invalid tier' });
+    }
+
+    try {
+        const user = await dbGetAsync(`SELECT id, email FROM users WHERE id = ?`, [decoded.id]);
+        if (!user) {
+            return res.status(404).json({ error: 'User not found' });
+        }
+
+        const currentPlanGb = await getUserPlanGb(user.id);
+        if (currentPlanGb && normalizedTier < currentPlanGb) {
+            const canDowngrade = await canDowngradeToTier(user.id, normalizedTier);
+            if (!canDowngrade) {
+                const usedBytes = await getUserUsedBytes(user.id);
+                const minTier = await getMinRequiredTier(user.id);
+                return res.status(400).json({
+                    error: 'Cannot downgrade: storage usage exceeds target plan capacity',
+                    code: 'DOWNGRADE_BLOCKED',
+                    usedBytes,
+                    targetTierGb: normalizedTier,
+                    minRequiredTier: minTier,
+                });
+            }
+        }
+
+        const txVerification = await verifySkrTokenTransaction(txSignature, skrAmount, SKR_TOKEN_MINT);
+        if (!txVerification.success) {
+            return res.status(400).json({ error: txVerification.error || 'SKR transaction verification failed' });
+        }
+
+        const existingTx = await dbGetAsync(
+            `SELECT * FROM solana_payments WHERE tx_signature = ?`,
+            [txSignature]
+        );
+        if (existingTx) {
+            return res.status(409).json({ error: 'Transaction already processed', existingPayment: existingTx });
+        }
+
+        const now = Date.now();
+        const durationMs = PLAN_DURATION_MS[duration] || PLAN_DURATION_MS.monthly;
+        const currentPlan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [user.id]);
+        const solanaExpiry = computePaidSubscriptionExpiry({
+            currentPlan,
+            purchaseAt: now,
+            durationMs,
+        });
+        const expiresAt = solanaExpiry.expiresAt;
+
+        await dbRunAsync(
+            `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, tier_gb, duration, created_at, verified_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [user.id, txSignature, 0, normalizedTier, duration || 'monthly', now, now]
+        );
+
+        await dbRunAsync(
+            `INSERT INTO user_plans (user_id, plan_gb, status, expires_at, trial_carryover_applied_at, updated_at)
+             VALUES (?, ?, 'active', ?, ?, ?)
+             ON CONFLICT(user_id) DO UPDATE SET
+                plan_gb = excluded.plan_gb,
+                status = 'active',
+                expires_at = excluded.expires_at,
+                trial_carryover_applied_at = COALESCE(excluded.trial_carryover_applied_at, user_plans.trial_carryover_applied_at),
+                payment_type = 'skr',
+                payment_at = excluded.updated_at,
+                grace_until = NULL,
+                updated_at = excluded.updated_at`,
+            [user.id, normalizedTier, expiresAt, solanaExpiry.trialCarryoverAppliedAt, now]
+        );
+
+        console.log(`[Solana SKR] Payment verified: ${txSignature} - User ${user.email} - ${normalizedTier}GB ${duration}`);
+
+        return res.json({
+            success: true,
+            message: 'SKR payment verified and subscription activated',
+            subscription: {
+                tierGb: normalizedTier,
+                status: 'active',
+                expiresAt: new Date(expiresAt).toISOString(),
+            },
+        });
+    } catch (e) {
+        console.error('[Solana SKR] Payment verification error:', e);
+        return res.status(500).json({ error: 'SKR payment verification failed' });
+    }
+});
+
 // Helper function to verify Solana transaction
 async function verifySolanaTransaction(txSignature, expectedSolAmount) {
     console.log('[Solana] Verifying transaction:', txSignature, 'expected amount:', expectedSolAmount);
