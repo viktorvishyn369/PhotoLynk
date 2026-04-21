@@ -4373,9 +4373,9 @@ app.post('/api/solana/verify-skr-payment', async (req, res) => {
         const expiresAt = solanaExpiry.expiresAt;
 
         await dbRunAsync(
-            `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, tier_gb, duration, created_at, verified_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [user.id, txSignature, 0, normalizedTier, duration || 'monthly', now, now]
+            `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, skr_amount, payment_token, tier_gb, duration, created_at, verified_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            [user.id, txSignature, 0, Number(skrAmount) || 0, 'SKR', normalizedTier, duration || 'monthly', now, now]
         );
 
         await dbRunAsync(
@@ -4606,6 +4606,17 @@ db.run(`CREATE TABLE IF NOT EXISTS solana_payments (
     verified_at INTEGER,
     FOREIGN KEY(user_id) REFERENCES users(id)
 )`);
+// Backwards-compatible migration: add SKR payment columns if missing
+db.run(`ALTER TABLE solana_payments ADD COLUMN skr_amount REAL`, (err) => {
+    if (err && !String(err.message).includes('duplicate column')) {
+        console.log('[DB] skr_amount migration note:', err.message);
+    }
+});
+db.run(`ALTER TABLE solana_payments ADD COLUMN payment_token TEXT`, (err) => {
+    if (err && !String(err.message).includes('duplicate column')) {
+        console.log('[DB] payment_token migration note:', err.message);
+    }
+});
 
 // Upload File
 app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => {
@@ -9029,9 +9040,9 @@ try {
 
             const now = Date.now();
             await dbRunAsync(
-                `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, tier_gb, duration, created_at, verified_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                [user.id, txSignature, 0, 0, 'premium_skr', now, now]
+                `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, skr_amount, payment_token, tier_gb, duration, created_at, verified_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [user.id, txSignature, 0, Number(skrAmount) || 0, 'SKR', 0, 'premium_skr', now, now]
             );
 
             const premiumResult = nftService.balance.setPremium(user.id, txSignature, 'skr');
