@@ -579,7 +579,7 @@ function statusBadge(st){var c='badge-'+(st||'none').replace(/\\s/g,'_');return'
 
 function paymentBadges(u){var tags=[];if(u.payment_type){tags.push('<span class="payment-badge payment-'+(u.payment_type||'').toLowerCase()+'">'+u.payment_type+'</span>')}if(u.nft_is_premium){tags.push('<span class="payment-badge nft-premium">Premium</span>')}if(u.nft_payments&&u.nft_payments.length>0){var types={};u.nft_payments.forEach(function(p){var k=(p.platform||'iap')+':'+(p.type||'');types[k]=(types[k]||0)+1});Object.keys(types).forEach(function(k){var parts=k.split(':');tags.push('<span class="mini-tag">'+parts[0]+' x'+types[k]+'</span>')})}if(u.sol_payments&&u.sol_payments.length>0){tags.push('<span class="payment-badge payment-solana">SOL x'+u.sol_payments.length+'</span>')}return tags.length?tags.join(' '):'<span class="date-cell">-</span>'}
 
-function totalPaidCell(u){var parts=[];var iap=u.nft_total_paid||0;var sol=u.sol_total_paid||0;if(iap>0)parts.push('$'+iap.toFixed(2));if(sol>0)parts.push(sol.toFixed(4)+' SOL');if(!parts.length)return'<span class="money-cell zero">-</span>';return'<span class="money-cell">'+parts.join('<br>')+'</span>'}
+function totalPaidCell(u){var parts=[];var iap=u.nft_total_paid||0;var sol=u.sol_total_paid||0;var skr=u.skr_total_paid||0;if(iap>0)parts.push('$'+iap.toFixed(2));if(sol>0)parts.push(sol.toFixed(4)+' SOL');if(skr>0)parts.push(skr.toFixed(2)+' SKR');if(!parts.length)return'<span class="money-cell zero">-</span>';return'<span class="money-cell">'+parts.join('<br>')+'</span>'}
 
 function planLabel(gb){if(!gb)return'-';return gb>=1000?(gb/1000)+'TB':gb+'GB'}
 
@@ -591,7 +591,7 @@ async function loadUsers(){
     if(!r.ok)throw new Error(d.error||'Failed');
     serverTime=d.server_time||'';
     adminStats=d.admin_stats||adminStats;
-    allUsers=d.users.map(function(u){return{id:u.id,email:u.email||'',alias_email:u.alias_email||'',display_handle:u.display_handle||'',user_uuid:u.user_uuid||'',device_uuids:u.device_uuids||'',last_login:u.last_login||0,last_login_date:u.last_login_date,storage_used:u.storage_used_bytes||0,storage_quota:u.storage_quota_bytes||0,file_count:u.file_count||0,plan_gb:u.plan.plan_gb||0,premium_gb:u.plan.premium_gb||0,status:u.plan.effective_status||u.plan.status||'none',trial_until:u.plan.trial_until,trial_until_date:u.plan.trial_until_date,expires_at:u.plan.expires_at,expires_at_date:u.plan.expires_at_date,grace_until:u.plan.grace_until,created_at:u.user_created_at,created_at_date:u.user_created_at_date,payment_type:u.plan.payment_type||'',payment_at:u.plan.payment_at,payment_at_date:u.plan.payment_at_date,updated_at:u.plan.updated_at,updated_at_date:u.plan.updated_at_date,nft_is_premium:u.nft.is_premium,nft_mints:u.nft.mint_count||0,nft_paid_mints:u.nft.paid_mint_count||0,nft_free_premium_mints:u.nft.free_premium_mint_count||0,nft_premium_total_mints:u.nft.premium_mint_count||0,nft_free_remaining:u.nft.free_mints_remaining||0,nft_balance:u.nft.balance_usd||0,nft_total_paid:u.nft.total_paid_usd||0,nft_total_purchased:u.nft.total_purchased_usd||0,nft_total_spent:u.nft.total_spent_usd||0,nft_payments:u.nft.payments||[],sol_payments:u.solana.payments||[],sol_total_paid:u.solana.total_paid_sol||0,total_paid:(u.nft.total_paid_usd||0)+(u.solana.total_paid_sol||0)*100}});
+    allUsers=d.users.map(function(u){return{id:u.id,email:u.email||'',alias_email:u.alias_email||'',display_handle:u.display_handle||'',user_uuid:u.user_uuid||'',device_uuids:u.device_uuids||'',last_login:u.last_login||0,last_login_date:u.last_login_date,storage_used:u.storage_used_bytes||0,storage_quota:u.storage_quota_bytes||0,file_count:u.file_count||0,plan_gb:u.plan.plan_gb||0,premium_gb:u.plan.premium_gb||0,status:u.plan.effective_status||u.plan.status||'none',trial_until:u.plan.trial_until,trial_until_date:u.plan.trial_until_date,expires_at:u.plan.expires_at,expires_at_date:u.plan.expires_at_date,grace_until:u.plan.grace_until,created_at:u.user_created_at,created_at_date:u.user_created_at_date,payment_type:u.plan.payment_type||'',payment_at:u.plan.payment_at,payment_at_date:u.plan.payment_at_date,updated_at:u.plan.updated_at,updated_at_date:u.plan.updated_at_date,nft_is_premium:u.nft.is_premium,nft_mints:u.nft.mint_count||0,nft_paid_mints:u.nft.paid_mint_count||0,nft_free_premium_mints:u.nft.free_premium_mint_count||0,nft_premium_total_mints:u.nft.premium_mint_count||0,nft_free_remaining:u.nft.free_mints_remaining||0,nft_balance:u.nft.balance_usd||0,nft_total_paid:u.nft.total_paid_usd||0,nft_total_purchased:u.nft.total_purchased_usd||0,nft_total_spent:u.nft.total_spent_usd||0,nft_payments:u.nft.payments||[],sol_payments:u.solana.payments||[],sol_total_paid:u.solana.total_paid_sol||0,skr_total_paid:u.solana.total_paid_skr||0,total_paid:(u.nft.total_paid_usd||0)+(u.solana.total_paid_sol||0)*100+(u.solana.total_paid_skr||0)}});
     updateStats();buildFilters();applyFilters();
     document.getElementById('loading').style.display='none';
     document.getElementById('users-table').style.display='';
@@ -1005,7 +1005,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
 
         // Get Solana payments
         try {
-            const solPayments = await dbAllAsync(`SELECT user_id, sol_amount, tier_gb, duration, created_at, verified_at FROM solana_payments ORDER BY created_at DESC`);
+            const solPayments = await dbAllAsync(`SELECT user_id, sol_amount, skr_amount, payment_token, tier_gb, duration, created_at, verified_at FROM solana_payments ORDER BY created_at DESC`);
             for (const sp of solPayments) {
                 if (!solanaPaymentsByUser[sp.user_id]) solanaPaymentsByUser[sp.user_id] = [];
                 solanaPaymentsByUser[sp.user_id].push(sp);
@@ -1049,6 +1049,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
             const solPayments = solanaPaymentsByUser[user.id] || [];
             const totalNftPaid = nftPayments.reduce((s, p) => s + (p.amount_usd || 0), 0);
             const totalSolPaid = solPayments.reduce((s, p) => s + (p.sol_amount || 0), 0);
+            const totalSkrPaid = solPayments.reduce((s, p) => s + (p.skr_amount || 0), 0);
             // Compute effective storage quota in bytes
             const planQuotaBytes = (user.plan_gb || 0) * 1073741824;
             const premiumQuotaBytes = premium.cloudQuotaBytes || ((user.premium_gb || 0) * 1073741824);
@@ -1103,8 +1104,9 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                     total_paid_usd: totalNftPaid,
                 },
                 solana: {
-                    payments: solPayments.map(sp => ({ sol: sp.sol_amount, tier_gb: sp.tier_gb, duration: sp.duration, date: sp.created_at ? new Date(sp.created_at).toISOString() : null })),
+                    payments: solPayments.map(sp => ({ sol: sp.sol_amount, skr: sp.skr_amount || 0, payment_token: sp.payment_token || (sp.skr_amount > 0 ? 'SKR' : 'SOL'), tier_gb: sp.tier_gb, duration: sp.duration, date: sp.created_at ? new Date(sp.created_at).toISOString() : null })),
                     total_paid_sol: totalSolPaid,
+                    total_paid_skr: totalSkrPaid,
                 },
             };
         });
