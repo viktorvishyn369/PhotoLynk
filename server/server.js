@@ -4148,6 +4148,9 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
 // Payment wallet: 8uaqEooTysK7mtb5gLKMD1MJbsKVPoahEXVMAESwptMg
 
 const SOLANA_PAYMENT_WALLET = 'HttTZkUG8xn5A1uJPjRDJqqufdwvHmNQroEGmST8iimU';
+const SKR_TOKEN_MINT = 'SKRbvo6Gf7GondiT3BbTfuRDPqLWei4j2Qy2NPGZhW3';
+const SKR_TOKEN_SYMBOL = 'SKR';
+const SKR_TOKEN_DECIMALS = 6;
 const SOLANA_RPC_ENDPOINT = process.env.SOLANA_RPC_ENDPOINT || 'https://api.mainnet-beta.solana.com';
 const LAMPORTS_PER_SOL = 1000000000;
 
@@ -4372,6 +4375,97 @@ async function verifySolanaTransaction(txSignature, expectedSolAmount) {
         receiver,
         blockTime: tx.blockTime,
         slot: tx.slot,
+    };
+}
+
+async function verifySkrTokenTransaction(txSignature, expectedSkrAmount, expectedTokenMint = SKR_TOKEN_MINT) {
+    console.log('[Solana SKR] Verifying transaction:', txSignature, 'expected amount:', expectedSkrAmount);
+
+    const maxRetries = 5;
+    const retryDelay = 2000;
+    let tx = null;
+
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+        try {
+            console.log(`[Solana SKR] Attempt ${attempt}/${maxRetries} to fetch transaction`);
+            const response = await axios.post(SOLANA_RPC_ENDPOINT, {
+                jsonrpc: '2.0',
+                id: 1,
+                method: 'getTransaction',
+                params: [
+                    txSignature,
+                    { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0, commitment: 'confirmed' }
+                ],
+            }, {
+                timeout: 30000,
+                headers: { 'Content-Type': 'application/json' },
+            });
+
+            tx = response.data?.result;
+            if (tx) break;
+
+            if (attempt < maxRetries) {
+                await new Promise(resolve => setTimeout(resolve, retryDelay));
+            }
+        } catch (e) {
+            console.error(`[Solana SKR] RPC error on attempt ${attempt}:`, e.message);
+            if (attempt < maxRetries) {
+                await new Promise(resolve => setTimeout(resolve, retryDelay));
+            }
+        }
+    }
+
+    if (!tx) {
+        return { success: false, error: 'Transaction not found after retries - may still be propagating' };
+    }
+
+    if (tx.meta && tx.meta.err) {
+        return { success: false, error: 'Transaction failed on chain' };
+    }
+
+    const preTokenBalances = Array.isArray(tx.meta?.preTokenBalances) ? tx.meta.preTokenBalances : [];
+    const postTokenBalances = Array.isArray(tx.meta?.postTokenBalances) ? tx.meta.postTokenBalances : [];
+    const expectedRawAmount = Number.isFinite(Number(expectedSkrAmount)) && Number(expectedSkrAmount) > 0
+        ? Math.ceil(Number(expectedSkrAmount) * Math.pow(10, SKR_TOKEN_DECIMALS))
+        : null;
+
+    let matchedTransfer = null;
+
+    for (const postBalance of postTokenBalances) {
+        if (postBalance?.owner !== SOLANA_PAYMENT_WALLET) continue;
+        if (postBalance?.mint !== expectedTokenMint) continue;
+
+        const preBalance = preTokenBalances.find((entry) => entry.accountIndex === postBalance.accountIndex);
+        const postRaw = Number(postBalance?.uiTokenAmount?.amount || 0);
+        const preRaw = Number(preBalance?.uiTokenAmount?.amount || 0);
+        const deltaRaw = postRaw - preRaw;
+
+        if (deltaRaw > 0) {
+            matchedTransfer = {
+                receivedRawAmount: deltaRaw,
+                owner: postBalance.owner,
+                mint: postBalance.mint,
+                blockTime: tx.blockTime,
+                slot: tx.slot,
+            };
+            break;
+        }
+    }
+
+    if (!matchedTransfer) {
+        return { success: false, error: 'No valid SKR transfer to the payment wallet was found in transaction' };
+    }
+
+    if (expectedRawAmount && matchedTransfer.receivedRawAmount < expectedRawAmount) {
+        return {
+            success: false,
+            error: `Received ${matchedTransfer.receivedRawAmount} raw ${SKR_TOKEN_SYMBOL} but expected at least ${expectedRawAmount}`,
+        };
+    }
+
+    return {
+        success: true,
+        ...matchedTransfer,
     };
 }
 
@@ -8784,12 +8878,101 @@ try {
                 cloudQuotaBytes: premiumResult.cloudQuotaBytes,
                 balanceUsd: bal.balanceUsd,
                 premiumGb: planActivation.premiumGb,
-                expiresAt: new Date(planActivation.expiresAt).toISOString(),
+                expiresAt: null,
                 subscription: st,
             });
         } catch (e) {
             console.error('[Solana Premium] Payment verification error:', e);
             return res.status(500).json({ error: 'Premium payment verification failed' });
+        }
+    });
+
+    app.post('/api/solana/verify-premium-skr-payment', async (req, res) => {
+        const { txSignature, skrAmount, paymentWallet, tokenMint, tokenSymbol } = req.body;
+
+        const authHeader = req.headers.authorization;
+        if (!authHeader || !authHeader.startsWith('Bearer ')) {
+            return res.status(401).json({ error: 'Authorization token required' });
+        }
+        const token = authHeader.substring(7);
+        let decoded;
+        try {
+            decoded = jwt.verify(token, JWT_SECRET);
+        } catch (e) {
+            return res.status(401).json({ error: 'Invalid or expired token' });
+        }
+
+        if (!txSignature) {
+            return res.status(400).json({ error: 'Missing required field: txSignature' });
+        }
+        if (paymentWallet && paymentWallet !== SOLANA_PAYMENT_WALLET) {
+            return res.status(400).json({ error: 'Invalid payment wallet' });
+        }
+        if (tokenMint && tokenMint !== SKR_TOKEN_MINT) {
+            return res.status(400).json({ error: 'Invalid token mint' });
+        }
+        if (tokenSymbol && tokenSymbol !== SKR_TOKEN_SYMBOL) {
+            return res.status(400).json({ error: 'Invalid token symbol' });
+        }
+
+        try {
+            const user = await dbGetAsync(`SELECT id, email FROM users WHERE id = ?`, [decoded.id]);
+            if (!user) {
+                return res.status(404).json({ error: 'User not found' });
+            }
+
+            const existingPremium = nftService.balance.getPremiumStatus(user.id);
+            if (existingPremium && existingPremium.isPremium) {
+                return res.status(409).json({ error: 'Already premium', isPremium: true });
+            }
+
+            const txVerification = await verifySkrTokenTransaction(txSignature, skrAmount, SKR_TOKEN_MINT);
+            if (!txVerification.success) {
+                return res.status(400).json({ error: txVerification.error || 'SKR transaction verification failed' });
+            }
+
+            const existingTx = await dbGetAsync(
+                `SELECT * FROM solana_payments WHERE tx_signature = ?`,
+                [txSignature]
+            );
+            if (existingTx) {
+                return res.status(409).json({ error: 'Transaction already processed' });
+            }
+
+            const now = Date.now();
+            await dbRunAsync(
+                `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, tier_gb, duration, created_at, verified_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                [user.id, txSignature, 0, 0, 'premium_skr', now, now]
+            );
+
+            const premiumResult = nftService.balance.setPremium(user.id, txSignature, 'skr');
+            const bal = nftService.balance.getBalance(user.id);
+
+            if (!premiumResult.isDuplicate) {
+                nftService.balance.recordPayment(user.id, 'premium_49', 49.99, txSignature, 'skr');
+            }
+
+            const planActivation = await activateSolanaPremiumPlan(user.id, now, { now });
+            if (planActivation.capacityExceeded) {
+                console.log(`[Solana Premium SKR] Capacity check failed but payment already accepted. User ${user.id} will get premium entitlement without storage allocation.`);
+            }
+
+            console.log(`[Solana Premium SKR] Payment verified: ${txSignature} - User ${user.email}`);
+
+            const st = await resolveSubscriptionState(user.id);
+            return res.json({
+                success: true,
+                isPremium: premiumResult.isPremium,
+                cloudQuotaBytes: premiumResult.cloudQuotaBytes,
+                balanceUsd: bal.balanceUsd,
+                premiumGb: planActivation.premiumGb,
+                expiresAt: null,
+                subscription: st,
+            });
+        } catch (e) {
+            console.error('[Solana Premium SKR] Payment verification error:', e);
+            return res.status(500).json({ error: 'Premium SKR payment verification failed' });
         }
     });
 
