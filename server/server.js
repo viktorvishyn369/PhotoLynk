@@ -59,9 +59,9 @@ const computePerceptualHash = async (filePath) => {
                     .grayscale()
                     .raw()
                     .toBuffer({ resolveWithObject: true });
-                
+
                 if (info.width !== 9 || info.height !== 8) return null;
-                
+
                 // Compute difference hash - compare adjacent horizontal pixels
                 let hash = BigInt(0);
                 for (let y = 0; y < 8; y++) {
@@ -73,16 +73,16 @@ const computePerceptualHash = async (filePath) => {
                         }
                     }
                 }
-                
+
                 // Convert to 16-char hex string
                 return hash.toString(16).padStart(16, '0');
             });
         })();
-        
-        const timeoutPromise = new Promise((_, reject) => 
+
+        const timeoutPromise = new Promise((_, reject) =>
             setTimeout(() => reject(new Error('Perceptual hash timeout')), timeoutMs)
         );
-        
+
         return await Promise.race([hashPromise, timeoutPromise]);
     } catch (e) {
         console.log('computePerceptualHash error:', e.message);
@@ -98,7 +98,7 @@ const findFfmpeg = () => {
     const platform = process.platform === 'darwin' ? 'darwin' : process.platform === 'win32' ? 'win32' : 'linux';
     const arch = process.arch === 'arm64' ? 'arm64' : process.arch === 'x64' ? 'x64' : process.arch;
     const ffmpegName = platform === 'win32' ? 'ffmpeg.exe' : 'ffmpeg';
-    
+
     // Check in node_modules relative to script
     const localPaths = [
         path.join(scriptDir, 'node_modules', '@ffmpeg-installer', `${platform}-${arch}`, ffmpegName),
@@ -106,14 +106,14 @@ const findFfmpeg = () => {
         path.join(scriptDir, '..', 'app.asar.unpacked', 'node_modules', '@ffmpeg-installer', `${platform}-${arch}`, ffmpegName),
         path.join(scriptDir, '..', 'app.asar.unpacked', 'node_modules', '@ffmpeg-installer', `${platform}-x64`, ffmpegName),
     ];
-    
+
     for (const p of localPaths) {
         if (fs.existsSync(p)) {
             console.log('Using bundled ffmpeg (local):', p);
             return p;
         }
     }
-    
+
     // 2. Try @ffmpeg-installer/ffmpeg module
     try {
         const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
@@ -129,8 +129,8 @@ const findFfmpeg = () => {
                 console.log('Bundled ffmpeg not found at:', installerPath);
             }
         }
-    } catch (e) {}
-    
+    } catch (e) { }
+
     // 3. Try ffmpeg-static
     try {
         let staticPath = require('ffmpeg-static');
@@ -143,8 +143,8 @@ const findFfmpeg = () => {
                 return staticPath;
             }
         }
-    } catch (e2) {}
-    
+    } catch (e2) { }
+
     console.log('No bundled ffmpeg available, using system ffmpeg');
     return 'ffmpeg';
 };
@@ -198,7 +198,7 @@ const reserveStealthCloudIncomingBytes = async ({ userId, incomingBytes }) => {
             reservedBytes: Number(cloudUploadReservedBytes.get(String(userId)) || 0) || 0,
             remainingBytes: 0,
             marginBytes: USER_QUOTA_MARGIN_BYTES,
-            release: () => {},
+            release: () => { },
         };
     }
 
@@ -219,7 +219,7 @@ const reserveStealthCloudIncomingBytes = async ({ userId, incomingBytes }) => {
                 reservedBytes,
                 remainingBytes: remaining,
                 marginBytes: USER_QUOTA_MARGIN_BYTES,
-                release: () => {},
+                release: () => { },
             };
         }
 
@@ -341,7 +341,7 @@ app.use('/images', express.static(path.join(__dirname, 'public', 'images')));
 
 // Desktop app downloads directory (builds uploaded here become available at /photolynk/download)
 const DOWNLOADS_DIR = process.env.DOWNLOADS_DIR || path.join(AUX_ROOT, 'downloads');
-if (!fs.existsSync(DOWNLOADS_DIR)) { try { fs.mkdirSync(DOWNLOADS_DIR, { recursive: true }); } catch (_) {} }
+if (!fs.existsSync(DOWNLOADS_DIR)) { try { fs.mkdirSync(DOWNLOADS_DIR, { recursive: true }); } catch (_) { } }
 
 // Serve .well-known directory for capacity JSON
 app.use('/.well-known', express.static(path.join(AUX_ROOT, '.well-known')));
@@ -988,18 +988,18 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
             }
             try {
                 nftAdminStats = nftService.balance.getAdminStats();
-            } catch (_) {}
+            } catch (_) { }
             // Get premium + balance for each user
             for (const u of users) {
                 try {
                     nftPremiumByUser[u.id] = nftService.balance.getPremiumStatus(u.id);
-                } catch (_) {}
+                } catch (_) { }
                 try {
                     nftMintStatsByUser[u.id] = nftService.balance.getUserMintStats(u.id);
-                } catch (_) {}
+                } catch (_) { }
                 try {
                     nftBalanceByUser[u.id] = nftService.balance.getBalance(u.id);
-                } catch (_) {}
+                } catch (_) { }
             }
         } catch (_) { /* nft-service not available */ }
 
@@ -1010,7 +1010,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 if (!solanaPaymentsByUser[sp.user_id]) solanaPaymentsByUser[sp.user_id] = [];
                 solanaPaymentsByUser[sp.user_id].push(sp);
             }
-        } catch (_) {}
+        } catch (_) { }
 
         // Compute effective subscription status from raw plan fields (read-only, mirrors resolveSubscriptionState)
         const computeEffectiveStatus = (u) => {
@@ -1130,7 +1130,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
 app.post('/admin/api/user/delete', adminAuth, async (req, res) => {
     try {
         const { userId, deleteFiles } = req.body;
-        
+
         if (!userId || typeof userId !== 'number') {
             return res.status(400).json({ error: 'userId (number) required' });
         }
@@ -1143,9 +1143,9 @@ app.post('/admin/api/user/delete', adminAuth, async (req, res) => {
             deleteFiles: !!deleteFiles,
             reason: 'admin_delete',
         });
-        
-        return res.json({ 
-            ok: true, 
+
+        return res.json({
+            ok: true,
             message: `User ${userId} deleted successfully`,
             deleted: result.deleted
         });
@@ -1462,7 +1462,7 @@ const resolveClassicFileForUser = async (user, filename) => {
             if (fs.existsSync(filePath) && fs.statSync(filePath).isFile()) {
                 return { filePath, deviceUuid: uuid };
             }
-        } catch (e) {}
+        } catch (e) { }
     }
     return null;
 };
@@ -1609,7 +1609,7 @@ const resolveSubscriptionState = async (userId) => {
                 `UPDATE user_plans SET status = ?, plan_gb = NULL, trial_until = NULL, grace_until = NULL, expires_at = NULL, updated_at = ? WHERE user_id = ?`,
                 ['trial_complimentary_expired', nextUpdatedAt, userId]
             );
-        } catch (e) {}
+        } catch (e) { }
         if (premiumGb > 0) return await resolvePremiumState('premium_over_capacity', { complimentaryUntil });
         return {
             allowed: false,
@@ -1642,7 +1642,7 @@ const resolveSubscriptionState = async (userId) => {
                     paymentType: row.payment_type || null,
                 };
             }
-        } catch (e) {}
+        } catch (e) { }
     }
 
     if (expiresAt && expiresAt > 0 && expiresAt <= now) {
@@ -1662,7 +1662,7 @@ const resolveSubscriptionState = async (userId) => {
                     `UPDATE user_plans SET status = ?, updated_at = ? WHERE user_id = ?`,
                     ['expired', nextUpdatedAt, userId]
                 );
-            } catch (e) {}
+            } catch (e) { }
         }
         if (premiumGb > 0) {
             if (allowedInGrace) {
@@ -1849,7 +1849,7 @@ db.serialize(() => {
         if (err) return;
         const names = Array.isArray(cols) ? cols.map(c => c && c.name).filter(Boolean) : [];
         if (!names.includes('hardware_device_id')) {
-            db.run(`ALTER TABLE users ADD COLUMN hardware_device_id TEXT`, [], () => {});
+            db.run(`ALTER TABLE users ADD COLUMN hardware_device_id TEXT`, [], () => { });
         }
         if (!names.includes('created_at')) {
             db.run(`ALTER TABLE users ADD COLUMN created_at INTEGER`, [], () => {
@@ -1863,21 +1863,21 @@ db.serialize(() => {
         }
         // Security: email verification status
         if (!names.includes('email_verified')) {
-            db.run(`ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0`, [], () => {});
+            db.run(`ALTER TABLE users ADD COLUMN email_verified INTEGER DEFAULT 0`, [], () => { });
         }
         // Security: last known country code for geo verification
         if (!names.includes('last_country_code')) {
-            db.run(`ALTER TABLE users ADD COLUMN last_country_code TEXT`, [], () => {});
+            db.run(`ALTER TABLE users ADD COLUMN last_country_code TEXT`, [], () => { });
         }
         // Security: list of verified country codes (JSON array)
         if (!names.includes('verified_countries')) {
-            db.run(`ALTER TABLE users ADD COLUMN verified_countries TEXT DEFAULT '[]'`, [], () => {});
+            db.run(`ALTER TABLE users ADD COLUMN verified_countries TEXT DEFAULT '[]'`, [], () => { });
         }
         if (!names.includes('alias_email')) {
-            db.run(`ALTER TABLE users ADD COLUMN alias_email TEXT`, [], () => {});
+            db.run(`ALTER TABLE users ADD COLUMN alias_email TEXT`, [], () => { });
         }
         if (!names.includes('wallet_address')) {
-            db.run(`ALTER TABLE users ADD COLUMN wallet_address TEXT`, [], () => {});
+            db.run(`ALTER TABLE users ADD COLUMN wallet_address TEXT`, [], () => { });
         }
         if (!names.includes('seeker_id')) {
             db.run(`ALTER TABLE users ADD COLUMN seeker_id TEXT`, [], () => {
@@ -1945,49 +1945,49 @@ db.serialize(() => {
         if (err) return;
         const names = Array.isArray(cols) ? cols.map(c => c && c.name).filter(Boolean) : [];
         if (!names.includes('plan_gb')) {
-            db.run(`ALTER TABLE user_plans ADD COLUMN plan_gb INTEGER`, [], () => {});
+            db.run(`ALTER TABLE user_plans ADD COLUMN plan_gb INTEGER`, [], () => { });
         }
         if (!names.includes('premium_gb')) {
-            db.run(`ALTER TABLE user_plans ADD COLUMN premium_gb INTEGER`, [], () => {});
+            db.run(`ALTER TABLE user_plans ADD COLUMN premium_gb INTEGER`, [], () => { });
         }
         if (!names.includes('rc_app_user_id')) {
-            db.run(`ALTER TABLE user_plans ADD COLUMN rc_app_user_id TEXT`, [], () => {});
+            db.run(`ALTER TABLE user_plans ADD COLUMN rc_app_user_id TEXT`, [], () => { });
         }
         if (!names.includes('rc_product_id')) {
-            db.run(`ALTER TABLE user_plans ADD COLUMN rc_product_id TEXT`, [], () => {});
+            db.run(`ALTER TABLE user_plans ADD COLUMN rc_product_id TEXT`, [], () => { });
         }
         if (!names.includes('rc_entitlement')) {
-            db.run(`ALTER TABLE user_plans ADD COLUMN rc_entitlement TEXT`, [], () => {});
+            db.run(`ALTER TABLE user_plans ADD COLUMN rc_entitlement TEXT`, [], () => { });
         }
         if (!names.includes('status')) {
-            db.run(`ALTER TABLE user_plans ADD COLUMN status TEXT`, [], () => {});
+            db.run(`ALTER TABLE user_plans ADD COLUMN status TEXT`, [], () => { });
         }
         if (!names.includes('expires_at')) {
-            db.run(`ALTER TABLE user_plans ADD COLUMN expires_at INTEGER`, [], () => {});
+            db.run(`ALTER TABLE user_plans ADD COLUMN expires_at INTEGER`, [], () => { });
         }
         if (!names.includes('grace_until')) {
-            db.run(`ALTER TABLE user_plans ADD COLUMN grace_until INTEGER`, [], () => {});
+            db.run(`ALTER TABLE user_plans ADD COLUMN grace_until INTEGER`, [], () => { });
         }
         if (!names.includes('trial_until')) {
-            db.run(`ALTER TABLE user_plans ADD COLUMN trial_until INTEGER`, [], () => {});
+            db.run(`ALTER TABLE user_plans ADD COLUMN trial_until INTEGER`, [], () => { });
         }
         if (!names.includes('trial_carryover_applied_at')) {
-            db.run(`ALTER TABLE user_plans ADD COLUMN trial_carryover_applied_at INTEGER`, [], () => {});
+            db.run(`ALTER TABLE user_plans ADD COLUMN trial_carryover_applied_at INTEGER`, [], () => { });
         }
         if (!names.includes('last_store_purchase_at')) {
-            db.run(`ALTER TABLE user_plans ADD COLUMN last_store_purchase_at INTEGER`, [], () => {});
+            db.run(`ALTER TABLE user_plans ADD COLUMN last_store_purchase_at INTEGER`, [], () => { });
         }
         if (!names.includes('deleted_at')) {
-            db.run(`ALTER TABLE user_plans ADD COLUMN deleted_at INTEGER`, [], () => {});
+            db.run(`ALTER TABLE user_plans ADD COLUMN deleted_at INTEGER`, [], () => { });
         }
         if (!names.includes('payment_type')) {
-            db.run(`ALTER TABLE user_plans ADD COLUMN payment_type TEXT`, [], () => {});
+            db.run(`ALTER TABLE user_plans ADD COLUMN payment_type TEXT`, [], () => { });
         }
         if (!names.includes('payment_at')) {
-            db.run(`ALTER TABLE user_plans ADD COLUMN payment_at INTEGER`, [], () => {});
+            db.run(`ALTER TABLE user_plans ADD COLUMN payment_at INTEGER`, [], () => { });
         }
         if (!names.includes('updated_at')) {
-            db.run(`ALTER TABLE user_plans ADD COLUMN updated_at INTEGER`, [], () => {});
+            db.run(`ALTER TABLE user_plans ADD COLUMN updated_at INTEGER`, [], () => { });
         }
 
         db.all(`PRAGMA table_info(user_plans)`, [], (err2, cols2) => {
@@ -2081,7 +2081,7 @@ db.serialize(() => {
     db.run(`ALTER TABLE devices ADD COLUMN last_seen INTEGER`, (err) => {
         // Ignore error if column already exists
     });
-    
+
     // Files table to track metadata
     db.run(`CREATE TABLE IF NOT EXISTS files (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2096,7 +2096,7 @@ db.serialize(() => {
         UNIQUE(user_id, filename),
         UNIQUE(user_id, file_hash)
     )`);
-    
+
     // Add perceptual_hash column if it doesn't exist (migration for existing DBs)
     db.run(`ALTER TABLE files ADD COLUMN perceptual_hash TEXT`, (err) => {
         // Ignore error if column already exists
@@ -2155,7 +2155,7 @@ db.serialize(() => {
         label TEXT,
         UNIQUE(device_uuid_a, device_uuid_b)
     )`);
-    
+
     // Clean up database on startup - remove entries for files that don't exist
     setTimeout(() => {
         db.all(`
@@ -2164,20 +2164,20 @@ db.serialize(() => {
             JOIN devices d ON f.user_id = d.user_id
         `, [], (err, rows) => {
             if (err) return console.error('Cleanup error:', err);
-            
+
             let cleaned = 0;
             rows.forEach(row => {
                 // Files are stored by device_uuid, not user_id
                 const deviceDir = path.join(UPLOAD_DIR, row.device_uuid);
                 const filePath = path.join(deviceDir, row.filename);
-                
+
                 if (!fs.existsSync(filePath)) {
-                    db.run(`DELETE FROM files WHERE user_id = ? AND filename = ?`, 
+                    db.run(`DELETE FROM files WHERE user_id = ? AND filename = ?`,
                         [row.user_id, row.filename]);
                     cleaned++;
                 }
             });
-            
+
             if (cleaned > 0) {
                 console.log(`Database cleanup: removed ${cleaned} orphaned entries`);
             }
@@ -2319,7 +2319,7 @@ const clearStealthCloudDedupCachesForKeys = (keys) => {
         if (!key) continue;
         try {
             serverDedupCache.delete(path.join(CLOUD_DIR, 'users', key, 'manifests'));
-        } catch (_) {}
+        } catch (_) { }
     }
 };
 
@@ -2496,9 +2496,9 @@ const ensureStealthCloudUserDirs = (user) => {
     const canUsePreferred = preferredKey && preferredKey !== 'unknown';
     const cloudUsersRoot = path.join(CLOUD_DIR, 'users');
     const chunksUsersRoot = CHUNKS_DIR ? path.join(CHUNKS_DIR, 'users') : null;
-    try { if (!fs.existsSync(cloudUsersRoot)) fs.mkdirSync(cloudUsersRoot, { recursive: true }); } catch (e) {}
+    try { if (!fs.existsSync(cloudUsersRoot)) fs.mkdirSync(cloudUsersRoot, { recursive: true }); } catch (e) { }
     if (chunksUsersRoot) {
-        try { if (!fs.existsSync(chunksUsersRoot)) fs.mkdirSync(chunksUsersRoot, { recursive: true }); } catch (e) {}
+        try { if (!fs.existsSync(chunksUsersRoot)) fs.mkdirSync(chunksUsersRoot, { recursive: true }); } catch (e) { }
     }
 
     // Prefer the stable key only if it already exists; otherwise use the first existing legacy key.
@@ -2510,7 +2510,7 @@ const ensureStealthCloudUserDirs = (user) => {
             try {
                 if (fs.existsSync(preferredCloud)) return true;
                 if (preferredChunks && fs.existsSync(preferredChunks)) return true;
-            } catch (e) {}
+            } catch (e) { }
             return false;
         })();
         if (!preferredExists) {
@@ -2523,7 +2523,7 @@ const ensureStealthCloudUserDirs = (user) => {
                         key = k;
                         break;
                     }
-                } catch (e) {}
+                } catch (e) { }
             }
         }
     } else {
@@ -2536,18 +2536,18 @@ const ensureStealthCloudUserDirs = (user) => {
                     key = k;
                     break;
                 }
-            } catch (e) {}
+            } catch (e) { }
         }
     }
 
     const userDir = path.join(CLOUD_DIR, 'users', key);
     // Chunks go to HDD RAID10 if CHUNKS_DIR is set, otherwise same as CLOUD_DIR
-    const chunksDir = CHUNKS_DIR 
+    const chunksDir = CHUNKS_DIR
         ? path.join(CHUNKS_DIR, 'users', key, 'chunks')
         : path.join(userDir, 'chunks');
     const manifestsDir = path.join(userDir, 'manifests'); // Manifests always on NVMe (CLOUD_DIR)
     // Raw files go to RAID10 alongside chunks (same storage tier as chunks)
-    const rawDir = CHUNKS_DIR 
+    const rawDir = CHUNKS_DIR
         ? path.join(CHUNKS_DIR, 'users', key, 'raw')
         : path.join(userDir, 'raw');
     const rawMetaDir = path.join(userDir, 'raw-meta'); // Metadata for raw files (thumbnails, EXIF) - on NVMe
@@ -2646,7 +2646,7 @@ const storage = multer.diskStorage({
         // Use original name but sanitize or prepend timestamp to avoid collisions if needed.
         // For sync, we often want to keep the exact filename or a hash.
         // Here we assume the client sends a unique filename (e.g. UUID or timestamped name)
-        cb(null, file.originalname); 
+        cb(null, file.originalname);
     }
 });
 
@@ -2703,7 +2703,7 @@ const CHECKSUMS_FILE = path.join(DOWNLOADS_DIR, 'checksums.json');
 function loadChecksums() {
     try {
         if (fs.existsSync(CHECKSUMS_FILE)) return JSON.parse(fs.readFileSync(CHECKSUMS_FILE, 'utf8'));
-    } catch (_) {}
+    } catch (_) { }
     return {};
 }
 
@@ -2827,7 +2827,7 @@ app.post('/api/downloads/upload', authenticateToken, downloadUpload.single('buil
         if (!req.user || (req.user.username !== 'admin' && req.user.role !== 'admin')) {
             // Also check if user is the server owner (userId 1)
             if (!req.user || req.user.userId !== 1) {
-                if (req.file) try { fs.unlinkSync(req.file.path); } catch (_) {}
+                if (req.file) try { fs.unlinkSync(req.file.path); } catch (_) { }
                 return res.status(403).json({ error: 'Admin access required' });
             }
         }
@@ -2837,7 +2837,7 @@ app.post('/api/downloads/upload', authenticateToken, downloadUpload.single('buil
         const filePath = path.join(DOWNLOADS_DIR, filename);
         const info = parseBuildFilename(filename);
         if (!info) {
-            try { fs.unlinkSync(filePath); } catch (_) {}
+            try { fs.unlinkSync(filePath); } catch (_) { }
             return res.status(400).json({ error: 'Invalid filename format. Expected: PhotoLynk Desktop-{version}-{platform}.{ext}' });
         }
 
@@ -2943,7 +2943,7 @@ const getUserUsedBytes = async (userId, userOrNull) => {
         [userId]
     );
     const encryptedBytes = row && row.usedBytes !== undefined && row.usedBytes !== null ? Number(row.usedBytes) : 0;
-    
+
     // Get raw files size from filesystem
     let rawBytes = 0;
     // If user object not provided, look it up from database
@@ -2956,7 +2956,7 @@ const getUserUsedBytes = async (userId, userOrNull) => {
                 const devRow = await dbGetAsync(`SELECT device_uuid FROM devices WHERE user_id = ? ORDER BY id DESC LIMIT 1`, [userId]);
                 user = { ...dbUser, device_uuid: devRow ? devRow.device_uuid : null };
             }
-        } catch (e) {}
+        } catch (e) { }
     }
     if (user) {
         try {
@@ -2967,12 +2967,12 @@ const getUserUsedBytes = async (userId, userOrNull) => {
                     try {
                         const stat = fs.statSync(path.join(rawDir, file));
                         if (stat.isFile()) rawBytes += stat.size;
-                    } catch (e) {}
+                    } catch (e) { }
                 }
             }
-        } catch (e) {}
+        } catch (e) { }
     }
-    
+
     const total = encryptedBytes + rawBytes;
     return Number.isFinite(total) ? total : 0;
 };
@@ -3131,7 +3131,7 @@ app.post('/api/register', authRateLimiter, async (req, res) => {
         const u = (crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex'));
         const storageUuid = computeStorageUuidFromEmail(normalizedEmail);
         const now = Date.now();
-        db.run(`INSERT INTO users (user_uuid, storage_uuid, email, password, hardware_device_id, created_at) VALUES (?, ?, ?, ?, ?, ?)`, [u, storageUuid, normalizedEmail, hashedPassword, hwDeviceId, now], function(err) {
+        db.run(`INSERT INTO users (user_uuid, storage_uuid, email, password, hardware_device_id, created_at) VALUES (?, ?, ?, ?, ?, ?)`, [u, storageUuid, normalizedEmail, hashedPassword, hwDeviceId, now], function (err) {
             if (err) {
                 if (err.message.includes('UNIQUE constraint failed')) return res.status(409).json({ error: 'Email already exists' });
                 return res.status(500).json({ error: err.message });
@@ -3173,8 +3173,8 @@ app.post('/api/login', authRateLimiter, async (req, res) => {
 
         // Check email verification (if enabled)
         if (REQUIRE_EMAIL_VERIFICATION && !user.email_verified) {
-            return res.status(403).json({ 
-                error: 'Email not verified', 
+            return res.status(403).json({
+                error: 'Email not verified',
                 requiresEmailVerification: true,
                 hint: 'Please verify your email before logging in'
             });
@@ -3185,17 +3185,17 @@ app.post('/api/login', authRateLimiter, async (req, res) => {
         if (REQUIRE_COUNTRY_VERIFICATION) {
             const clientIp = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip;
             currentCountry = await getCountryFromIP(clientIp);
-            
+
             if (currentCountry && currentCountry.countryCode) {
                 const verifiedCountries = JSON.parse(user.verified_countries || '[]');
-                const isNewCountry = !verifiedCountries.includes(currentCountry.countryCode) && 
-                                     user.last_country_code && 
-                                     user.last_country_code !== currentCountry.countryCode;
-                
+                const isNewCountry = !verifiedCountries.includes(currentCountry.countryCode) &&
+                    user.last_country_code &&
+                    user.last_country_code !== currentCountry.countryCode;
+
                 if (isNewCountry) {
                     const verifyKey = `country:${user.id}:${currentCountry.countryCode}`;
                     const pending = pendingVerifications.get(verifyKey);
-                    
+
                     // Check if verification code was provided
                     if (country_verification_code) {
                         if (pending && pending.code === country_verification_code && Date.now() < pending.expiresAt) {
@@ -3222,11 +3222,11 @@ app.post('/api/login', authRateLimiter, async (req, res) => {
                             country: currentCountry.country,
                             countryCode: currentCountry.countryCode
                         });
-                        
+
                         console.log(`[Geo] New country login detected for user ${user.id}: ${currentCountry.country} (code: ${code})`);
                         // TODO: Send email with code (for now, log it)
                         // In production: await sendVerificationEmail(user.email, code, currentCountry.country);
-                        
+
                         return res.status(403).json({
                             error: 'Login from new country detected',
                             requiresCountryVerification: true,
@@ -3268,7 +3268,7 @@ app.post('/api/login', authRateLimiter, async (req, res) => {
                         if (fs.existsSync(path.join(cloudUsersRoot, k))) return true;
                         if (chunksUsersRoot && fs.existsSync(path.join(chunksUsersRoot, k))) return true;
                         if (fs.existsSync(path.join(nftRoot, k))) return true;
-                    } catch (e) {}
+                    } catch (e) { }
                     return false;
                 };
 
@@ -3285,7 +3285,7 @@ app.post('/api/login', authRateLimiter, async (req, res) => {
                         const dv = r && r.device_uuid ? String(r.device_uuid).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128) : '';
                         if (dv) legacyKeys.add(dv);
                     });
-                } catch (e) {}
+                } catch (e) { }
 
                 let otherLegacyExists = false;
                 for (const k of legacyKeys) {
@@ -3304,8 +3304,8 @@ app.post('/api/login', authRateLimiter, async (req, res) => {
 
         // Register/Update Device (update last_seen on every login)
         db.run(`INSERT INTO devices (user_id, device_uuid, device_name, last_seen) VALUES (?, ?, ?, ?)
-                 ON CONFLICT(user_id, device_uuid) DO UPDATE SET last_seen = ?, device_name = COALESCE(?, device_name)`, 
-            [user.id, device_uuid, device_name || 'Unknown Device', Date.now(), Date.now(), device_name || null], 
+                 ON CONFLICT(user_id, device_uuid) DO UPDATE SET last_seen = ?, device_name = COALESCE(?, device_name)`,
+            [user.id, device_uuid, device_name || 'Unknown Device', Date.now(), Date.now(), device_name || null],
             async (devErr) => {
                 if (devErr) console.error('Device reg error:', devErr);
 
@@ -3333,7 +3333,7 @@ app.post('/api/login', authRateLimiter, async (req, res) => {
                     `UPDATE user_plans SET rc_app_user_id = ?, updated_at = ? WHERE user_id = ?`,
                     [normalizedEmail, now, user.id]
                 );
-                
+
                 // Update last known country
                 if (currentCountry && currentCountry.countryCode) {
                     const verifiedCountries = JSON.parse(user.verified_countries || '[]');
@@ -3343,7 +3343,7 @@ app.post('/api/login', authRateLimiter, async (req, res) => {
                     db.run(`UPDATE users SET last_country_code = ?, verified_countries = ? WHERE id = ?`,
                         [currentCountry.countryCode, JSON.stringify(verifiedCountries), user.id]);
                 }
-                
+
                 // Generate Token BOUND to this device
                 const storageUuid = user.storage_uuid || computeStorageUuidFromEmail(user.email);
                 if (storageUuid && !user.storage_uuid) {
@@ -3370,7 +3370,7 @@ app.post('/api/auth/request-email-verification', authRateLimiter, async (req, re
     db.get(`SELECT id, email, email_verified FROM users WHERE email = ?`, [normalizedEmail], async (err, user) => {
         if (err) return res.status(500).json({ error: 'Database error' });
         if (!user) return res.status(404).json({ error: 'Account not found' });
-        
+
         if (user.email_verified) {
             return res.json({ message: 'Email already verified', alreadyVerified: true });
         }
@@ -3416,7 +3416,7 @@ app.post('/api/auth/verify-email', authRateLimiter, async (req, res) => {
         // Mark email as verified
         db.run(`UPDATE users SET email_verified = 1 WHERE id = ?`, [user.id], (updateErr) => {
             if (updateErr) return res.status(500).json({ error: 'Failed to verify email' });
-            
+
             pendingVerifications.delete(verifyKey);
             console.log(`[Email] User ${user.id} email verified: ${normalizedEmail}`);
             res.json({ message: 'Email verified successfully', success: true });
@@ -3441,7 +3441,7 @@ app.post('/api/auth/resend-country-code', authRateLimiter, async (req, res) => {
 
         const verifyKey = `country:${user.id}:${countryCode}`;
         const code = generateVerificationCode();
-        
+
         pendingVerifications.set(verifyKey, {
             code,
             expiresAt: Date.now() + 15 * 60 * 1000,
@@ -3470,7 +3470,7 @@ app.post('/api/auth/request-password-reset', authRateLimiter, async (req, res) =
 
     db.get(`SELECT id, email FROM users WHERE email = ?`, [normalizedEmail], async (err, user) => {
         if (err) return res.status(500).json({ error: 'Database error' });
-        
+
         // Always return success to prevent email enumeration attacks
         if (!user) {
             console.log(`[Password Reset] Request for non-existent email: ${normalizedEmail}`);
@@ -3519,7 +3519,7 @@ app.post('/api/auth/reset-password-with-code', authRateLimiter, async (req, res)
 
         try {
             const hashedPassword = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
-            db.run(`UPDATE users SET password = ? WHERE id = ?`, [hashedPassword, user.id], function(updateErr) {
+            db.run(`UPDATE users SET password = ? WHERE id = ?`, [hashedPassword, user.id], function (updateErr) {
                 if (updateErr) return res.status(500).json({ error: 'Failed to update password' });
 
                 pendingVerifications.delete(verifyKey);
@@ -3554,7 +3554,7 @@ app.post('/api/reset-password-device', authRateLimiter, async (req, res) => {
 
         // Check if hardware_device_id was stored during registration
         if (!user.hardware_device_id) {
-            return res.status(403).json({ 
+            return res.status(403).json({
                 error: 'Password reset is not available for this account. The account was created before device-bound reset was enabled.',
                 hint: 'no_hardware_id_stored'
             });
@@ -3562,7 +3562,7 @@ app.post('/api/reset-password-device', authRateLimiter, async (req, res) => {
 
         // Compare hardware device IDs
         if (user.hardware_device_id !== hwDeviceId) {
-            return res.status(403).json({ 
+            return res.status(403).json({
                 error: 'Password reset is only allowed from the device that created this account',
                 hint: 'device_mismatch'
             });
@@ -3571,7 +3571,7 @@ app.post('/api/reset-password-device', authRateLimiter, async (req, res) => {
         // Device matches - allow password reset
         try {
             const hashedPassword = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
-            db.run(`UPDATE users SET password = ? WHERE id = ?`, [hashedPassword, user.id], function(updateErr) {
+            db.run(`UPDATE users SET password = ? WHERE id = ?`, [hashedPassword, user.id], function (updateErr) {
                 if (updateErr) return res.status(500).json({ error: 'Failed to update password' });
 
                 console.log(`[PASSWORD RESET] Password updated for ${normalizedEmail} via hardware device-bound reset`);
@@ -3880,7 +3880,7 @@ app.get('/api/subscription/downgrade-check', authenticateToken, async (req, res)
         const premiumGb = await getUserPremiumGb(userId);
         const minRequiredTier = await getMinRequiredTier(userId);
         const GB = 1000 * 1000 * 1000;
-        
+
         // Check each tier (account for permanent premium storage)
         const tiers = [100, 200, 400, 1000];
         const tierStatus = {};
@@ -3893,7 +3893,7 @@ app.get('/api/subscription/downgrade-check', authenticateToken, async (req, res)
                 usedPercent: tierBytes > 0 ? Math.round((usedBytes / tierBytes) * 100) : 0,
             };
         }
-        
+
         return res.json({
             currentPlanGb: currentPlan,
             premiumGb,
@@ -4026,8 +4026,8 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
         const store = (event && (event.store || event.Store)) ? String(event.store || event.Store).toUpperCase() : '';
         const paymentType =
             store === 'APP_STORE' ? 'apple' :
-            store === 'PLAY_STORE' ? 'google' :
-            null;
+                store === 'PLAY_STORE' ? 'google' :
+                    null;
 
         db.get(
             `SELECT up.user_id AS user_id
@@ -4160,13 +4160,13 @@ const PLAN_DURATION_MS = {
 // Verify Solana payment transaction
 app.post('/api/solana/verify-payment', async (req, res) => {
     const { txSignature, tierGb, duration, solAmount, paymentWallet } = req.body;
-    
+
     // Extract user from JWT token in Authorization header
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
         return res.status(401).json({ error: 'Authorization token required' });
     }
-    
+
     const token = authHeader.substring(7);
     let decoded;
     try {
@@ -4174,29 +4174,29 @@ app.post('/api/solana/verify-payment', async (req, res) => {
     } catch (e) {
         return res.status(401).json({ error: 'Invalid or expired token' });
     }
-    
+
     if (!txSignature || !tierGb) {
         return res.status(400).json({ error: 'Missing required fields: txSignature, tierGb' });
     }
-    
+
     // Validate payment wallet matches
     if (paymentWallet && paymentWallet !== SOLANA_PAYMENT_WALLET) {
         return res.status(400).json({ error: 'Invalid payment wallet' });
     }
-    
+
     // Normalize tier
     const normalizedTier = normalizeTierGb(tierGb);
     if (!normalizedTier) {
         return res.status(400).json({ error: 'Invalid tier' });
     }
-    
+
     try {
         // Find user by ID from JWT token
         const user = await dbGetAsync(`SELECT id, email FROM users WHERE id = ?`, [decoded.id]);
         if (!user) {
             return res.status(404).json({ error: 'User not found' });
         }
-        
+
         // DOWNGRADE GUARD: Reject if user's storage exceeds target tier
         const currentPlanGb = await getUserPlanGb(user.id);
         if (currentPlanGb && normalizedTier < currentPlanGb) {
@@ -4213,13 +4213,13 @@ app.post('/api/solana/verify-payment', async (req, res) => {
                 });
             }
         }
-        
+
         // Verify transaction on Solana blockchain
         const txVerification = await verifySolanaTransaction(txSignature, solAmount);
         if (!txVerification.success) {
             return res.status(400).json({ error: txVerification.error || 'Transaction verification failed' });
         }
-        
+
         // Check if this transaction was already processed
         const existingTx = await dbGetAsync(
             `SELECT * FROM solana_payments WHERE tx_signature = ?`,
@@ -4228,11 +4228,11 @@ app.post('/api/solana/verify-payment', async (req, res) => {
         if (existingTx) {
             return res.status(409).json({ error: 'Transaction already processed', existingPayment: existingTx });
         }
-        
+
         // Calculate subscription expiry
         const now = Date.now();
         const durationMs = PLAN_DURATION_MS[duration] || PLAN_DURATION_MS.monthly;
-        
+
         // Get current plan to check existing expiration
         const currentPlan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [user.id]);
         const solanaExpiry = computePaidSubscriptionExpiry({
@@ -4241,14 +4241,14 @@ app.post('/api/solana/verify-payment', async (req, res) => {
             durationMs,
         });
         const expiresAt = solanaExpiry.expiresAt;
-        
+
         // Record the payment
         await dbRunAsync(
             `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, tier_gb, duration, created_at, verified_at)
              VALUES (?, ?, ?, ?, ?, ?, ?)`,
             [user.id, txSignature, solAmount || 0, normalizedTier, duration || 'monthly', now, now]
         );
-        
+
         // Activate subscription
         await dbRunAsync(
             `INSERT INTO user_plans (user_id, plan_gb, status, expires_at, trial_carryover_applied_at, updated_at)
@@ -4264,9 +4264,9 @@ app.post('/api/solana/verify-payment', async (req, res) => {
                 updated_at = excluded.updated_at`,
             [user.id, normalizedTier, expiresAt, solanaExpiry.trialCarryoverAppliedAt, now]
         );
-        
+
         console.log(`[Solana] Payment verified: ${txSignature} - User ${user.email} - ${normalizedTier}GB ${duration}`);
-        
+
         return res.json({
             success: true,
             message: 'Payment verified and subscription activated',
@@ -4285,12 +4285,12 @@ app.post('/api/solana/verify-payment', async (req, res) => {
 // Helper function to verify Solana transaction
 async function verifySolanaTransaction(txSignature, expectedSolAmount) {
     console.log('[Solana] Verifying transaction:', txSignature, 'expected amount:', expectedSolAmount);
-    
+
     // Retry up to 5 times with 2 second intervals to allow tx to propagate
     const maxRetries = 5;
     const retryDelay = 2000;
     let tx = null;
-    
+
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
             console.log(`[Solana] Attempt ${attempt}/${maxRetries} to fetch transaction`);
@@ -4306,13 +4306,13 @@ async function verifySolanaTransaction(txSignature, expectedSolAmount) {
                 timeout: 30000,
                 headers: { 'Content-Type': 'application/json' },
             });
-            
+
             tx = response.data?.result;
             if (tx) {
                 console.log('[Solana] Transaction found on attempt', attempt);
                 break;
             }
-            
+
             if (attempt < maxRetries) {
                 console.log(`[Solana] Transaction not found yet, waiting ${retryDelay}ms...`);
                 await new Promise(resolve => setTimeout(resolve, retryDelay));
@@ -4324,49 +4324,49 @@ async function verifySolanaTransaction(txSignature, expectedSolAmount) {
             }
         }
     }
-    
+
     if (!tx) {
         return { success: false, error: 'Transaction not found after retries - may still be propagating' };
     }
-        
-        // Check if transaction explicitly failed (only if meta exists)
-        if (tx.meta && tx.meta.err) {
-            return { success: false, error: 'Transaction failed on chain' };
+
+    // Check if transaction explicitly failed (only if meta exists)
+    if (tx.meta && tx.meta.err) {
+        return { success: false, error: 'Transaction failed on chain' };
+    }
+
+    // Parse transfer instructions to find sender, receiver, and amount
+    const instructions = tx.transaction?.message?.instructions || [];
+    let sender = null;
+    let receiver = null;
+    let transferAmount = 0;
+
+    for (const ix of instructions) {
+        // Look for System Program transfer instruction
+        if (ix.program === 'system' && ix.parsed?.type === 'transfer') {
+            sender = ix.parsed.info.source;
+            receiver = ix.parsed.info.destination;
+            transferAmount = ix.parsed.info.lamports / LAMPORTS_PER_SOL;
+            console.log(`[Solana] Transfer found: ${sender} -> ${receiver}, amount: ${transferAmount} SOL`);
+            break;
         }
-        
-        // Parse transfer instructions to find sender, receiver, and amount
-        const instructions = tx.transaction?.message?.instructions || [];
-        let sender = null;
-        let receiver = null;
-        let transferAmount = 0;
-        
-        for (const ix of instructions) {
-            // Look for System Program transfer instruction
-            if (ix.program === 'system' && ix.parsed?.type === 'transfer') {
-                sender = ix.parsed.info.source;
-                receiver = ix.parsed.info.destination;
-                transferAmount = ix.parsed.info.lamports / LAMPORTS_PER_SOL;
-                console.log(`[Solana] Transfer found: ${sender} -> ${receiver}, amount: ${transferAmount} SOL`);
-                break;
-            }
-        }
-        
-        if (!sender || !receiver || transferAmount <= 0) {
-            console.log('[Solana] No valid transfer instruction found in transaction');
-            console.log('[Solana] Instructions:', JSON.stringify(instructions, null, 2));
-            return { success: false, error: 'No valid transfer found in transaction' };
-        }
-        
-        // Verify the payment is TO our wallet
-        if (receiver !== SOLANA_PAYMENT_WALLET) {
-            console.log(`[Solana] Payment not to our wallet. Expected: ${SOLANA_PAYMENT_WALLET}, Got: ${receiver}`);
-            return { success: false, error: 'Payment not sent to correct wallet' };
-        }
-        
-        console.log(`[Solana] Valid payment: ${transferAmount} SOL from ${sender} to ${receiver}`);
-        
-    return { 
-        success: true, 
+    }
+
+    if (!sender || !receiver || transferAmount <= 0) {
+        console.log('[Solana] No valid transfer instruction found in transaction');
+        console.log('[Solana] Instructions:', JSON.stringify(instructions, null, 2));
+        return { success: false, error: 'No valid transfer found in transaction' };
+    }
+
+    // Verify the payment is TO our wallet
+    if (receiver !== SOLANA_PAYMENT_WALLET) {
+        console.log(`[Solana] Payment not to our wallet. Expected: ${SOLANA_PAYMENT_WALLET}, Got: ${receiver}`);
+        return { success: false, error: 'Payment not sent to correct wallet' };
+    }
+
+    console.log(`[Solana] Valid payment: ${transferAmount} SOL from ${sender} to ${receiver}`);
+
+    return {
+        success: true,
         receivedAmount: transferAmount,
         sender,
         receiver,
@@ -4393,20 +4393,20 @@ app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => 
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
     const { filename, path: filePath, originalname, mimetype, size } = req.file;
-    
+
     // Calculate file hash to detect duplicates
     const fileBuffer = fs.readFileSync(filePath);
     const fileHash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
-    
+
     // Check if this exact file already exists for this user (by hash only - same content = duplicate)
-    db.get(`SELECT filename, file_hash FROM files WHERE user_id = ? AND file_hash = ?`, 
-        [req.user.id, fileHash], 
+    db.get(`SELECT filename, file_hash FROM files WHERE user_id = ? AND file_hash = ?`,
+        [req.user.id, fileHash],
         (err, row) => {
             if (row) {
                 // Check if the file actually exists on disk
                 const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
                 const existingFilePath = path.join(deviceDir, row.filename);
-                
+
                 if (fs.existsSync(existingFilePath)) {
                     // Duplicate file exists - delete the uploaded file and return existing filename
                     fs.unlinkSync(filePath);
@@ -4419,7 +4419,7 @@ app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => 
                     // Continue to save the new file below
                 }
             }
-            
+
             // Not a duplicate - save to DB
             db.run(`INSERT OR REPLACE INTO files (user_id, filename, original_name, mime_type, size, file_hash) VALUES (?, ?, ?, ?, ?, ?)`,
                 [req.user.id, originalname, originalname, mimetype, size, fileHash],
@@ -4443,7 +4443,7 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
     if (!originalname) return res.status(400).json({ error: 'Missing x-filename header' });
 
     const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
-    try { fs.mkdirSync(deviceDir, { recursive: true }); } catch (e) {}
+    try { fs.mkdirSync(deviceDir, { recursive: true }); } catch (e) { }
 
     const safeName = path.basename(originalname);
     const tmpName = `${Date.now()}_${Math.random().toString(16).slice(2)}_${safeName}.uploading`;
@@ -4477,12 +4477,12 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
 
     const out = fs.createWriteStream(tmpPath);
     let streamClosed = false;
-    
+
     // Properly close stream and wait for file handle release before cleanup
     const closeStreamAndCleanup = () => {
         if (streamClosed) return;
         streamClosed = true;
-        
+
         const doDelete = () => {
             try {
                 if (fs.existsSync(tmpPath)) {
@@ -4494,7 +4494,7 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
                 setTimeout(doDelete, 500);
             }
         };
-        
+
         try {
             if (!out.destroyed) {
                 out.end(() => {
@@ -4547,7 +4547,7 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
                 } catch (e) {
                     // Retry once after 500ms if file is still locked
                     setTimeout(() => {
-                        try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) {}
+                        try { if (fs.existsSync(tmpPath)) fs.unlinkSync(tmpPath); } catch (e2) { }
                     }, 500);
                 }
             };
@@ -4558,7 +4558,7 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
         const fileHash = hasher.digest('hex');
         const mimetype = (req.headers['content-type'] || 'application/octet-stream').toString();
         const size = writtenBytes;
-        
+
         // Detect real file format from magic bytes and fix extension if mismatched
         // Android sometimes reports screenshots as .jpg when they're actually PNG
         let correctedSafeName = safeName;
@@ -4567,11 +4567,11 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
             const magicBuf = Buffer.alloc(12);
             fs.readSync(fd, magicBuf, 0, 12, 0);
             fs.closeSync(fd);
-            
+
             const ext = safeName.split('.').pop()?.toLowerCase();
             const isPNG = magicBuf[0] === 0x89 && magicBuf[1] === 0x50 && magicBuf[2] === 0x4E && magicBuf[3] === 0x47;
             const isJPEG = magicBuf[0] === 0xFF && magicBuf[1] === 0xD8 && magicBuf[2] === 0xFF;
-            
+
             if (isPNG && ext !== 'png') {
                 correctedSafeName = safeName.replace(/\.[^.]+$/, '.png');
                 console.log(`[Format] Corrected ${safeName} -> ${correctedSafeName} (PNG magic bytes)`);
@@ -4582,7 +4582,7 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
         } catch (e) {
             // If detection fails, use original name
         }
-        
+
         const isImage = /\.(jpg|jpeg|png|gif|bmp|webp|heic|heif|tiff?|raw|cr2|cr3|nef|arw|dng|orf|rw2|pef|srw|raf|psd|psb|exr|hdr|avif)$/i.test(correctedSafeName);
 
         // Get client's perceptual hash from header (for HEIC files where sharp fails)
@@ -4691,11 +4691,11 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
                 if (fs.existsSync(correctedFinalPath)) {
                     fs.unlinkSync(correctedFinalPath);
                 }
-            } catch (e) {}
+            } catch (e) { }
 
             try {
                 fs.renameSync(tmpPath, correctedFinalPath);
-                try { fs.chmodSync(correctedFinalPath, 0o644); } catch (e) {}
+                try { fs.chmodSync(correctedFinalPath, 0o644); } catch (e) { }
             } catch (e) {
                 console.error(`[Upload] Failed to rename ${tmpPath} -> ${correctedFinalPath}: ${e.message}`);
                 cleanupTmp(200);
@@ -4709,7 +4709,7 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
                 (err2) => {
                     if (err2) {
                         console.error('Metadata save error:', err2);
-                        try { fs.unlinkSync(correctedFinalPath); } catch (e) {}
+                        try { fs.unlinkSync(correctedFinalPath); } catch (e) { }
                         return res.status(500).json({ error: 'Failed to save file metadata' });
                     }
                     return res.json({ message: 'File uploaded', filename: correctedSafeName, fileHash, perceptualHash });
@@ -4757,7 +4757,7 @@ app.get('/api/files', authenticateToken, async (req, res) => {
                     if (!existing || (existing.created_at && next.created_at && next.created_at > existing.created_at)) {
                         byName.set(filename, next);
                     }
-                } catch (e) {}
+                } catch (e) { }
             }
         }
 
@@ -4768,12 +4768,12 @@ app.get('/api/files', authenticateToken, async (req, res) => {
         if (limit > 0) {
             files = files.slice(offset, offset + limit);
         }
-        
+
         // If meta=true, enrich with hash metadata from database
         if (includeMeta && files.length > 0) {
             const filenames = files.map(f => f.filename);
             const placeholders = filenames.map(() => '?').join(',');
-            
+
             // Get primary hashes from files table
             db.all(
                 `SELECT filename, file_hash, perceptual_hash, size FROM files WHERE user_id = ? AND filename IN (${placeholders})`,
@@ -4783,7 +4783,7 @@ app.get('/api/files', authenticateToken, async (req, res) => {
                         console.error('[LIST FILES] DB error:', err);
                         return res.json({ files, total });
                     }
-                    
+
                     // Create lookup map for primary hashes
                     const hashMap = {};
                     for (const row of (rows || [])) {
@@ -4792,7 +4792,7 @@ app.get('/api/files', authenticateToken, async (req, res) => {
                             perceptualHash: row.perceptual_hash
                         };
                     }
-                    
+
                     // Get platform-specific hashes (fallback for cross-platform dedup)
                     db.all(
                         `SELECT filename, platform, perceptual_hash, file_hash FROM platform_hashes WHERE user_id = ? AND filename IN (${placeholders})`,
@@ -4809,7 +4809,7 @@ app.get('/api/files', authenticateToken, async (req, res) => {
                                     fileHash: row.file_hash
                                 };
                             }
-                            
+
                             // Enrich files with hash metadata
                             for (const file of files) {
                                 const meta = hashMap[file.filename];
@@ -4823,7 +4823,7 @@ app.get('/api/files', authenticateToken, async (req, res) => {
                                     file.platformHashes = platformMeta;
                                 }
                             }
-                            
+
                             console.log(`[LIST FILES] Returning ${files.length} files with meta (offset=${offset} limit=${limit || 'all'} total=${total})`);
                             res.json({ files, total });
                         }
@@ -4902,21 +4902,21 @@ app.post('/api/files/migrate-hashes', authenticateToken, async (req, res) => {
 // Called by clients after syncing a file to store their platform's computed hash
 app.post('/api/files/platform-hash', authenticateToken, (req, res) => {
     const { filename, platform, perceptualHash, fileHash } = req.body || {};
-    
+
     if (!filename || !platform) {
         return res.status(400).json({ error: 'filename and platform required' });
     }
-    
+
     if (!perceptualHash && !fileHash) {
         return res.status(400).json({ error: 'perceptualHash or fileHash required' });
     }
-    
+
     // Validate platform
     const validPlatforms = ['ios', 'android'];
     if (!validPlatforms.includes(platform)) {
         return res.status(400).json({ error: 'Invalid platform. Must be ios or android' });
     }
-    
+
     db.run(
         `INSERT OR REPLACE INTO platform_hashes (user_id, filename, platform, perceptual_hash, file_hash) VALUES (?, ?, ?, ?, ?)`,
         [req.user.id, filename, platform, perceptualHash || null, fileHash || null],
@@ -4933,21 +4933,21 @@ app.post('/api/files/platform-hash', authenticateToken, (req, res) => {
 // Batch submit platform hashes (more efficient for sync)
 app.post('/api/files/platform-hashes', authenticateToken, (req, res) => {
     const { platform, hashes } = req.body || {};
-    
+
     if (!platform || !Array.isArray(hashes) || hashes.length === 0) {
         return res.status(400).json({ error: 'platform and hashes array required' });
     }
-    
+
     const validPlatforms = ['ios', 'android'];
     if (!validPlatforms.includes(platform)) {
         return res.status(400).json({ error: 'Invalid platform' });
     }
-    
+
     let saved = 0;
     let errors = 0;
-    
+
     const stmt = db.prepare(`INSERT OR REPLACE INTO platform_hashes (user_id, filename, platform, perceptual_hash, file_hash) VALUES (?, ?, ?, ?, ?)`);
-    
+
     for (const h of hashes) {
         if (h.filename && (h.perceptualHash || h.fileHash)) {
             stmt.run([req.user.id, h.filename, platform, h.perceptualHash || null, h.fileHash || null], (err) => {
@@ -4956,7 +4956,7 @@ app.post('/api/files/platform-hashes', authenticateToken, (req, res) => {
             });
         }
     }
-    
+
     stmt.finalize((err) => {
         if (err) {
             console.error('[PLATFORM-HASHES] Finalize error:', err);
@@ -4970,13 +4970,13 @@ app.post('/api/files/platform-hashes', authenticateToken, (req, res) => {
 // This enables mobile sync to get fileHash for EXIF lookup
 app.post('/api/files/register', authenticateToken, (req, res) => {
     const { filename, fileHash, perceptualHash, size, mimeType } = req.body || {};
-    
+
     if (!filename) {
         return res.status(400).json({ error: 'filename required' });
     }
-    
+
     console.log(`[REGISTER] Registering file: ${filename}, hash: ${fileHash?.substring(0, 16)}...`);
-    
+
     db.run(
         `INSERT OR REPLACE INTO files (user_id, filename, original_name, mime_type, size, file_hash, perceptual_hash) VALUES (?, ?, ?, ?, ?, ?, ?)`,
         [req.user.id, filename, filename, mimeType || 'application/octet-stream', size || 0, fileHash || null, perceptualHash || null],
@@ -5029,7 +5029,7 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
             for (const row of rows) {
                 if (row.file_hash) fileHashes.push(row.file_hash);
             }
-        } catch (e) {}
+        } catch (e) { }
 
         let filesDeleted = 0;
         let stubbornFiles = [];
@@ -5050,7 +5050,7 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
                     if (!fs.existsSync(entryPath)) continue;
                     const stat = fs.statSync(entryPath);
                     if (stat.isFile()) {
-                        try { fs.chmodSync(entryPath, 0o666); } catch (e) {}
+                        try { fs.chmodSync(entryPath, 0o666); } catch (e) { }
                         fs.unlinkSync(entryPath);
                         filesDeleted++;
                     } else if (stat.isDirectory()) {
@@ -5070,7 +5070,7 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
                     for (let attempt = 0; attempt < 20; attempt++) {
                         try {
                             if (!fs.existsSync(filePath)) break;
-                            try { fs.chmodSync(filePath, 0o666); } catch (e) {}
+                            try { fs.chmodSync(filePath, 0o666); } catch (e) { }
                             fs.unlinkSync(filePath);
                             console.log(`[Purge-BG] Deleted stubborn file: ${path.basename(filePath)}`);
                             break;
@@ -5081,12 +5081,12 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
                 }
             }, 1000);
         }
-        
+
         console.log(`[Purge-Classic] Deleted ${filesDeleted} files, ${stubbornFiles.length} deferred to background`)
-        
+
         // Ensure device directories exist after cleanup
         for (const d of deviceDirs) {
-            try { fs.mkdirSync(d.dir, { recursive: true }); } catch (e) {}
+            try { fs.mkdirSync(d.dir, { recursive: true }); } catch (e) { }
         }
 
         // Delete EXIF files for this user's files
@@ -5098,7 +5098,7 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
                     fs.unlinkSync(exifPath);
                     exifDeleted++;
                 }
-            } catch (e) {}
+            } catch (e) { }
         }
 
         try {
@@ -5110,7 +5110,7 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
         // Delete platform hashes for this user (local/remote mode)
         try {
             await dbRunAsync(`DELETE FROM platform_hashes WHERE user_id = ?`, [req.user.id]);
-        } catch (e) {}
+        } catch (e) { }
 
         console.log(`[Purge-Classic] User ${req.user.id}: files=${filesBefore}, exif=${exifDeleted}`);
 
@@ -5137,19 +5137,19 @@ app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
     let ext = (filename || '').split('.').pop()?.toLowerCase() || '';
     let isImage = ['jpg', 'jpeg', 'png', 'heic', 'heif', 'webp', 'gif', 'bmp', 'tiff', 'tif', 'raw', 'cr2', 'cr3', 'nef', 'arw', 'dng', 'orf', 'rw2', 'pef', 'srw', 'raf', 'psd', 'psb', 'exr', 'hdr', 'avif'].includes(ext);
     let isVideo = ['mp4', 'mov', 'avi', 'mkv', 'm4v', '3gp', 'webm'].includes(ext);
-    
+
     // Check magic bytes to detect actual format (handles mismatched extensions)
     try {
         const fd = fs.openSync(filePath, 'r');
         const magicBuf = Buffer.alloc(12);
         fs.readSync(fd, magicBuf, 0, 12, 0);
         fs.closeSync(fd);
-        
+
         const isPNG = magicBuf[0] === 0x89 && magicBuf[1] === 0x50 && magicBuf[2] === 0x4E && magicBuf[3] === 0x47;
         const isJPEG = magicBuf[0] === 0xFF && magicBuf[1] === 0xD8 && magicBuf[2] === 0xFF;
         const isGIF = magicBuf[0] === 0x47 && magicBuf[1] === 0x49 && magicBuf[2] === 0x46;
         const isWEBP = magicBuf[8] === 0x57 && magicBuf[9] === 0x45 && magicBuf[10] === 0x42 && magicBuf[11] === 0x50;
-        
+
         // If magic bytes indicate image but extension says otherwise, trust magic bytes
         if (isPNG || isJPEG || isGIF || isWEBP) {
             const detectedFormat = isPNG ? 'PNG' : isJPEG ? 'JPEG' : isGIF ? 'GIF' : 'WEBP';
@@ -5205,7 +5205,7 @@ app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
                 res.set('Content-Type', 'image/jpeg');
                 res.set('Cache-Control', 'public, max-age=86400');
                 return res.send(placeholder);
-            } catch (e2) {}
+            } catch (e2) { }
         }
         return res.status(500).json({ error: 'Video thumbnail generation failed' });
     }
@@ -5215,7 +5215,7 @@ app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
         // Check if this is a HEIC file that needs conversion
         const isHeicFile = ['heic', 'heif'].includes(ext);
         let inputBuffer = null;
-        
+
         // Try to convert HEIC to JPEG first if heic-convert is available
         if (isHeicFile && heicConvert) {
             try {
@@ -5232,7 +5232,7 @@ app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
                 console.log(`[THUMB] HEIC conversion failed for ${filename}:`, heicErr.message);
             }
         }
-        
+
         try {
             // Read file into buffer to avoid Sharp holding file handle open on Windows
             const sharpInput = inputBuffer || fs.readFileSync(filePath);
@@ -5252,8 +5252,8 @@ app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
                 const placeholder = await sharp({
                     create: { width: 150, height: 150, channels: 3, background: { r: 60, g: 60, b: 80 } }
                 })
-                .composite([{
-                    input: Buffer.from(`<svg width="150" height="150">
+                    .composite([{
+                        input: Buffer.from(`<svg width="150" height="150">
                         <rect width="150" height="150" fill="url(#grad)"/>
                         <defs><linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%">
                             <stop offset="0%" style="stop-color:#3a3a4a"/>
@@ -5261,11 +5261,11 @@ app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
                         </linearGradient></defs>
                         <text x="75" y="80" text-anchor="middle" fill="#888" font-size="12">No Preview</text>
                     </svg>`),
-                    top: 0,
-                    left: 0
-                }])
-                .jpeg({ quality: 80 })
-                .toBuffer();
+                        top: 0,
+                        left: 0
+                    }])
+                    .jpeg({ quality: 80 })
+                    .toBuffer();
                 res.set('Content-Type', 'image/jpeg');
                 res.set('Cache-Control', 'public, max-age=3600'); // Shorter cache for placeholders
                 return res.send(placeholder);
@@ -5284,7 +5284,7 @@ app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
             res.set('Content-Type', 'image/jpeg');
             res.set('Cache-Control', 'public, max-age=86400');
             return res.send(placeholder);
-        } catch (e) {}
+        } catch (e) { }
     }
     res.status(500).json({ error: 'Thumbnail generation failed' });
 });
@@ -5306,7 +5306,7 @@ app.get('/api/debug/download-test', (req, res) => {
                     if (fs.statSync(fp).isFile()) { testFile = fp; break; }
                 }
                 if (testFile) break;
-            } catch (e) {}
+            } catch (e) { }
         }
         if (!testFile) return res.json({ error: 'No files found', UPLOAD_DIR, dirs });
         const stat = fs.statSync(testFile);
@@ -5340,7 +5340,7 @@ app.get('/api/debug/state', (req, res) => {
                     const files = fs.readdirSync(full).filter(f => !f.startsWith('.')).slice(0, 5);
                     info.dirs.push({ name: d, fileCount: fs.readdirSync(full).filter(f => !f.startsWith('.')).length, sampleFiles: files });
                 }
-            } catch (e) {}
+            } catch (e) { }
         }
         db.all(`SELECT id, email, user_uuid FROM users`, [], (err, users) => {
             info.users = users || [];
@@ -5880,7 +5880,7 @@ app.post('/api/cloud/purge', authenticateToken, async (req, res) => {
                 if (cloudManifestsDir.startsWith(path.join(CLOUD_DIR, 'users'))) {
                     fs.rmSync(cloudManifestsDir, { recursive: true, force: true });
                 }
-            } catch (e) {}
+            } catch (e) { }
 
             if (CHUNKS_DIR) {
                 try {
@@ -5888,14 +5888,14 @@ app.post('/api/cloud/purge', authenticateToken, async (req, res) => {
                     if (chunksUserDir.startsWith(path.join(CHUNKS_DIR, 'users'))) {
                         fs.rmSync(chunksUserDir, { recursive: true, force: true });
                     }
-                } catch (e) {}
+                } catch (e) { }
             } else {
                 try {
                     const cloudChunksDir = path.join(CLOUD_DIR, 'users', k, 'chunks');
                     if (cloudChunksDir.startsWith(path.join(CLOUD_DIR, 'users'))) {
                         fs.rmSync(cloudChunksDir, { recursive: true, force: true });
                     }
-                } catch (e) {}
+                } catch (e) { }
             }
         }
 
@@ -5903,18 +5903,18 @@ app.post('/api/cloud/purge', authenticateToken, async (req, res) => {
         // clear the corresponding DB usage rows so /api/cloud/usage returns 0 immediately.
         try {
             await dbRunAsync(`DELETE FROM cloud_chunks WHERE user_id = ?`, [req.user.id]);
-        } catch (e) {}
+        } catch (e) { }
 
         // Recreate directories for the current (canonical) user key
-        try { fs.mkdirSync(chunksDir, { recursive: true }); } catch (e) {}
-        try { fs.mkdirSync(manifestsDir, { recursive: true }); } catch (e) {}
-        
+        try { fs.mkdirSync(chunksDir, { recursive: true }); } catch (e) { }
+        try { fs.mkdirSync(manifestsDir, { recursive: true }); } catch (e) { }
+
         // Clear dedup cache for this user since we just deleted their manifests
         try {
             if (typeof serverDedupCache !== 'undefined') {
                 serverDedupCache.delete(manifestsDir);
             }
-        } catch (e) {}
+        } catch (e) { }
 
         console.log(`[Purge] User ${req.user.id}: chunks=${chunksBefore}, manifests=${manifestsBefore}`);
 
@@ -6044,7 +6044,7 @@ app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req
         } catch (e) {
             return res.status(500).json({ error: 'Chunk verification failed' });
         } finally {
-            try { reservation.release(); } catch (e) {}
+            try { reservation.release(); } catch (e) { }
         }
     }
 
@@ -6064,14 +6064,14 @@ app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req
         const { chunksDir } = ensureStealthCloudUserDirs(req.user);
         const existing = path.join(chunksDir, requestedId);
         if (fs.existsSync(existing)) {
-            try { fs.unlinkSync(tmpPath); } catch (e) {}
+            try { fs.unlinkSync(tmpPath); } catch (e) { }
             return res.json({ chunkId: requestedId, stored: true });
         }
     }
 
     const reservationMultipart = await reserveStealthCloudIncomingBytes({ userId: req.user.id, incomingBytes: tmpSize });
     if (!reservationMultipart.allowed) {
-        try { fs.unlinkSync(tmpPath); } catch (e) {}
+        try { fs.unlinkSync(tmpPath); } catch (e) { }
         return res.status(413).json({
             error: 'Storage limit reached',
             code: 'QUOTA_EXCEEDED',
@@ -6117,7 +6117,7 @@ app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req
         } catch (e) {
             return res.status(500).json({ error: 'Chunk verification failed' });
         } finally {
-            try { reservationMultipart.release(); } catch (e) {}
+            try { reservationMultipart.release(); } catch (e) { }
         }
     }
 
@@ -6128,7 +6128,7 @@ app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req
     try {
         res.json({ chunkId: storedName, stored: true });
     } finally {
-        try { reservationMultipart.release(); } catch (e) {}
+        try { reservationMultipart.release(); } catch (e) { }
     }
 });
 
@@ -6143,11 +6143,11 @@ app.get('/api/cloud/chunks/:chunkId', authenticateToken, blockDeletedSubscriptio
     if (!chunkPath.startsWith(chunksRoot)) {
         return res.status(403).json({ error: 'Access denied' });
     }
-    
+
     if (fs.existsSync(chunkPath)) {
         return res.download(chunkPath);
     }
-    
+
     return res.status(404).json({ error: 'Chunk not found' });
 });
 
@@ -6196,27 +6196,27 @@ function buildServerDedupSets(manifestsDir) {
         exifTimeModel: new Set(),
         exifTimeMake: new Set(),
     };
-    
+
     if (!fs.existsSync(manifestsDir)) {
         serverDedupCache.delete(manifestsDir);
         return emptySets;
     }
-    
+
     let cacheEntry = serverDedupCache.get(manifestsDir);
     if (!cacheEntry) {
         cacheEntry = { sets: emptySets, files: new Set() };
         serverDedupCache.set(manifestsDir, cacheEntry);
     }
-    
+
     try {
         const currentFiles = fs.readdirSync(manifestsDir).filter(f => f.endsWith('.json') && !f.startsWith('.'));
-        
+
         // If files were deleted (rare), easiest is to invalidate and rebuild from scratch
         if (currentFiles.length < cacheEntry.files.size) {
             serverDedupCache.delete(manifestsDir);
             return buildServerDedupSets(manifestsDir);
         }
-        
+
         // Incrementally add new files
         for (const f of currentFiles) {
             if (!cacheEntry.files.has(f)) {
@@ -6224,7 +6224,7 @@ function buildServerDedupSets(manifestsDir) {
                     const content = JSON.parse(fs.readFileSync(path.join(manifestsDir, f), 'utf8'));
                     const manifestId = f.replace(/\.json$/, '');
                     cacheEntry.sets.manifestIds.add(manifestId);
-                    
+
                     if (content.meta) {
                         if (content.meta.filename) {
                             const normalized = normalizeFilenameForCompare(content.meta.filename);
@@ -6232,7 +6232,7 @@ function buildServerDedupSets(manifestsDir) {
                         }
                         if (content.meta.fileHash) cacheEntry.sets.fileHashes.add(content.meta.fileHash);
                         if (content.meta.perceptualHash) cacheEntry.sets.perceptualHashes.add(content.meta.perceptualHash);
-                        
+
                         // EXIF-based dedup keys
                         const ct = content.meta.exifCaptureTime;
                         const mk = content.meta.exifMake;
@@ -6250,7 +6250,7 @@ function buildServerDedupSets(manifestsDir) {
     } catch (e) {
         console.warn('[SC] Failed to build dedup sets:', e.message);
     }
-    
+
     return cacheEntry.sets;
 }
 
@@ -6312,19 +6312,19 @@ app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (
     // Build dedup sets from existing manifests
     const dedupSets = buildServerDedupSets(manifestsDir);
     console.log(`[SC-Dedup] Checking ${safeId}: ${dedupSets.manifestIds.size} manifestIds, ${dedupSets.fileHashes.size} fHashes, ${dedupSets.perceptualHashes.size} pHashes`);
-    
+
     // Check 1: ManifestId (filename + size hash) - exact match only
     if (dedupSets.manifestIds.has(safeId)) {
         console.log(`[SC-Dedup] Skipping ${safeId} - manifestId already exists`);
         return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'manifestId' });
     }
-    
+
     // Check 2: Exact file hash match (byte-identical files)
     if (fileHash && dedupSets.fileHashes.has(fileHash)) {
         console.log(`[SC-Dedup] Skipping ${safeId} - fileHash already exists`);
         return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'fileHash' });
     }
-    
+
     // Check 3: Perceptual hash match (images - 1-bit tolerance for identical)
     if (perceptualHash) {
         const phashMatch = findPerceptualHashMatchServer(perceptualHash, dedupSets.perceptualHashes);
@@ -6333,13 +6333,13 @@ app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (
             return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'perceptualHash' });
         }
     }
-    
+
     // NOTE: Removed filename-only and EXIF-only dedup checks - too many false positives
     // Client already does thorough dedup, server is just a safety net
-    
+
     // ========== No duplicates found - store the manifest ==========
     const manifestPath = path.join(manifestsDir, `${safeId}.json`);
-    
+
     // Store encrypted manifest + unencrypted metadata for fast dedup lookups
     const payload = {
         manifestId: safeId,
@@ -6365,7 +6365,7 @@ app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (
         }
     };
     fs.writeFileSync(manifestPath, JSON.stringify(payload));
-    
+
     console.log(`[SC] Stored manifest ${safeId} for user ${req.user.id}`);
     res.json({ ok: true, manifestId: safeId });
 });
@@ -6384,15 +6384,15 @@ app.get('/api/cloud/manifests', authenticateToken, blockDeletedSubscription, (re
     res.setHeader('ETag', '');
     const { manifestsDir } = ensureStealthCloudUserDirs(req.user);
     if (!fs.existsSync(manifestsDir)) return res.json({ manifests: [], total: 0 });
-    
+
     const files = fs.readdirSync(manifestsDir)
         .filter(f => f.endsWith('.json'))
         .filter(f => !f.startsWith('.')); // Skip hidden files like .DS_Store
-    
+
     let list = files.map(f => {
         const manifestId = f.replace(/\.json$/, '');
         const entry = { manifestId };
-        
+
         // Include metadata if requested (for fast dedup without decryption)
         if (includeMeta) {
             try {
@@ -6420,7 +6420,7 @@ app.get('/api/cloud/manifests', authenticateToken, blockDeletedSubscription, (re
                 // Ignore read errors, just return manifestId
             }
         }
-        
+
         return entry;
     });
 
@@ -6454,17 +6454,17 @@ app.get('/api/cloud/manifests/:manifestId', authenticateToken, blockDeletedSubsc
 app.patch('/api/cloud/manifests/:manifestId', authenticateToken, (req, res) => {
     const safeId = (req.params.manifestId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
     if (!safeId) return res.status(400).json({ error: 'Invalid manifest id' });
-    
+
     const { manifestsDir } = ensureStealthCloudUserDirs(req.user);
     const manifestPath = path.join(manifestsDir, `${safeId}.json`);
-    
+
     if (!manifestPath.startsWith(manifestsDir)) {
         return res.status(403).json({ error: 'Access denied' });
     }
     if (!fs.existsSync(manifestPath)) {
         return res.status(404).json({ error: 'Manifest not found' });
     }
-    
+
     try {
         const content = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
         const {
@@ -6472,10 +6472,10 @@ app.patch('/api/cloud/manifests/:manifestId', authenticateToken, (req, res) => {
             creationTime, exifCaptureTime, exifMake, exifModel,
             thumbChunkId, thumbNonce, thumbSize, thumbW, thumbH, thumbMime
         } = req.body || {};
-        
+
         // Initialize meta if missing
         if (!content.meta) content.meta = {};
-        
+
         // Only update fields that are provided and not already set
         if (filename && !content.meta.filename) content.meta.filename = filename;
         if (mediaType && !content.meta.mediaType) content.meta.mediaType = mediaType;
@@ -6492,10 +6492,10 @@ app.patch('/api/cloud/manifests/:manifestId', authenticateToken, (req, res) => {
         if (typeof thumbW === 'number' && !content.meta.thumbW) content.meta.thumbW = thumbW;
         if (typeof thumbH === 'number' && !content.meta.thumbH) content.meta.thumbH = thumbH;
         if (thumbMime && !content.meta.thumbMime) content.meta.thumbMime = thumbMime;
-        
+
         fs.writeFileSync(manifestPath, JSON.stringify(content));
         // Invalidate dedup cache so backfilled hashes are picked up immediately
-        try { serverDedupCache.delete(manifestsDir); } catch (e) {}
+        try { serverDedupCache.delete(manifestsDir); } catch (e) { }
         console.log(`[SC] Updated metadata for manifest ${safeId}`);
         res.json({ ok: true, manifestId: safeId });
     } catch (e) {
@@ -6512,17 +6512,17 @@ app.patch('/api/cloud/manifests/:manifestId', authenticateToken, (req, res) => {
 app.post('/api/cloud/raw', authenticateToken, requireUploadSubscription, express.raw({ type: '*/*', limit: '500mb' }), async (req, res) => {
     const filename = (req.headers['x-filename'] || '').toString();
     if (!filename) return res.status(400).json({ error: 'Missing X-Filename header' });
-    
+
     const safeName = path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 255);
     if (!safeName) return res.status(400).json({ error: 'Invalid filename' });
-    
+
     const { rawDir, rawMetaDir } = ensureStealthCloudUserDirs(req.user);
     const filePath = path.join(rawDir, safeName);
-    
+
     if (!filePath.startsWith(rawDir)) {
         return res.status(403).json({ error: 'Access denied' });
     }
-    
+
     // Check quota
     const fileSize = req.body?.length || 0;
     const reservation = await reserveStealthCloudIncomingBytes({ userId: req.user.id, incomingBytes: fileSize });
@@ -6535,11 +6535,11 @@ app.post('/api/cloud/raw', authenticateToken, requireUploadSubscription, express
             remainingBytes: reservation.remainingBytes,
         });
     }
-    
+
     try {
         // Compute file hash for deduplication
         const fileHash = crypto.createHash('sha256').update(req.body).digest('hex');
-        
+
         // Check if file already exists (by hash)
         const existingFiles = fs.readdirSync(rawDir);
         for (const existing of existingFiles) {
@@ -6548,9 +6548,9 @@ app.post('/api/cloud/raw', authenticateToken, requireUploadSubscription, express
                 const existingHash = crypto.createHash('sha256').update(fs.readFileSync(existingPath)).digest('hex');
                 if (existingHash === fileHash) {
                     reservation.release();
-                    return res.json({ 
-                        success: true, 
-                        filename: existing, 
+                    return res.json({
+                        success: true,
+                        filename: existing,
                         fileHash,
                         duplicate: true,
                         message: 'File already exists (duplicate)'
@@ -6558,15 +6558,15 @@ app.post('/api/cloud/raw', authenticateToken, requireUploadSubscription, express
                 }
             }
         }
-        
+
         // Write file
         fs.writeFileSync(filePath, req.body);
-        
+
         console.log(`[SC-RAW] Uploaded: ${safeName} (${fileSize} bytes) for user ${req.user.id}`);
-        
-        res.json({ 
-            success: true, 
-            filename: safeName, 
+
+        res.json({
+            success: true,
+            filename: safeName,
             fileHash,
             size: fileSize,
             duplicate: false
@@ -6575,7 +6575,7 @@ app.post('/api/cloud/raw', authenticateToken, requireUploadSubscription, express
         console.error(`[SC-RAW] Upload failed for ${safeName}:`, e.message);
         res.status(500).json({ error: 'Failed to save file' });
     } finally {
-        try { reservation.release(); } catch (e) {}
+        try { reservation.release(); } catch (e) { }
     }
 });
 
@@ -6584,16 +6584,16 @@ app.post('/api/cloud/raw/:filename/meta', authenticateToken, express.json({ limi
     const filename = req.params.filename;
     const safeName = path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 255);
     if (!safeName) return res.status(400).json({ error: 'Invalid filename' });
-    
+
     const { rawMetaDir } = ensureStealthCloudUserDirs(req.user);
     const metaPath = path.join(rawMetaDir, `${safeName}.json`);
-    
+
     if (!metaPath.startsWith(rawMetaDir)) {
         return res.status(403).json({ error: 'Access denied' });
     }
-    
+
     const meta = req.body || {};
-    
+
     try {
         fs.writeFileSync(metaPath, JSON.stringify(meta, null, 2));
         console.log(`[SC-RAW] Saved metadata for ${safeName}`);
@@ -6608,11 +6608,11 @@ app.post('/api/cloud/raw/:filename/meta', authenticateToken, express.json({ limi
 app.get('/api/cloud/raw', authenticateToken, (req, res) => {
     const { rawDir, rawMetaDir } = ensureStealthCloudUserDirs(req.user);
     const includeMeta = req.query.meta === 'true';
-    
+
     if (!fs.existsSync(rawDir)) {
         return res.json({ files: [], total: 0 });
     }
-    
+
     try {
         const files = fs.readdirSync(rawDir)
             .filter(f => !f.startsWith('.'))
@@ -6620,14 +6620,14 @@ app.get('/api/cloud/raw', authenticateToken, (req, res) => {
                 const filePath = path.join(rawDir, filename);
                 const stats = fs.statSync(filePath);
                 if (!stats.isFile()) return null;
-                
+
                 const file = {
                     type: 'raw',
                     filename,
                     size: stats.size,
                     createdAt: stats.mtime.toISOString(),
                 };
-                
+
                 // Include metadata if requested
                 if (includeMeta) {
                     const metaPath = path.join(rawMetaDir, `${filename}.json`);
@@ -6635,14 +6635,14 @@ app.get('/api/cloud/raw', authenticateToken, (req, res) => {
                         try {
                             const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
                             file.meta = meta;
-                        } catch (e) {}
+                        } catch (e) { }
                     }
                 }
-                
+
                 return file;
             })
             .filter(Boolean);
-        
+
         res.json({ files, total: files.length });
     } catch (e) {
         console.error('[SC-RAW] List error:', e.message);
@@ -6655,18 +6655,18 @@ app.get('/api/cloud/raw/:filename', authenticateToken, (req, res) => {
     const filename = req.params.filename;
     const safeName = path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 255);
     if (!safeName) return res.status(400).json({ error: 'Invalid filename' });
-    
+
     const { rawDir } = ensureStealthCloudUserDirs(req.user);
     const filePath = path.join(rawDir, safeName);
-    
+
     if (!filePath.startsWith(rawDir)) {
         return res.status(403).json({ error: 'Access denied' });
     }
-    
+
     if (!fs.existsSync(filePath)) {
         return res.status(404).json({ error: 'File not found' });
     }
-    
+
     res.sendFile(filePath);
 });
 
@@ -6675,9 +6675,9 @@ app.get('/api/cloud/raw/:filename/thumb', authenticateToken, async (req, res) =>
     const filename = req.params.filename;
     const safeName = path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 255);
     if (!safeName) return res.status(400).json({ error: 'Invalid filename' });
-    
+
     const { rawDir, rawMetaDir } = ensureStealthCloudUserDirs(req.user);
-    
+
     // First check if we have a stored thumbnail in metadata
     const metaPath = path.join(rawMetaDir, `${safeName}.json`);
     if (fs.existsSync(metaPath)) {
@@ -6688,19 +6688,19 @@ app.get('/api/cloud/raw/:filename/thumb', authenticateToken, async (req, res) =>
                 res.setHeader('Content-Type', meta.thumbMime || 'image/jpeg');
                 return res.send(thumbBuffer);
             }
-        } catch (e) {}
+        } catch (e) { }
     }
-    
+
     // Generate thumbnail on-the-fly if sharp is available
     const filePath = path.join(rawDir, safeName);
     if (!fs.existsSync(filePath)) {
         return res.status(404).json({ error: 'File not found' });
     }
-    
+
     const ext = path.extname(safeName).toLowerCase();
     const isImage = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif', '.bmp', '.tiff', '.tif', '.raw', '.cr2', '.cr3', '.nef', '.arw', '.dng', '.orf', '.rw2', '.pef', '.srw', '.raf', '.psd', '.psb', '.exr', '.hdr', '.avif'].includes(ext);
     const isVideo = ['.mp4', '.mov', '.avi', '.mkv', '.m4v', '.3gp'].includes(ext);
-    
+
     if (isImage && sharp) {
         try {
             // Read file into buffer first to avoid Sharp holding file handle open on Windows
@@ -6715,7 +6715,7 @@ app.get('/api/cloud/raw/:filename/thumb', authenticateToken, async (req, res) =>
             console.log(`[SC-RAW] Thumb generation failed for ${safeName}:`, e.message);
         }
     }
-    
+
     // For videos, try ffmpeg if available
     if (isVideo && ffmpegPath !== 'ffmpeg') {
         try {
@@ -6732,7 +6732,7 @@ app.get('/api/cloud/raw/:filename/thumb', authenticateToken, async (req, res) =>
             console.log(`[SC-RAW] Video thumb failed for ${safeName}:`, e.message);
         }
     }
-    
+
     res.status(404).json({ error: 'Thumbnail not available' });
 });
 
@@ -6741,15 +6741,15 @@ app.delete('/api/cloud/raw/:filename', authenticateToken, (req, res) => {
     const filename = req.params.filename;
     const safeName = path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 255);
     if (!safeName) return res.status(400).json({ error: 'Invalid filename' });
-    
+
     const { rawDir, rawMetaDir } = ensureStealthCloudUserDirs(req.user);
     const filePath = path.join(rawDir, safeName);
     const metaPath = path.join(rawMetaDir, `${safeName}.json`);
-    
+
     if (!filePath.startsWith(rawDir)) {
         return res.status(403).json({ error: 'Access denied' });
     }
-    
+
     try {
         if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
         if (fs.existsSync(metaPath)) fs.unlinkSync(metaPath);
@@ -6765,9 +6765,9 @@ app.delete('/api/cloud/raw/:filename', authenticateToken, (req, res) => {
 app.get('/api/cloud/files', authenticateToken, (req, res) => {
     const { manifestsDir, rawDir, rawMetaDir } = ensureStealthCloudUserDirs(req.user);
     const includeMeta = req.query.meta === 'true';
-    
+
     const files = [];
-    
+
     // Get encrypted files from manifests
     if (fs.existsSync(manifestsDir)) {
         try {
@@ -6791,9 +6791,9 @@ app.get('/api/cloud/files', authenticateToken, (req, res) => {
                 })
                 .filter(Boolean);
             files.push(...manifests);
-        } catch (e) {}
+        } catch (e) { }
     }
-    
+
     // Get raw files
     if (fs.existsSync(rawDir)) {
         try {
@@ -6803,30 +6803,30 @@ app.get('/api/cloud/files', authenticateToken, (req, res) => {
                     const filePath = path.join(rawDir, filename);
                     const stats = fs.statSync(filePath);
                     if (!stats.isFile()) return null;
-                    
+
                     const file = {
                         type: 'raw',
                         filename,
                         size: stats.size,
                         createdAt: stats.mtime.toISOString(),
                     };
-                    
+
                     if (includeMeta) {
                         const metaPath = path.join(rawMetaDir, `${filename}.json`);
                         if (fs.existsSync(metaPath)) {
                             try {
                                 file.meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-                            } catch (e) {}
+                            } catch (e) { }
                         }
                     }
-                    
+
                     return file;
                 })
                 .filter(Boolean);
             files.push(...rawFiles);
-        } catch (e) {}
+        } catch (e) { }
     }
-    
+
     res.json({ files, total: files.length });
 });
 
@@ -6836,21 +6836,21 @@ app.delete('/api/account', authenticateToken, async (req, res) => {
         const userId = req.user.id;
         const userEmail = req.user.email || '';
         const userKey = getStealthCloudUserKey(req.user);
-        
+
         console.log(`[Account Deletion] Starting deletion for user ${userId} (${userEmail})`);
-        
+
         // Get user directories
         const userDir = path.join(CLOUD_DIR, 'users', userKey);
-        const chunksDir = CHUNKS_DIR 
+        const chunksDir = CHUNKS_DIR
             ? path.join(CHUNKS_DIR, 'users', userKey)
             : path.join(userDir, 'chunks');
         const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid || '');
-        
+
         // Clear dedup cache before deleting user directories
         try {
             const manifestsDir = path.join(userDir, 'manifests');
             serverDedupCache.delete(manifestsDir);
-        } catch (e) {}
+        } catch (e) { }
 
         // Delete all user files (chunks, manifests, classic uploads)
         const dirsToDelete = [chunksDir, userDir, deviceDir].filter(d => d && d.length > 10);
@@ -6864,7 +6864,7 @@ app.delete('/api/account', authenticateToken, async (req, res) => {
                 console.error(`[Account Deletion] Error deleting ${dir}:`, e.message);
             }
         }
-        
+
         // Delete user from database
         await new Promise((resolve, reject) => {
             db.run('DELETE FROM user_plans WHERE user_id = ?', [userId], (err) => {
@@ -6872,7 +6872,7 @@ app.delete('/api/account', authenticateToken, async (req, res) => {
                 resolve();
             });
         });
-        
+
         await new Promise((resolve, reject) => {
             db.run('DELETE FROM users WHERE id = ?', [userId], (err) => {
                 if (err) {
@@ -6884,7 +6884,7 @@ app.delete('/api/account', authenticateToken, async (req, res) => {
                 }
             });
         });
-        
+
         console.log(`[Account Deletion] Successfully deleted account for user ${userId}`);
         res.json({ success: true, message: 'Account and all associated data deleted successfully' });
     } catch (error) {
@@ -6920,20 +6920,20 @@ const getExifPath = (fileHash) => {
 app.post('/api/exif/store', authenticateToken, async (req, res) => {
     try {
         const { fileHash, exif, platform } = req.body || {};
-        
+
         if (!fileHash || typeof fileHash !== 'string') {
             return res.status(400).json({ error: 'Missing or invalid fileHash' });
         }
-        
+
         if (!exif || typeof exif !== 'object') {
             return res.status(400).json({ error: 'Missing or invalid exif object' });
         }
-        
+
         const exifPath = getExifPath(fileHash);
         if (!exifPath) {
             return res.status(400).json({ error: 'Invalid fileHash format' });
         }
-        
+
         // Don't overwrite existing EXIF (first upload wins) — atomic via O_EXCL
         // Exception: upgrade=true allows overwrite when new EXIF has more non-null fields
         const { upgrade } = req.body || {};
@@ -6945,7 +6945,7 @@ app.post('/api/exif/store', authenticateToken, async (req, res) => {
             exif: exif,
         };
         const countMeaningful = (obj) => Object.values(obj || {}).filter(v => v != null && v !== '' && v !== false).length;
-        
+
         let fd;
         try {
             fd = fs.openSync(exifPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL);
@@ -6964,16 +6964,16 @@ app.post('/api/exif/store', authenticateToken, async (req, res) => {
                             console.log(`[EXIF] Upgraded EXIF for hash ${fileHash.slice(0, 16)}... (${oldCount}→${newCount} fields)`);
                             return res.json({ ok: true, upgraded: true, oldFields: oldCount, newFields: newCount });
                         }
-                    } catch (_) {}
+                    } catch (_) { }
                 }
                 return res.json({ ok: true, exists: true, message: 'EXIF already stored' });
             }
             throw excl;
         } finally {
-            if (fd !== undefined) try { fs.closeSync(fd); } catch (_) {}
+            if (fd !== undefined) try { fs.closeSync(fd); } catch (_) { }
         }
         console.log(`[EXIF] Stored EXIF for hash ${fileHash.slice(0, 16)}... (${platform})`);
-        
+
         return res.json({ ok: true, stored: true });
     } catch (e) {
         console.error('[EXIF] Store error:', e.message);
@@ -6985,20 +6985,20 @@ app.post('/api/exif/store', authenticateToken, async (req, res) => {
 app.get('/api/exif/:fileHash', authenticateToken, async (req, res) => {
     try {
         const fileHash = req.params.fileHash;
-        
+
         if (!fileHash || typeof fileHash !== 'string') {
             return res.status(400).json({ error: 'Missing or invalid fileHash' });
         }
-        
+
         const exifPath = getExifPath(fileHash);
         if (!exifPath) {
             return res.status(400).json({ error: 'Invalid fileHash format' });
         }
-        
+
         if (!fs.existsSync(exifPath)) {
             return res.status(404).json({ error: 'EXIF not found', fileHash });
         }
-        
+
         const exifData = JSON.parse(fs.readFileSync(exifPath, 'utf8'));
         return res.json(exifData);
     } catch (e) {
@@ -7011,21 +7011,21 @@ app.get('/api/exif/:fileHash', authenticateToken, async (req, res) => {
 app.post('/api/exif/batch', authenticateToken, async (req, res) => {
     try {
         const { fileHashes } = req.body || {};
-        
+
         if (!Array.isArray(fileHashes)) {
             return res.status(400).json({ error: 'fileHashes must be an array' });
         }
-        
+
         // Limit batch size to prevent abuse
         const limitedHashes = fileHashes.slice(0, 100);
         const results = {};
-        
+
         for (const hash of limitedHashes) {
             if (!hash || typeof hash !== 'string') continue;
-            
+
             const exifPath = getExifPath(hash);
             if (!exifPath) continue;
-            
+
             if (fs.existsSync(exifPath)) {
                 try {
                     results[hash] = JSON.parse(fs.readFileSync(exifPath, 'utf8'));
@@ -7034,7 +7034,7 @@ app.post('/api/exif/batch', authenticateToken, async (req, res) => {
                 }
             }
         }
-        
+
         return res.json({ exifData: results, found: Object.keys(results).length });
     } catch (e) {
         console.error('[EXIF] Batch retrieve error:', e.message);
@@ -7278,31 +7278,31 @@ const checkNftStorageEligibility = async (userId, fileSizeBytes) => {
     // First check subscription status - trial users should also be eligible
     const subscriptionState = await resolveSubscriptionState(userId);
     const isActiveSubscription = subscriptionState.status === 'active' || subscriptionState.status === 'trial' || subscriptionState.status === 'premium_only';
-    
+
     if (!isActiveSubscription) {
         return { eligible: false, reason: 'No active StealthCloud plan' };
     }
-    
+
     const quotaBytes = await getUserQuotaBytes(userId);
     const usedBytes = await getUserUsedBytes(userId);
-    
+
     // If user has active/trial status but no plan_gb set, use default trial quota (5GB)
     const effectiveQuotaBytes = quotaBytes > 0 ? quotaBytes : (5 * 1000 * 1000 * 1000);
-    
+
     const availableBytes = effectiveQuotaBytes - usedBytes;
     if (fileSizeBytes > availableBytes) {
-        return { 
-            eligible: false, 
+        return {
+            eligible: false,
             reason: 'Not enough space',
             availableBytes,
             requiredBytes: fileSizeBytes,
         };
     }
-    
-    return { 
-        eligible: true, 
-        quotaBytes: effectiveQuotaBytes, 
-        usedBytes, 
+
+    return {
+        eligible: true,
+        quotaBytes: effectiveQuotaBytes,
+        usedBytes,
         availableBytes,
     };
 };
@@ -7339,15 +7339,15 @@ app.post('/api/nft/upload', authenticateToken, (req, res, next) => {
         if (!req.file) {
             return res.status(400).json({ error: 'No image file provided' });
         }
-        
+
         const userId = req.user.id;
         const userKey = resolveNftStorageKeyFromUser(req.user);
         const fileSize = req.file.size;
-        
+
         // NFT uploads are allowed for all authenticated users without subscription check
         // NFT images/thumbnails are essential for NFT functionality and users pay commission per mint
         // No quota check - NFT storage is separate from backup storage
-        
+
         // Generate unique image ID
         const imageId = crypto.randomBytes(16).toString('hex');
         const mimeToExt = {
@@ -7360,18 +7360,18 @@ app.post('/api/nft/upload', authenticateToken, (req, res, next) => {
         };
         const ext = mimeToExt[req.file.mimetype] || 'jpg';
         const filename = `${imageId}.${ext}`;
-        
+
         // Save to user's NFT directory
         const userNftDir = ensureUserNftDir(userKey);
         const filePath = path.join(userNftDir, filename);
         fs.writeFileSync(filePath, req.file.buffer);
-        
+
         // Public URL (served via nft.stealthlynk.io or /api/nft/image/:userId/:imageId)
         const publicUrl = `https://nft.stealthlynk.io/${userKey}/${filename}`;
         const fallbackUrl = `/api/nft/image/${userKey}/${filename}`;
-        
+
         console.log(`[NFT] Image uploaded: user=${userId} id=${imageId} size=${fileSize}`);
-        
+
         res.json({
             success: true,
             imageId,
@@ -7392,7 +7392,7 @@ app.get('/api/nft/eligibility', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
         const fileSize = parseInt(req.query.size) || 5 * 1024 * 1024; // Default 5MB estimate
-        
+
         const eligibility = await checkNftStorageEligibility(userId, fileSize);
         res.json(eligibility);
     } catch (error) {
@@ -7408,11 +7408,11 @@ app.get('/api/nft/images', authenticateToken, async (req, res) => {
         const userId = req.user.id;
         const userKey = resolveNftStorageKeyFromUser(req.user);
         const userNftDir = path.join(NFT_DIR, String(userKey));
-        
+
         if (!fs.existsSync(userNftDir)) {
             return res.json({ images: [] });
         }
-        
+
         const files = fs.readdirSync(userNftDir);
         const images = files.map(f => {
             const filePath = path.join(userNftDir, f);
@@ -7426,7 +7426,7 @@ app.get('/api/nft/images', authenticateToken, async (req, res) => {
                 createdAt: stats.birthtime,
             };
         });
-        
+
         res.json({ images });
     } catch (error) {
         console.error('[NFT] List images error:', error);
@@ -7442,12 +7442,24 @@ const serveNftImage = async (req, res) => {
         const { userId, filename } = req.params;
         const safeFilename = String(filename).replace(/[^a-zA-Z0-9._-]/g, '');
         const safeKey = await resolveNftStorageKeyFromParam(userId);
-        
+
         if (!safeKey || !safeFilename) {
             return res.status(400).json({ error: 'Invalid request' });
         }
 
         let filePath = path.join(NFT_DIR, safeKey, safeFilename);
+        const hasExtension = path.extname(safeFilename).length > 0;
+        const extensionsToTry = ['.bin', '.jpg', '.jpeg', '.png', '.webp'];
+        if (!hasExtension && !fs.existsSync(filePath)) {
+            for (const ext of extensionsToTry) {
+                const testPath = path.join(NFT_DIR, safeKey, safeFilename + ext);
+                if (fs.existsSync(testPath)) {
+                    filePath = testPath;
+                    console.log(`[NFT] Found image with extension: ${safeFilename}${ext}`);
+                    break;
+                }
+            }
+        }
         if (!fs.existsSync(filePath)) {
             // Backward compat: try the raw userId param as-is (could be old storage_uuid, device_uuid, or numeric id)
             const rawKey = sanitizeUserKey(userId);
@@ -7468,12 +7480,39 @@ const serveNftImage = async (req, res) => {
                     }
                 } catch (e) { /* ignore */ }
             }
+            // Last resort: search all user folders for this filename (handles credential migration)
+            if (!fs.existsSync(filePath)) {
+                try {
+                    const dirs = fs.readdirSync(NFT_DIR, { withFileTypes: true });
+                    for (const d of dirs) {
+                        if (!d.isDirectory()) continue;
+                        const testPath = path.join(NFT_DIR, d.name, safeFilename);
+                        if (fs.existsSync(testPath)) {
+                            filePath = testPath;
+                            console.log(`[NFT] Found image via global search: ${d.name}/${safeFilename}`);
+                            break;
+                        }
+                        if (!hasExtension) {
+                            for (const ext of extensionsToTry) {
+                                const testPathWithExt = path.join(NFT_DIR, d.name, safeFilename + ext);
+                                if (fs.existsSync(testPathWithExt)) {
+                                    filePath = testPathWithExt;
+                                    console.log(`[NFT] Found image via global search with ext: ${d.name}/${safeFilename}${ext}`);
+                                    break;
+                                }
+                            }
+                            if (fs.existsSync(filePath)) break;
+                        }
+                    }
+                } catch (e) { /* ignore */ }
+            }
         }
-        
+
         if (!fs.existsSync(filePath)) {
+            console.log(`[NFT] Image not found: ${safeKey}/${safeFilename}`);
             return res.status(404).json({ error: 'Image not found' });
         }
-        
+
         // Determine content type
         const ext = path.extname(safeFilename).toLowerCase();
         const contentTypes = {
@@ -7483,18 +7522,25 @@ const serveNftImage = async (req, res) => {
             '.cr2': 'image/x-canon-cr2', '.cr3': 'image/x-canon-cr3', '.nef': 'image/x-nikon-nef',
             '.arw': 'image/x-sony-arw', '.raf': 'image/x-fuji-raf', '.orf': 'image/x-olympus-orf',
             '.rw2': 'image/x-panasonic-rw2', '.pef': 'image/x-pentax-pef', '.srw': 'image/x-samsung-srw',
+            '.bin': 'application/octet-stream', // Encrypted image binary - download only
         };
         const contentType = contentTypes[ext] || 'application/octet-stream';
-        
+
         // Set cache headers for CDN/browser caching
         // Override helmet's restrictive CORP header for public NFT images
-        res.set({
+        const headers = {
             'Content-Type': contentType,
             'Cache-Control': 'public, max-age=31536000, immutable', // 1 year cache
             'Access-Control-Allow-Origin': '*', // Allow cross-origin for NFT viewers
             'Cross-Origin-Resource-Policy': 'cross-origin', // Allow embedding in any origin
-        });
-        
+        };
+
+        // Force download for encrypted .bin files - browsers can't display encrypted binary
+        if (ext === '.bin') {
+            headers['Content-Disposition'] = `attachment; filename="${safeFilename}"`;
+        }
+
+        res.set(headers);
         res.sendFile(filePath);
     } catch (error) {
         console.error('[NFT] Serve image error:', error);
@@ -7659,7 +7705,7 @@ const mergeStoredNft = (existing, incoming) => {
             updated++;
         }
     };
-    const fillGapFields = ['thumbnailUrl','imageUrl','license','nftType','assetId','txSignature','attributes','createdAt','mintedAt','ipfsThumbnailUrl','metadataUrl','contentHash','exifHash','exifRawHash','exifBindingHash','hasRfc3161','hasC2pa','mintPlatform','ownerAddress','creatorWallet','name','description','discoveredAt','arweaveUrl'];
+    const fillGapFields = ['thumbnailUrl', 'imageUrl', 'license', 'nftType', 'assetId', 'txSignature', 'attributes', 'createdAt', 'mintedAt', 'ipfsThumbnailUrl', 'metadataUrl', 'contentHash', 'exifHash', 'exifRawHash', 'exifBindingHash', 'hasRfc3161', 'hasC2pa', 'mintPlatform', 'ownerAddress', 'creatorWallet', 'name', 'description', 'discoveredAt', 'arweaveUrl'];
     for (const field of fillGapFields) {
         if (incoming[field] !== undefined && incoming[field] !== null && (existing[field] === undefined || existing[field] === null || existing[field] === '')) {
             existing[field] = incoming[field];
@@ -7722,9 +7768,9 @@ const mergeStoredCertificate = (existing, incoming) => {
             updated++;
         }
     };
-    const fillGapFields = ['name','txSignature','license','nftType','metadataUrl','description','version','type','imageUrl',
-        'issuedAt','createdAt','mintedAt','contentHash','exifHash','cameraHash','exifRawHash','exifBindingHash',
-        'rfc3161Policy','rfc3161Tsa'];
+    const fillGapFields = ['name', 'txSignature', 'license', 'nftType', 'metadataUrl', 'description', 'version', 'type', 'imageUrl',
+        'issuedAt', 'createdAt', 'mintedAt', 'contentHash', 'exifHash', 'cameraHash', 'exifRawHash', 'exifBindingHash',
+        'rfc3161Policy', 'rfc3161Tsa'];
     for (const field of fillGapFields) {
         if (incoming[field] !== undefined && incoming[field] !== null && (existing[field] === undefined || existing[field] === null || existing[field] === '')) {
             existing[field] = incoming[field];
@@ -7828,7 +7874,7 @@ const readNftsForWalletGlobal = (walletAddress) => {
                     seenIdx[key] = merged.length;
                     merged.push(nft);
                 }
-            } catch (_) {}
+            } catch (_) { }
         }
     } catch (e) { console.error('[NFT] readNftsForWalletGlobal error:', e.message); }
     return merged;
@@ -7947,7 +7993,7 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
                             fs.writeFileSync(linkedPath, JSON.stringify(linkedData, null, 2));
                             console.log(`[NFT] Album remove (linked ${uuid}): mint=${mintAddress} removed=${linkedBefore - linkedData.nfts.length}`);
                         }
-                    } catch (_) {}
+                    } catch (_) { }
                 }
             } catch (linkErr) { console.warn('[NFT] Album remove linked folders error:', linkErr.message); }
             if (senderWallet) {
@@ -7971,7 +8017,7 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
                                 fs.writeFileSync(globalPath, JSON.stringify(globalData, null, 2));
                                 globalRemoved += removedHere;
                             }
-                        } catch (_) {}
+                        } catch (_) { }
                     }
                 } catch (globalErr) {
                     console.warn('[NFT] Album remove global wallet purge error:', globalErr.message);
@@ -8069,6 +8115,32 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
     }
 });
 
+// POST /api/nft/clear-all - Clear all user's NFTs from server (blockchain remains)
+app.post('/api/nft/clear-all', authenticateToken, async (req, res) => {
+    try {
+        const userKey = resolveNftStorageKeyFromUser(req.user);
+        const userNftDir = path.join(NFT_DIR, String(userKey));
+        const metadataPath = getNftMetadataPath(userKey);
+
+        // Delete nft-album.json (the NFT list)
+        if (fs.existsSync(metadataPath)) {
+            fs.unlinkSync(metadataPath);
+        }
+
+        // Delete certificates.json
+        const certsPath = path.join(userNftDir, 'certificates.json');
+        if (fs.existsSync(certsPath)) {
+            fs.unlinkSync(certsPath);
+        }
+
+        console.log(`[NFT] Cleared all NFTs for user: ${userKey}`);
+        res.json({ success: true, message: 'NFT album cleared' });
+    } catch (error) {
+        console.error('[NFT] Clear all error:', error);
+        res.status(500).json({ error: 'Failed to clear NFT album' });
+    }
+});
+
 // Helper: scan ALL user NFT folders for certificates matching a wallet address
 // Certificates belong to wallets, not user accounts — same logic as readNftsForWalletGlobal
 const readCertsForWalletGlobal = (walletAddress) => {
@@ -8100,7 +8172,7 @@ const readCertsForWalletGlobal = (walletAddress) => {
                     seenIdx[key] = merged.length;
                     merged.push({ ...c });
                 }
-            } catch (_) {}
+            } catch (_) { }
         }
     } catch (e) { console.error('[NFT] readCertsForWalletGlobal error:', e.message); }
     return merged;
@@ -8169,12 +8241,12 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
 
         const full = req.query.full === 'true';
         const requestedId = req.query.id || '';
-        const API_SLIM_KEYS = ['id','name','mintAddress','txSignature','creatorWallet','ownerAddress',
-            'issuedAt','createdAt','edition','license','contentHash','exifHash','cameraHash',
-            'exifRawHash','exifBindingHash','rfc3161Policy','mintedAt',
-            'hasRfc3161','hasC2pa','encrypted','watermarked','storageType','nftType','isCompressed',
-            'rfc3161Tsa','metadataUrl','description','version','type','imageUrl','certificationMode',
-            'transferredFrom','transferredAt','transferNftKey','transferNonce','transferThumbnailNonce'];
+        const API_SLIM_KEYS = ['id', 'name', 'mintAddress', 'txSignature', 'creatorWallet', 'ownerAddress',
+            'issuedAt', 'createdAt', 'edition', 'license', 'contentHash', 'exifHash', 'cameraHash',
+            'exifRawHash', 'exifBindingHash', 'rfc3161Policy', 'mintedAt',
+            'hasRfc3161', 'hasC2pa', 'encrypted', 'watermarked', 'storageType', 'nftType', 'isCompressed',
+            'rfc3161Tsa', 'metadataUrl', 'description', 'version', 'type', 'imageUrl', 'certificationMode',
+            'transferredFrom', 'transferredAt', 'transferNftKey', 'transferNonce', 'transferThumbnailNonce'];
         const DISK_SAFE_KEYS = [...API_SLIM_KEYS, 'rfc3161Token', 'c2paManifest'];
         const keysToUse = full ? DISK_SAFE_KEYS : API_SLIM_KEYS;
         const slimForApi = (c) => {
@@ -8225,29 +8297,29 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
     }
 });
 
-  app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
+app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
     try {
         const userKey = resolveNftStorageKeyFromUser(req.user);
         const userNftDir = path.join(NFT_DIR, String(userKey));
         if (!fs.existsSync(userNftDir)) fs.mkdirSync(userNftDir, { recursive: true });
         const certsPath = path.join(userNftDir, 'certificates.json');
-        
+
         let certs = [];
         if (fs.existsSync(certsPath)) {
-            try { certs = JSON.parse(fs.readFileSync(certsPath, 'utf8')); } catch (_) {}
+            try { certs = JSON.parse(fs.readFileSync(certsPath, 'utf8')); } catch (_) { }
         }
-        
+
         const { action, certificate, certificates, certId, mintAddress } = req.body;
         const existingIds = new Set(certs.map(c => c.id));
-        
+
         // Disk-safe keys: preserve rfc3161Token + c2paManifest so the desktop can recover them
-        const DISK_SAFE_KEYS = ['id','name','mintAddress','txSignature','creatorWallet','ownerAddress',
-            'issuedAt','createdAt','edition','license','contentHash','exifHash','cameraHash',
-            'exifRawHash','exifBindingHash','rfc3161Policy','mintedAt',
-            'hasRfc3161','hasC2pa','encrypted','watermarked','storageType','nftType','isCompressed',
-            'rfc3161Tsa','metadataUrl','description','version','type','imageUrl','certificationMode',
-            'transferredFrom','transferredAt','transferNftKey','transferNonce','transferThumbnailNonce',
-            'rfc3161Token','c2paManifest'];
+        const DISK_SAFE_KEYS = ['id', 'name', 'mintAddress', 'txSignature', 'creatorWallet', 'ownerAddress',
+            'issuedAt', 'createdAt', 'edition', 'license', 'contentHash', 'exifHash', 'cameraHash',
+            'exifRawHash', 'exifBindingHash', 'rfc3161Policy', 'mintedAt',
+            'hasRfc3161', 'hasC2pa', 'encrypted', 'watermarked', 'storageType', 'nftType', 'isCompressed',
+            'rfc3161Tsa', 'metadataUrl', 'description', 'version', 'type', 'imageUrl', 'certificationMode',
+            'transferredFrom', 'transferredAt', 'transferNftKey', 'transferNonce', 'transferThumbnailNonce',
+            'rfc3161Token', 'c2paManifest'];
         const slimCert = (c) => {
             const copy = {};
             for (const k of DISK_SAFE_KEYS) { if (c[k] !== undefined) copy[k] = c[k]; }
@@ -8257,7 +8329,7 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
             if (copy.imageUrl && copy.imageUrl.startsWith('data:') && copy.imageUrl.length > 5000) delete copy.imageUrl;
             return copy;
         };
-        
+
         if (action === 'add' && certificate) {
             const slimmed = slimCert(certificate);
             if (!existingIds.has(slimmed.id)) {
@@ -8325,7 +8397,7 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
             const inboxCertsPath = path.join(inboxDir, 'certificates.json');
             let inboxCerts = [];
             if (fs.existsSync(inboxCertsPath)) {
-                try { inboxCerts = JSON.parse(fs.readFileSync(inboxCertsPath, 'utf8')); } catch (_) {}
+                try { inboxCerts = JSON.parse(fs.readFileSync(inboxCertsPath, 'utf8')); } catch (_) { }
             }
             // Deduplicate by id
             const inboxIds = new Set(inboxCerts.map(c => c.id));
@@ -8406,7 +8478,7 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
                     const inboxAlbumPath = path.join(inboxDir, 'nft-album.json');
                     let inboxAlbum = { nfts: [] };
                     if (fs.existsSync(inboxAlbumPath)) {
-                        try { inboxAlbum = JSON.parse(fs.readFileSync(inboxAlbumPath, 'utf8')); } catch (_) {}
+                        try { inboxAlbum = JSON.parse(fs.readFileSync(inboxAlbumPath, 'utf8')); } catch (_) { }
                     }
                     const inboxMints = new Set((inboxAlbum.nfts || []).map(n => normalizeWalletMint(n.mintAddress)));
                     if (!inboxMints.has(recipientMint)) {
@@ -8470,7 +8542,7 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
                                     console.log(`[NFT] Cert transfer remove (linked ${uuid}): mint=${certificate.mintAddress}`);
                                 }
                             }
-                        } catch (_) {}
+                        } catch (_) { }
                     }
                     // Remove NFT album entry
                     const linkedAlbumPath = getNftMetadataPath(uuid);
@@ -8483,7 +8555,7 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
                                 fs.writeFileSync(linkedAlbumPath, JSON.stringify(linkedAlbum, null, 2));
                                 console.log(`[NFT] NFT transfer remove (linked ${uuid}): mint=${certificate.mintAddress}`);
                             }
-                        } catch (_) {}
+                        } catch (_) { }
                     }
                 }
             } catch (linkErr) { console.warn('[NFT] Transfer linked removal error:', linkErr.message); }
@@ -8491,7 +8563,7 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
         } else {
             return res.status(400).json({ error: 'Invalid action' });
         }
-        
+
         // Ensure only whitelisted fields persist on disk
         const cleanCerts = certs.map(c => slimCert(c));
         fs.writeFileSync(certsPath, JSON.stringify(cleanCerts, null, 2));
@@ -8509,7 +8581,12 @@ try {
     const nftService = require('../nft-service');
     nftService.initialize();
 
-    app.use('/api/nft-service', authenticateToken, nftService.routes);
+    app.use('/api/nft-service', (req, res, next) => {
+        if (req.path === '/das-proxy' && (req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1')) {
+            return next();
+        }
+        return authenticateToken(req, res, next);
+    }, nftService.routes);
 
     // After nft-service mounts, add a dedicated endpoint for client to confirm premium storage
     // Client calls this right after a successful /api/nft-service/upgrade-premium response
@@ -8726,7 +8803,7 @@ app.post('/solana-rpc', async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-    
+
     const rpcEndpoints = [
         process.env.SOLANA_RPC_ENDPOINT,          // Custom RPC if configured (highest priority)
         'https://api.mainnet-beta.solana.com',
@@ -8736,7 +8813,7 @@ app.post('/solana-rpc', async (req, res) => {
         (process.env.HELIUS_RPC_KEY || process.env.HELIUS_API_KEY) ? `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_RPC_KEY || process.env.HELIUS_API_KEY}` : null, // Helius (env)
         'https://solana-mainnet.g.alchemy.com/v2/demo'
     ].filter(Boolean);
-    
+
     for (const rpc of rpcEndpoints) {
         try {
             const response = await axios.post(rpc, req.body, {
@@ -8752,7 +8829,7 @@ app.post('/solana-rpc', async (req, res) => {
             console.log('[Solana RPC] Failed:', rpc, e.message);
         }
     }
-    
+
     res.status(503).json({ error: 'All RPC endpoints failed' });
 });
 
@@ -8770,14 +8847,14 @@ app.get('/local-image', (req, res) => {
     if (!imagePath) {
         return res.status(400).json({ error: 'No path provided' });
     }
-    
+
     const resolvedPath = path.resolve(imagePath);
-    
+
     // Allow any path for now (desktop app is trusted)
     if (!fs.existsSync(resolvedPath)) {
         return res.status(404).json({ error: 'File not found' });
     }
-    
+
     // Determine content type
     const ext = path.extname(resolvedPath).toLowerCase();
     const mimeTypes = {
@@ -8789,7 +8866,7 @@ app.get('/local-image', (req, res) => {
         '.heic': 'image/heic',
         '.heif': 'image/heif',
     };
-    
+
     // Add CORS headers for Electron renderer
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET');
@@ -8840,7 +8917,7 @@ app.get('/sol-price', async (req, res) => {
         try {
             const price = await src();
             if (price && price > 0) return res.json({ solana: { usd: price } });
-        } catch (_) {}
+        } catch (_) { }
     }
     res.status(503).json({ error: 'Price unavailable' });
 });
@@ -9764,6 +9841,14 @@ app.get('/nft-payment', (req, res) => {
         if (errMsg.includes('User rejected')) errMsg = 'Transaction rejected. Click the button to try again.';
         showStatus(errMsg, 'error');
         setLoading(false);
+        
+        // Notify desktop app of mint failure
+        const stage = err.stage || (err.message && err.message.includes('mint') ? 'mint' : 'payment');
+        fetch('/nft-mint-failed', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ error: errMsg, stage: stage })
+        }).catch(e => console.log('Failed to notify app of failure:', e));
       }
     }
 
@@ -9834,11 +9919,34 @@ app.get('/nft-mint-success', (req, res) => {
     }
 });
 
+// NFT mint failure callback - receives mint failure from browser to notify app
+app.post('/nft-mint-failed', (req, res) => {
+    const { error, stage } = req.body;
+    console.log('[NFT] Mint failed:', { error, stage });
+    global.nftMintFailure = {
+        error: error || 'Mint failed',
+        stage: stage || 'unknown',
+        timestamp: Date.now()
+    };
+    res.json({ success: true });
+});
+
+// NFT mint failure poll endpoint - app polls this to get failure details
+app.get('/nft-mint-failed', (req, res) => {
+    const data = global.nftMintFailure;
+    if (data && Date.now() - data.timestamp < 60000) { // Valid for 60 seconds
+        global.nftMintFailure = null; // Clear after reading
+        res.json({ failed: true, ...data });
+    } else {
+        res.json({ failed: false });
+    }
+});
+
 // NFT mint after QR payment - called when QR payment is detected via polling
 app.post('/api/nft/mint-after-payment', async (req, res) => {
     const { paymentSignature, recipient, metadataUrl, nftType, name } = req.body;
     console.log('[NFT] Mint after QR payment:', { paymentSignature, nftType, name });
-    
+
     try {
         // For now, store the success for the app to poll
         // In a full implementation, this would trigger actual NFT minting via Metaplex
@@ -9851,7 +9959,7 @@ app.post('/api/nft/mint-after-payment', async (req, res) => {
             name: name,
             timestamp: Date.now()
         };
-        
+
         console.log('[NFT] QR payment mint success stored for app polling');
         res.json({ success: true, signature: paymentSignature });
     } catch (err) {
@@ -10182,7 +10290,7 @@ app.get('/nft-transfer-sign', (req, res) => {
         return res.status(400).send('Missing parameters');
     }
     const isVersioned = versioned === '1';
-    
+
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.send(`<!DOCTYPE html>
 <html>
@@ -10365,346 +10473,346 @@ const startExifBackfill = async () => {
     _exifBackfillRunning = true;
 
     try {
-    // Load cursor — never permanently complete; always re-scan for new files
-    let cursor = { processedFiles: [] };
-    try {
-        if (fs.existsSync(EXIF_BACKFILL_CURSOR_PATH)) {
-            cursor = JSON.parse(fs.readFileSync(EXIF_BACKFILL_CURSOR_PATH, 'utf8'));
-        }
-    } catch (_) {}
-
-    const processedSet = new Set(cursor.processedFiles || []);
-    console.log(`[ExifBackfill] Starting server-side backfill (${processedSet.size} previously processed)`);
-
-    // Collect all uploaded files across all device directories (UUID folders)
-    let allFiles = [];
-    try {
-        const deviceDirs = fs.readdirSync(UPLOAD_DIR).filter(d => {
-            if (d.startsWith('.')) return false;
-            try { return fs.statSync(path.join(UPLOAD_DIR, d)).isDirectory(); } catch (_) { return false; }
-        });
-        for (const dd of deviceDirs) {
-            const dirPath = path.join(UPLOAD_DIR, dd);
-            try {
-                const files = fs.readdirSync(dirPath).filter(f => EXIF_BACKFILL_IMAGE_EXTS.test(f));
-                for (const f of files) {
-                    allFiles.push({ dir: dirPath, filename: f, key: `${dd}/${f}` });
-                }
-            } catch (_) {}
-        }
-    } catch (e) {
-        console.error('[ExifBackfill] Failed to scan upload dirs:', e.message);
-        return;
-    }
-
-    // Filter out already-processed (files where we already stored rich EXIF)
-    allFiles = allFiles.filter(f => !processedSet.has(f.key));
-    console.log(`[ExifBackfill] ${allFiles.length} files to check`);
-
-    if (allFiles.length === 0) {
-        console.log('[ExifBackfill] Nothing new to backfill');
-        return;
-    }
-
-    let stored = 0, upgraded = 0, skipped = 0, errors = 0;
-
-    // Helper: extract EXIF from file using sharp + exif-reader
-    const extractExifFromFile = async (filePath, meta) => {
-        const r4 = (v) => {
-            const n = Number(v);
-            if (n == null || isNaN(n)) return null;
-            return Number.isInteger(n) ? n : Math.round(n * 1e4) / 1e4;
-        };
-        const t4 = (v) => {
-            const n = Number(v);
-            if (n == null || isNaN(n)) return null;
-            return Math.trunc(n * 1e4) / 1e4;
-        };
-
-        let exifTags = {};
-        if (meta.exif) {
-            try {
-                const exifReader = require('exif-reader');
-                exifTags = exifReader(meta.exif) || {};
-                const flat = {};
-                if (exifTags.image) Object.assign(flat, exifTags.image);
-                if (exifTags.exif) Object.assign(flat, exifTags.exif);
-                if (exifTags.gps) {
-                    if (exifTags.gps.GPSLatitude) flat.GPSLatitude = exifTags.gps.GPSLatitude;
-                    if (exifTags.gps.GPSLongitude) flat.GPSLongitude = exifTags.gps.GPSLongitude;
-                    if (exifTags.gps.GPSAltitude) flat.GPSAltitude = exifTags.gps.GPSAltitude;
-                    if (exifTags.gps.GPSLatitudeRef) flat.GPSLatitudeRef = exifTags.gps.GPSLatitudeRef;
-                    if (exifTags.gps.GPSLongitudeRef) flat.GPSLongitudeRef = exifTags.gps.GPSLongitudeRef;
-                    if (exifTags.gps.GPSAltitudeRef) flat.GPSAltitudeRef = exifTags.gps.GPSAltitudeRef;
-                }
-                exifTags = flat;
-            } catch (e) {
-                exifTags = {};
-            }
-        }
-
-        const exif = {
-            captureTime: null, make: null, model: null,
-            offsetTimeOriginal: null, subSecTimeOriginal: null,
-            exposureTime: null, fNumber: null, iso: null,
-            focalLength: null, focalLengthIn35mm: null,
-            flash: null, whiteBalance: null, meteringMode: null,
-            exposureProgram: null, exposureBias: null,
-            width: null, height: null, orientation: null, colorSpace: null,
-            gpsLatitude: null, gpsLongitude: null, gpsAltitude: null,
-            software: null, lensMake: null, lensModel: null,
-        };
-
-        let dto = exifTags.DateTimeOriginal || exifTags.DateTimeDigitized;
-        if (dto instanceof Date) {
-            exif.captureTime = dto.toISOString().slice(0, 19);
-        } else if (typeof dto === 'string') {
-            const normalized = dto.replace(/^(\d{4}):(\d{2}):(\d{2})/, '$1-$2-$3').replace(' ', 'T');
-            if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(normalized)) exif.captureTime = normalized.slice(0, 19);
-        }
-
-        if (exifTags.Make) exif.make = String(exifTags.Make).replace(/\0/g, '').trim().toLowerCase() || null;
-        if (exifTags.Model) exif.model = String(exifTags.Model).replace(/\0/g, '').trim().toLowerCase() || null;
-        if (exifTags.OffsetTimeOriginal) exif.offsetTimeOriginal = String(exifTags.OffsetTimeOriginal).trim();
-        if (exifTags.SubSecTimeOriginal != null) exif.subSecTimeOriginal = String(exifTags.SubSecTimeOriginal);
-        if (exifTags.ExposureTime != null) exif.exposureTime = r4(exifTags.ExposureTime);
-        if (exifTags.FNumber != null) exif.fNumber = r4(exifTags.FNumber);
-        if (exifTags.ISO != null) exif.iso = Number(exifTags.ISO);
-        else if (exifTags.ISOSpeedRatings != null) exif.iso = Array.isArray(exifTags.ISOSpeedRatings) ? exifTags.ISOSpeedRatings[0] : Number(exifTags.ISOSpeedRatings);
-        if (exifTags.FocalLength != null) exif.focalLength = r4(exifTags.FocalLength);
-        if (exifTags.FocalLengthIn35mmFormat != null) exif.focalLengthIn35mm = r4(exifTags.FocalLengthIn35mmFormat);
-        if (exifTags.Flash != null) exif.flash = typeof exifTags.Flash === 'number' ? exifTags.Flash : null;
-        if (exifTags.WhiteBalance != null) exif.whiteBalance = Number(exifTags.WhiteBalance);
-        if (exifTags.MeteringMode != null) exif.meteringMode = Number(exifTags.MeteringMode);
-        if (exifTags.ExposureProgram != null) exif.exposureProgram = Number(exifTags.ExposureProgram);
-        if (exifTags.ExposureBiasValue != null) exif.exposureBias = r4(exifTags.ExposureBiasValue);
-        exif.width = meta.width || null;
-        exif.height = meta.height || null;
-        if (exifTags.Orientation != null) exif.orientation = Number(exifTags.Orientation);
-        else if (meta.orientation) exif.orientation = meta.orientation;
-        if (exifTags.ColorSpace != null) exif.colorSpace = Number(exifTags.ColorSpace);
-        if (exifTags.Software) exif.software = String(exifTags.Software).replace(/\0/g, '').trim() || null;
-        if (exifTags.LensMake) exif.lensMake = String(exifTags.LensMake).replace(/\0/g, '').trim() || null;
-        if (exifTags.LensModel) exif.lensModel = String(exifTags.LensModel).replace(/\0/g, '').trim() || null;
-
-        // GPS — convert DMS arrays to decimal, then truncate to 4dp
-        if (Array.isArray(exifTags.GPSLatitude) && exifTags.GPSLatitude.length === 3) {
-            const [d, m, s] = exifTags.GPSLatitude;
-            let lat = d + m / 60 + s / 3600;
-            if (exifTags.GPSLatitudeRef === 'S') lat = -lat;
-            exif.gpsLatitude = t4(lat);
-        } else if (typeof exifTags.GPSLatitude === 'number') {
-            let lat = exifTags.GPSLatitude;
-            if (exifTags.GPSLatitudeRef === 'S' && lat > 0) lat = -lat;
-            exif.gpsLatitude = t4(lat);
-        }
-        if (Array.isArray(exifTags.GPSLongitude) && exifTags.GPSLongitude.length === 3) {
-            const [d, m, s] = exifTags.GPSLongitude;
-            let lon = d + m / 60 + s / 3600;
-            if (exifTags.GPSLongitudeRef === 'W') lon = -lon;
-            exif.gpsLongitude = t4(lon);
-        } else if (typeof exifTags.GPSLongitude === 'number') {
-            let lon = exifTags.GPSLongitude;
-            if (exifTags.GPSLongitudeRef === 'W' && lon > 0) lon = -lon;
-            exif.gpsLongitude = t4(lon);
-        }
-        if (exifTags.GPSAltitude != null) {
-            let alt = Number(exifTags.GPSAltitude);
-            if (exifTags.GPSAltitudeRef === 1 && alt > 0) alt = -alt;
-            exif.gpsAltitude = t4(alt);
-        }
-
-        return exif;
-    };
-
-    for (let i = 0; i < allFiles.length; i++) {
-        const { dir, filename, key } = allFiles[i];
-        const filePath = path.join(dir, filename);
-
+        // Load cursor — never permanently complete; always re-scan for new files
+        let cursor = { processedFiles: [] };
         try {
-            // Compute SHA-256 file hash
-            const fileHash = await new Promise((resolve, reject) => {
-                const hash = crypto.createHash('sha256');
-                const stream = fs.createReadStream(filePath);
-                stream.on('data', d => hash.update(d));
-                stream.on('end', () => resolve(hash.digest('hex')));
-                stream.on('error', reject);
+            if (fs.existsSync(EXIF_BACKFILL_CURSOR_PATH)) {
+                cursor = JSON.parse(fs.readFileSync(EXIF_BACKFILL_CURSOR_PATH, 'utf8'));
+            }
+        } catch (_) { }
+
+        const processedSet = new Set(cursor.processedFiles || []);
+        console.log(`[ExifBackfill] Starting server-side backfill (${processedSet.size} previously processed)`);
+
+        // Collect all uploaded files across all device directories (UUID folders)
+        let allFiles = [];
+        try {
+            const deviceDirs = fs.readdirSync(UPLOAD_DIR).filter(d => {
+                if (d.startsWith('.')) return false;
+                try { return fs.statSync(path.join(UPLOAD_DIR, d)).isDirectory(); } catch (_) { return false; }
             });
-
-            const exifPath = getExifPath(fileHash);
-            if (!exifPath) { processedSet.add(key); continue; }
-
-            // Check if EXIF sidecar exists and whether it's "short" (incomplete)
-            let existingCount = 0;
-            let exifExists = false;
-            if (fs.existsSync(exifPath)) {
-                exifExists = true;
+            for (const dd of deviceDirs) {
+                const dirPath = path.join(UPLOAD_DIR, dd);
                 try {
-                    const existing = JSON.parse(fs.readFileSync(exifPath, 'utf8'));
-                    existingCount = countMeaningfulFields(existing?.exif);
-                } catch (_) { existingCount = 0; /* corrupt file — rewrite */ exifExists = false; }
-                if (existingCount >= EXIF_SHORT_THRESHOLD) {
-                    // Already rich — skip
-                    skipped++;
+                    const files = fs.readdirSync(dirPath).filter(f => EXIF_BACKFILL_IMAGE_EXTS.test(f));
+                    for (const f of files) {
+                        allFiles.push({ dir: dirPath, filename: f, key: `${dd}/${f}` });
+                    }
+                } catch (_) { }
+            }
+        } catch (e) {
+            console.error('[ExifBackfill] Failed to scan upload dirs:', e.message);
+            return;
+        }
+
+        // Filter out already-processed (files where we already stored rich EXIF)
+        allFiles = allFiles.filter(f => !processedSet.has(f.key));
+        console.log(`[ExifBackfill] ${allFiles.length} files to check`);
+
+        if (allFiles.length === 0) {
+            console.log('[ExifBackfill] Nothing new to backfill');
+            return;
+        }
+
+        let stored = 0, upgraded = 0, skipped = 0, errors = 0;
+
+        // Helper: extract EXIF from file using sharp + exif-reader
+        const extractExifFromFile = async (filePath, meta) => {
+            const r4 = (v) => {
+                const n = Number(v);
+                if (n == null || isNaN(n)) return null;
+                return Number.isInteger(n) ? n : Math.round(n * 1e4) / 1e4;
+            };
+            const t4 = (v) => {
+                const n = Number(v);
+                if (n == null || isNaN(n)) return null;
+                return Math.trunc(n * 1e4) / 1e4;
+            };
+
+            let exifTags = {};
+            if (meta.exif) {
+                try {
+                    const exifReader = require('exif-reader');
+                    exifTags = exifReader(meta.exif) || {};
+                    const flat = {};
+                    if (exifTags.image) Object.assign(flat, exifTags.image);
+                    if (exifTags.exif) Object.assign(flat, exifTags.exif);
+                    if (exifTags.gps) {
+                        if (exifTags.gps.GPSLatitude) flat.GPSLatitude = exifTags.gps.GPSLatitude;
+                        if (exifTags.gps.GPSLongitude) flat.GPSLongitude = exifTags.gps.GPSLongitude;
+                        if (exifTags.gps.GPSAltitude) flat.GPSAltitude = exifTags.gps.GPSAltitude;
+                        if (exifTags.gps.GPSLatitudeRef) flat.GPSLatitudeRef = exifTags.gps.GPSLatitudeRef;
+                        if (exifTags.gps.GPSLongitudeRef) flat.GPSLongitudeRef = exifTags.gps.GPSLongitudeRef;
+                        if (exifTags.gps.GPSAltitudeRef) flat.GPSAltitudeRef = exifTags.gps.GPSAltitudeRef;
+                    }
+                    exifTags = flat;
+                } catch (e) {
+                    exifTags = {};
+                }
+            }
+
+            const exif = {
+                captureTime: null, make: null, model: null,
+                offsetTimeOriginal: null, subSecTimeOriginal: null,
+                exposureTime: null, fNumber: null, iso: null,
+                focalLength: null, focalLengthIn35mm: null,
+                flash: null, whiteBalance: null, meteringMode: null,
+                exposureProgram: null, exposureBias: null,
+                width: null, height: null, orientation: null, colorSpace: null,
+                gpsLatitude: null, gpsLongitude: null, gpsAltitude: null,
+                software: null, lensMake: null, lensModel: null,
+            };
+
+            let dto = exifTags.DateTimeOriginal || exifTags.DateTimeDigitized;
+            if (dto instanceof Date) {
+                exif.captureTime = dto.toISOString().slice(0, 19);
+            } else if (typeof dto === 'string') {
+                const normalized = dto.replace(/^(\d{4}):(\d{2}):(\d{2})/, '$1-$2-$3').replace(' ', 'T');
+                if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(normalized)) exif.captureTime = normalized.slice(0, 19);
+            }
+
+            if (exifTags.Make) exif.make = String(exifTags.Make).replace(/\0/g, '').trim().toLowerCase() || null;
+            if (exifTags.Model) exif.model = String(exifTags.Model).replace(/\0/g, '').trim().toLowerCase() || null;
+            if (exifTags.OffsetTimeOriginal) exif.offsetTimeOriginal = String(exifTags.OffsetTimeOriginal).trim();
+            if (exifTags.SubSecTimeOriginal != null) exif.subSecTimeOriginal = String(exifTags.SubSecTimeOriginal);
+            if (exifTags.ExposureTime != null) exif.exposureTime = r4(exifTags.ExposureTime);
+            if (exifTags.FNumber != null) exif.fNumber = r4(exifTags.FNumber);
+            if (exifTags.ISO != null) exif.iso = Number(exifTags.ISO);
+            else if (exifTags.ISOSpeedRatings != null) exif.iso = Array.isArray(exifTags.ISOSpeedRatings) ? exifTags.ISOSpeedRatings[0] : Number(exifTags.ISOSpeedRatings);
+            if (exifTags.FocalLength != null) exif.focalLength = r4(exifTags.FocalLength);
+            if (exifTags.FocalLengthIn35mmFormat != null) exif.focalLengthIn35mm = r4(exifTags.FocalLengthIn35mmFormat);
+            if (exifTags.Flash != null) exif.flash = typeof exifTags.Flash === 'number' ? exifTags.Flash : null;
+            if (exifTags.WhiteBalance != null) exif.whiteBalance = Number(exifTags.WhiteBalance);
+            if (exifTags.MeteringMode != null) exif.meteringMode = Number(exifTags.MeteringMode);
+            if (exifTags.ExposureProgram != null) exif.exposureProgram = Number(exifTags.ExposureProgram);
+            if (exifTags.ExposureBiasValue != null) exif.exposureBias = r4(exifTags.ExposureBiasValue);
+            exif.width = meta.width || null;
+            exif.height = meta.height || null;
+            if (exifTags.Orientation != null) exif.orientation = Number(exifTags.Orientation);
+            else if (meta.orientation) exif.orientation = meta.orientation;
+            if (exifTags.ColorSpace != null) exif.colorSpace = Number(exifTags.ColorSpace);
+            if (exifTags.Software) exif.software = String(exifTags.Software).replace(/\0/g, '').trim() || null;
+            if (exifTags.LensMake) exif.lensMake = String(exifTags.LensMake).replace(/\0/g, '').trim() || null;
+            if (exifTags.LensModel) exif.lensModel = String(exifTags.LensModel).replace(/\0/g, '').trim() || null;
+
+            // GPS — convert DMS arrays to decimal, then truncate to 4dp
+            if (Array.isArray(exifTags.GPSLatitude) && exifTags.GPSLatitude.length === 3) {
+                const [d, m, s] = exifTags.GPSLatitude;
+                let lat = d + m / 60 + s / 3600;
+                if (exifTags.GPSLatitudeRef === 'S') lat = -lat;
+                exif.gpsLatitude = t4(lat);
+            } else if (typeof exifTags.GPSLatitude === 'number') {
+                let lat = exifTags.GPSLatitude;
+                if (exifTags.GPSLatitudeRef === 'S' && lat > 0) lat = -lat;
+                exif.gpsLatitude = t4(lat);
+            }
+            if (Array.isArray(exifTags.GPSLongitude) && exifTags.GPSLongitude.length === 3) {
+                const [d, m, s] = exifTags.GPSLongitude;
+                let lon = d + m / 60 + s / 3600;
+                if (exifTags.GPSLongitudeRef === 'W') lon = -lon;
+                exif.gpsLongitude = t4(lon);
+            } else if (typeof exifTags.GPSLongitude === 'number') {
+                let lon = exifTags.GPSLongitude;
+                if (exifTags.GPSLongitudeRef === 'W' && lon > 0) lon = -lon;
+                exif.gpsLongitude = t4(lon);
+            }
+            if (exifTags.GPSAltitude != null) {
+                let alt = Number(exifTags.GPSAltitude);
+                if (exifTags.GPSAltitudeRef === 1 && alt > 0) alt = -alt;
+                exif.gpsAltitude = t4(alt);
+            }
+
+            return exif;
+        };
+
+        for (let i = 0; i < allFiles.length; i++) {
+            const { dir, filename, key } = allFiles[i];
+            const filePath = path.join(dir, filename);
+
+            try {
+                // Compute SHA-256 file hash
+                const fileHash = await new Promise((resolve, reject) => {
+                    const hash = crypto.createHash('sha256');
+                    const stream = fs.createReadStream(filePath);
+                    stream.on('data', d => hash.update(d));
+                    stream.on('end', () => resolve(hash.digest('hex')));
+                    stream.on('error', reject);
+                });
+
+                const exifPath = getExifPath(fileHash);
+                if (!exifPath) { processedSet.add(key); continue; }
+
+                // Check if EXIF sidecar exists and whether it's "short" (incomplete)
+                let existingCount = 0;
+                let exifExists = false;
+                if (fs.existsSync(exifPath)) {
+                    exifExists = true;
+                    try {
+                        const existing = JSON.parse(fs.readFileSync(exifPath, 'utf8'));
+                        existingCount = countMeaningfulFields(existing?.exif);
+                    } catch (_) { existingCount = 0; /* corrupt file — rewrite */ exifExists = false; }
+                    if (existingCount >= EXIF_SHORT_THRESHOLD) {
+                        // Already rich — skip
+                        skipped++;
+                        processedSet.add(key);
+                        continue;
+                    }
+                }
+
+                // Extract EXIF using sharp
+                let meta;
+                try {
+                    meta = await sharp(filePath).metadata();
+                } catch (e) {
                     processedSet.add(key);
                     continue;
                 }
-            }
 
-            // Extract EXIF using sharp
-            let meta;
-            try {
-                meta = await sharp(filePath).metadata();
-            } catch (e) {
+                if (!meta) {
+                    processedSet.add(key);
+                    continue;
+                }
+
+                const exif = await extractExifFromFile(filePath, meta);
+
+                // Only store if we have meaningful data
+                if (!exif.captureTime && !exif.make && exif.gpsLatitude == null) {
+                    processedSet.add(key);
+                    continue;
+                }
+
+                const newCount = countMeaningfulFields(exif);
+
+                // Skip if new extraction isn't richer than existing
+                if (exifExists && newCount <= existingCount) {
+                    processedSet.add(key);
+                    continue;
+                }
+
+                // Write EXIF sidecar (new or upgrade)
+                const exifData = {
+                    fileHash: fileHash.slice(0, 64),
+                    platform: 'server',
+                    storedAt: new Date().toISOString(),
+                    userId: 'backfill',
+                    exif,
+                };
+                if (exifExists) {
+                    exifData.upgradedFrom = { fields: existingCount, storedAt: new Date().toISOString() };
+                }
+                fs.writeFileSync(exifPath, JSON.stringify(exifData, null, 2), 'utf8');
+                if (exifExists) {
+                    upgraded++;
+                } else {
+                    stored++;
+                }
+
                 processedSet.add(key);
-                continue;
-            }
 
-            if (!meta) {
-                processedSet.add(key);
-                continue;
-            }
+                if ((stored + upgraded) % 50 === 0 || (i + 1) % 200 === 0) {
+                    console.log(`[ExifBackfill] Progress: ${i + 1}/${allFiles.length}, stored=${stored}, upgraded=${upgraded}, skipped=${skipped}, errors=${errors}`);
+                }
 
-            const exif = await extractExifFromFile(filePath, meta);
-
-            // Only store if we have meaningful data
-            if (!exif.captureTime && !exif.make && exif.gpsLatitude == null) {
-                processedSet.add(key);
-                continue;
-            }
-
-            const newCount = countMeaningfulFields(exif);
-
-            // Skip if new extraction isn't richer than existing
-            if (exifExists && newCount <= existingCount) {
-                processedSet.add(key);
-                continue;
-            }
-
-            // Write EXIF sidecar (new or upgrade)
-            const exifData = {
-                fileHash: fileHash.slice(0, 64),
-                platform: 'server',
-                storedAt: new Date().toISOString(),
-                userId: 'backfill',
-                exif,
-            };
-            if (exifExists) {
-                exifData.upgradedFrom = { fields: existingCount, storedAt: new Date().toISOString() };
-            }
-            fs.writeFileSync(exifPath, JSON.stringify(exifData, null, 2), 'utf8');
-            if (exifExists) {
-                upgraded++;
-            } else {
-                stored++;
-            }
-
-            processedSet.add(key);
-
-            if ((stored + upgraded) % 50 === 0 || (i + 1) % 200 === 0) {
-                console.log(`[ExifBackfill] Progress: ${i + 1}/${allFiles.length}, stored=${stored}, upgraded=${upgraded}, skipped=${skipped}, errors=${errors}`);
-            }
-
-            // Save cursor every 100 writes
-            if ((stored + upgraded) % 100 === 0) {
-                try {
-                    fs.writeFileSync(EXIF_BACKFILL_CURSOR_PATH, JSON.stringify({
-                        processedFiles: [...processedSet].slice(-10000),
-                        updatedAt: new Date().toISOString(),
-                    }));
-                } catch (_) {}
-            }
-
-            // Throttle: yield to event loop every file (non-blocking)
-            await new Promise(r => setImmediate(r));
-
-        } catch (e) {
-            errors++;
-            processedSet.add(key);
-            if (errors <= 5) console.warn(`[ExifBackfill] Error on ${filename}:`, e.message);
-        }
-    }
-
-    // Save cursor after Phase 1 (legacy uploads)
-    try {
-        fs.writeFileSync(EXIF_BACKFILL_CURSOR_PATH, JSON.stringify({
-            processedFiles: [...processedSet].slice(-10000),
-            updatedAt: new Date().toISOString(),
-        }));
-    } catch (_) {}
-    console.log(`[ExifBackfill] Phase 1 (legacy uploads) complete. stored=${stored}, upgraded=${upgraded}, skipped=${skipped}, errors=${errors}, total=${allFiles.length}`);
-
-    // ── Phase 2: Mine StealthCloud manifest metadata for E2EE files ──
-    // StealthCloud chunks are encrypted — server CANNOT extract EXIF from them.
-    // But manifests store basic EXIF in plaintext: exifCaptureTime, exifMake, exifModel.
-    // Create minimal EXIF sidecars for files that have NO sidecar at all.
-    // This ensures old-app users who never update still get at least basic EXIF preserved.
-    const cloudUsersRoot = path.join(CLOUD_DIR, 'users');
-    let manifestStored = 0, manifestSkipped = 0, manifestErrors = 0;
-    try {
-        if (fs.existsSync(cloudUsersRoot)) {
-            const userDirs = fs.readdirSync(cloudUsersRoot).filter(d => {
-                if (d.startsWith('.')) return false;
-                try { return fs.statSync(path.join(cloudUsersRoot, d)).isDirectory(); } catch (_) { return false; }
-            });
-            for (const ud of userDirs) {
-                const manifestsDir = path.join(cloudUsersRoot, ud, 'manifests');
-                if (!fs.existsSync(manifestsDir)) continue;
-                let manifestFiles;
-                try { manifestFiles = fs.readdirSync(manifestsDir).filter(f => f.endsWith('.json') && !f.startsWith('.')); } catch (_) { continue; }
-
-                for (const mf of manifestFiles) {
+                // Save cursor every 100 writes
+                if ((stored + upgraded) % 100 === 0) {
                     try {
-                        const content = JSON.parse(fs.readFileSync(path.join(manifestsDir, mf), 'utf8'));
-                        const meta = content?.meta;
-                        if (!meta?.fileHash) continue; // no fileHash → can't create sidecar
+                        fs.writeFileSync(EXIF_BACKFILL_CURSOR_PATH, JSON.stringify({
+                            processedFiles: [...processedSet].slice(-10000),
+                            updatedAt: new Date().toISOString(),
+                        }));
+                    } catch (_) { }
+                }
 
-                        const exifPath = getExifPath(meta.fileHash);
-                        if (!exifPath) continue;
-                        if (fs.existsSync(exifPath)) { manifestSkipped++; continue; } // already has sidecar
+                // Throttle: yield to event loop every file (non-blocking)
+                await new Promise(r => setImmediate(r));
 
-                        // Build minimal EXIF from manifest metadata
-                        const exif = {};
-                        if (meta.exifCaptureTime) exif.captureTime = String(meta.exifCaptureTime).slice(0, 30);
-                        if (meta.exifMake) exif.make = String(meta.exifMake).replace(/\0/g, '').trim().toLowerCase() || null;
-                        if (meta.exifModel) exif.model = String(meta.exifModel).replace(/\0/g, '').trim().toLowerCase() || null;
-                        if (meta.originalSize) exif.originalSize = meta.originalSize;
+            } catch (e) {
+                errors++;
+                processedSet.add(key);
+                if (errors <= 5) console.warn(`[ExifBackfill] Error on ${filename}:`, e.message);
+            }
+        }
 
-                        if (!exif.captureTime && !exif.make) continue; // no meaningful data
+        // Save cursor after Phase 1 (legacy uploads)
+        try {
+            fs.writeFileSync(EXIF_BACKFILL_CURSOR_PATH, JSON.stringify({
+                processedFiles: [...processedSet].slice(-10000),
+                updatedAt: new Date().toISOString(),
+            }));
+        } catch (_) { }
+        console.log(`[ExifBackfill] Phase 1 (legacy uploads) complete. stored=${stored}, upgraded=${upgraded}, skipped=${skipped}, errors=${errors}, total=${allFiles.length}`);
 
-                        const exifData = {
-                            fileHash: meta.fileHash.slice(0, 64),
-                            platform: 'manifest-backfill',
-                            storedAt: new Date().toISOString(),
-                            userId: ud,
-                            exif,
-                        };
+        // ── Phase 2: Mine StealthCloud manifest metadata for E2EE files ──
+        // StealthCloud chunks are encrypted — server CANNOT extract EXIF from them.
+        // But manifests store basic EXIF in plaintext: exifCaptureTime, exifMake, exifModel.
+        // Create minimal EXIF sidecars for files that have NO sidecar at all.
+        // This ensures old-app users who never update still get at least basic EXIF preserved.
+        const cloudUsersRoot = path.join(CLOUD_DIR, 'users');
+        let manifestStored = 0, manifestSkipped = 0, manifestErrors = 0;
+        try {
+            if (fs.existsSync(cloudUsersRoot)) {
+                const userDirs = fs.readdirSync(cloudUsersRoot).filter(d => {
+                    if (d.startsWith('.')) return false;
+                    try { return fs.statSync(path.join(cloudUsersRoot, d)).isDirectory(); } catch (_) { return false; }
+                });
+                for (const ud of userDirs) {
+                    const manifestsDir = path.join(cloudUsersRoot, ud, 'manifests');
+                    if (!fs.existsSync(manifestsDir)) continue;
+                    let manifestFiles;
+                    try { manifestFiles = fs.readdirSync(manifestsDir).filter(f => f.endsWith('.json') && !f.startsWith('.')); } catch (_) { continue; }
 
-                        // Use O_EXCL to not race with client-side backfill
-                        let fd;
+                    for (const mf of manifestFiles) {
                         try {
-                            fd = fs.openSync(exifPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL);
-                            fs.writeSync(fd, JSON.stringify(exifData, null, 2), 0, 'utf8');
-                            manifestStored++;
-                        } catch (excl) {
-                            if (excl.code === 'EEXIST') { manifestSkipped++; continue; }
-                            throw excl;
-                        } finally {
-                            if (fd !== undefined) try { fs.closeSync(fd); } catch (_) {}
-                        }
-                    } catch (_) { manifestErrors++; }
+                            const content = JSON.parse(fs.readFileSync(path.join(manifestsDir, mf), 'utf8'));
+                            const meta = content?.meta;
+                            if (!meta?.fileHash) continue; // no fileHash → can't create sidecar
 
-                    // Yield every file
-                    await new Promise(r => setImmediate(r));
+                            const exifPath = getExifPath(meta.fileHash);
+                            if (!exifPath) continue;
+                            if (fs.existsSync(exifPath)) { manifestSkipped++; continue; } // already has sidecar
+
+                            // Build minimal EXIF from manifest metadata
+                            const exif = {};
+                            if (meta.exifCaptureTime) exif.captureTime = String(meta.exifCaptureTime).slice(0, 30);
+                            if (meta.exifMake) exif.make = String(meta.exifMake).replace(/\0/g, '').trim().toLowerCase() || null;
+                            if (meta.exifModel) exif.model = String(meta.exifModel).replace(/\0/g, '').trim().toLowerCase() || null;
+                            if (meta.originalSize) exif.originalSize = meta.originalSize;
+
+                            if (!exif.captureTime && !exif.make) continue; // no meaningful data
+
+                            const exifData = {
+                                fileHash: meta.fileHash.slice(0, 64),
+                                platform: 'manifest-backfill',
+                                storedAt: new Date().toISOString(),
+                                userId: ud,
+                                exif,
+                            };
+
+                            // Use O_EXCL to not race with client-side backfill
+                            let fd;
+                            try {
+                                fd = fs.openSync(exifPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL);
+                                fs.writeSync(fd, JSON.stringify(exifData, null, 2), 0, 'utf8');
+                                manifestStored++;
+                            } catch (excl) {
+                                if (excl.code === 'EEXIST') { manifestSkipped++; continue; }
+                                throw excl;
+                            } finally {
+                                if (fd !== undefined) try { fs.closeSync(fd); } catch (_) { }
+                            }
+                        } catch (_) { manifestErrors++; }
+
+                        // Yield every file
+                        await new Promise(r => setImmediate(r));
+                    }
                 }
             }
+        } catch (e) {
+            console.error('[ExifBackfill] Phase 2 manifest scan error:', e.message);
         }
-    } catch (e) {
-        console.error('[ExifBackfill] Phase 2 manifest scan error:', e.message);
-    }
-    if (manifestStored > 0 || manifestErrors > 0) {
-        console.log(`[ExifBackfill] Phase 2 (manifest metadata) complete. stored=${manifestStored}, skipped=${manifestSkipped}, errors=${manifestErrors}`);
-    }
+        if (manifestStored > 0 || manifestErrors > 0) {
+            console.log(`[ExifBackfill] Phase 2 (manifest metadata) complete. stored=${manifestStored}, skipped=${manifestSkipped}, errors=${manifestErrors}`);
+        }
 
     } finally {
         _exifBackfillRunning = false;
