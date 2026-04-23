@@ -7799,7 +7799,11 @@ const nftMatchesWalletScope = (nft, walletAddress) => {
 const certificateMatchesWalletScope = (cert, walletAddress) => {
     const targetWallet = normalizeWalletAddress(walletAddress);
     if (!targetWallet || !cert) return false;
-    return normalizeWalletAddress(cert.ownerAddress) === targetWallet;
+    const owner = normalizeWalletAddress(cert.ownerAddress);
+    const creator = normalizeWalletAddress(cert.creatorWallet);
+    const ownerMatch = owner === targetWallet;
+    const creatorMatch = creator === targetWallet && (!owner || owner === targetWallet);
+    return ownerMatch || creatorMatch;
 };
 const filterNftsForWalletScope = (nfts, walletAddress) => {
     const targetWallet = normalizeWalletAddress(walletAddress);
@@ -8311,25 +8315,167 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
 });
 
 // POST /api/nft/clear-all - Clear all user's NFTs from server (blockchain remains)
+// Body: { deleteAssets?: boolean, unpinIpfs?: boolean }
+//   deleteAssets = true  → also delete all image/thumbnail files from StealthCloud
+//   unpinIpfs    = true  → also unpin every IPFS CID found in album metadata from Pinata
 app.post('/api/nft/clear-all', authenticateToken, async (req, res) => {
     try {
         const userKey = resolveNftStorageKeyFromUser(req.user);
-        const userNftDir = path.join(NFT_DIR, String(userKey));
-        const metadataPath = getNftMetadataPath(userKey);
-
-        // Delete nft-album.json (the NFT list)
-        if (fs.existsSync(metadataPath)) {
-            fs.unlinkSync(metadataPath);
+        const deleteAssets = !!(req.body && req.body.deleteAssets);
+        const unpinIpfs = !!(req.body && req.body.unpinIpfs);
+        const targetWallet = normalizeWalletAddress(req.body && req.body.walletAddress);
+        if (!targetWallet) {
+            return res.status(400).json({ error: 'walletAddress is required' });
         }
 
-        // Delete certificates.json
-        const certsPath = path.join(userNftDir, 'certificates.json');
-        if (fs.existsSync(certsPath)) {
-            fs.unlinkSync(certsPath);
+        const parseJwtList = (value) => String(value || '').split(/[\s,]+/).map(v => v.trim()).filter(Boolean);
+        const extractCid = (url) => {
+            if (!url || typeof url !== 'string') return null;
+            const m = url.match(/\b(Qm[1-9A-HJ-NP-Za-km-z]{44,}|bafy[a-z2-7]{50,})\b/);
+            return m ? m[1] : null;
+        };
+        const resolveStealthCloudPath = (url) => {
+            if (!url || typeof url !== 'string') return null;
+            const raw = String(url).trim();
+            if (!raw || raw.startsWith('data:') || raw.startsWith('ipfs://')) return null;
+            let parsed;
+            try {
+                parsed = new URL(raw.startsWith('/') ? `https://stealthlynk.io${raw}` : raw);
+            } catch (_) {
+                return null;
+            }
+            const parts = parsed.pathname.split('/').filter(Boolean);
+            let folderKey = '';
+            let filename = '';
+            if (parts[0] === 'api' && parts[1] === 'nft' && parts[2] === 'image' && parts[3] && parts[4]) {
+                folderKey = sanitizeUserKey(parts[3]);
+                filename = path.basename(parts[4]);
+            } else if ((parsed.hostname.includes('nft.stealthlynk.io') || parsed.hostname.includes('stealthlynk.io')) && parts[0] && parts[1]) {
+                folderKey = sanitizeUserKey(parts[0]);
+                filename = path.basename(parts[1]);
+            }
+            if (!folderKey || !filename) return null;
+            return path.join(NFT_DIR, folderKey, filename);
+        };
+        const getPinataJwtCandidates = () => {
+            let nftConfig = null;
+            try { nftConfig = require('../nft-service/config'); } catch (_) { }
+            const dynamicEnvValues = Object.keys(process.env)
+                .filter(key => /^PINATA_JWT($|_)/.test(key))
+                .sort()
+                .flatMap(key => parseJwtList(process.env[key]));
+            return [...new Set([
+                nftConfig?.PINATA_JWT,
+                nftConfig?.PINATA_JWT_FALLBACK,
+                process.env.PINATA_JWT,
+                process.env.PINATA_JWT_FALLBACK,
+                process.env.PINATA_JWT_EXTRA,
+                ...(nftConfig?.PINATA_JWT_LIST ? parseJwtList(nftConfig.PINATA_JWT_LIST) : []),
+                ...parseJwtList(process.env.PINATA_JWT_LIST),
+                ...dynamicEnvValues,
+            ].filter(Boolean))];
+        };
+
+        const folderKeys = fs.readdirSync(NFT_DIR, { withFileTypes: true })
+            .filter(d => d.isDirectory())
+            .map(d => String(d.name));
+        const matchedFilePaths = new Set();
+        const matchedCids = new Set();
+        let nftsCleared = 0;
+        let certsCleared = 0;
+
+        for (const folderKey of folderKeys) {
+            const metadataPath = getNftMetadataPath(folderKey);
+            if (fs.existsSync(metadataPath)) {
+                try {
+                    const raw = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+                    const currentNfts = Array.isArray(raw) ? raw : (raw.nfts || []);
+                    const matchingNfts = filterNftsForWalletScope(currentNfts, targetWallet);
+                    if (matchingNfts.length > 0) {
+                        nftsCleared += matchingNfts.length;
+                        for (const nft of matchingNfts) {
+                            for (const field of ['imageUrl', 'arweaveUrl', 'thumbnailUrl']) {
+                                const cid = extractCid(nft[field]);
+                                if (cid) matchedCids.add(cid);
+                                const filePath = resolveStealthCloudPath(nft[field]);
+                                if (filePath) matchedFilePaths.add(filePath);
+                            }
+                            for (const field of ['ipfsThumbnailUrl', 'metadataUrl']) {
+                                const cid = extractCid(nft[field]);
+                                if (cid) matchedCids.add(cid);
+                            }
+                        }
+                        const remainingNfts = currentNfts.filter(nft => !nftMatchesWalletScope(nft, targetWallet));
+                        if (remainingNfts.length > 0) {
+                            fs.writeFileSync(metadataPath, JSON.stringify(Array.isArray(raw) ? remainingNfts : { ...raw, nfts: remainingNfts }, null, 2));
+                        } else {
+                            fs.unlinkSync(metadataPath);
+                        }
+                    }
+                } catch (_) { }
+            }
+
+            const certsPath = path.join(NFT_DIR, String(folderKey), 'certificates.json');
+            if (fs.existsSync(certsPath)) {
+                try {
+                    const currentCerts = JSON.parse(fs.readFileSync(certsPath, 'utf8'));
+                    const matchingCerts = filterCertificatesForWalletScope(Array.isArray(currentCerts) ? currentCerts : [], targetWallet);
+                    if (matchingCerts.length > 0) {
+                        certsCleared += matchingCerts.length;
+                        const remainingCerts = currentCerts.filter(cert => !certificateMatchesWalletScope(cert, targetWallet));
+                        if (remainingCerts.length > 0) {
+                            fs.writeFileSync(certsPath, JSON.stringify(remainingCerts, null, 2));
+                        } else {
+                            fs.unlinkSync(certsPath);
+                        }
+                    }
+                } catch (_) { }
+            }
         }
 
-        console.log(`[NFT] Cleared all NFTs for user: ${userKey}`);
-        res.json({ success: true, message: 'NFT album cleared' });
+        let filesDeleted = 0;
+        if (deleteAssets) {
+            for (const filePath of matchedFilePaths) {
+                try {
+                    if (fs.existsSync(filePath)) {
+                        fs.unlinkSync(filePath);
+                        filesDeleted++;
+                    }
+                } catch (_) { }
+            }
+        }
+
+        let unpinned = 0;
+        let unpinFailed = 0;
+        if (unpinIpfs) {
+            const pinataJwts = getPinataJwtCandidates();
+            if (!pinataJwts.length) {
+                unpinFailed = matchedCids.size;
+                console.log('[NFT] Unpin requested but no Pinata JWT configured');
+            } else {
+                for (const cid of matchedCids) {
+                    for (const jwt of pinataJwts) {
+                        try {
+                            await axios.delete(`https://api.pinata.cloud/pinning/unpin/${cid}`, {
+                                headers: { Authorization: `Bearer ${jwt}` },
+                                timeout: 15000,
+                            });
+                            unpinned++;
+                        } catch (e) {
+                            const status = e.response?.status;
+                            if (status === 404) {
+                                continue;
+                            }
+                            unpinFailed++;
+                            console.log(`[NFT] Unpin failed for CID ${cid}: ${status || e.message}`);
+                        }
+                    }
+                }
+            }
+        }
+
+        console.log(`[NFT] Cleared wallet album for user: ${userKey} wallet=${targetWallet} nfts=${nftsCleared} certs=${certsCleared} deleteAssets=${deleteAssets} filesDeleted=${filesDeleted} unpinIpfs=${unpinIpfs} unpinned=${unpinned} unpinFailed=${unpinFailed}`);
+        res.json({ success: true, message: 'NFT album cleared', walletAddress: targetWallet, nftsCleared, certsCleared, filesDeleted, unpinned, unpinFailed, totalCids: matchedCids.size });
     } catch (error) {
         console.error('[NFT] Clear all error:', error);
         res.status(500).json({ error: 'Failed to clear NFT album' });
