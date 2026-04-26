@@ -4508,13 +4508,18 @@ async function verifySolanaTransaction(txSignature, expectedSolAmount) {
 async function verifySkrTokenTransaction(txSignature, expectedSkrAmount, expectedTokenMint = SKR_TOKEN_MINT) {
     console.log('[Solana SKR] Verifying transaction:', txSignature, 'expected amount:', expectedSkrAmount);
 
-    const maxRetries = 5;
-    const retryDelay = 2000;
+    const maxRetries = 7;
+    const retryDelay = 2500;
     let tx = null;
+    let matchedTransfer = null;
+
+    const expectedRawAmount = Number.isFinite(Number(expectedSkrAmount)) && Number(expectedSkrAmount) > 0
+        ? Math.ceil(Number(expectedSkrAmount) * Math.pow(10, SKR_TOKEN_DECIMALS))
+        : null;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
-            console.log(`[Solana SKR] Attempt ${attempt}/${maxRetries} to fetch transaction`);
+            console.log(`[Solana SKR] Attempt ${attempt}/${maxRetries} to fetch/verify transaction`);
             const response = await axios.post(SOLANA_RPC_ENDPOINT, {
                 jsonrpc: '2.0',
                 id: 1,
@@ -4529,8 +4534,104 @@ async function verifySkrTokenTransaction(txSignature, expectedSkrAmount, expecte
             });
 
             tx = response.data?.result;
-            if (tx) break;
 
+            if (!tx) {
+                console.log(`[Solana SKR] Transaction not found yet (attempt ${attempt})`);
+                if (attempt < maxRetries) {
+                    await new Promise(resolve => setTimeout(resolve, retryDelay));
+                }
+                continue;
+            }
+
+            if (tx.meta && tx.meta.err) {
+                return { success: false, error: 'Transaction failed on chain' };
+            }
+
+            // --- Approach 1: postTokenBalances (preferred) ---
+            const preTokenBalances = Array.isArray(tx.meta?.preTokenBalances) ? tx.meta.preTokenBalances : [];
+            const postTokenBalances = Array.isArray(tx.meta?.postTokenBalances) ? tx.meta.postTokenBalances : [];
+
+            for (const postBalance of postTokenBalances) {
+                if (postBalance?.owner !== SOLANA_PAYMENT_WALLET) continue;
+                if (postBalance?.mint !== expectedTokenMint) continue;
+
+                const preBalance = preTokenBalances.find((entry) => entry.accountIndex === postBalance.accountIndex);
+                const postRaw = Number(postBalance?.uiTokenAmount?.amount || 0);
+                const preRaw = Number(preBalance?.uiTokenAmount?.amount || 0);
+                const deltaRaw = postRaw - preRaw;
+
+                if (deltaRaw > 0) {
+                    matchedTransfer = {
+                        receivedRawAmount: deltaRaw,
+                        owner: postBalance.owner,
+                        mint: postBalance.mint,
+                        blockTime: tx.blockTime,
+                        slot: tx.slot,
+                    };
+                    break;
+                }
+            }
+
+            if (matchedTransfer) break;
+
+            // --- Approach 2: Fallback — parse spl-token transfer instructions ---
+            const accountKeys = (tx.transaction?.message?.accountKeys || []).map(
+                k => (typeof k === 'string' ? k : k?.pubkey || '')
+            );
+            const allInstructions = [
+                ...(tx.transaction?.message?.instructions || []),
+                ...((tx.meta?.innerInstructions || []).flatMap(ii => ii.instructions || [])),
+            ];
+
+            for (const ix of allInstructions) {
+                if (ix.program !== 'spl-token') continue;
+                const pType = ix.parsed?.type;
+                if (pType !== 'transfer' && pType !== 'transferChecked') continue;
+
+                const info = ix.parsed?.info;
+                if (!info) continue;
+
+                const destAccount = info.destination;
+                const rawAmount = Number(pType === 'transferChecked' ? info.tokenAmount?.amount : info.amount) || 0;
+                if (rawAmount <= 0) continue;
+
+                const destIdx = accountKeys.indexOf(destAccount);
+                const destOwnerFromBalances = postTokenBalances.find(
+                    b => b.accountIndex === destIdx && b.mint === expectedTokenMint
+                );
+
+                if (destOwnerFromBalances?.owner === SOLANA_PAYMENT_WALLET) {
+                    matchedTransfer = {
+                        receivedRawAmount: rawAmount,
+                        owner: SOLANA_PAYMENT_WALLET,
+                        mint: expectedTokenMint,
+                        blockTime: tx.blockTime,
+                        slot: tx.slot,
+                    };
+                    break;
+                }
+
+                if (!destOwnerFromBalances) {
+                    const preDestBal = preTokenBalances.find(b => b.accountIndex === destIdx);
+                    if (!preDestBal && destIdx >= 0) {
+                        const paymentWalletIdx = accountKeys.indexOf(SOLANA_PAYMENT_WALLET);
+                        if (paymentWalletIdx >= 0) {
+                            matchedTransfer = {
+                                receivedRawAmount: rawAmount,
+                                owner: SOLANA_PAYMENT_WALLET,
+                                mint: expectedTokenMint,
+                                blockTime: tx.blockTime,
+                                slot: tx.slot,
+                            };
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (matchedTransfer) break;
+
+            console.log(`[Solana SKR] Tx found but no token match on attempt ${attempt}. postTokenBalances count: ${postTokenBalances.length}, instructions: ${allInstructions.length}`);
             if (attempt < maxRetries) {
                 await new Promise(resolve => setTimeout(resolve, retryDelay));
             }
@@ -4546,40 +4647,8 @@ async function verifySkrTokenTransaction(txSignature, expectedSkrAmount, expecte
         return { success: false, error: 'Transaction not found after retries - may still be propagating' };
     }
 
-    if (tx.meta && tx.meta.err) {
-        return { success: false, error: 'Transaction failed on chain' };
-    }
-
-    const preTokenBalances = Array.isArray(tx.meta?.preTokenBalances) ? tx.meta.preTokenBalances : [];
-    const postTokenBalances = Array.isArray(tx.meta?.postTokenBalances) ? tx.meta.postTokenBalances : [];
-    const expectedRawAmount = Number.isFinite(Number(expectedSkrAmount)) && Number(expectedSkrAmount) > 0
-        ? Math.ceil(Number(expectedSkrAmount) * Math.pow(10, SKR_TOKEN_DECIMALS))
-        : null;
-
-    let matchedTransfer = null;
-
-    for (const postBalance of postTokenBalances) {
-        if (postBalance?.owner !== SOLANA_PAYMENT_WALLET) continue;
-        if (postBalance?.mint !== expectedTokenMint) continue;
-
-        const preBalance = preTokenBalances.find((entry) => entry.accountIndex === postBalance.accountIndex);
-        const postRaw = Number(postBalance?.uiTokenAmount?.amount || 0);
-        const preRaw = Number(preBalance?.uiTokenAmount?.amount || 0);
-        const deltaRaw = postRaw - preRaw;
-
-        if (deltaRaw > 0) {
-            matchedTransfer = {
-                receivedRawAmount: deltaRaw,
-                owner: postBalance.owner,
-                mint: postBalance.mint,
-                blockTime: tx.blockTime,
-                slot: tx.slot,
-            };
-            break;
-        }
-    }
-
     if (!matchedTransfer) {
+        console.error('[Solana SKR] No valid transfer found. postTokenBalances:', JSON.stringify(tx.meta?.postTokenBalances || []));
         return { success: false, error: 'No valid SKR transfer to the payment wallet was found in transaction' };
     }
 
@@ -4590,6 +4659,7 @@ async function verifySkrTokenTransaction(txSignature, expectedSkrAmount, expecte
         };
     }
 
+    console.log(`[Solana SKR] Verified: ${matchedTransfer.receivedRawAmount} raw ${SKR_TOKEN_SYMBOL} to ${SOLANA_PAYMENT_WALLET}`);
     return {
         success: true,
         ...matchedTransfer,
@@ -8983,16 +9053,18 @@ try {
     const activateSolanaPremiumPlan = async (userId, purchaseTimestamp, options = {}) => {
         const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
         const purchasedAt = Number.isFinite(Number(purchaseTimestamp)) && Number(purchaseTimestamp) > 0 ? Number(purchaseTimestamp) : now;
+        const paymentType = options.paymentType === 'skr' ? 'premium_skr' : (options.paymentType === 'sol' ? 'premium_sol' : null);
         const storageResult = await ensurePremiumStorageCapacity(userId, now);
         await ensurePlanRow(userId);
 
         await dbRunAsync(
             `UPDATE user_plans
                 SET payment_at = COALESCE(payment_at, ?),
+                    payment_type = COALESCE(?, payment_type),
                     deleted_at = NULL,
                     updated_at = ?
               WHERE user_id = ?`,
-            [purchasedAt, now, userId]
+            [purchasedAt, paymentType, now, userId]
         );
 
         return {
@@ -9111,7 +9183,7 @@ try {
                 nftService.balance.recordPayment(user.id, 'premium_49', 49.99, txSignature, 'solana');
             }
 
-            const planActivation = await activateSolanaPremiumPlan(user.id, now, { now });
+            const planActivation = await activateSolanaPremiumPlan(user.id, now, { now, paymentType: 'sol' });
             if (planActivation.capacityExceeded) {
                 console.log(`[Solana Premium] Capacity check failed but payment already accepted. User ${user.id} will get premium entitlement without storage allocation.`);
             }
@@ -9200,7 +9272,7 @@ try {
                 nftService.balance.recordPayment(user.id, 'premium_49', 49.99, txSignature, 'skr');
             }
 
-            const planActivation = await activateSolanaPremiumPlan(user.id, now, { now });
+            const planActivation = await activateSolanaPremiumPlan(user.id, now, { now, paymentType: 'skr' });
             if (planActivation.capacityExceeded) {
                 console.log(`[Solana Premium SKR] Capacity check failed but payment already accepted. User ${user.id} will get premium entitlement without storage allocation.`);
             }
