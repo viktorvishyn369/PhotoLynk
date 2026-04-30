@@ -2193,6 +2193,24 @@ db.serialize(() => {
         UNIQUE(device_uuid_a, device_uuid_b)
     )`);
 
+    db.run(`CREATE TABLE IF NOT EXISTS nft_discount_cycles (
+        user_id INTEGER PRIMARY KEY,
+        cycle_started_at INTEGER NOT NULL,
+        cycle_expires_at INTEGER NOT NULL,
+        mint_count INTEGER NOT NULL DEFAULT 0,
+        updated_at INTEGER NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )`);
+
+    db.run(`CREATE TABLE IF NOT EXISTS nft_discount_mints (
+        user_id INTEGER NOT NULL,
+        mint_address TEXT NOT NULL,
+        counted_at INTEGER NOT NULL,
+        cycle_started_at INTEGER NOT NULL,
+        PRIMARY KEY(user_id, mint_address),
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )`);
+
     // Clean up database on startup - remove entries for files that don't exist
     setTimeout(() => {
         db.all(`
@@ -8199,27 +8217,13 @@ const readNftsForWalletGlobal = (walletAddress) => {
     return merged;
 };
 
-const getNftMintTimestamp = (nft) => {
-    const candidates = [nft?.mintedAt, nft?.createdAt, nft?.mintTimestamp, nft?.syncedAt, nft?.discoveredAt];
-    for (const value of candidates) {
-        const ts = new Date(value).getTime();
-        if (Number.isFinite(ts) && ts > 0) return ts;
-    }
-    return 0;
-};
-
 const buildWeeklyNftDiscountQuote = async ({ user }) => {
     const serverNow = Date.now();
     const windowMs = 7 * 24 * 60 * 60 * 1000;
-    const since = serverNow - windowMs;
     const userId = user.id;
-    const userKey = resolveNftStorageKeyFromUser(user);
-    const deviceUuid = sanitizeUserKey(user.device_uuid || user.deviceUuid);
-    const nfts = await readMergedNftsForDevice(deviceUuid || userKey, userId, [userKey]);
-    const weeklyMintCount = (Array.isArray(nfts) ? nfts : []).filter((nft) => {
-        const ts = getNftMintTimestamp(nft);
-        return ts >= since && ts <= serverNow;
-    }).length;
+    const cycle = await dbGetAsync(`SELECT * FROM nft_discount_cycles WHERE user_id = ?`, [userId]);
+    const activeCycle = cycle && Number(cycle.cycle_expires_at) > serverNow ? cycle : null;
+    const weeklyMintCount = activeCycle ? Math.max(0, Number(activeCycle.mint_count) || 0) : 0;
     const discountPercent = Math.min(90, Math.max(0, weeklyMintCount * 10));
     return {
         serverNow,
@@ -8230,7 +8234,40 @@ const buildWeeklyNftDiscountQuote = async ({ user }) => {
         appliesTo: 'skr_photolynk_fee',
         nextDiscountPercent: Math.min(90, discountPercent + 10),
         mintsToMaxDiscount: Math.max(0, 9 - weeklyMintCount),
+        cycleStartedAt: activeCycle ? Number(activeCycle.cycle_started_at) : null,
+        cycleExpiresAt: activeCycle ? Number(activeCycle.cycle_expires_at) : null,
     };
+};
+
+const registerNftDiscountMint = async ({ userId, mintAddress }) => {
+    const normalizedMint = normalizeWalletMint(mintAddress);
+    if (!userId || !normalizedMint) return null;
+    const serverNow = Date.now();
+    const windowMs = 7 * 24 * 60 * 60 * 1000;
+    const existingMint = await dbGetAsync(`SELECT mint_address FROM nft_discount_mints WHERE user_id = ? AND mint_address = ?`, [userId, normalizedMint]);
+    if (existingMint) return await dbGetAsync(`SELECT * FROM nft_discount_cycles WHERE user_id = ?`, [userId]);
+    let cycle = await dbGetAsync(`SELECT * FROM nft_discount_cycles WHERE user_id = ?`, [userId]);
+    if (!cycle || Number(cycle.cycle_expires_at) <= serverNow) {
+        const cycleExpiresAt = serverNow + windowMs;
+        await dbRunAsync(
+            `INSERT INTO nft_discount_cycles (user_id, cycle_started_at, cycle_expires_at, mint_count, updated_at)
+             VALUES (?, ?, ?, 0, ?)
+             ON CONFLICT(user_id) DO UPDATE SET cycle_started_at = excluded.cycle_started_at, cycle_expires_at = excluded.cycle_expires_at, mint_count = 0, updated_at = excluded.updated_at`,
+            [userId, serverNow, cycleExpiresAt, serverNow]
+        );
+        cycle = await dbGetAsync(`SELECT * FROM nft_discount_cycles WHERE user_id = ?`, [userId]);
+    }
+    await dbRunAsync(
+        `INSERT OR IGNORE INTO nft_discount_mints (user_id, mint_address, counted_at, cycle_started_at) VALUES (?, ?, ?, ?)`,
+        [userId, normalizedMint, serverNow, Number(cycle.cycle_started_at)]
+    );
+    await dbRunAsync(
+        `UPDATE nft_discount_cycles SET mint_count = (
+            SELECT COUNT(*) FROM nft_discount_mints WHERE user_id = ? AND cycle_started_at = ?
+         ), updated_at = ? WHERE user_id = ?`,
+        [userId, Number(cycle.cycle_started_at), serverNow, userId]
+    );
+    return await dbGetAsync(`SELECT * FROM nft_discount_cycles WHERE user_id = ?`, [userId]);
 };
 
 // Helper: read NFTs from all linked device folders and merge (dedup by mintAddress)
@@ -8339,6 +8376,7 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
                 data.nfts.push(nft);
                 console.log(`[NFT] Album add: user=${userId} mint=${nft.mintAddress}`);
             }
+            await registerNftDiscountMint({ userId, mintAddress: nft.mintAddress });
         } else if (action === 'remove' && mintAddress) {
             // Normalize cnft_ prefix so both cnft_ABC and ABC forms are removed
             const normMintTarget = normalizeWalletMint(mintAddress);
