@@ -831,6 +831,7 @@ app.post('/admin/api/user/plan', adminAuth, async (req, res) => {
         const params = [];
         const now = Date.now();
         const DAY_MS = 24 * 60 * 60 * 1000;
+        const hasRequestValue = (v) => v !== undefined && v !== null && v !== '';
 
         if (planGb !== undefined && planGb !== null && planGb !== '') {
             const normalized = normalizeTierGb(planGb);
@@ -888,6 +889,25 @@ app.post('/admin/api/user/plan', adminAuth, async (req, res) => {
             if (!allowed.has(String(status))) return res.status(400).json({ error: 'Invalid status' });
             updates.push('status = ?');
             params.push(String(status));
+            if (String(status) === 'active') {
+                if (!hasRequestValue(trialUntil) && !hasRequestValue(extendTrialDays)) {
+                    updates.push('trial_until = ?');
+                    params.push(null);
+                }
+                if (!hasRequestValue(graceUntil)) {
+                    updates.push('grace_until = ?');
+                    params.push(null);
+                }
+            } else if (String(status) === 'expired' || String(status) === 'none') {
+                if (!hasRequestValue(trialUntil) && !hasRequestValue(extendTrialDays)) {
+                    updates.push('trial_until = ?');
+                    params.push(null);
+                }
+                if (!hasRequestValue(graceUntil)) {
+                    updates.push('grace_until = ?');
+                    params.push(null);
+                }
+            }
         }
 
         if (!updates.length) return res.status(400).json({ error: 'No updates provided' });
@@ -1025,7 +1045,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
             const complimentaryUntil = trialUntil ? (trialUntil + complimentaryMs) : null;
             const graceMs = Math.max(0, SUBSCRIPTION_GRACE_DAYS) * 24 * 60 * 60 * 1000;
 
-            if (dbStatus === 'active' && expiresAt && expiresAt > 0 && expiresAt > now) return 'active';
+            if (dbStatus === 'active') return 'active';
             if (trialUntil && trialUntil > now) return 'trial';
             if (dbStatus === 'trial' && trialUntil && trialUntil > 0 && complimentaryUntil && now <= complimentaryUntil) {
                 return premGb > 0 ? 'premium_only' : 'trial_complimentary';
@@ -1038,7 +1058,6 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 const inGrace = gu && gu > 0 ? now <= gu : false;
                 return premGb > 0 ? 'premium_only' : (inGrace ? 'grace' : 'expired');
             }
-            if (dbStatus === 'active') return 'active';
             return premGb > 0 ? 'premium_only' : dbStatus;
         };
 
@@ -1531,7 +1550,7 @@ const getUserQuotaProfileFromRow = (row, now = Date.now()) => {
     const graceUntil = graceUntilRaw && graceUntilRaw > 0 ? graceUntilRaw : (expiresAt && expiresAt > 0 ? (expiresAt + graceMs) : null);
     const planGb = Number.isFinite(planGbRaw) && planGbRaw > 0 ? planGbRaw : 0;
     const premiumGb = Number.isFinite(premiumGbRaw) && premiumGbRaw > 0 ? premiumGbRaw : 0;
-    const paidPlanActive = status === 'active' && !!(expiresAt && expiresAt > now);
+    const paidPlanActive = status === 'active' && (!expiresAt || expiresAt > now);
     const trialActive = !!(trialUntil && trialUntil > now) && !paidPlanActive;
     const graceActive = !paidPlanActive && !!(expiresAt && expiresAt > 0 && expiresAt <= now && graceUntil && graceUntil > now);
     const effectivePlanGb = paidPlanActive || graceActive ? planGb : (trialActive ? Math.max(0, planGb - premiumGb) : 0);
@@ -1779,7 +1798,7 @@ const requireActiveSubscription = async (req, res, next) => {
     }
 };
 
-// Uploads remain available unless the account data has been deleted.
+// Uploads require an active storage plan/trial; read-only cloud access stays available unless data was deleted.
 const requireUploadSubscription = async (req, res, next) => {
     try {
         const st = await resolveSubscriptionState(req.user.id);
@@ -1788,6 +1807,16 @@ const requireUploadSubscription = async (req, res, next) => {
                 error: 'Data deleted',
                 code: 'SUBSCRIPTION_DATA_DELETED',
                 deletedAt: st.deletedAt,
+            });
+        }
+        const canUpload = st.status === 'active' || st.status === 'trial' || st.status === 'grace';
+        if (!canUpload) {
+            return res.status(402).json({
+                error: 'StealthCloud backup requires an active storage plan',
+                code: 'SUBSCRIPTION_REQUIRED',
+                status: st.status,
+                trialUntil: st.trialUntil || null,
+                expiresAt: st.expiresAt || null,
             });
         }
         return next();
@@ -6228,7 +6257,7 @@ app.get('/api/cloud/device-state', authenticateToken, blockDeletedSubscription, 
     }
 });
 
-app.put('/api/cloud/device-state', authenticateToken, blockDeletedSubscription, async (req, res) => {
+app.put('/api/cloud/device-state', authenticateToken, requireUploadSubscription, async (req, res) => {
     try {
         const deviceUuid = (req.user && (req.user.device_uuid || req.user.deviceUuid)) ? String(req.user.device_uuid || req.user.deviceUuid) : '';
         const state = req && req.body && typeof req.body === 'object' ? (req.body.state !== undefined ? req.body.state : req.body) : null;
@@ -9064,6 +9093,27 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
 try {
     const nftService = require('../nft-service');
     nftService.initialize();
+    nftService.balance.setFeeEntitlementProvider(async (userId) => {
+        const now = Date.now();
+        const st = await resolveSubscriptionState(userId);
+        if (nftService.balance.isPremium(userId) || Number(st.premiumGb) > 0 || st.status === 'premium_only') {
+            return {
+                photoLynkFeeFree: true,
+                reason: 'premium',
+                expiresAt: null,
+                message: 'Premium never expires and includes 0% PhotoLynk mint fees.',
+            };
+        }
+        if (st.status === 'active' && Number(st.planGb) > 0 && (!st.expiresAt || Number(st.expiresAt) > now)) {
+            return {
+                photoLynkFeeFree: true,
+                reason: 'active_plan',
+                expiresAt: st.expiresAt || null,
+                message: 'Your active storage plan includes 0% PhotoLynk mint fees until the plan expires. Renew to keep the perk.',
+            };
+        }
+        return { photoLynkFeeFree: false };
+    });
 
     app.use('/api/nft-service', (req, res, next) => {
         if (req.path === '/das-proxy' && (req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1')) {
