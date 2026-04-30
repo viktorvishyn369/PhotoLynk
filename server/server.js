@@ -2211,6 +2211,15 @@ db.serialize(() => {
         FOREIGN KEY(user_id) REFERENCES users(id)
     )`);
 
+    db.run(`CREATE TABLE IF NOT EXISTS nft_discount_loyalty (
+        user_id INTEGER PRIMARY KEY,
+        free_starts_at INTEGER NOT NULL,
+        free_expires_at INTEGER NOT NULL,
+        earned_at INTEGER NOT NULL,
+        qualifying_cycle_started_at INTEGER NOT NULL,
+        FOREIGN KEY(user_id) REFERENCES users(id)
+    )`);
+
     // Clean up database on startup - remove entries for files that don't exist
     setTimeout(() => {
         db.all(`
@@ -8222,18 +8231,28 @@ const buildWeeklyNftDiscountQuote = async ({ user }) => {
     const windowMs = 7 * 24 * 60 * 60 * 1000;
     const userId = user.id;
     const cycle = await dbGetAsync(`SELECT * FROM nft_discount_cycles WHERE user_id = ?`, [userId]);
+    const loyalty = await dbGetAsync(`SELECT * FROM nft_discount_loyalty WHERE user_id = ?`, [userId]);
     const activeCycle = cycle && Number(cycle.cycle_expires_at) > serverNow ? cycle : null;
+    const activeLoyalty = loyalty && Number(loyalty.free_starts_at) <= serverNow && Number(loyalty.free_expires_at) > serverNow ? loyalty : null;
+    const pendingLoyalty = loyalty && Number(loyalty.free_starts_at) > serverNow ? loyalty : null;
     const weeklyMintCount = activeCycle ? Math.max(0, Number(activeCycle.mint_count) || 0) : 0;
-    const discountPercent = Math.min(90, Math.max(0, weeklyMintCount * 10));
+    const gradualDiscountPercent = Math.min(90, Math.max(0, weeklyMintCount * 10));
+    const discountPercent = activeLoyalty ? 100 : gradualDiscountPercent;
     return {
         serverNow,
         windowDays: 7,
         weeklyMintCount,
         discountPercent,
-        multiplier: Math.max(0.1, (100 - discountPercent) / 100),
+        gradualDiscountPercent,
+        multiplier: activeLoyalty ? 0 : Math.max(0.1, (100 - discountPercent) / 100),
         appliesTo: 'skr_photolynk_fee',
-        nextDiscountPercent: Math.min(90, discountPercent + 10),
-        mintsToMaxDiscount: Math.max(0, 9 - weeklyMintCount),
+        nextDiscountPercent: activeLoyalty ? 100 : Math.min(90, discountPercent + 10),
+        mintsToMaxDiscount: activeLoyalty ? 0 : Math.max(0, 9 - weeklyMintCount),
+        mintsToLoyaltyFreeWeek: activeLoyalty ? 0 : Math.max(0, 100 - weeklyMintCount),
+        loyaltyFreeWeekActive: !!activeLoyalty,
+        loyaltyFreeWeekPending: !!pendingLoyalty,
+        loyaltyFreeStartsAt: activeLoyalty || pendingLoyalty ? Number((activeLoyalty || pendingLoyalty).free_starts_at) : null,
+        loyaltyFreeExpiresAt: activeLoyalty || pendingLoyalty ? Number((activeLoyalty || pendingLoyalty).free_expires_at) : null,
         cycleStartedAt: activeCycle ? Number(activeCycle.cycle_started_at) : null,
         cycleExpiresAt: activeCycle ? Number(activeCycle.cycle_expires_at) : null,
     };
@@ -8267,6 +8286,17 @@ const registerNftDiscountMint = async ({ userId, mintAddress }) => {
          ), updated_at = ? WHERE user_id = ?`,
         [userId, Number(cycle.cycle_started_at), serverNow, userId]
     );
+    const updatedCycle = await dbGetAsync(`SELECT * FROM nft_discount_cycles WHERE user_id = ?`, [userId]);
+    if (updatedCycle && Number(updatedCycle.mint_count) >= 100) {
+        const freeStartsAt = Number(updatedCycle.cycle_expires_at);
+        const freeExpiresAt = freeStartsAt + windowMs;
+        await dbRunAsync(
+            `INSERT INTO nft_discount_loyalty (user_id, free_starts_at, free_expires_at, earned_at, qualifying_cycle_started_at)
+             VALUES (?, ?, ?, ?, ?)
+             ON CONFLICT(user_id) DO UPDATE SET free_starts_at = excluded.free_starts_at, free_expires_at = excluded.free_expires_at, earned_at = excluded.earned_at, qualifying_cycle_started_at = excluded.qualifying_cycle_started_at`,
+            [userId, freeStartsAt, freeExpiresAt, serverNow, Number(updatedCycle.cycle_started_at)]
+        );
+    }
     return await dbGetAsync(`SELECT * FROM nft_discount_cycles WHERE user_id = ?`, [userId]);
 };
 
@@ -8664,22 +8694,33 @@ app.post('/api/nft/clear-all', authenticateToken, async (req, res) => {
                 console.log('[NFT] Unpin requested but no Pinata JWT configured');
             } else {
                 for (const cid of matchedCids) {
+                    let removed = false;
+                    let allNotFound = true;
                     for (const jwt of pinataJwts) {
                         try {
-                            await axios.delete(`https://api.pinata.cloud/pinning/unpin/${cid}`, {
+                            const response = await axios.delete(`https://api.pinata.cloud/pinning/unpin/${cid}`, {
                                 headers: { Authorization: `Bearer ${jwt}` },
                                 timeout: 15000,
+                                validateStatus: () => true,
                             });
-                            unpinned++;
-                        } catch (e) {
-                            const status = e.response?.status;
-                            if (status === 404) {
+                            if (response.status >= 200 && response.status < 300) {
+                                removed = true;
+                                break;
+                            }
+                            const body = typeof response.data === 'string' ? response.data : JSON.stringify(response.data || {});
+                            if (response.status === 404 || /CURRENT_USER_HAS_NOT_PINNED_CID|not.*pinned|not\s*found/i.test(body)) {
                                 continue;
                             }
-                            unpinFailed++;
+                            allNotFound = false;
+                            console.log(`[NFT] Unpin failed for CID ${cid}: ${response.status} ${body.slice(0, 200)}`);
+                        } catch (e) {
+                            allNotFound = false;
+                            const status = e.response?.status;
                             console.log(`[NFT] Unpin failed for CID ${cid}: ${status || e.message}`);
                         }
                     }
+                    if (removed || allNotFound) unpinned++;
+                    else unpinFailed++;
                 }
             }
         }
