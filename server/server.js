@@ -947,6 +947,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 u.alias_email,
                 u.seeker_id,
                 u.user_uuid,
+                u.storage_uuid,
                 u.created_at AS user_created_at,
                 GROUP_CONCAT(DISTINCT d.device_uuid) AS device_uuids,
                 MAX(d.last_seen) AS last_login,
@@ -1041,12 +1042,44 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
             return premGb > 0 ? 'premium_only' : dbStatus;
         };
 
+        const countStoredNftImages = (user) => {
+            try {
+                const keys = new Set();
+                const addKey = (v) => {
+                    const safe = sanitizeUserKey(v);
+                    if (safe) keys.add(safe);
+                };
+                addKey(user.id);
+                addKey(user.user_uuid);
+                addKey(user.storage_uuid);
+                if (user.device_uuids) {
+                    String(user.device_uuids).split(',').forEach(addKey);
+                }
+                const imageExts = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bin']);
+                let count = 0;
+                for (const key of keys) {
+                    const dir = path.join(NFT_DIR, key);
+                    if (!fs.existsSync(dir)) continue;
+                    const files = fs.readdirSync(dir).filter(f => {
+                        const p = path.join(dir, f);
+                        if (!fs.statSync(p).isFile()) return false;
+                        return imageExts.has(path.extname(f).toLowerCase());
+                    });
+                    count += files.length;
+                }
+                return count;
+            } catch (_) {
+                return 0;
+            }
+        };
+
         const formattedUsers = users.map(user => {
             const nftPayments = nftPaymentsByUser[user.id] || [];
             const premium = nftPremiumByUser[user.id] || {};
             const nftMintStats = nftMintStatsByUser[user.id] || {};
             const balance = nftBalanceByUser[user.id] || {};
             const solPayments = solanaPaymentsByUser[user.id] || [];
+            const storedNftImageCount = countStoredNftImages(user);
             const totalNftPaid = nftPayments.reduce((s, p) => s + (p.amount_usd || 0), 0);
             const totalSolPaid = solPayments.reduce((s, p) => s + (p.sol_amount || 0), 0);
             const totalSkrPaid = solPayments.reduce((s, p) => s + (p.skr_amount || 0), 0);
@@ -1065,6 +1098,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 seeker_id: user.seeker_id,
                 display_handle: displayHandle,
                 user_uuid: user.user_uuid,
+                storage_uuid: user.storage_uuid,
                 device_uuids: user.device_uuids || null,
                 user_created_at: user.user_created_at,
                 user_created_at_date: user.user_created_at ? new Date(user.user_created_at).toISOString() : null,
@@ -1092,10 +1126,11 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 },
                 nft: {
                     is_premium: !!(premium.isPremium),
-                    mint_count: nftMintStats.totalMintCount || 0,
+                    mint_count: Math.max(Number(nftMintStats.totalMintCount || 0), storedNftImageCount),
                     paid_mint_count: nftMintStats.paidMintCount || 0,
                     free_premium_mint_count: nftMintStats.freePremiumMintCount || 0,
                     premium_mint_count: nftMintStats.premiumMintCount || 0,
+                    stored_image_count: storedNftImageCount,
                     free_mints_remaining: premium.freeMintsRemaining || 0,
                     balance_usd: balance.balanceUsd || 0,
                     total_purchased_usd: balance.totalPurchased || 0,
