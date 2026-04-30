@@ -8200,7 +8200,7 @@ const buildWeeklyNftDiscountQuote = async ({ user }) => {
     const userId = user.id;
     const userKey = resolveNftStorageKeyFromUser(user);
     const deviceUuid = sanitizeUserKey(user.device_uuid || user.deviceUuid);
-    const nfts = await readMergedNftsForDevice(deviceUuid || userKey, userId);
+    const nfts = await readMergedNftsForDevice(deviceUuid || userKey, userId, [userKey]);
     const weeklyMintCount = (Array.isArray(nfts) ? nfts : []).filter((nft) => {
         const ts = getNftMintTimestamp(nft);
         return ts >= since && ts <= serverNow;
@@ -8219,8 +8219,12 @@ const buildWeeklyNftDiscountQuote = async ({ user }) => {
 };
 
 // Helper: read NFTs from all linked device folders and merge (dedup by mintAddress)
-const readMergedNftsForDevice = async (deviceUuid, userId) => {
+const readMergedNftsForDevice = async (deviceUuid, userId, includeKeys = []) => {
     const linkedUuids = await getLinkedDeviceUuids(deviceUuid, userId);
+    for (const key of includeKeys) {
+        const safeKey = sanitizeUserKey(key);
+        if (safeKey && !linkedUuids.includes(safeKey)) linkedUuids.push(safeKey);
+    }
     const seen = new Set();
     const merged = [];
 
@@ -8459,7 +8463,8 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
             if (n.arweaveUrl && n.arweaveUrl.startsWith('data:') && n.arweaveUrl.length > 5000) n.arweaveUrl = undefined;
         }
         fs.writeFileSync(metadataPath, JSON.stringify(data, null, 2));
-        res.json({ success: true, count: data.nfts.length });
+        const weeklyDiscountQuote = await buildWeeklyNftDiscountQuote({ user: req.user }).catch(() => null);
+        res.json({ success: true, count: data.nfts.length, weeklyDiscountQuote });
     } catch (error) {
         console.error('[NFT] Sync error:', error);
         res.status(500).json({ error: 'Failed to sync NFT album' });
