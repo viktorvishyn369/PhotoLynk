@@ -3722,6 +3722,21 @@ app.post('/api/save-wallet', authenticateToken, async (req, res) => {
     }
 });
 
+app.get('/api/wallet-profile', authenticateToken, async (req, res) => {
+    try {
+        const row = await dbGetAsync(`SELECT wallet_address, seeker_id, alias_email, email FROM users WHERE id = ?`, [req.user.id]);
+        const seekerId = deriveAdminDisplayHandle(row?.seeker_id, row?.alias_email, row?.email);
+        res.json({
+            success: true,
+            wallet_address: row?.wallet_address || null,
+            seeker_id: seekerId || null,
+        });
+    } catch (e) {
+        console.error('[Wallet] Profile error:', e.message);
+        res.status(500).json({ error: 'Failed to load wallet profile' });
+    }
+});
+
 // Lookup wallet address by email (for NFT transfers by email)
 app.post('/api/lookup-wallet', authenticateToken, async (req, res) => {
     try {
