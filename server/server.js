@@ -1640,16 +1640,9 @@ const resolveSubscriptionState = async (userId) => {
     }
 
     if (row.status === 'trial' && trialUntil && trialUntil > 0 && complimentaryUntil && complimentaryUntil < now) {
-        try {
-            const nextUpdatedAt = Date.now();
-            await dbRunAsync(
-                `UPDATE user_plans SET status = ?, plan_gb = NULL, trial_until = NULL, grace_until = NULL, expires_at = NULL, updated_at = ? WHERE user_id = ?`,
-                ['trial_complimentary_expired', nextUpdatedAt, userId]
-            );
-        } catch (e) { }
         if (premiumGb > 0) return await resolvePremiumState('premium_over_capacity', { complimentaryUntil });
         return {
-            allowed: false,
+            allowed: true,
             status: 'trial_complimentary_expired',
             trialUntil,
             complimentaryUntil,
@@ -1716,11 +1709,11 @@ const resolveSubscriptionState = async (userId) => {
             return await resolvePremiumState('premium_over_capacity');
         }
         return {
-            allowed: allowedInGrace,
+            allowed: true,
             status: allowedInGrace ? 'grace' : 'expired',
             expiresAt,
             graceUntil: gu,
-            planGb: allowedInGrace ? (planGb || null) : null,
+            planGb: planGb || null,
             premiumGb,
             paymentType: row.payment_type || null,
         };
@@ -1741,7 +1734,7 @@ const resolveSubscriptionState = async (userId) => {
     if (premiumGb > 0) return await resolvePremiumState('premium_over_capacity');
 
     return {
-        allowed: false,
+        allowed: true,
         status: row.status || 'none',
         trialUntil: trialUntil || null,
         expiresAt: expiresAt || null,
@@ -1773,31 +1766,6 @@ const blockDeletedSubscription = async (req, res, next) => {
 const requireActiveSubscription = async (req, res, next) => {
     try {
         const st = await resolveSubscriptionState(req.user.id);
-        if (st.allowed) return next();
-
-        if (st.status === 'trial_complimentary') {
-            return next(); // allow sync/read during complimentary window
-        }
-
-        if (st.status === 'grace' || st.status === 'expired') {
-            return res.status(402).json({
-                error: 'Subscription expired',
-                code: 'SUBSCRIPTION_EXPIRED',
-                expiresAt: st.expiresAt,
-                graceUntil: st.graceUntil,
-                deleteInDays: SUBSCRIPTION_GRACE_DAYS,
-            });
-        }
-
-        if (st.status === 'trial_expired' || st.status === 'trial_complimentary_expired') {
-            return res.status(402).json({
-                error: 'Trial expired',
-                code: 'TRIAL_EXPIRED',
-                trialUntil: st.trialUntil,
-                complimentaryUntil: st.complimentaryUntil || null,
-            });
-        }
-
         if (st.status === 'deleted') {
             return res.status(410).json({
                 error: 'Data deleted',
@@ -1805,50 +1773,16 @@ const requireActiveSubscription = async (req, res, next) => {
                 deletedAt: st.deletedAt,
             });
         }
-
-        return res.status(402).json({
-            error: 'Subscription required',
-            code: 'SUBSCRIPTION_REQUIRED',
-        });
+        return next();
     } catch (e) {
         return res.status(500).json({ error: 'Subscription check failed' });
     }
 };
 
-// Uploads are more restrictive than read-only sync.
-// Policy: active + trial + premium_only can upload; grace/trial_expired can only sync/restore.
+// Uploads remain available unless the account data has been deleted.
 const requireUploadSubscription = async (req, res, next) => {
     try {
         const st = await resolveSubscriptionState(req.user.id);
-        if (st.status === 'active' || st.status === 'trial' || st.status === 'premium_only') return next();
-
-        if (st.status === 'trial_complimentary') {
-            return res.status(402).json({
-                error: 'Trial complimentary window (sync-only)',
-                code: 'TRIAL_COMPLIMENTARY_SYNC_ONLY',
-                trialUntil: st.trialUntil,
-                complimentaryUntil: st.complimentaryUntil || null,
-            });
-        }
-
-        if (st.status === 'grace' || st.status === 'expired') {
-            return res.status(402).json({
-                error: 'Subscription expired (sync-only)',
-                code: 'SUBSCRIPTION_EXPIRED_SYNC_ONLY',
-                expiresAt: st.expiresAt,
-                graceUntil: st.graceUntil,
-                deleteInDays: SUBSCRIPTION_GRACE_DAYS,
-            });
-        }
-
-        if (st.status === 'trial_expired') {
-            return res.status(402).json({
-                error: 'Trial expired (sync-only)',
-                code: 'TRIAL_EXPIRED_SYNC_ONLY',
-                trialUntil: st.trialUntil,
-            });
-        }
-
         if (st.status === 'deleted') {
             return res.status(410).json({
                 error: 'Data deleted',
@@ -1856,11 +1790,7 @@ const requireUploadSubscription = async (req, res, next) => {
                 deletedAt: st.deletedAt,
             });
         }
-
-        return res.status(402).json({
-            error: 'Subscription required',
-            code: 'SUBSCRIPTION_REQUIRED',
-        });
+        return next();
     } catch (e) {
         return res.status(500).json({ error: 'Subscription check failed' });
     }
@@ -2511,45 +2441,7 @@ const purgeUserEverywhere = async (userId, options = {}) => {
 };
 
 const purgeExpiredComplimentaryUsers = async () => {
-    const complimentaryMs = Math.max(0, TRIAL_COMPLIMENTARY_DAYS) * 24 * 60 * 60 * 1000;
-    if (complimentaryMs <= 0) return { scanned: 0, purged: 0 };
-
-    const now = Date.now();
-    const expiredUsers = await dbAllAsync(
-        `SELECT u.id
-           FROM users u
-           JOIN user_plans p ON p.user_id = u.id
-          WHERE p.trial_until IS NOT NULL
-            AND p.trial_until > 0
-            AND (p.premium_gb IS NULL OR p.premium_gb <= 0)
-            AND (
-                p.status = 'trial_complimentary_expired'
-                OR (
-                    p.status = 'trial'
-                    AND (p.trial_until + ?) < ?
-                )
-            )`,
-        [complimentaryMs, now]
-    );
-
-    let purged = 0;
-    for (const row of expiredUsers) {
-        try {
-            const result = await purgeUserEverywhere(row.id, {
-                deleteFiles: true,
-                reason: 'expired_complimentary',
-            });
-            if (!result.alreadyDeleted) purged++;
-        } catch (e) {
-            console.error(`[ComplimentaryCleanup] Failed for user ${row.id}:`, e.message);
-        }
-    }
-
-    if (purged > 0) {
-        console.log(`[ComplimentaryCleanup] Purged ${purged} expired complimentary user(s)`);
-    }
-
-    return { scanned: expiredUsers.length, purged };
+    return { scanned: 0, purged: 0 };
 };
 
 const getStealthCloudStorageKey = (user) => {
