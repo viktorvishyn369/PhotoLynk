@@ -8184,6 +8184,40 @@ const readNftsForWalletGlobal = (walletAddress) => {
     return merged;
 };
 
+const getNftMintTimestamp = (nft) => {
+    const candidates = [nft?.mintedAt, nft?.createdAt, nft?.mintTimestamp, nft?.syncedAt, nft?.discoveredAt];
+    for (const value of candidates) {
+        const ts = new Date(value).getTime();
+        if (Number.isFinite(ts) && ts > 0) return ts;
+    }
+    return 0;
+};
+
+const buildWeeklyNftDiscountQuote = async ({ user }) => {
+    const serverNow = Date.now();
+    const windowMs = 7 * 24 * 60 * 60 * 1000;
+    const since = serverNow - windowMs;
+    const userId = user.id;
+    const userKey = resolveNftStorageKeyFromUser(user);
+    const deviceUuid = sanitizeUserKey(user.device_uuid || user.deviceUuid);
+    const nfts = await readMergedNftsForDevice(deviceUuid || userKey, userId);
+    const weeklyMintCount = (Array.isArray(nfts) ? nfts : []).filter((nft) => {
+        const ts = getNftMintTimestamp(nft);
+        return ts >= since && ts <= serverNow;
+    }).length;
+    const discountPercent = Math.min(90, Math.max(0, weeklyMintCount * 10));
+    return {
+        serverNow,
+        windowDays: 7,
+        weeklyMintCount,
+        discountPercent,
+        multiplier: Math.max(0.1, (100 - discountPercent) / 100),
+        appliesTo: 'skr_photolynk_fee',
+        nextDiscountPercent: Math.min(90, discountPercent + 10),
+        mintsToMaxDiscount: Math.max(0, 9 - weeklyMintCount),
+    };
+};
+
 // Helper: read NFTs from all linked device folders and merge (dedup by mintAddress)
 const readMergedNftsForDevice = async (deviceUuid, userId) => {
     const linkedUuids = await getLinkedDeviceUuids(deviceUuid, userId);
@@ -8215,6 +8249,19 @@ const readMergedNftsForDevice = async (deviceUuid, userId) => {
     }
     return merged;
 };
+
+app.get('/api/nft/weekly-discount', authenticateToken, async (req, res) => {
+    try {
+        const quote = await buildWeeklyNftDiscountQuote({
+            user: req.user,
+        });
+        res.setHeader('Cache-Control', 'no-store');
+        res.json({ success: true, quote });
+    } catch (error) {
+        console.error('[NFT] Weekly discount error:', error);
+        res.status(500).json({ error: 'Failed to get NFT weekly discount' });
+    }
+});
 
 // Get user's NFT album (list of minted NFTs) — merges linked device folders
 // GET /api/nft/list
