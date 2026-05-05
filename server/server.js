@@ -338,6 +338,7 @@ app.use(express.json({ limit: '25mb' }));
 
 // Serve static files from public directory (company website assets)
 app.use('/images', express.static(path.join(__dirname, 'public', 'images')));
+app.use('/paceseeker', express.static(path.join(__dirname, 'public', 'paceseeker')));
 
 // Desktop app downloads directory (builds uploaded here become available at /photolynk/download)
 const DOWNLOADS_DIR = process.env.DOWNLOADS_DIR || path.join(AUX_ROOT, 'downloads');
@@ -11446,8 +11447,8 @@ const startExifBackfill = async () => {
 
 const startHttp = () => {
     const httpServer = http.createServer(app);
-    httpServer.listen(PORT, '0.0.0.0', () => {
-        console.log(`\n🚀 Secure Backup Server running on 0.0.0.0:${PORT}`);
+    httpServer.listen(PORT, '127.0.0.1', () => {
+        console.log(`\n🚀 Secure Backup Server running on 127.0.0.1:${PORT}`);
         console.log(`📁 Upload directory: ${UPLOAD_DIR}`);
         console.log(`💾 Database: ${DB_PATH}\n`);
         startUpdateChecker();
@@ -11475,8 +11476,8 @@ const startHttps = () => {
     };
 
     const httpsServer = https.createServer(tlsOptions, app);
-    httpsServer.listen(HTTPS_PORT, '0.0.0.0', () => {
-        console.log(`\n🔐 HTTPS enabled on 0.0.0.0:${HTTPS_PORT}`);
+    httpsServer.listen(HTTPS_PORT, '127.0.0.1', () => {
+        console.log(`\n🔐 HTTPS enabled on 127.0.0.1:${HTTPS_PORT}`);
         console.log(`📁 Upload directory: ${UPLOAD_DIR}`);
         console.log(`💾 Database: ${DB_PATH}\n`);
         startUpdateChecker();
@@ -11492,8 +11493,8 @@ const startHttps = () => {
             const location = `https://${host}${portPart}${req.originalUrl}`;
             res.redirect(301, location);
         });
-        http.createServer(redirectApp).listen(PORT, '0.0.0.0', () => {
-            console.log(`↪️  HTTP redirect enabled on 0.0.0.0:${PORT} -> HTTPS`);
+        http.createServer(redirectApp).listen(PORT, '127.0.0.1', () => {
+            console.log(`↪️  HTTP redirect enabled on 127.0.0.1:${PORT} -> HTTPS`);
         });
     }
 };
