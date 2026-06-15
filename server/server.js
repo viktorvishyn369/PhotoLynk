@@ -2677,6 +2677,17 @@ app.get('/health', (req, res) => {
     res.status(200).json({ ok: true });
 });
 
+// PaceSeeker remote config (served here so Cloudflare Tunnel stays on port 3000)
+app.get('/remote-config.json', (req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    const cfgPath = path.join(__dirname, 'remote-config.json');
+    if (fs.existsSync(cfgPath)) {
+        return res.sendFile(cfgPath);
+    }
+    res.status(404).json({ error: 'Remote config not found' });
+});
+
 // ============================================================================
 // PHOTOLYNK DESKTOP DOWNLOADS — Self-hosted build distribution with SHA-256
 // ============================================================================
