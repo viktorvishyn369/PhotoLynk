@@ -225,3 +225,9 @@ server-tray/node_modules/
 server/sync/
 The_Carters/
 .windsurf
+
+# PaceSeeker trading app (private — never push to public repo)
+PaceSeeker/
+
+# Remote config with API keys (pulled at runtime, never committed)
+server/remote-config.json
