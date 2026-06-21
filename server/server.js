@@ -2688,6 +2688,33 @@ app.get('/remote-config.json', (req, res) => {
     res.status(404).json({ error: 'Remote config not found' });
 });
 
+
+// ─── PaceSeeker invite code tracker ───
+const USED_CODES_PATH = path.join(__dirname, 'used-invite-codes.json');
+let usedInviteCodes = new Set();
+try {
+  const existing = JSON.parse(fs.readFileSync(USED_CODES_PATH, 'utf8'));
+  if (Array.isArray(existing)) existing.forEach((c) => usedInviteCodes.add(c));
+} catch (_) { /* no file yet */ }
+function saveUsedInviteCodes() {
+  fs.writeFileSync(USED_CODES_PATH, JSON.stringify([...usedInviteCodes], null, 2) + '\n', 'utf8');
+}
+app.post('/track-invite', express.json(), (req, res) => {
+  const { code } = req.body || {};
+  if (!code || typeof code !== 'string' || code.length !== 15) {
+    return res.status(400).json({ error: 'Invalid code' });
+  }
+  const hash = crypto.createHash('sha256').update(code.toUpperCase()).digest('hex');
+  const alreadyUsed = usedInviteCodes.has(hash);
+  if (!alreadyUsed) {
+    usedInviteCodes.add(hash);
+    saveUsedInviteCodes();
+  }
+  res.json({ ok: true, alreadyUsed, count: usedInviteCodes.size });
+});
+app.get('/track-invite/stats', (_req, res) => {
+  res.json({ totalUsed: usedInviteCodes.size });
+});
 // ============================================================================
 // PHOTOLYNK DESKTOP DOWNLOADS — Self-hosted build distribution with SHA-256
 // ============================================================================
