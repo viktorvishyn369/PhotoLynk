@@ -228,6 +228,15 @@ The_Carters/
 
 # PaceSeeker trading app (private — never push to public repo)
 PaceSeeker/
+PaceSeeker*/
+
+# Companion app (private — never push to public repo)
+Companion/
+
+# DietPlanner (different developer — do not push)
+dietplanner/
+DietPlanner/
+dietplanner-pages/
 
 # Remote config with API keys (pulled at runtime, never committed)
 server/remote-config.json
