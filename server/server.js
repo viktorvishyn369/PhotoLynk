@@ -311,7 +311,8 @@ const COMPLIMENTARY_PURGE_INTERVAL_MS = Number.parseInt(process.env.COMPLIMENTAR
 const REVENUECAT_WEBHOOK_SECRET = process.env.REVENUECAT_WEBHOOK_SECRET || '';
 const USER_QUOTA_MARGIN_BYTES = Number.parseInt(process.env.USER_QUOTA_MARGIN_BYTES || String(50 * 1024 * 1024), 10);
 const GB_BYTES = 1000 * 1000 * 1000;
-const PREMIUM_STORAGE_GB = 20;
+const PREMIUM_STORAGE_GB = 1000;
+const PREMIUM_STORAGE_DURATION_MS = 365 * 24 * 60 * 60 * 1000; // 1 year
 const ENABLE_CLOUD_UPLOAD_LOCK = String(process.env.ENABLE_CLOUD_UPLOAD_LOCK || 'true').toLowerCase() !== 'false';
 const ADMIN_USER = process.env.ADMIN_USER || '';
 const ADMIN_PASSWORD_BCRYPT = process.env.ADMIN_PASSWORD_BCRYPT || '';
@@ -679,7 +680,7 @@ function renderTable(){
     html+='<td class="uuid-cell" title="'+(u.device_uuids||'')+'" onclick="copyUuid(this,&apos;'+((u.device_uuids||'').replace(/'/g,'&apos;'))+'&apos;)">'+((u.device_uuids||'').substring(0,13)||'-')+'</td>';
     html+='<td>'+fmtLogin(u.last_login_date)+'</td>';
     html+='<td>'+storageCell(u.storage_used,u.storage_quota)+'</td>';
-    var planStr=planLabel(u.plan_gb);if(u.premium_gb)planStr+=' <span class="payment-badge nft-premium" style="font-size:9px">+'+u.premium_gb+'GB</span>';
+    var planStr=planLabel(u.plan_gb);if(u.premium_gb)planStr+=' <span class="payment-badge nft-premium" style="font-size:9px">+'+u.premium_gb+'GB</span>';if(u.premium_expires_at)planStr+='<br><span class="mini-tag">expires '+fmtDate(u.premium_expires_at).replace(/<[^>]*>/g,'')+'</span>';
     html+='<td class="plan-cell">'+planStr+'</td>';
     html+='<td>'+statusBadge(u.status)+'</td>';
     var nftStr=u.nft_mints>0?'<span class="nft-count">'+u.nft_mints+'</span>':'<span class="date-cell">0</span>';
@@ -974,6 +975,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 MAX(d.last_seen) AS last_login,
                 p.plan_gb,
                 p.premium_gb,
+                p.premium_expires_at,
                 p.status as plan_status,
                 p.trial_until,
                 p.expires_at,
@@ -1130,6 +1132,8 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 plan: {
                     plan_gb: user.plan_gb,
                     premium_gb: user.premium_gb,
+                    premium_expires_at: user.premium_expires_at,
+                    premium_expires_at_date: user.premium_expires_at ? new Date(user.premium_expires_at).toISOString() : null,
                     status: user.plan_status,
                     effective_status: effectiveStatus,
                     trial_until: user.trial_until,
@@ -1540,6 +1544,7 @@ const getUserQuotaProfileFromRow = (row, now = Date.now()) => {
     const status = row && row.status ? String(row.status) : 'none';
     const planGbRaw = row && row.plan_gb !== null && row.plan_gb !== undefined ? Number(row.plan_gb) : 0;
     const premiumGbRaw = row && row.premium_gb !== null && row.premium_gb !== undefined ? Number(row.premium_gb) : 0;
+    const premiumExpiresAt = row && row.premium_expires_at ? Number(row.premium_expires_at) : null;
     const expiresAt = row && row.expires_at ? Number(row.expires_at) : null;
     const graceUntilRaw = row && row.grace_until ? Number(row.grace_until) : null;
     const trialUntil = row && row.trial_until ? Number(row.trial_until) : null;
@@ -1550,7 +1555,11 @@ const getUserQuotaProfileFromRow = (row, now = Date.now()) => {
     const graceMs = Math.max(0, SUBSCRIPTION_GRACE_DAYS) * 24 * 60 * 60 * 1000;
     const graceUntil = graceUntilRaw && graceUntilRaw > 0 ? graceUntilRaw : (expiresAt && expiresAt > 0 ? (expiresAt + graceMs) : null);
     const planGb = Number.isFinite(planGbRaw) && planGbRaw > 0 ? planGbRaw : 0;
-    const premiumGb = Number.isFinite(premiumGbRaw) && premiumGbRaw > 0 ? premiumGbRaw : 0;
+    // Premium storage expires after premium_expires_at; NFT minting benefits remain via nft-service
+    let premiumGb = Number.isFinite(premiumGbRaw) && premiumGbRaw > 0 ? premiumGbRaw : 0;
+    if (premiumGb > 0 && premiumExpiresAt && premiumExpiresAt > 0 && now > premiumExpiresAt) {
+        premiumGb = 0;
+    }
     const paidPlanActive = status === 'active' && (!expiresAt || expiresAt > now);
     const trialActive = !!(trialUntil && trialUntil > now) && !paidPlanActive;
     const graceActive = !paidPlanActive && !!(expiresAt && expiresAt > 0 && expiresAt <= now && graceUntil && graceUntil > now);
@@ -1921,6 +1930,7 @@ db.serialize(() => {
         user_id INTEGER PRIMARY KEY,
         plan_gb INTEGER,
         premium_gb INTEGER,
+        premium_expires_at INTEGER,
         rc_app_user_id TEXT,
         rc_product_id TEXT,
         rc_entitlement TEXT,
@@ -1946,6 +1956,9 @@ db.serialize(() => {
         }
         if (!names.includes('premium_gb')) {
             db.run(`ALTER TABLE user_plans ADD COLUMN premium_gb INTEGER`, [], () => { });
+        }
+        if (!names.includes('premium_expires_at')) {
+            db.run(`ALTER TABLE user_plans ADD COLUMN premium_expires_at INTEGER`, [], () => { });
         }
         if (!names.includes('rc_app_user_id')) {
             db.run(`ALTER TABLE user_plans ADD COLUMN rc_app_user_id TEXT`, [], () => { });
@@ -2171,12 +2184,10 @@ db.serialize(() => {
         FOREIGN KEY(user_id) REFERENCES users(id)
     )`);
 
-    db.run(`CREATE TABLE IF NOT EXISTS nft_discount_loyalty (
+    db.run(`CREATE TABLE IF NOT EXISTS nft_discount_streaks (
         user_id INTEGER PRIMARY KEY,
-        free_starts_at INTEGER NOT NULL,
-        free_expires_at INTEGER NOT NULL,
-        earned_at INTEGER NOT NULL,
-        qualifying_cycle_started_at INTEGER NOT NULL,
+        streak_count INTEGER NOT NULL DEFAULT 0,
+        last_qualifying_cycle_started_at INTEGER,
         FOREIGN KEY(user_id) REFERENCES users(id)
     )`);
 
@@ -2710,6 +2721,17 @@ app.post('/track-invite', express.json(), (req, res) => {
     usedInviteCodes.add(hash);
     saveUsedInviteCodes();
   }
+  res.json({ ok: true, alreadyUsed, count: usedInviteCodes.size });
+});
+// Read-only check — does NOT consume the code. Used by the client for
+// background re-verification of offline-redemptions.
+app.post('/check-invite', express.json(), (req, res) => {
+  const { code } = req.body || {};
+  if (!code || typeof code !== 'string' || code.length !== 15) {
+    return res.status(400).json({ error: 'Invalid code' });
+  }
+  const hash = crypto.createHash('sha256').update(code.toUpperCase()).digest('hex');
+  const alreadyUsed = usedInviteCodes.has(hash);
   res.json({ ok: true, alreadyUsed, count: usedInviteCodes.size });
 });
 app.get('/track-invite/stats', (_req, res) => {
@@ -3754,7 +3776,7 @@ app.get('/api/subscription/status', authenticateToken, async (req, res) => {
             const nftService = require('../nft-service');
             const premiumStatus = nftService.balance.getPremiumStatus(userId);
             if (premiumStatus && premiumStatus.isPremium) {
-                const row = await dbGetAsync(`SELECT premium_gb, status, expires_at, payment_type FROM user_plans WHERE user_id = ?`, [userId]);
+                const row = await dbGetAsync(`SELECT premium_gb, premium_expires_at, status, expires_at, payment_type FROM user_plans WHERE user_id = ?`, [userId]);
                 const latestSolanaPremium = await dbGetAsync(
                     `SELECT created_at
                        FROM solana_payments
@@ -3771,12 +3793,20 @@ app.get('/api/subscription/status', authenticateToken, async (req, res) => {
                     const healed = await activateSolanaPremiumPlan(userId, Number(latestSolanaPremium.created_at) || Date.now(), { now: Date.now() });
                     console.log(`[Premium] Self-healed Solana premium plan for user ${userId} (storageAllocated=${healed.storageAllocated})`);
                 } else if (!latestSolanaPremium && (!row || !row.premium_gb || Number(row.premium_gb) !== PREMIUM_STORAGE_GB)) {
+                    const now = Date.now();
                     await ensurePlanRow(userId);
                     await dbRunAsync(
-                        `UPDATE user_plans SET premium_gb = ?, updated_at = ? WHERE user_id = ?`,
-                        [PREMIUM_STORAGE_GB, Date.now(), userId]
+                        `UPDATE user_plans SET premium_gb = ?, premium_expires_at = ?, updated_at = ? WHERE user_id = ?`,
+                        [PREMIUM_STORAGE_GB, now + PREMIUM_STORAGE_DURATION_MS, now, userId]
                     );
                     console.log(`[Premium] Self-healed premium_gb=${PREMIUM_STORAGE_GB} for user ${userId}`);
+                } else if (row && row.premium_gb && Number(row.premium_gb) === PREMIUM_STORAGE_GB && !row.premium_expires_at) {
+                    const now = Date.now();
+                    await dbRunAsync(
+                        `UPDATE user_plans SET premium_expires_at = ?, updated_at = ? WHERE user_id = ?`,
+                        [now + PREMIUM_STORAGE_DURATION_MS, now, userId]
+                    );
+                    console.log(`[Premium] Self-healed premium_expires_at for user ${userId}`);
                 }
             }
         } catch (_) { /* nft-service not available */ }
@@ -6809,8 +6839,17 @@ app.patch('/api/cloud/manifests/:manifestId', authenticateToken, (req, res) => {
         const {
             filename, mediaType, originalSize, fileHash, perceptualHash,
             creationTime, exifCaptureTime, exifMake, exifModel,
-            thumbChunkId, thumbNonce, thumbSize, thumbW, thumbH, thumbMime
+            thumbChunkId, thumbNonce, thumbSize, thumbW, thumbH, thumbMime,
+            encryptedManifest
         } = req.body || {};
+
+        // Allow updating encryptedManifest for re-encryption migration.
+        // Client-side encrypted data — server cannot verify content.
+        if (encryptedManifest && typeof encryptedManifest === 'string') {
+            content.encryptedManifest = encryptedManifest;
+            content.reencryptedAt = new Date().toISOString();
+            console.log(`[SC] Updated encryptedManifest for manifest ${safeId}`);
+        }
 
         // Initialize meta if missing
         if (!content.meta) content.meta = {};
@@ -8191,28 +8230,31 @@ const buildWeeklyNftDiscountQuote = async ({ user }) => {
     const windowMs = 7 * 24 * 60 * 60 * 1000;
     const userId = user.id;
     const cycle = await dbGetAsync(`SELECT * FROM nft_discount_cycles WHERE user_id = ?`, [userId]);
-    const loyalty = await dbGetAsync(`SELECT * FROM nft_discount_loyalty WHERE user_id = ?`, [userId]);
+    const streak = await dbGetAsync(`SELECT * FROM nft_discount_streaks WHERE user_id = ?`, [userId]);
     const activeCycle = cycle && Number(cycle.cycle_expires_at) > serverNow ? cycle : null;
-    const activeLoyalty = loyalty && Number(loyalty.free_starts_at) <= serverNow && Number(loyalty.free_expires_at) > serverNow ? loyalty : null;
-    const pendingLoyalty = loyalty && Number(loyalty.free_starts_at) > serverNow ? loyalty : null;
     const weeklyMintCount = activeCycle ? Math.max(0, Number(activeCycle.mint_count) || 0) : 0;
-    const gradualDiscountPercent = Math.min(90, Math.max(0, weeklyMintCount * 10));
-    const discountPercent = activeLoyalty ? 100 : gradualDiscountPercent;
+    const streakCount = streak ? Math.max(0, Number(streak.streak_count) || 0) : 0;
+    // Streak bonus: each consecutive qualified week (≥10 mints) adds +10% starting discount.
+    const streakBonusPercent = Math.min(80, streakCount * 10);
+    const effectiveMintCount = weeklyMintCount + (streakBonusPercent / 10);
+    const gradualDiscountPercent = Math.min(90, Math.max(0, Math.floor(effectiveMintCount) * 10));
+    const discountPercent = gradualDiscountPercent;
     return {
         serverNow,
         windowDays: 7,
         weeklyMintCount,
+        streakCount,
+        streakBonusPercent,
         discountPercent,
         gradualDiscountPercent,
-        multiplier: activeLoyalty ? 0 : Math.max(0.1, (100 - discountPercent) / 100),
+        multiplier: Math.max(0.1, (100 - discountPercent) / 100),
         appliesTo: 'skr_photolynk_fee',
-        nextDiscountPercent: activeLoyalty ? 100 : Math.min(90, discountPercent + 10),
-        mintsToMaxDiscount: activeLoyalty ? 0 : Math.max(0, 9 - weeklyMintCount),
-        mintsToLoyaltyFreeWeek: activeLoyalty ? 0 : Math.max(0, 100 - weeklyMintCount),
-        loyaltyFreeWeekActive: !!activeLoyalty,
-        loyaltyFreeWeekPending: !!pendingLoyalty,
-        loyaltyFreeStartsAt: activeLoyalty || pendingLoyalty ? Number((activeLoyalty || pendingLoyalty).free_starts_at) : null,
-        loyaltyFreeExpiresAt: activeLoyalty || pendingLoyalty ? Number((activeLoyalty || pendingLoyalty).free_expires_at) : null,
+        nextDiscountPercent: Math.min(90, discountPercent + 10),
+        mintsToMaxDiscount: Math.max(0, Math.ceil(9 - effectiveMintCount)),
+        loyaltyFreeWeekActive: false,
+        loyaltyFreeWeekPending: false,
+        loyaltyFreeStartsAt: null,
+        loyaltyFreeExpiresAt: null,
         cycleStartedAt: activeCycle ? Number(activeCycle.cycle_started_at) : null,
         cycleExpiresAt: activeCycle ? Number(activeCycle.cycle_expires_at) : null,
     };
@@ -8223,10 +8265,15 @@ const registerNftDiscountMint = async ({ userId, mintAddress }) => {
     if (!userId || !normalizedMint) return null;
     const serverNow = Date.now();
     const windowMs = 7 * 24 * 60 * 60 * 1000;
-    const existingMint = await dbGetAsync(`SELECT mint_address FROM nft_discount_mints WHERE user_id = ? AND mint_address = ?`, [userId, normalizedMint]);
-    if (existingMint) return await dbGetAsync(`SELECT * FROM nft_discount_cycles WHERE user_id = ?`, [userId]);
     let cycle = await dbGetAsync(`SELECT * FROM nft_discount_cycles WHERE user_id = ?`, [userId]);
+    let cycleWasReset = false;
+    let oldCycleMintCount = 0;
+    let oldCycleExpiredAt = 0;
     if (!cycle || Number(cycle.cycle_expires_at) <= serverNow) {
+        if (cycle) {
+            oldCycleMintCount = Number(cycle.mint_count) || 0;
+            oldCycleExpiredAt = Number(cycle.cycle_expires_at) || 0;
+        }
         const cycleExpiresAt = serverNow + windowMs;
         await dbRunAsync(
             `INSERT INTO nft_discount_cycles (user_id, cycle_started_at, cycle_expires_at, mint_count, updated_at)
@@ -8235,7 +8282,29 @@ const registerNftDiscountMint = async ({ userId, mintAddress }) => {
             [userId, serverNow, cycleExpiresAt, serverNow]
         );
         cycle = await dbGetAsync(`SELECT * FROM nft_discount_cycles WHERE user_id = ?`, [userId]);
+        cycleWasReset = true;
     }
+    // When cycle resets, purge old mint entries so the new cycle starts clean.
+    if (cycleWasReset) {
+        await dbRunAsync(`DELETE FROM nft_discount_mints WHERE user_id = ?`, [userId]);
+        // Update streak: previous cycle must have had ≥10 mints AND no more than one cycle gap.
+        const gapMs = oldCycleExpiredAt > 0 ? (serverNow - oldCycleExpiredAt) : 0;
+        const hadQualifiedWeek = oldCycleMintCount >= 10;
+        const gapWithinOneCycle = gapMs <= windowMs;
+        const existingStreak = await dbGetAsync(`SELECT * FROM nft_discount_streaks WHERE user_id = ?`, [userId]);
+        let newStreak = 0;
+        if (hadQualifiedWeek && gapWithinOneCycle) {
+            newStreak = (existingStreak ? Number(existingStreak.streak_count) : 0) + 1;
+        }
+        await dbRunAsync(
+            `INSERT INTO nft_discount_streaks (user_id, streak_count, last_qualifying_cycle_started_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(user_id) DO UPDATE SET streak_count = excluded.streak_count, last_qualifying_cycle_started_at = excluded.last_qualifying_cycle_started_at`,
+            [userId, newStreak, serverNow]
+        );
+    }
+    const existingMint = await dbGetAsync(`SELECT mint_address FROM nft_discount_mints WHERE user_id = ? AND mint_address = ? AND cycle_started_at = ?`, [userId, normalizedMint, Number(cycle.cycle_started_at)]);
+    if (existingMint) return await dbGetAsync(`SELECT * FROM nft_discount_cycles WHERE user_id = ?`, [userId]);
     await dbRunAsync(
         `INSERT OR IGNORE INTO nft_discount_mints (user_id, mint_address, counted_at, cycle_started_at) VALUES (?, ?, ?, ?)`,
         [userId, normalizedMint, serverNow, Number(cycle.cycle_started_at)]
@@ -8246,17 +8315,6 @@ const registerNftDiscountMint = async ({ userId, mintAddress }) => {
          ), updated_at = ? WHERE user_id = ?`,
         [userId, Number(cycle.cycle_started_at), serverNow, userId]
     );
-    const updatedCycle = await dbGetAsync(`SELECT * FROM nft_discount_cycles WHERE user_id = ?`, [userId]);
-    if (updatedCycle && Number(updatedCycle.mint_count) >= 100) {
-        const freeStartsAt = Number(updatedCycle.cycle_expires_at);
-        const freeExpiresAt = freeStartsAt + windowMs;
-        await dbRunAsync(
-            `INSERT INTO nft_discount_loyalty (user_id, free_starts_at, free_expires_at, earned_at, qualifying_cycle_started_at)
-             VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT(user_id) DO UPDATE SET free_starts_at = excluded.free_starts_at, free_expires_at = excluded.free_expires_at, earned_at = excluded.earned_at, qualifying_cycle_started_at = excluded.qualifying_cycle_started_at`,
-            [userId, freeStartsAt, freeExpiresAt, serverNow, Number(updatedCycle.cycle_started_at)]
-        );
-    }
     return await dbGetAsync(`SELECT * FROM nft_discount_cycles WHERE user_id = ?`, [userId]);
 };
 
@@ -8592,24 +8650,29 @@ app.post('/api/nft/clear-all', authenticateToken, async (req, res) => {
                     const currentNfts = Array.isArray(raw) ? raw : (raw.nfts || []);
                     const matchingNfts = filterNftsForWalletScope(currentNfts, targetWallet);
                     if (matchingNfts.length > 0) {
-                        nftsCleared += matchingNfts.length;
-                        for (const nft of matchingNfts) {
-                            for (const field of ['imageUrl', 'arweaveUrl', 'thumbnailUrl']) {
-                                const cid = extractCid(nft[field]);
-                                if (cid) matchedCids.add(cid);
-                                const filePath = resolveStealthCloudPath(nft[field]);
-                                if (filePath) matchedFilePaths.add(filePath);
+                        // Only purge album entries when permanently deleting assets.
+                        // When just clearing the album view, preserve metadata (including
+                        // encryptionData) so rescanned encrypted NFTs can still decrypt.
+                        if (deleteAssets) {
+                            nftsCleared += matchingNfts.length;
+                            for (const nft of matchingNfts) {
+                                for (const field of ['imageUrl', 'arweaveUrl', 'thumbnailUrl']) {
+                                    const cid = extractCid(nft[field]);
+                                    if (cid) matchedCids.add(cid);
+                                    const filePath = resolveStealthCloudPath(nft[field]);
+                                    if (filePath) matchedFilePaths.add(filePath);
+                                }
+                                for (const field of ['ipfsThumbnailUrl', 'metadataUrl']) {
+                                    const cid = extractCid(nft[field]);
+                                    if (cid) matchedCids.add(cid);
+                                }
                             }
-                            for (const field of ['ipfsThumbnailUrl', 'metadataUrl']) {
-                                const cid = extractCid(nft[field]);
-                                if (cid) matchedCids.add(cid);
+                            const remainingNfts = currentNfts.filter(nft => !nftMatchesWalletScope(nft, targetWallet));
+                            if (remainingNfts.length > 0) {
+                                fs.writeFileSync(metadataPath, JSON.stringify(Array.isArray(raw) ? remainingNfts : { ...raw, nfts: remainingNfts }, null, 2));
+                            } else {
+                                fs.unlinkSync(metadataPath);
                             }
-                        }
-                        const remainingNfts = currentNfts.filter(nft => !nftMatchesWalletScope(nft, targetWallet));
-                        if (remainingNfts.length > 0) {
-                            fs.writeFileSync(metadataPath, JSON.stringify(Array.isArray(raw) ? remainingNfts : { ...raw, nfts: remainingNfts }, null, 2));
-                        } else {
-                            fs.unlinkSync(metadataPath);
                         }
                     }
                 } catch (_) { }
@@ -9140,7 +9203,7 @@ try {
                 photoLynkFeeFree: true,
                 reason: 'premium',
                 expiresAt: null,
-                message: 'Premium never expires and includes 0% PhotoLynk mint fees.',
+                message: 'Premium includes 0% PhotoLynk mint fees while active.',
             };
         }
         if (st.status === 'active' && Number(st.planGb) > 0 && (!st.expiresAt || Number(st.expiresAt) > now)) {
@@ -9165,13 +9228,23 @@ try {
     // Client calls this right after a successful /api/nft-service/upgrade-premium response
     const ensurePremiumStorageCapacity = async (userId, now) => {
         await ensurePlanRow(userId);
-        const existingRow = await dbGetAsync(`SELECT plan_gb, premium_gb, status, trial_until FROM user_plans WHERE user_id = ?`, [userId]);
+        const existingRow = await dbGetAsync(`SELECT plan_gb, premium_gb, premium_expires_at, status, trial_until FROM user_plans WHERE user_id = ?`, [userId]);
         const existingPremiumGb = existingRow && existingRow.premium_gb !== null && existingRow.premium_gb !== undefined ? Number(existingRow.premium_gb) : 0;
-        if (existingPremiumGb === PREMIUM_STORAGE_GB) return { premiumGb: PREMIUM_STORAGE_GB, allocated: true };
+        if (existingPremiumGb === PREMIUM_STORAGE_GB) {
+            const existingExpiresAt = existingRow.premium_expires_at ? Number(existingRow.premium_expires_at) : null;
+            // Renew expired allocations; backfill missing expiration timestamps
+            if (!existingExpiresAt || existingExpiresAt <= now) {
+                await dbRunAsync(
+                    `UPDATE user_plans SET premium_expires_at = ?, updated_at = ? WHERE user_id = ?`,
+                    [now + PREMIUM_STORAGE_DURATION_MS, now, userId]
+                );
+            }
+            return { premiumGb: PREMIUM_STORAGE_GB, allocated: true };
+        }
         if (existingPremiumGb > 0) {
             await dbRunAsync(
-                `UPDATE user_plans SET premium_gb = ?, updated_at = ? WHERE user_id = ?`,
-                [PREMIUM_STORAGE_GB, now, userId]
+                `UPDATE user_plans SET premium_gb = ?, premium_expires_at = ?, updated_at = ? WHERE user_id = ?`,
+                [PREMIUM_STORAGE_GB, now + PREMIUM_STORAGE_DURATION_MS, now, userId]
             );
             return { premiumGb: PREMIUM_STORAGE_GB, allocated: true };
         }
@@ -9183,8 +9256,9 @@ try {
         if (totalServerBytes !== null) {
             const allocRow = await dbGetAsync(
                 `SELECT COALESCE(SUM(CASE WHEN plan_gb IS NOT NULL AND plan_gb > 0 AND (deleted_at IS NULL OR deleted_at = 0) AND status IN ('active','grace','trial') THEN plan_gb ELSE 0 END), 0) AS totalPlanGb,
-                        COALESCE(SUM(CASE WHEN premium_gb IS NOT NULL AND premium_gb > 0 AND (deleted_at IS NULL OR deleted_at = 0) THEN premium_gb ELSE 0 END), 0) AS totalPremiumGb
-                   FROM user_plans`
+                        COALESCE(SUM(CASE WHEN premium_gb IS NOT NULL AND premium_gb > 0 AND (deleted_at IS NULL OR deleted_at = 0) AND (premium_expires_at IS NULL OR premium_expires_at > ?) THEN premium_gb ELSE 0 END), 0) AS totalPremiumGb
+                   FROM user_plans`,
+                [now]
             );
             const totalPlanGb = allocRow ? Number(allocRow.totalPlanGb) : 0;
             const totalPremiumGb = allocRow ? Number(allocRow.totalPremiumGb) : 0;
@@ -9207,8 +9281,8 @@ try {
         }
 
         await dbRunAsync(
-            `UPDATE user_plans SET premium_gb = ?, updated_at = ? WHERE user_id = ?`,
-            [PREMIUM_STORAGE_GB, now, userId]
+            `UPDATE user_plans SET premium_gb = ?, premium_expires_at = ?, updated_at = ? WHERE user_id = ?`,
+            [PREMIUM_STORAGE_GB, now + PREMIUM_STORAGE_DURATION_MS, now, userId]
         );
         return { premiumGb: PREMIUM_STORAGE_GB, allocated: true };
     };
@@ -9221,12 +9295,14 @@ try {
 
         await dbRunAsync(
             `UPDATE user_plans
-                SET payment_at = COALESCE(payment_at, ?),
+                SET premium_gb = COALESCE(premium_gb, ?),
+                    premium_expires_at = COALESCE(premium_expires_at, ?),
+                    payment_at = COALESCE(payment_at, ?),
                     payment_type = COALESCE(?, payment_type),
                     deleted_at = NULL,
                     updated_at = ?
               WHERE user_id = ?`,
-            [purchasedAt, paymentType, now, userId]
+            [PREMIUM_STORAGE_GB, now + PREMIUM_STORAGE_DURATION_MS, purchasedAt, paymentType, now, userId]
         );
 
         return {
@@ -9265,9 +9341,10 @@ try {
                 }
             }
 
+            const now = Date.now();
             await dbRunAsync(
-                `UPDATE user_plans SET premium_gb = ?, updated_at = ? WHERE user_id = ?`,
-                [PREMIUM_STORAGE_GB, Date.now(), userId]
+                `UPDATE user_plans SET premium_gb = ?, premium_expires_at = ?, updated_at = ? WHERE user_id = ?`,
+                [PREMIUM_STORAGE_GB, now + PREMIUM_STORAGE_DURATION_MS, now, userId]
             );
             console.log(`[Premium] Set premium_gb=${PREMIUM_STORAGE_GB} for user ${userId}`);
             const st = await resolveSubscriptionState(userId);
