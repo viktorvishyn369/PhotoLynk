@@ -240,3 +240,10 @@ dietplanner-pages/
 
 # Remote config with API keys (pulled at runtime, never committed)
 server/remote-config.json
+
+# Infrastructure scripts (private IP, SSH keys, server paths — never public)
+pull-from-backup.sh
+security/security-audit.sh
+server-tray/EMERGENCY-REVERT-ROUTER.sh
+server-tray/backup-network-config.sh
+server-tray/regenerate-desktop-icons.sh
