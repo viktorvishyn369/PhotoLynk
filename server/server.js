@@ -154,6 +154,7 @@ require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const HOST = process.env.HOST || '127.0.0.1'; // Bind address: 127.0.0.1 for Cloudflare Tunnel security, 0.0.0.0 for desktop tray
 const JWT_SECRET = process.env.JWT_SECRET || 'super-secure-secret-key-change-this';
 const BCRYPT_ROUNDS = Number.parseInt(process.env.BCRYPT_ROUNDS || '10', 10);
 
@@ -2699,13 +2700,20 @@ app.get('/remote-config.json', (req, res) => {
     res.status(404).json({ error: 'Remote config not found' });
 });
 
-// PhotoLynk remote config (in-app update check + feature flags)
+// PhotoLynk remote config (legacy endpoint — extracts from unified remote-config.json)
 app.get('/photolynk-remote-config.json', (req, res) => {
     res.setHeader('Content-Type', 'application/json');
     res.setHeader('Cache-Control', 'public, max-age=300');
-    const cfgPath = path.join(__dirname, 'photolynk-remote-config.json');
+    const cfgPath = path.join(__dirname, 'remote-config.json');
     if (fs.existsSync(cfgPath)) {
-        return res.sendFile(cfgPath);
+        try {
+            const raw = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+            if (raw.photolynk) return res.json(raw.photolynk);
+            // Fallback: if no photolynk field, return the whole file (legacy plain JSON)
+            return res.json(raw);
+        } catch (e) {
+            return res.status(500).json({ error: 'Invalid config format' });
+        }
     }
     res.status(404).json({ error: 'Remote config not found' });
 });
@@ -11573,8 +11581,8 @@ const startExifBackfill = async () => {
 
 const startHttp = () => {
     const httpServer = http.createServer(app);
-    httpServer.listen(PORT, '127.0.0.1', () => {
-        console.log(`\n🚀 Secure Backup Server running on 127.0.0.1:${PORT}`);
+    httpServer.listen(PORT, HOST, () => {
+        console.log(`\n🚀 Secure Backup Server running on ${HOST}:${PORT}`);
         console.log(`📁 Upload directory: ${UPLOAD_DIR}`);
         console.log(`💾 Database: ${DB_PATH}\n`);
         startUpdateChecker();
@@ -11602,8 +11610,8 @@ const startHttps = () => {
     };
 
     const httpsServer = https.createServer(tlsOptions, app);
-    httpsServer.listen(HTTPS_PORT, '127.0.0.1', () => {
-        console.log(`\n🔐 HTTPS enabled on 127.0.0.1:${HTTPS_PORT}`);
+    httpsServer.listen(HTTPS_PORT, HOST, () => {
+        console.log(`\n🔐 HTTPS enabled on ${HOST}:${HTTPS_PORT}`);
         console.log(`📁 Upload directory: ${UPLOAD_DIR}`);
         console.log(`💾 Database: ${DB_PATH}\n`);
         startUpdateChecker();
@@ -11619,8 +11627,8 @@ const startHttps = () => {
             const location = `https://${host}${portPart}${req.originalUrl}`;
             res.redirect(301, location);
         });
-        http.createServer(redirectApp).listen(PORT, '127.0.0.1', () => {
-            console.log(`↪️  HTTP redirect enabled on 127.0.0.1:${PORT} -> HTTPS`);
+        http.createServer(redirectApp).listen(PORT, HOST, () => {
+            console.log(`↪️  HTTP redirect enabled on ${HOST}:${PORT} -> HTTPS`);
         });
     }
 };
