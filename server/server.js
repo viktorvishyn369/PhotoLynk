@@ -2699,6 +2699,17 @@ app.get('/remote-config.json', (req, res) => {
     res.status(404).json({ error: 'Remote config not found' });
 });
 
+// PhotoLynk remote config (in-app update check + feature flags)
+app.get('/photolynk-remote-config.json', (req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    const cfgPath = path.join(__dirname, 'photolynk-remote-config.json');
+    if (fs.existsSync(cfgPath)) {
+        return res.sendFile(cfgPath);
+    }
+    res.status(404).json({ error: 'Remote config not found' });
+});
+
 
 // ─── PaceSeeker invite code tracker ───
 const USED_CODES_PATH = path.join(__dirname, 'used-invite-codes.json');
@@ -9200,21 +9211,21 @@ try {
         const st = await resolveSubscriptionState(userId);
         if (nftService.balance.isPremium(userId) || Number(st.premiumGb) > 0 || st.status === 'premium_only') {
             return {
-                photoLynkFeeFree: true,
+                discountPct: 100,
                 reason: 'premium',
                 expiresAt: null,
-                message: 'Premium includes 0% PhotoLynk mint fees while active.',
+                message: 'Premium includes $0.02 USDC per mint beyond 100 while active (covers all expenses).',
             };
         }
         if (st.status === 'active' && Number(st.planGb) > 0 && (!st.expiresAt || Number(st.expiresAt) > now)) {
             return {
-                photoLynkFeeFree: true,
+                discountPct: 80,
                 reason: 'active_plan',
                 expiresAt: st.expiresAt || null,
-                message: 'Your active storage plan includes 0% PhotoLynk mint fees until the plan expires. Renew to keep the perk.',
+                message: 'Your active plan includes a flat $0.15 USDC per mint fee.',
             };
         }
-        return { photoLynkFeeFree: false };
+        return { discountPct: 0 };
     });
 
     app.use('/api/nft-service', (req, res, next) => {

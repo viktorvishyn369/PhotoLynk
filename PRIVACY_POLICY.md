@@ -50,7 +50,7 @@ When you make in-app purchases, we collect and process:
 
 - **Purchase Receipts**: Transaction receipts from Apple App Store or Google Play Store for verification purposes
 - **Account Balance**: Credit balance and transaction history for photo certification services
-- **Premium Status**: Whether you have purchased the Premium tier ($49.99 USD one-time) and associated feature entitlements (100 GB encrypted cloud storage for 4 years, 25 free certifications, 250 commission-free certifications)
+- **Premium Status**: Whether you have purchased the Premium tier ($49.99 USD one-time) and associated feature entitlements (1TB encrypted cloud storage for 1 year, 100 completely free certifications)
 - **Verification Credit**: Photo Verification Credit purchases ($15.00 USD consumable) that add to your account balance for photo certification services
 - **Platform Information**: The platform (iOS or Android) where the purchase was made
 

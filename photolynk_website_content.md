@@ -35,10 +35,12 @@ Flexible options for secure, byte-perfect storage (full EXIF preserved across fo
 - 100 GB • 200 GB • 400 GB • 1 TB
 - 7-day free trial to test everything risk-free
 
-### One-Time Lifetime Purchase ($50 USD):
-- 20 GB permanent encrypted cloud storage — media stored byte-for-byte identical, forever preserved with full metadata integrity.
-- 25 free photo verifications included — issue tamper-evident certificates of authenticity instantly (time-stamped and verifiable online).
-- 250 additional verifications with zero PhotoLynk fees — only tiny network fees apply (often pennies or less).
+### Premium Plan ($49.99 USD):
+- 1TB encrypted cloud storage for 1 year — media stored byte-for-byte identical with full metadata integrity.
+- 100 completely free photo certifications included.
+- $0.02 USDC per NFT beyond 100 (covers all on-chain expenses).
+- Pay with SOL or SKR via hardware wallet.
+- Subscription auto-renews monthly. Cancel anytime in Settings.
 - Top up anytime in-app for unlimited extra certifications as needed.
 
 ## Grace Period After Expiration

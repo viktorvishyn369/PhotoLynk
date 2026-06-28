@@ -574,11 +574,13 @@ PhotoLynk offers two optional in-app purchases to unlock additional features:
 - Unused credit does not expire and carries forward across sessions
 - Multiple purchases are cumulative — each adds to your total balance
 
-### Premium — $49.99 USD (Non-Consumable, One-Time)
-- Unlocks 100 GB of end-to-end encrypted cloud storage for 4 years
-- Includes 25 free photo certifications and 250 commission-free certifications
+### Premium — $49.99 USD (One-Time)
+- Unlocks 1TB of end-to-end encrypted cloud storage for 1 year
+- Includes 100 completely free photo certifications
+- $0.02 USDC per NFT beyond 100 (covers all on-chain expenses)
 - Full access across all platforms and devices linked to your account
-- One-time payment — no recurring charges, no auto-renewal
+- Pay with SOL or SKR via hardware wallet
+- Subscription auto-renews monthly. Cancel anytime in Settings.
 
 All purchases are processed through the respective platform's payment system (Apple App Store or Google Play Store). Listed prices are base prices; Apple or Google may automatically add applicable taxes, fees, or regional price adjustments at checkout for one-time purchases and subscriptions. PhotoLynk does not directly handle payment card information. Both purchases are final and non-refundable except as required by applicable law.
 
