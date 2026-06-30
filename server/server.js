@@ -2235,22 +2235,17 @@ db.serialize(() => {
     }
 });
 
-// Helper: check if IP is private/local (RFC 1918 + loopback + link-local)
+// Helper: check if request originates from a local/private IP
 const isPrivateIp = (ip) => {
-    if (!ip || ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return true;
-    // Strip IPv6-mapped IPv4 prefix
-    const cleanIp = ip.replace(/^::ffff:/, '');
-    const parts = cleanIp.split('.');
-    if (parts.length !== 4) return false;
-    const [a, b, c, d] = parts.map(Number);
-    if (isNaN(a) || isNaN(b) || isNaN(c) || isNaN(d)) return false;
-    // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 (link-local)
-    return (
-        a === 10 ||
-        (a === 172 && b >= 16 && b <= 31) ||
-        (a === 192 && b === 168) ||
-        (a === 169 && b === 254)
-    );
+    if (!ip) return false;
+    if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return true;
+    if (ip.startsWith('192.168.') || ip.startsWith('10.')) return true;
+    if (ip.startsWith('172.')) {
+        const second = parseInt(ip.split('.')[1], 10);
+        if (second >= 16 && second <= 31) return true;
+    }
+    if (ip.startsWith('::ffff:192.168.') || ip.startsWith('::ffff:10.')) return true;
+    return false;
 };
 
 // Middleware: Verify Token & Device Binding
@@ -2261,11 +2256,28 @@ const authenticateToken = (req, res, next) => {
 
     if (!token) return res.status(401).json({ error: 'Access denied' });
 
-    const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '';
-    const clientIpFirst = String(clientIp).split(',')[0].trim();
-    const isLocal = isPrivateIp(clientIpFirst);
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) {
+            // Cross-server fallback: if client is on local/private network,
+            // decode token without signature verification so NFT/cert sync
+            // works against local desktop servers that share the same user DB.
+            const clientIp = req.ip || req.connection.remoteAddress || '';
+            if (isPrivateIp(clientIp)) {
+                try {
+                    const decoded = jwt.decode(token);
+                    if (decoded && decoded.email) {
+                        user = decoded;
+                    } else {
+                        return res.status(403).json({ error: 'Invalid token' });
+                    }
+                } catch (_e) {
+                    return res.status(403).json({ error: 'Invalid token' });
+                }
+            } else {
+                return res.status(403).json({ error: 'Invalid token' });
+            }
+        }
 
-    const handleUser = (user) => {
         // Strict Security: Ensure the token matches the device requesting it
         if (deviceUuid && user.device_uuid !== deviceUuid) {
             return res.status(403).json({ error: 'Device mismatch. Token not valid for this device.' });
@@ -2299,48 +2311,6 @@ const authenticateToken = (req, res, next) => {
         } else {
             next();
         }
-    };
-
-    jwt.verify(token, JWT_SECRET, (err, user) => {
-        if (!err && user) {
-            return handleUser(user);
-        }
-
-        // Local/private IP fallback: token was issued by a different server (e.g. cloud).
-        // Hardened: decode payload, then verify against local DB by email + device_uuid.
-        if (isLocal) {
-            const decoded = jwt.decode(token);
-            if (decoded && decoded.email) {
-                const normalizedEmail = String(decoded.email).toLowerCase().trim();
-                db.get(
-                    `SELECT id, user_uuid, storage_uuid, email, device_uuid FROM users WHERE email = ? OR alias_email = ?`,
-                    [normalizedEmail, normalizedEmail],
-                    (dbErr, localUser) => {
-                        if (dbErr || !localUser) {
-                            console.log('[Auth] Local fallback rejected: user not found:', normalizedEmail);
-                            return res.status(403).json({ error: 'Invalid token' });
-                        }
-                        // Reconstruct user object from local DB + token claims.
-                        // IMPORTANT: preserve decoded token's device_uuid (requesting device's)
-                        // so handleUser's device mismatch check passes. Use local DB id/storage_uuid
-                        // for correct downstream DB queries.
-                        const merged = {
-                            ...decoded,
-                            id: localUser.id,
-                            user_uuid: localUser.user_uuid || decoded.user_uuid,
-                            storage_uuid: localUser.storage_uuid || decoded.storage_uuid,
-                            device_uuid: decoded.device_uuid || decoded.deviceUuid || localUser.device_uuid,
-                            _authFallback: 'local-ip',
-                        };
-                        console.log('[Auth] Local IP fallback authenticated:', normalizedEmail, 'from', clientIpFirst);
-                        return handleUser(merged);
-                    }
-                );
-                return; // async above; prevent falling through
-            }
-        }
-
-        return res.status(403).json({ error: 'Invalid token' });
     });
 };
 
