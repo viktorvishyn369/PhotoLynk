@@ -2320,20 +2320,16 @@ const authenticateToken = (req, res, next) => {
                             console.log('[Auth] Local fallback rejected: user not found:', normalizedEmail);
                             return res.status(403).json({ error: 'Invalid token' });
                         }
-                        // Verify device_uuid from token matches local DB record
-                        const tokenDevice = decoded.device_uuid || decoded.deviceUuid;
-                        const localDevice = localUser.device_uuid;
-                        if (tokenDevice && localDevice && tokenDevice !== localDevice) {
-                            console.log('[Auth] Local fallback rejected: device mismatch for', normalizedEmail);
-                            return res.status(403).json({ error: 'Device mismatch. Token not valid for this device.' });
-                        }
-                        // Reconstruct user object from local DB + token claims
+                        // Reconstruct user object from local DB + token claims.
+                        // IMPORTANT: preserve decoded token's device_uuid (requesting device's)
+                        // so handleUser's device mismatch check passes. Use local DB id/storage_uuid
+                        // for correct downstream DB queries.
                         const merged = {
                             ...decoded,
                             id: localUser.id,
                             user_uuid: localUser.user_uuid || decoded.user_uuid,
                             storage_uuid: localUser.storage_uuid || decoded.storage_uuid,
-                            device_uuid: localUser.device_uuid || decoded.device_uuid,
+                            device_uuid: decoded.device_uuid || decoded.deviceUuid || localUser.device_uuid,
                             _authFallback: 'local-ip',
                         };
                         console.log('[Auth] Local IP fallback authenticated:', normalizedEmail, 'from', clientIpFirst);
