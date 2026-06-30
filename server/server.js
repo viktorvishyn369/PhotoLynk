@@ -8326,7 +8326,6 @@ const buildWeeklyNftDiscountQuote = async ({ user }) => {
             cycleStartedAt: null,
             cycleExpiresAt: null,
             reason: 'active_plan',
-            flatFeeUsd: 0.15,
         };
     }
 
@@ -9306,16 +9305,15 @@ try {
                 flatFeeUsd: 0.02,
                 reason: 'premium',
                 expiresAt: null,
-                message: 'Premium includes $0.02 USDC flat fee per mint while active (covers all expenses).',
+                message: 'Premium includes $0.02 USDC flat app fee per mint while active. Network fees (SOL) apply.',
             };
         }
         if (st.status === 'active' && Number(st.planGb) > 0 && (!st.expiresAt || Number(st.expiresAt) > now)) {
             return {
                 discountPct: 80,
-                flatFeeUsd: 0.15,
                 reason: 'active_plan',
                 expiresAt: st.expiresAt || null,
-                message: 'Your active plan includes a flat $0.15 USDC per mint fee.',
+                message: 'Your active plan includes 80% off the PhotoLynk app fee per mint.',
             };
         }
         return { discountPct: 0 };
