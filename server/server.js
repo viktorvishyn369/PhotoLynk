@@ -8280,6 +8280,54 @@ const buildWeeklyNftDiscountQuote = async ({ user }) => {
     const serverNow = Date.now();
     const windowMs = 7 * 24 * 60 * 60 * 1000;
     const userId = user.id;
+
+    // Check subscription status for premium/active plan discounts (works on local + cloud)
+    const subState = await resolveSubscriptionState(userId);
+    if (subState && (subState.status === 'premium_only' || subState.status === 'premium_over_capacity')) {
+        return {
+            serverNow,
+            windowDays: 7,
+            weeklyMintCount: 0,
+            streakCount: 0,
+            streakBonusPercent: 0,
+            discountPercent: 100,
+            gradualDiscountPercent: 100,
+            multiplier: 0,
+            appliesTo: 'skr_photolynk_fee',
+            nextDiscountPercent: 100,
+            mintsToMaxDiscount: 0,
+            loyaltyFreeWeekActive: false,
+            loyaltyFreeWeekPending: false,
+            loyaltyFreeStartsAt: null,
+            loyaltyFreeExpiresAt: null,
+            cycleStartedAt: null,
+            cycleExpiresAt: null,
+            reason: 'premium',
+        };
+    }
+    if (subState && subState.status === 'active') {
+        return {
+            serverNow,
+            windowDays: 7,
+            weeklyMintCount: 0,
+            streakCount: 0,
+            streakBonusPercent: 0,
+            discountPercent: 80,
+            gradualDiscountPercent: 80,
+            multiplier: 0.2,
+            appliesTo: 'skr_photolynk_fee',
+            nextDiscountPercent: 80,
+            mintsToMaxDiscount: 0,
+            loyaltyFreeWeekActive: false,
+            loyaltyFreeWeekPending: false,
+            loyaltyFreeStartsAt: null,
+            loyaltyFreeExpiresAt: null,
+            cycleStartedAt: null,
+            cycleExpiresAt: null,
+            reason: 'active_plan',
+        };
+    }
+
     const cycle = await dbGetAsync(`SELECT * FROM nft_discount_cycles WHERE user_id = ?`, [userId]);
     const streak = await dbGetAsync(`SELECT * FROM nft_discount_streaks WHERE user_id = ?`, [userId]);
     const activeCycle = cycle && Number(cycle.cycle_expires_at) > serverNow ? cycle : null;
@@ -8308,6 +8356,7 @@ const buildWeeklyNftDiscountQuote = async ({ user }) => {
         loyaltyFreeExpiresAt: null,
         cycleStartedAt: activeCycle ? Number(activeCycle.cycle_started_at) : null,
         cycleExpiresAt: activeCycle ? Number(activeCycle.cycle_expires_at) : null,
+        reason: 'gradual',
     };
 };
 
