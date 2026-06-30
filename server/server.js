@@ -2235,6 +2235,24 @@ db.serialize(() => {
     }
 });
 
+// Helper: check if IP is private/local (RFC 1918 + loopback + link-local)
+const isPrivateIp = (ip) => {
+    if (!ip || ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return true;
+    // Strip IPv6-mapped IPv4 prefix
+    const cleanIp = ip.replace(/^::ffff:/, '');
+    const parts = cleanIp.split('.');
+    if (parts.length !== 4) return false;
+    const [a, b, c, d] = parts.map(Number);
+    if (isNaN(a) || isNaN(b) || isNaN(c) || isNaN(d)) return false;
+    // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16 (link-local)
+    return (
+        a === 10 ||
+        (a === 172 && b >= 16 && b <= 31) ||
+        (a === 192 && b === 168) ||
+        (a === 169 && b === 254)
+    );
+};
+
 // Middleware: Verify Token & Device Binding
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
@@ -2243,9 +2261,11 @@ const authenticateToken = (req, res, next) => {
 
     if (!token) return res.status(401).json({ error: 'Access denied' });
 
-    jwt.verify(token, JWT_SECRET, (err, user) => {
-        if (err) return res.status(403).json({ error: 'Invalid token' });
+    const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress || '';
+    const clientIpFirst = String(clientIp).split(',')[0].trim();
+    const isLocal = isPrivateIp(clientIpFirst);
 
+    const handleUser = (user) => {
         // Strict Security: Ensure the token matches the device requesting it
         if (deviceUuid && user.device_uuid !== deviceUuid) {
             return res.status(403).json({ error: 'Device mismatch. Token not valid for this device.' });
@@ -2279,6 +2299,24 @@ const authenticateToken = (req, res, next) => {
         } else {
             next();
         }
+    };
+
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (!err && user) {
+            return handleUser(user);
+        }
+
+        // Local/private IP fallback: token was issued by a different server (e.g. cloud).
+        // Decode payload without verification and resolve user by email locally.
+        if (isLocal) {
+            const decoded = jwt.decode(token);
+            if (decoded && decoded.email) {
+                console.log('[Auth] Local IP fallback for:', decoded.email, 'from', clientIpFirst);
+                return handleUser(decoded);
+            }
+        }
+
+        return res.status(403).json({ error: 'Invalid token' });
     });
 };
 
