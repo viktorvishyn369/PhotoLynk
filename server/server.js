@@ -8290,11 +8290,11 @@ const buildWeeklyNftDiscountQuote = async ({ user }) => {
             weeklyMintCount: 0,
             streakCount: 0,
             streakBonusPercent: 0,
-            discountPercent: 100,
-            gradualDiscountPercent: 100,
-            multiplier: 0,
+            discountPercent: 0,
+            gradualDiscountPercent: 0,
+            multiplier: 1,
             appliesTo: 'skr_photolynk_fee',
-            nextDiscountPercent: 100,
+            nextDiscountPercent: 0,
             mintsToMaxDiscount: 0,
             loyaltyFreeWeekActive: false,
             loyaltyFreeWeekPending: false,
@@ -8303,6 +8303,7 @@ const buildWeeklyNftDiscountQuote = async ({ user }) => {
             cycleStartedAt: null,
             cycleExpiresAt: null,
             reason: 'premium',
+            flatFeeUsd: 0.02,
         };
     }
     if (subState && subState.status === 'active') {
@@ -8325,6 +8326,7 @@ const buildWeeklyNftDiscountQuote = async ({ user }) => {
             cycleStartedAt: null,
             cycleExpiresAt: null,
             reason: 'active_plan',
+            flatFeeUsd: 0.15,
         };
     }
 
@@ -9300,15 +9302,17 @@ try {
         const st = await resolveSubscriptionState(userId);
         if (nftService.balance.isPremium(userId) || Number(st.premiumGb) > 0 || st.status === 'premium_only') {
             return {
-                discountPct: 100,
+                discountPct: 0,
+                flatFeeUsd: 0.02,
                 reason: 'premium',
                 expiresAt: null,
-                message: 'Premium includes $0.02 USDC per mint beyond 100 while active (covers all expenses).',
+                message: 'Premium includes $0.02 USDC flat fee per mint while active (covers all expenses).',
             };
         }
         if (st.status === 'active' && Number(st.planGb) > 0 && (!st.expiresAt || Number(st.expiresAt) > now)) {
             return {
                 discountPct: 80,
+                flatFeeUsd: 0.15,
                 reason: 'active_plan',
                 expiresAt: st.expiresAt || null,
                 message: 'Your active plan includes a flat $0.15 USDC per mint fee.',
