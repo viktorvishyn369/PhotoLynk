@@ -248,3 +248,4 @@ security/security-audit.sh
 server-tray/EMERGENCY-REVERT-ROUTER.sh
 server-tray/backup-network-config.sh
 server-tray/regenerate-desktop-icons.sh
+server/public/photolynk-download.html
