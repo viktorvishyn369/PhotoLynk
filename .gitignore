@@ -125,8 +125,7 @@ mobile-v2/
 solana-seeker/
 nft-service/
 SERVER SETUP/
-PhotoBackupSystem/*
-!PhotoBackupSystem/solana-seeker/
+PhotoBackupSystem/
 !PhotoBackupSystem/verify-exif-hash.js
 Companion/
 .devin/
