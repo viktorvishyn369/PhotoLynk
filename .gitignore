@@ -125,8 +125,12 @@ mobile-v2/
 solana-seeker/
 nft-service/
 SERVER SETUP/
-PhotoBackupSystem/
+PhotoBackupSystem/*
+!PhotoBackupSystem/solana-seeker/
 !PhotoBackupSystem/verify-exif-hash.js
+Companion/
+.devin/
+.windsurf/
 server/generate-capacity-json.js
 server/sweep-expired-users.js
 server/reconcile-cloud-usage.js

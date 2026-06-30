@@ -1,0 +1,153 @@
+{
+  "expo": {
+    "name": "PhotoLynk",
+    "slug": "photosync",
+    "version": "2.2.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": false,
+    "developmentClient": {
+      "silentLaunch": true
+    },
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#121212"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.photosync.app",
+      "buildNumber": "75",
+      "infoPlist": {
+        "NSPhotoLibraryUsageDescription": "PhotoLynk needs read access to choose photos and videos to back up from your device to your PhotoLynk account.",
+        "NSPhotoLibraryAddUsageDescription": "PhotoLynk saves photos and videos you restore or export from your backup back into your library.",
+        "NSCameraUsageDescription": "Allow PhotoLynk to use the camera to scan QR codes for server pairing.",
+        "NSFaceIDUsageDescription": "PhotoLynk uses Face ID to unlock your account for quick auto-login without entering your password.",
+        "NSLocalNetworkUsageDescription": "PhotoLynk needs access to your local network to discover and connect to your PhotoLynk server for photo backup.",
+        "NSBonjourServices": [
+          "_expo._tcp",
+          "_http._tcp"
+        ],
+        "UIBackgroundModes": [
+          "fetch"
+        ],
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": true,
+          "NSAllowsLocalNetworking": true
+        },
+        "CFBundleLocalizations": [
+          "en",
+          "ar",
+          "bg",
+          "cs",
+          "da",
+          "de",
+          "el",
+          "en-GB",
+          "es",
+          "et",
+          "fi",
+          "fr",
+          "hi",
+          "hr",
+          "hu",
+          "id",
+          "it",
+          "ja",
+          "ko",
+          "lt",
+          "lv",
+          "nl",
+          "no",
+          "pl",
+          "pt",
+          "pt-BR",
+          "ro",
+          "ru",
+          "sv",
+          "tr",
+          "uk",
+          "zh"
+        ]
+      },
+      "appleTeamId": "C9X2WT7AA5",
+      "requireFullScreen": false
+    },
+    "android": {
+      "screenOrientation": "portrait",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "monochromeImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#121212"
+      },
+      "permissions": [
+        "INTERNET",
+        "POST_NOTIFICATIONS",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_DATA_SYNC",
+        "RECEIVE_BOOT_COMPLETED",
+        "WAKE_LOCK",
+        "ACCESS_MEDIA_LOCATION",
+        "READ_EXTERNAL_STORAGE",
+        "READ_MEDIA_IMAGES",
+        "READ_MEDIA_VIDEO",
+        "CAMERA",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE",
+        "android.permission.ACCESS_MEDIA_LOCATION",
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.CAMERA"
+      ],
+      "package": "com.photolynk.solana",
+      "versionCode": 75,
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "autoVerify": true,
+          "data": [
+            {
+              "scheme": "solana",
+              "host": "*"
+            }
+          ],
+          "category": [
+            "BROWSABLE",
+            "DEFAULT"
+          ]
+        }
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-secure-store",
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "PhotoLynk needs read access to choose photos and videos to back up from your device to your PhotoLynk account.",
+          "savePhotosPermission": "PhotoLynk saves photos and videos you restore or export from your backup back into your library.",
+          "isAccessMediaLocationEnabled": true
+        }
+      ],
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow PhotoLynk to use the camera to scan QR codes for server pairing."
+        }
+      ],
+      "./plugins/withCleartextTraffic.js",
+      "./plugins/withIosLocalNetworkPrompt.js",
+      "expo-localization"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "2b94cf69-f0ee-4bf6-8d77-a37b9ae2e5d0"
+      }
+    },
+    "owner": "vishyn369"
+  }
+}

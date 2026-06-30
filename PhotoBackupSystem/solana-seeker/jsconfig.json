@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "allowJs": true,
+    "checkJs": false,
+    "noEmit": true,
+    "moduleResolution": "node",
+    "target": "ESNext",
+    "types": []
+  },
+  "typeAcquisition": {
+    "enable": false
+  },
+  "include": [
+    "*.js",
+    "*.jsx",
+    "*.json",
+    "**/*.js",
+    "**/*.jsx"
+  ],
+  "exclude": [
+    "node_modules",
+    "android",
+    "ios",
+    "dist",
+    "build"
+  ]
+}
