@@ -2307,12 +2307,40 @@ const authenticateToken = (req, res, next) => {
         }
 
         // Local/private IP fallback: token was issued by a different server (e.g. cloud).
-        // Decode payload without verification and resolve user by email locally.
+        // Hardened: decode payload, then verify against local DB by email + device_uuid.
         if (isLocal) {
             const decoded = jwt.decode(token);
             if (decoded && decoded.email) {
-                console.log('[Auth] Local IP fallback for:', decoded.email, 'from', clientIpFirst);
-                return handleUser(decoded);
+                const normalizedEmail = String(decoded.email).toLowerCase().trim();
+                db.get(
+                    `SELECT id, user_uuid, storage_uuid, email, device_uuid FROM users WHERE email = ? OR alias_email = ?`,
+                    [normalizedEmail, normalizedEmail],
+                    (dbErr, localUser) => {
+                        if (dbErr || !localUser) {
+                            console.log('[Auth] Local fallback rejected: user not found:', normalizedEmail);
+                            return res.status(403).json({ error: 'Invalid token' });
+                        }
+                        // Verify device_uuid from token matches local DB record
+                        const tokenDevice = decoded.device_uuid || decoded.deviceUuid;
+                        const localDevice = localUser.device_uuid;
+                        if (tokenDevice && localDevice && tokenDevice !== localDevice) {
+                            console.log('[Auth] Local fallback rejected: device mismatch for', normalizedEmail);
+                            return res.status(403).json({ error: 'Device mismatch. Token not valid for this device.' });
+                        }
+                        // Reconstruct user object from local DB + token claims
+                        const merged = {
+                            ...decoded,
+                            id: localUser.id,
+                            user_uuid: localUser.user_uuid || decoded.user_uuid,
+                            storage_uuid: localUser.storage_uuid || decoded.storage_uuid,
+                            device_uuid: localUser.device_uuid || decoded.device_uuid,
+                            _authFallback: 'local-ip',
+                        };
+                        console.log('[Auth] Local IP fallback authenticated:', normalizedEmail, 'from', clientIpFirst);
+                        return handleUser(merged);
+                    }
+                );
+                return; // async above; prevent falling through
             }
         }
 
