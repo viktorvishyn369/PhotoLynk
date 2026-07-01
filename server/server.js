@@ -8337,7 +8337,7 @@ const buildWeeklyNftDiscountQuote = async ({ user }) => {
     // Streak bonus: each consecutive qualified week (≥10 mints) adds +10% starting discount.
     const streakBonusPercent = Math.min(80, streakCount * 10);
     const effectiveMintCount = weeklyMintCount + (streakBonusPercent / 10);
-    const gradualDiscountPercent = Math.min(90, Math.max(0, Math.floor(effectiveMintCount) * 10));
+    const gradualDiscountPercent = Math.min(80, Math.max(0, Math.floor(effectiveMintCount) * 10));
     const discountPercent = gradualDiscountPercent;
     return {
         serverNow,
@@ -8349,8 +8349,8 @@ const buildWeeklyNftDiscountQuote = async ({ user }) => {
         gradualDiscountPercent,
         multiplier: Math.max(0.1, (100 - discountPercent) / 100),
         appliesTo: 'skr_photolynk_fee',
-        nextDiscountPercent: Math.min(90, discountPercent + 10),
-        mintsToMaxDiscount: Math.max(0, Math.ceil(9 - effectiveMintCount)),
+        nextDiscountPercent: Math.min(80, discountPercent + 10),
+        mintsToMaxDiscount: Math.max(0, Math.ceil(8 - effectiveMintCount)),
         loyaltyFreeWeekActive: false,
         loyaltyFreeWeekPending: false,
         loyaltyFreeStartsAt: null,
