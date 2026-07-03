@@ -8303,7 +8303,7 @@ const buildWeeklyNftDiscountQuote = async ({ user }) => {
             cycleStartedAt: null,
             cycleExpiresAt: null,
             reason: 'premium',
-            flatFeeUsd: 0.02,
+            flatFeeUsd: 0.01,
         };
     }
     if (subState && subState.status === 'active') {
@@ -9302,10 +9302,10 @@ try {
         if (nftService.balance.isPremium(userId) || Number(st.premiumGb) > 0 || st.status === 'premium_only') {
             return {
                 discountPct: 0,
-                flatFeeUsd: 0.02,
+                flatFeeUsd: 0.01,
                 reason: 'premium',
                 expiresAt: null,
-                message: 'Premium includes $0.02 USDC flat app fee per mint while active. Network fees (SOL) apply.',
+                message: 'Premium includes $0.01 USDC flat app fee per mint while active. Network fees (SOL) apply.',
             };
         }
         if (st.status === 'active' && Number(st.planGb) > 0 && (!st.expiresAt || Number(st.expiresAt) > now)) {
