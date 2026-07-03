@@ -506,6 +506,9 @@ tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowr
       <th data-col="plan_gb" onclick="sortBy('plan_gb')">Plan <span class="sort-arrow">&#9650;</span></th>
       <th data-col="status" onclick="sortBy('status')">Status <span class="sort-arrow">&#9650;</span></th>
       <th data-col="nft_mints" onclick="sortBy('nft_mints')">NFTs <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="nft_is_premium" onclick="sortBy('nft_is_premium')">Premium <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="nft_free_remaining" onclick="sortBy('nft_free_remaining')">Free Left <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="nft_premium_total_mints" onclick="sortBy('nft_premium_total_mints')">Cap <span class="sort-arrow">&#9650;</span></th>
       <th data-col="total_paid" onclick="sortBy('total_paid')">Total Paid <span class="sort-arrow">&#9650;</span></th>
       <th data-col="payment_type" onclick="sortBy('payment_type')">Pay Type <span class="sort-arrow">&#9650;</span></th>
       <th data-col="created_at" onclick="sortBy('created_at')">Registered <span class="sort-arrow">&#9650;</span></th>
@@ -541,6 +544,10 @@ tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowr
       <div class="form-group"><label>Trial Until (epoch ms)</label><input id="e-trialUntil" placeholder="absolute epoch"/></div>
       <div class="form-group"><label>Expires At (epoch ms)</label><input id="e-expiresAt" placeholder="absolute epoch"/></div>
       <div class="form-group"><label>Grace Until (epoch ms)</label><input id="e-graceUntil" placeholder="absolute epoch"/></div>
+      <div class="form-group"><label>Premium GB</label>
+        <select id="e-premiumGb"><option value="">unchanged</option><option value="0">0 GB</option><option value="1000">1,000 GB</option></select>
+      </div>
+      <div class="form-group"><label>Premium Expires At (epoch ms)</label><input id="e-premiumExpiresAt" placeholder="absolute epoch"/></div>
     </div>
     <div class="modal-actions">
       <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
@@ -621,7 +628,7 @@ function buildFilters(){
   // Special filters
   var premCount=allUsers.filter(function(u){return u.nft_is_premium}).length;
   var paidCount=allUsers.filter(function(u){return u.total_paid>0}).length;
-  if(premCount)html+='<button class="pill" data-f="premium" onclick="setFilter(this,&apos;premium&apos;)">premium<span class="count">'+premCount+'</span></button>';
+  html+='<button class="pill" data-f="premium" onclick="setFilter(this,&apos;premium&apos;)">premium<span class="count">'+premCount+'</span></button>';
   if(paidCount)html+='<button class="pill" data-f="paid" onclick="setFilter(this,&apos;paid&apos;)">paid<span class="count">'+paidCount+'</span></button>';
   document.getElementById('status-filters').innerHTML=html;
 }
@@ -647,7 +654,7 @@ function applyFilters(){
 
 function sortBy(col){
   if(sortCol===col)sortDir=sortDir==='asc'?'desc':'asc';
-  else{sortCol=col;sortDir=col==='id'||col==='total_paid'||col==='nft_mints'||col==='storage_used'||col==='last_login'?'desc':'asc'}
+  else{sortCol=col;sortDir=col==='id'||col==='total_paid'||col==='nft_mints'||col==='storage_used'||col==='last_login'||col==='nft_free_remaining'||col==='nft_premium_total_mints'?'desc':'asc'}
   document.querySelectorAll('thead th').forEach(function(th){th.classList.remove('sorted');if(th.dataset.col===col)th.classList.add('sorted')});
   document.querySelectorAll('.sort-arrow').forEach(function(a){a.innerHTML='&#9650;'});
   var th=document.querySelector('th[data-col="'+col+'"]');
@@ -685,9 +692,14 @@ function renderTable(){
     html+='<td class="plan-cell">'+planStr+'</td>';
     html+='<td>'+statusBadge(u.status)+'</td>';
     var nftStr=u.nft_mints>0?'<span class="nft-count">'+u.nft_mints+'</span>':'<span class="date-cell">0</span>';
-    if(u.nft_is_premium)nftStr+=' <span class="payment-badge nft-premium" style="font-size:9px">P</span>';
-    if(u.nft_free_remaining>0)nftStr+='<br><span class="mini-tag">'+u.nft_free_remaining+' free left</span>';
     html+='<td>'+nftStr+'</td>';
+    var premStr=u.nft_is_premium?'<span class="badge badge-active">Active</span>':'<span class="badge badge-none">Inactive</span>';
+    html+='<td>'+premStr+'</td>';
+    var freeStr=u.nft_free_remaining>0?'<span class="mini-tag">'+u.nft_free_remaining+' / 100</span>':'<span class="date-cell">-</span>';
+    html+='<td>'+freeStr+'</td>';
+    var capTotal=u.nft_premium_total_mints||0;
+    var capStr=capTotal>0?'<span class="mini-tag">'+capTotal+' / 10,000</span>':'<span class="date-cell">-</span>';
+    html+='<td>'+capStr+'</td>';
     html+='<td>'+totalPaidCell(u)+'</td>';
     html+='<td>'+paymentBadges(u)+'</td>';
     html+='<td>'+fmtDate(u.created_at_date)+'</td>';
@@ -713,6 +725,8 @@ function openEdit(id){
   document.getElementById('e-trialUntil').value='';
   document.getElementById('e-expiresAt').value='';
   document.getElementById('e-graceUntil').value='';
+  document.getElementById('e-premiumGb').value='';
+  document.getElementById('e-premiumExpiresAt').value='';
   document.getElementById('edit-title').textContent='#'+u.id+' '+(u.display_handle||u.email);
   document.getElementById('edit-modal').classList.add('open');
 }
@@ -729,6 +743,8 @@ async function saveEdit(){
   v=document.getElementById('e-trialUntil').value;if(v)payload.trialUntil=Number(v);
   v=document.getElementById('e-expiresAt').value;if(v)payload.expiresAt=Number(v);
   v=document.getElementById('e-graceUntil').value;if(v)payload.graceUntil=Number(v);
+  v=document.getElementById('e-premiumGb').value;if(v!=='')payload.premiumGb=Number(v);
+  v=document.getElementById('e-premiumExpiresAt').value;if(v)payload.premiumExpiresAt=Number(v);
   try{
     var r=await fetch('/admin/api/user/plan',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
     var d=await r.json();
@@ -913,6 +929,24 @@ app.post('/admin/api/user/plan', adminAuth, async (req, res) => {
             }
         }
 
+        // Handle premium fields
+        const { premiumGb, premiumExpiresAt } = req.body || {};
+        if (premiumGb !== undefined && premiumGb !== null && premiumGb !== '') {
+            const pg = Number(premiumGb);
+            if (Number.isFinite(pg) && pg >= 0) {
+                updates.push('premium_gb = ?');
+                params.push(pg);
+            } else {
+                return res.status(400).json({ error: 'Invalid premiumGb' });
+            }
+        }
+        const pexp = numericOrNull(premiumExpiresAt);
+        if (premiumExpiresAt !== undefined && premiumExpiresAt !== null && premiumExpiresAt !== '') {
+            if (pexp === null) return res.status(400).json({ error: 'Invalid premiumExpiresAt' });
+            updates.push('premium_expires_at = ?');
+            params.push(pexp);
+        }
+
         if (!updates.length) return res.status(400).json({ error: 'No updates provided' });
 
         updates.push('updated_at = ?');
@@ -1079,7 +1113,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                     String(user.device_uuids).split(',').forEach(addKey);
                 }
                 const imageExts = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bin']);
-                let count = 0;
+                const seen = new Set();
                 for (const key of keys) {
                     const dir = path.join(NFT_DIR, key);
                     if (!fs.existsSync(dir)) continue;
@@ -1088,9 +1122,9 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                         if (!fs.statSync(p).isFile()) return false;
                         return imageExts.has(path.extname(f).toLowerCase());
                     });
-                    count += files.length;
+                    files.forEach(f => seen.add(f));
                 }
-                return count;
+                return seen.size;
             } catch (_) {
                 return 0;
             }
