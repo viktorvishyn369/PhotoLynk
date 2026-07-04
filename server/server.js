@@ -968,7 +968,12 @@ const ADMIN_BASE58_WALLET_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const normalizeStoredSeekerId = (value) => {
     const raw = String(value || '').trim().toLowerCase();
     if (!raw) return null;
-    if (raw.endsWith('.skr')) return raw;
+    // Recover previously corrupted values where the server appended .skr to a .sol domain
+    if (raw.endsWith('.sol.skr')) {
+        return raw.slice(0, -'.skr'.length);
+    }
+    // Preserve registered .skr and .sol domains as-is
+    if (raw.endsWith('.skr') || raw.endsWith('.sol')) return raw;
     if (raw.endsWith('@photolynk.local')) {
         const local = raw.slice(0, -'@photolynk.local'.length);
         if (local && !ADMIN_BASE58_WALLET_RE.test(local)) return `${local}.skr`;
@@ -1939,6 +1944,13 @@ db.serialize(() => {
                 });
             });
         }
+        // Fix previously corrupted seeker_ids where .skr was appended to a .sol domain
+        db.run(`UPDATE users SET seeker_id = SUBSTR(seeker_id, 1, LENGTH(seeker_id) - ?) WHERE seeker_id LIKE ?`, [
+            '.skr'.length,
+            '%.sol.skr',
+        ], (e2) => {
+            if (e2) console.log('[DB] Failed to repair .sol.skr seeker_ids:', e2.message);
+        });
         if (!names.includes('storage_uuid')) {
             db.run(`ALTER TABLE users ADD COLUMN storage_uuid TEXT`, [], () => {
                 db.all(`SELECT id, email FROM users WHERE storage_uuid IS NULL OR storage_uuid = ''`, [], (e2, rows) => {
@@ -3791,7 +3803,7 @@ app.post('/api/save-wallet', authenticateToken, async (req, res) => {
         }
         const normalizedSeekerId = rawSeekerId ? normalizeStoredSeekerId(rawSeekerId) : null;
         if (rawSeekerId && !normalizedSeekerId) {
-            return res.status(400).json({ error: 'Valid .skr or Seeker ID required' });
+            return res.status(400).json({ error: 'Valid .skr, .sol, or Seeker ID required' });
         }
         const updates = [];
         const params = [];
