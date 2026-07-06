@@ -220,6 +220,9 @@ server-app/dist/
 *.rpm
 server-tray/dist/
 server-tray/node_modules/
+server-tray/downloads/
+server-tray/icon512.png
+server-tray/renderer/_extracted.html
 *.idsig
 !server-tray/package-lock.json
 !server-tray/build/
@@ -248,7 +251,15 @@ server/photolynk-remote-config.json
 # Infrastructure scripts (private IP, SSH keys, server paths — never public)
 pull-from-backup.sh
 security/security-audit.sh
+server-intrusion-audit.sh
+server-security-audit.sh
+server-ssh-check.sh
 server-tray/EMERGENCY-REVERT-ROUTER.sh
 server-tray/backup-network-config.sh
 server-tray/regenerate-desktop-icons.sh
 server/public/photolynk-download.html
+
+# Secrets / backups
+AuthKey_F6SJ53SRXW.p8
+Companion.scaffold.backup.*/
+*_inspect_*.sh

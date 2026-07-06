@@ -12,6 +12,8 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const crypto = require('crypto');
 const axios = require('axios');
+const nacl = require('tweetnacl');
+const naclUtil = require('tweetnacl-util');
 const updater = require('./updater');
 let sharp;
 try { sharp = require('sharp'); console.log('[Server] sharp loaded'); } catch (e) { sharp = null; console.log('[Server] sharp failed to load:', e.message); }
@@ -1135,6 +1137,18 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
             }
         };
 
+        // Compute accurate per-user storage usage (encrypted chunks + raw files)
+        for (const user of users) {
+            try {
+                const deviceUuid = user.device_uuids ? String(user.device_uuids).split(',')[0] : null;
+                const userCtx = { ...user, device_uuid: deviceUuid };
+                user.storage_used_bytes = await getUserUsedBytes(user.id, userCtx);
+            } catch (e) {
+                console.error(`[Admin] Storage usage error for user ${user.id}:`, e.message);
+                user.storage_used_bytes = user.storage_used_bytes || 0;
+            }
+        }
+
         const formattedUsers = users.map(user => {
             const nftPayments = nftPaymentsByUser[user.id] || [];
             const premium = nftPremiumByUser[user.id] || {};
@@ -1627,13 +1641,16 @@ const getUserQuotaProfileFromRow = (row, now = Date.now()) => {
 const resolveSubscriptionState = async (userId) => {
     const now = Date.now();
     const row = await ensurePlanRow(userId);
-    if (!row) return { allowed: false, status: 'none', premiumGb: 0 };
+    if (!row) return { allowed: false, status: 'none', premiumGb: 0, usedBytes: 0, quotaBytes: 0 };
     const planInfo = getUserQuotaProfileFromRow(row, now);
     const { planGb, premiumGb, expiresAt, graceUntil, trialUntil, complimentaryUntil, deletedAt, updatedAt, paidPlanActive, trialActive } = planInfo;
 
+    // Always compute accurate usage + quota so the app can display it regardless of plan state
+    const usedBytes = await getUserUsedBytes(userId);
+    const quotaBytes = await getUserQuotaBytes(userId);
+
     const resolvePremiumState = async (overflowStatus, extra = {}) => {
         const premiumQuotaBytes = premiumGb > 0 ? Math.floor(premiumGb * GB_BYTES) : 0;
-        const usedBytes = premiumGb > 0 ? await getUserUsedBytes(userId) : 0;
         const overPremiumCapacity = premiumQuotaBytes > 0 && usedBytes > premiumQuotaBytes;
         return {
             allowed: premiumGb > 0,
@@ -1649,6 +1666,8 @@ const resolveSubscriptionState = async (userId) => {
             overPremiumCapacity,
             premiumQuotaBytes,
             overflowBytes: overPremiumCapacity ? (usedBytes - premiumQuotaBytes) : 0,
+            usedBytes,
+            quotaBytes,
         };
     };
 
@@ -1663,6 +1682,8 @@ const resolveSubscriptionState = async (userId) => {
             planGb: null,
             premiumGb,
             paymentType: row.payment_type || null,
+            usedBytes,
+            quotaBytes,
         };
     }
 
@@ -1676,6 +1697,8 @@ const resolveSubscriptionState = async (userId) => {
             planGb: planGb || null,
             premiumGb,
             paymentType: row.payment_type || null,
+            usedBytes,
+            quotaBytes,
         };
     }
 
@@ -1690,6 +1713,8 @@ const resolveSubscriptionState = async (userId) => {
             premiumGb,
             paymentType: row.payment_type || null,
             complimentaryUntil,
+            usedBytes,
+            quotaBytes,
         };
     }
 
@@ -1705,6 +1730,8 @@ const resolveSubscriptionState = async (userId) => {
             planGb: null,
             premiumGb,
             paymentType: row.payment_type || null,
+            usedBytes,
+            quotaBytes,
         };
     }
 
@@ -1720,6 +1747,8 @@ const resolveSubscriptionState = async (userId) => {
             planGb: null,
             premiumGb,
             paymentType: row.payment_type || null,
+            usedBytes,
+            quotaBytes,
         };
     }
 
@@ -1739,6 +1768,8 @@ const resolveSubscriptionState = async (userId) => {
                     planGb: planGb || null,
                     premiumGb,
                     paymentType: row.payment_type || null,
+                    usedBytes,
+                    quotaBytes,
                 };
             }
         } catch (e) { }
@@ -1773,6 +1804,8 @@ const resolveSubscriptionState = async (userId) => {
                     planGb: planGb || null,
                     premiumGb,
                     paymentType: row.payment_type || null,
+                    usedBytes,
+                    quotaBytes,
                 };
             }
             return await resolvePremiumState('premium_over_capacity');
@@ -1785,6 +1818,8 @@ const resolveSubscriptionState = async (userId) => {
             planGb: planGb || null,
             premiumGb,
             paymentType: row.payment_type || null,
+            usedBytes,
+            quotaBytes,
         };
     }
 
@@ -1797,6 +1832,8 @@ const resolveSubscriptionState = async (userId) => {
             planGb: planGb || null,
             premiumGb,
             paymentType: row.payment_type || null,
+            usedBytes,
+            quotaBytes,
         };
     }
 
@@ -1811,6 +1848,8 @@ const resolveSubscriptionState = async (userId) => {
         planGb: null,
         premiumGb,
         paymentType: row.payment_type || null,
+        usedBytes,
+        quotaBytes,
     };
 };
 
@@ -2393,6 +2432,15 @@ const getStealthCloudAllPossibleUserKeys = (user) => {
         if (safe) keys.add(safe);
     };
 
+    const addMultiple = (values) => {
+        if (!values) return;
+        if (Array.isArray(values)) {
+            values.forEach(v => addSafe(v));
+        } else if (typeof values === 'string') {
+            values.split(',').map(s => s.trim()).filter(Boolean).forEach(v => addSafe(v));
+        }
+    };
+
     // Current key (primary)
     addSafe(getStealthCloudUserKey(user));
 
@@ -2405,6 +2453,10 @@ const getStealthCloudAllPossibleUserKeys = (user) => {
     // All possible legacy keys
     if (user && (user.device_uuid || user.deviceUuid)) {
         addSafe(user.device_uuid || user.deviceUuid);
+    }
+    // Admin endpoint passes all linked device_uuids as comma-separated list
+    if (user && (user.device_uuids || user.deviceUuids)) {
+        addMultiple(user.device_uuids || user.deviceUuids);
     }
     if (user && (user.user_uuid || user.userUuid)) {
         addSafe(user.user_uuid || user.userUuid);
@@ -3084,39 +3136,85 @@ const getUserPremiumGb = async (userId) => {
     return Number.isFinite(premiumGb) && premiumGb > 0 ? premiumGb : 0;
 };
 
+const getDirectorySizeRecursive = (dirPath) => {
+    let total = 0;
+    try {
+        if (!fs.existsSync(dirPath)) return 0;
+        const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+        for (const entry of entries) {
+            const fullPath = path.join(dirPath, entry.name);
+            try {
+                if (entry.isDirectory()) {
+                    total += getDirectorySizeRecursive(fullPath);
+                } else if (entry.isFile()) {
+                    const stat = fs.statSync(fullPath);
+                    if (stat.isFile()) total += stat.size;
+                }
+            } catch (e) { }
+        }
+    } catch (e) { }
+    return total;
+};
+
 const getUserUsedBytes = async (userId, userOrNull) => {
     // Get encrypted chunks size from database
     const row = await dbGetAsync(
         `SELECT COALESCE(SUM(size), 0) AS usedBytes FROM cloud_chunks WHERE user_id = ?`,
         [userId]
     );
-    const encryptedBytes = row && row.usedBytes !== undefined && row.usedBytes !== null ? Number(row.usedBytes) : 0;
+    let encryptedBytes = row && row.usedBytes !== undefined && row.usedBytes !== null ? Number(row.usedBytes) : 0;
 
-    // Get raw files size from filesystem
-    let rawBytes = 0;
     // If user object not provided, look it up from database
     let user = userOrNull;
     if (!user && userId) {
         try {
             const dbUser = await dbGetAsync(`SELECT id, email, user_uuid, storage_uuid FROM users WHERE id = ?`, [userId]);
             if (dbUser) {
-                // Fetch the most recent device_uuid from devices table
-                const devRow = await dbGetAsync(`SELECT device_uuid FROM devices WHERE user_id = ? ORDER BY id DESC LIMIT 1`, [userId]);
-                user = { ...dbUser, device_uuid: devRow ? devRow.device_uuid : null };
+                // Fetch all device_uuids for this user (primary + legacy)
+                const devRows = await dbAllAsync(`SELECT device_uuid FROM devices WHERE user_id = ?`, [userId]);
+                const deviceUuids = (Array.isArray(devRows) ? devRows : []).map(r => r.device_uuid).filter(Boolean);
+                user = {
+                    ...dbUser,
+                    device_uuid: deviceUuids[0] || null,
+                    device_uuids: deviceUuids.length > 0 ? deviceUuids.join(',') : null,
+                };
             }
         } catch (e) { }
     }
+
+    // Get raw files + encrypted chunks from filesystem for all possible user keys
+    let rawBytes = 0;
+    let fsChunkBytes = 0;
     if (user) {
         try {
-            const { rawDir } = ensureStealthCloudUserDirs(user);
-            if (fs.existsSync(rawDir)) {
-                const files = fs.readdirSync(rawDir).filter(f => !f.startsWith('.'));
-                for (const file of files) {
-                    try {
-                        const stat = fs.statSync(path.join(rawDir, file));
-                        if (stat.isFile()) rawBytes += stat.size;
-                    } catch (e) { }
-                }
+            const allKeys = getStealthCloudAllPossibleUserKeys(user);
+            for (const key of allKeys) {
+                if (!key || key === 'unknown') continue;
+
+                // Encrypted chunks on disk (fallback if cloud_chunks table is stale/empty)
+                try {
+                    const chunksDir = CHUNKS_DIR
+                        ? path.join(CHUNKS_DIR, 'users', key, 'chunks')
+                        : path.join(CLOUD_DIR, 'users', key, 'chunks');
+                    if (fs.existsSync(chunksDir)) {
+                        fsChunkBytes += getDirectorySizeRecursive(chunksDir);
+                    }
+                } catch (e) { }
+
+                // Raw files (unencrypted backups)
+                try {
+                    const rawDir = CHUNKS_DIR
+                        ? path.join(CHUNKS_DIR, 'users', key, 'raw')
+                        : path.join(CLOUD_DIR, 'users', key, 'raw');
+                    if (fs.existsSync(rawDir)) {
+                        rawBytes += getDirectorySizeRecursive(rawDir);
+                    }
+                } catch (e) { }
+            }
+
+            // If cloud_chunks table is empty or missing rows, use the actual filesystem chunk size
+            if (encryptedBytes <= 0 && fsChunkBytes > 0) {
+                encryptedBytes = fsChunkBytes;
             }
         } catch (e) { }
     }
@@ -3267,10 +3365,11 @@ app.get('/api/cloud/usage', authenticateToken, async (req, res) => {
 
 // Register User
 app.post('/api/register', authRateLimiter, async (req, res) => {
-    const { email, password, plan_gb, hardware_device_id } = req.body;
+    const { email, password, plan_gb, hardware_device_id, wallet_domain } = req.body;
     if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
     const normalizedEmail = String(email).toLowerCase().trim();
     const hwDeviceId = hardware_device_id ? String(hardware_device_id).trim() : null;
+    const walletDomain = wallet_domain ? String(wallet_domain).toLowerCase().trim() : null;
 
     const normalizedPlanGb = normalizeTierGb(plan_gb);
 
@@ -3279,7 +3378,7 @@ app.post('/api/register', authRateLimiter, async (req, res) => {
         const u = (crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex'));
         const storageUuid = computeStorageUuidFromEmail(normalizedEmail);
         const now = Date.now();
-        db.run(`INSERT INTO users (user_uuid, storage_uuid, email, password, hardware_device_id, created_at) VALUES (?, ?, ?, ?, ?, ?)`, [u, storageUuid, normalizedEmail, hashedPassword, hwDeviceId, now], function (err) {
+        db.run(`INSERT INTO users (user_uuid, storage_uuid, email, alias_email, password, hardware_device_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, [u, storageUuid, normalizedEmail, walletDomain, hashedPassword, hwDeviceId, now], function (err) {
             if (err) {
                 if (err.message.includes('UNIQUE constraint failed')) return res.status(409).json({ error: 'Email already exists' });
                 return res.status(500).json({ error: err.message });
@@ -3308,9 +3407,10 @@ app.post('/api/register', authRateLimiter, async (req, res) => {
 
 // Login & Bind Device
 app.post('/api/login', authRateLimiter, async (req, res) => {
-    const { email, password, device_uuid, device_name, country_verification_code } = req.body;
+    const { email, password, device_uuid, device_name, country_verification_code, wallet_domain } = req.body;
     if (!email || !password || !device_uuid) return res.status(400).json({ error: 'Missing credentials or device ID' });
     const normalizedEmail = String(email).toLowerCase().trim();
+    const walletDomain = wallet_domain ? String(wallet_domain).toLowerCase().trim() : null;
 
     db.get(`SELECT * FROM users WHERE email = ? OR alias_email = ?`, [normalizedEmail, normalizedEmail], async (err, user) => {
         if (err) return res.status(500).json({ error: 'Database error' });
@@ -3477,6 +3577,13 @@ app.post('/api/login', authRateLimiter, async (req, res) => {
                     `UPDATE users SET hardware_device_id = COALESCE(hardware_device_id, ?) WHERE id = ?`,
                     [device_uuid, user.id]
                 );
+                // If the app provided a real wallet domain (e.g. alice.skr), store it as alias_email.
+                if (walletDomain) {
+                    db.run(
+                        `UPDATE users SET alias_email = COALESCE(alias_email, ?) WHERE id = ?`,
+                        [walletDomain, user.id]
+                    );
+                }
                 db.run(
                     `UPDATE user_plans SET rc_app_user_id = ?, updated_at = ? WHERE user_id = ?`,
                     [normalizedEmail, now, user.id]
@@ -3502,6 +3609,107 @@ app.post('/api/login', authRateLimiter, async (req, res) => {
             }
         );
     });
+});
+
+// Wallet Login
+// Allows users with a wallet-linked account to log in by proving ownership of the
+// wallet via a SIWS signature. The client sends the wallet address, the signed
+// message, the signature, and the public key (base64) for verification.
+app.post('/api/wallet-login', authRateLimiter, async (req, res) => {
+    const { wallet_address, signed_message, signature, public_key_b64, device_uuid, device_name, wallet_domain } = req.body;
+    if (!wallet_address || !signed_message || !signature || !public_key_b64 || !device_uuid) {
+        return res.status(400).json({ error: 'Missing wallet login parameters' });
+    }
+
+    try {
+        const walletAddressNorm = String(wallet_address).trim();
+        const walletAddressLower = walletAddressNorm.toLowerCase();
+        const walletDomain = wallet_domain ? String(wallet_domain).toLowerCase().trim() : null;
+        // Wallet-derived email/name variants that may exist from previous builds.
+        const walletDerivedEmails = [
+            `${walletAddressLower}@seeker.photolynk.local`,
+            `${walletAddressLower}@photolynk.local`,
+            `${walletAddressLower}.skr`,
+        ];
+
+        // Look up the user by linked wallet address or any wallet-derived email/name.
+        let user = await dbGetAsync(
+            `SELECT * FROM users WHERE wallet_address = ? OR LOWER(email) = ? OR LOWER(email) IN (?, ?, ?) OR LOWER(alias_email) = ? OR LOWER(alias_email) IN (?, ?, ?)`,
+            [walletAddressNorm, walletAddressLower, ...walletDerivedEmails, walletAddressLower, ...walletDerivedEmails]
+        );
+        if (!user) {
+            console.log('[WalletLogin] No account linked to wallet:', wallet_address);
+            return res.status(401).json({ error: 'No account linked to this wallet' });
+        }
+
+        // Repair corrupted records: ensure wallet_address and a proper wallet-derived email are set.
+        const expectedEmail = `${walletAddressLower}@seeker.photolynk.local`;
+        if (!user.wallet_address || String(user.wallet_address).toLowerCase() !== walletAddressLower) {
+            console.log('[WalletLogin] Repairing wallet_address for user', user.id, '→', wallet_address);
+            await dbRunAsync(
+                `UPDATE users SET wallet_address = COALESCE(wallet_address, ?), email = CASE WHEN email IS NULL OR email = '' OR LOWER(email) = ? OR email NOT LIKE '%@%' THEN ? ELSE email END WHERE id = ?`,
+                [walletAddressNorm, walletAddressLower, expectedEmail, user.id]
+            );
+        }
+
+        // Verify Ed25519 signature. MWA returns signed_message and signature as base64.
+        let publicKeyBytes, signatureBytes, messageBytes;
+        try {
+            publicKeyBytes = naclUtil.decodeBase64(public_key_b64);
+            signatureBytes = naclUtil.decodeBase64(signature);
+            messageBytes = naclUtil.decodeBase64(signed_message);
+        } catch (decodeErr) {
+            return res.status(400).json({ error: 'Invalid signature encoding' });
+        }
+        if (publicKeyBytes.length !== nacl.sign.publicKeyLength) {
+            return res.status(400).json({ error: 'Invalid public key length' });
+        }
+        if (signatureBytes.length !== nacl.sign.signatureLength) {
+            return res.status(400).json({ error: 'Invalid signature length' });
+        }
+        const valid = nacl.sign.detached.verify(messageBytes, signatureBytes, publicKeyBytes);
+        if (!valid) {
+            console.log('[WalletLogin] Invalid signature for wallet:', wallet_address);
+            return res.status(401).json({ error: 'Invalid wallet signature' });
+        }
+
+        // Basic SIWS message content validation.
+        const messageText = naclUtil.encodeUTF8(messageBytes);
+        if (!messageText.includes('stealthlynk.io') || !messageText.includes('PhotoLynk-MasterKey-v1')) {
+            console.log('[WalletLogin] SIWS message content rejected for wallet:', wallet_address);
+            return res.status(401).json({ error: 'Invalid sign-in message content' });
+        }
+
+        // Register/Update device.
+        await dbRunAsync(
+            `INSERT INTO devices (user_id, device_uuid, device_name, last_seen) VALUES (?, ?, ?, ?)
+             ON CONFLICT(user_id, device_uuid) DO UPDATE SET last_seen = ?, device_name = COALESCE(?, device_name)`,
+            [user.id, device_uuid, device_name || 'Wallet Device', Date.now(), Date.now(), device_name || null]
+        );
+
+        // If the app provided a real wallet domain (e.g. alice.skr), store it as alias_email.
+        if (walletDomain) {
+            await dbRunAsync(
+                `UPDATE users SET alias_email = COALESCE(alias_email, ?) WHERE id = ?`,
+                [walletDomain, user.id]
+            );
+        }
+
+        const storageUuid = user.storage_uuid || computeStorageUuidFromEmail(user.email);
+        if (storageUuid && !user.storage_uuid) {
+            await dbRunAsync(`UPDATE users SET storage_uuid = COALESCE(storage_uuid, ?) WHERE id = ?`, [storageUuid, user.id]);
+        }
+        const token = jwt.sign(
+            { id: user.id, user_uuid: user.user_uuid, storage_uuid: storageUuid, email: user.email, device_uuid: device_uuid },
+            JWT_SECRET,
+            { expiresIn: '30d' }
+        );
+        console.log('[WalletLogin] Successful login for user', user.id, 'wallet:', wallet_address);
+        res.json({ token, userId: user.id });
+    } catch (e) {
+        console.error('[WalletLogin] Error:', e.message);
+        res.status(500).json({ error: e.message || 'Wallet login failed' });
+    }
 });
 
 // ============================================================================

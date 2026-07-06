@@ -1,6 +1,7 @@
 {
   "dependencies": {
     "@noble/ed25519": "^3.1.0",
+    "@onsol/tldparser": "0.6.7",
     "exifreader": "^4.36.2",
     "sharp": "^0.33.2"
   }

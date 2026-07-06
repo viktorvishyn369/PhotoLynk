@@ -5184,8 +5184,8 @@ async function buildTransferTransaction(mint, from, to, isCompressed) {
       };
       const dasEndpoints = [
         { url: 'http://127.0.0.1:3000/api/nft-service/das-proxy', isProxy: true },
-        { url: 'https://mainnet.helius-rpc.com/?api-key=8b86bd0d-4534-4ce9-a61d-ec3850cb0b62', isProxy: false },
-        { url: 'https://mainnet.helius-rpc.com/?api-key=6b3d0180-4354-4e31-a2fc-9b6cd9e550a7', isProxy: false },
+        { url: 'https://mainnet.helius-rpc.com/?api-key=5d7d166c-5fc6-40c5-959f-ad6459b00cb9', isProxy: false },
+        { url: 'https://mainnet.helius-rpc.com/?api-key=9521ac59-0b26-4742-a96e-f339689c6551', isProxy: false },
       ];
       const callDAS = async (method, params) => {
         let lastError = null;
