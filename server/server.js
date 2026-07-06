@@ -1121,6 +1121,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 }
 
                 // Authoritative count: NFT entries in nft-album.json (deduped by mintAddress)
+                // Skip DAS-sourced NFTs (externally discovered wallet NFTs) - only count user-minted/certified ones
                 const seen = new Set();
                 for (const key of keys) {
                     const metaPath = path.join(NFT_DIR, key, 'nft-album.json');
@@ -1128,6 +1129,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                     try {
                         const data = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
                         for (const nft of (data.nfts || [])) {
+                            if (nft.source === 'das') continue;
                             const id = nft.mintAddress || nft.imageId || nft.id;
                             if (id) seen.add(id);
                         }
