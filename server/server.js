@@ -1119,8 +1119,24 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 if (user.device_uuids) {
                     String(user.device_uuids).split(',').forEach(addKey);
                 }
-                const imageExts = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bin']);
+
+                // Authoritative count: NFT entries in nft-album.json (deduped by mintAddress)
                 const seen = new Set();
+                for (const key of keys) {
+                    const metaPath = path.join(NFT_DIR, key, 'nft-album.json');
+                    if (!fs.existsSync(metaPath)) continue;
+                    try {
+                        const data = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
+                        for (const nft of (data.nfts || [])) {
+                            const id = nft.mintAddress || nft.imageId || nft.id;
+                            if (id) seen.add(id);
+                        }
+                    } catch (_) { }
+                }
+                if (seen.size > 0) return seen.size;
+
+                // Fallback: count unique image files by stripping extension
+                const imageExts = new Set(['.jpg', '.jpeg', '.png', '.webp', '.gif']);
                 for (const key of keys) {
                     const dir = path.join(NFT_DIR, key);
                     if (!fs.existsSync(dir)) continue;
@@ -1129,7 +1145,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                         if (!fs.statSync(p).isFile()) return false;
                         return imageExts.has(path.extname(f).toLowerCase());
                     });
-                    files.forEach(f => seen.add(f));
+                    files.forEach(f => seen.add(f.replace(/\.[^.]+$/, '')));
                 }
                 return seen.size;
             } catch (_) {
