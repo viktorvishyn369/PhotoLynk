@@ -1,0 +1,8 @@
+{
+  "android": {
+    "package": "com.anonymous.filesharing"
+  },
+  "ios": {
+    "bundleIdentifier": "com.anonymous.filesharing"
+  }
+}
