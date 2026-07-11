@@ -591,19 +591,22 @@ function statusBadge(st){var c='badge-'+(st||'none').replace(/\\s/g,'_');return'
 
 function paymentBadges(u){var tags=[];if(u.payment_type){tags.push('<span class="payment-badge payment-'+(u.payment_type||'').toLowerCase()+'">'+u.payment_type+'</span>')}if(u.nft_is_premium){tags.push('<span class="payment-badge nft-premium">Premium</span>')}if(u.nft_payments&&u.nft_payments.length>0){var types={};u.nft_payments.forEach(function(p){var k=(p.platform||'iap')+':'+(p.type||'');types[k]=(types[k]||0)+1});Object.keys(types).forEach(function(k){var parts=k.split(':');tags.push('<span class="mini-tag">'+parts[0]+' x'+types[k]+'</span>')})}if(u.sol_payments&&u.sol_payments.length>0){tags.push('<span class="payment-badge payment-solana">SOL x'+u.sol_payments.length+'</span>')}return tags.length?tags.join(' '):'<span class="date-cell">-</span>'}
 
-function totalPaidCell(u){var parts=[];var iap=u.nft_total_paid||0;var sol=u.sol_total_paid||0;var skr=u.skr_total_paid||0;if(iap>0)parts.push('$'+iap.toFixed(2));if(sol>0)parts.push(sol.toFixed(4)+' SOL');if(skr>0)parts.push(skr.toFixed(2)+' SKR');if(!parts.length)return'<span class="money-cell zero">-</span>';return'<span class="money-cell">'+parts.join('<br>')+'</span>'}
+function totalPaidCell(u){var parts=[];var totalUsd=u.total_usd_realtime||0;if(totalUsd>0)parts.push('$'+totalUsd.toFixed(2));var sol=u.sol_total_paid||0;var skr=u.skr_total_paid||0;if(sol>0)parts.push(sol.toFixed(4)+' SOL');if(skr>0)parts.push(skr.toFixed(2)+' SKR');if(!parts.length)return'<span class="money-cell zero">-</span>';return'<span class="money-cell">'+parts.join('<br>')+'</span>'}
 
 function planLabel(gb){if(!gb)return'-';return gb>=1000?(gb/1000)+'TB':gb+'GB'}
 
 function toast(msg,type){var el=document.createElement('div');el.className='toast toast-'+(type||'success');el.textContent=msg;document.body.appendChild(el);setTimeout(function(){el.remove()},3000)}
 
+var solPriceUsd=0,skrPriceUsd=0;
 async function loadUsers(){
   try{
     var r=await fetch('/admin/api/users');var d=await r.json();
     if(!r.ok)throw new Error(d.error||'Failed');
     serverTime=d.server_time||'';
     adminStats=d.admin_stats||adminStats;
-    allUsers=d.users.map(function(u){return{id:u.id,email:u.email||'',alias_email:u.alias_email||'',display_handle:u.display_handle||'',user_uuid:u.user_uuid||'',device_uuids:u.device_uuids||'',last_login:u.last_login||0,last_login_date:u.last_login_date,storage_used:u.storage_used_bytes||0,storage_quota:u.storage_quota_bytes||0,file_count:u.file_count||0,plan_gb:u.plan.plan_gb||0,premium_gb:u.plan.premium_gb||0,status:u.plan.effective_status||u.plan.status||'none',trial_until:u.plan.trial_until,trial_until_date:u.plan.trial_until_date,expires_at:u.plan.expires_at,expires_at_date:u.plan.expires_at_date,grace_until:u.plan.grace_until,created_at:u.user_created_at,created_at_date:u.user_created_at_date,payment_type:u.plan.payment_type||'',payment_at:u.plan.payment_at,payment_at_date:u.plan.payment_at_date,updated_at:u.plan.updated_at,updated_at_date:u.plan.updated_at_date,nft_is_premium:u.nft.is_premium,nft_mints:u.nft.mint_count||0,nft_paid_mints:u.nft.paid_mint_count||0,nft_free_premium_mints:u.nft.free_premium_mint_count||0,nft_premium_total_mints:u.nft.premium_mint_count||0,nft_free_remaining:u.nft.free_mints_remaining||0,nft_balance:u.nft.balance_usd||0,nft_total_paid:u.nft.total_paid_usd||0,nft_total_purchased:u.nft.total_purchased_usd||0,nft_total_spent:u.nft.total_spent_usd||0,nft_payments:u.nft.payments||[],sol_payments:u.solana.payments||[],sol_total_paid:u.solana.total_paid_sol||0,skr_total_paid:u.solana.total_paid_skr||0,total_paid:(u.nft.total_paid_usd||0)+(u.solana.total_paid_sol||0)*100+(u.solana.total_paid_skr||0)}});
+    solPriceUsd=d.sol_price_usd||0;
+    skrPriceUsd=d.skr_price_usd||0;
+    allUsers=d.users.map(function(u){return{id:u.id,email:u.email||'',alias_email:u.alias_email||'',display_handle:u.display_handle||'',user_uuid:u.user_uuid||'',device_uuids:u.device_uuids||'',last_login:u.last_login||0,last_login_date:u.last_login_date,storage_used:u.storage_used_bytes||0,storage_quota:u.storage_quota_bytes||0,file_count:u.file_count||0,plan_gb:u.plan.plan_gb||0,premium_gb:u.plan.premium_gb||0,status:u.plan.effective_status||u.plan.status||'none',trial_until:u.plan.trial_until,trial_until_date:u.plan.trial_until_date,expires_at:u.plan.expires_at,expires_at_date:u.plan.expires_at_date,grace_until:u.plan.grace_until,created_at:u.user_created_at,created_at_date:u.user_created_at_date,payment_type:u.plan.payment_type||'',payment_at:u.plan.payment_at,payment_at_date:u.plan.payment_at_date,updated_at:u.plan.updated_at,updated_at_date:u.plan.updated_at_date,nft_is_premium:u.nft.is_premium,nft_mints:u.nft.mint_count||0,nft_paid_mints:u.nft.paid_mint_count||0,nft_free_premium_mints:u.nft.free_premium_mint_count||0,nft_premium_total_mints:u.nft.premium_mint_count||0,nft_free_remaining:u.nft.free_mints_remaining||0,nft_balance:u.nft.balance_usd||0,nft_total_paid:u.nft.total_paid_usd||0,nft_total_purchased:u.nft.total_purchased_usd||0,nft_total_spent:u.nft.total_spent_usd||0,nft_payments:u.nft.payments||[],sol_payments:u.solana.payments||[],sol_total_paid:u.solana.total_paid_sol||0,skr_total_paid:u.solana.total_paid_skr||0,sol_usd_realtime:u.solana.sol_usd_realtime||0,skr_usd_realtime:u.solana.skr_usd_realtime||0,apple_google_usd:u.apple_google_usd||0,total_usd_realtime:u.total_usd_realtime||0,total_paid:(u.total_usd_realtime||0)}});
     updateStats();buildFilters();applyFilters();
     document.getElementById('loading').style.display='none';
     document.getElementById('users-table').style.display='';
@@ -616,10 +619,14 @@ function updateStats(){
   var trial=allUsers.filter(function(u){return u.status==='trial'||u.status==='trial_complimentary'}).length;
   var paying=allUsers.filter(function(u){return u.total_paid>0}).length;
   var premium=allUsers.filter(function(u){return u.nft_is_premium}).length;
-  var totalRev=allUsers.reduce(function(s,u){return s+(u.nft_total_paid||0)},0);
+  var totalRev=allUsers.reduce(function(s,u){return s+(u.total_usd_realtime||0)},0);
+  var totalSol=allUsers.reduce(function(s,u){return s+(u.sol_total_paid||0)},0);
+  var totalSkr=allUsers.reduce(function(s,u){return s+(u.skr_total_paid||0)},0);
   var recentLogin=allUsers.filter(function(u){return u.last_login&&(Date.now()-u.last_login)<86400000*7}).length;
   var st=serverTime?'<span>Server: <b>'+new Date(serverTime).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+'</b></span>':'';
-  document.getElementById('header-stats').innerHTML=st+'<span>Total: <b>'+total+'</b></span><span>Active: <b>'+active+'</b></span><span>Trial: <b>'+trial+'</b></span><span>Paying: <b>'+paying+'</b></span><span>Premium: <b>'+premium+'</b></span><span>PhotoLynk NFTs: <b>'+(adminStats.photolynk_nfts_minted||0)+'</b></span><span>7d Active: <b>'+recentLogin+'</b></span><span>Revenue: <b>$'+totalRev.toFixed(2)+'</b></span>';
+  var priceInfo=solPriceUsd>0?'<span>SOL: <b>$'+solPriceUsd.toFixed(2)+'</b></span>':'';
+  priceInfo+=skrPriceUsd>0?'<span>SKR: <b>$'+skrPriceUsd.toFixed(4)+'</b></span>':'';
+  document.getElementById('header-stats').innerHTML=st+'<span>Total: <b>'+total+'</b></span><span>Active: <b>'+active+'</b></span><span>Trial: <b>'+trial+'</b></span><span>Paying: <b>'+paying+'</b></span><span>Premium: <b>'+premium+'</b></span><span>PhotoLynk NFTs: <b>'+(adminStats.photolynk_nfts_minted||0)+'</b></span><span>7d Active: <b>'+recentLogin+'</b></span><span>Revenue: <b>$'+totalRev.toFixed(2)+'</b></span>'+priceInfo+'<span>Paid SOL: <b>'+totalSol.toFixed(4)+'</b></span><span>Paid SKR: <b>'+totalSkr.toFixed(2)+'</b></span>';
 }
 
 function buildFilters(){
@@ -1212,6 +1219,9 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
             }
         }
 
+        // Fetch real-time crypto prices for USD conversion
+        const [solPriceUsd, skrPriceUsd] = await Promise.all([fetchSolPriceUsd(), fetchSkrPriceUsd()]);
+
         const formattedUsers = users.map(user => {
             const nftPayments = nftPaymentsByUser[user.id] || [];
             const premium = nftPremiumByUser[user.id] || {};
@@ -1222,6 +1232,33 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
             const totalNftPaid = nftPayments.reduce((s, p) => s + (p.amount_usd || 0), 0);
             const totalSolPaid = solPayments.reduce((s, p) => s + (p.sol_amount || 0), 0);
             const totalSkrPaid = solPayments.reduce((s, p) => s + (p.skr_amount || 0), 0);
+            // Real-time USD conversion of actual crypto amounts paid
+            const solUsdRealtime = totalSolPaid * (solPriceUsd || 0);
+            const skrUsdRealtime = totalSkrPaid * (skrPriceUsd || 0);
+            // Also compute plan-based USD for Apple/Google subscriptions (no crypto payment records)
+            const PLAN_PRICES_USD = { 100: 1.75, 200: 2.45, 400: 3.99, 1000: 7.99 };
+            const PREMIUM_PRICE_USD = 49.99;
+            const totalSolUsdEquivalent = solPayments.reduce((s, p) => {
+                const tierGb = Number(p.tier_gb || 0);
+                const duration = String(p.duration || 'monthly').toLowerCase();
+                if (duration === 'premium') return s + PREMIUM_PRICE_USD;
+                const monthlyUsd = PLAN_PRICES_USD[tierGb] || 0;
+                const months = duration === 'yearly' ? 12 : 1;
+                return s + (monthlyUsd * months);
+            }, 0);
+            // Estimate Apple/Google subscription revenue from plan tier and payment period
+            let appleGoogleUsd = 0;
+            const payType = String(user.payment_type || '').toLowerCase();
+            if ((payType === 'apple' || payType === 'google') && user.payment_at && user.expires_at) {
+                const payAt = Number(user.payment_at);
+                const expAt = Number(user.expires_at);
+                if (payAt > 0 && expAt > payAt) {
+                    const months = Math.max(1, Math.round((expAt - payAt) / (30 * 24 * 60 * 60 * 1000)));
+                    const tierGb = Number(user.plan_gb || 0);
+                    appleGoogleUsd = (PLAN_PRICES_USD[tierGb] || 0) * months;
+                }
+            }
+            const totalUsdRealtime = totalNftPaid + solUsdRealtime + skrUsdRealtime + appleGoogleUsd;
             // Compute effective storage quota in bytes
             const planQuotaBytes = (user.plan_gb || 0) * 1073741824;
             const premiumQuotaBytes = premium.cloudQuotaBytes || ((user.premium_gb || 0) * 1073741824);
@@ -1283,13 +1320,20 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                     payments: solPayments.map(sp => ({ sol: sp.sol_amount, skr: sp.skr_amount || 0, payment_token: sp.payment_token || (sp.skr_amount > 0 ? 'SKR' : 'SOL'), tier_gb: sp.tier_gb, duration: sp.duration, date: sp.created_at ? new Date(sp.created_at).toISOString() : null })),
                     total_paid_sol: totalSolPaid,
                     total_paid_skr: totalSkrPaid,
+                    total_paid_usd_equivalent: totalSolUsdEquivalent,
+                    sol_usd_realtime: solUsdRealtime,
+                    skr_usd_realtime: skrUsdRealtime,
                 },
+                apple_google_usd: appleGoogleUsd,
+                total_usd_realtime: totalUsdRealtime,
             };
         });
 
         return res.json({
             total_users: formattedUsers.length,
             server_time: new Date().toISOString(),
+            sol_price_usd: solPriceUsd,
+            skr_price_usd: skrPriceUsd,
             admin_stats: {
                 photolynk_nfts_minted: Number(nftAdminStats?.totalMintCount || 0),
                 photolynk_paid_nfts_minted: Number(nftAdminStats?.paidMintCount || 0),
@@ -10030,9 +10074,16 @@ app.get('/lib/solana-web3.js', (req, res) => {
     res.status(404).send('// solana web3 not found locally');
 });
 
-// SOL price proxy - avoids CORS when fetching from browser
-app.get('/sol-price', async (req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
+// Shared crypto price fetcher (used by /sol-price, /skr-price, and admin API)
+let _cachedSolPrice = null;
+let _cachedSkrPrice = null;
+let _solPriceFetchedAt = 0;
+let _skrPriceFetchedAt = 0;
+const PRICE_CACHE_MS = 60000;
+
+async function fetchSolPriceUsd() {
+    const now = Date.now();
+    if (_cachedSolPrice && _cachedSolPrice > 0 && (now - _solPriceFetchedAt) < PRICE_CACHE_MS) return _cachedSolPrice;
     const sources = [
         async () => {
             const r = await axios.get('https://api.binance.com/api/v3/ticker/price?symbol=SOLUSDT', { timeout: 5000 });
@@ -10053,9 +10104,65 @@ app.get('/sol-price', async (req, res) => {
     for (const src of sources) {
         try {
             const price = await src();
-            if (price && price > 0) return res.json({ solana: { usd: price } });
+            if (price && price > 0) {
+                _cachedSolPrice = price;
+                _solPriceFetchedAt = now;
+                return price;
+            }
         } catch (_) { }
     }
+    return null;
+}
+
+async function fetchSkrPriceUsd() {
+    const now = Date.now();
+    if (_cachedSkrPrice && _cachedSkrPrice > 0 && (now - _skrPriceFetchedAt) < PRICE_CACHE_MS) return _cachedSkrPrice;
+    const sources = [
+        async () => {
+            const r = await axios.get(`https://price.jup.ag/v6/price?ids=${SKR_TOKEN_MINT}`, { timeout: 5000 });
+            const p = r.data?.data?.[SKR_TOKEN_MINT]?.price;
+            if (p > 0) return parseFloat(p);
+        },
+        async () => {
+            const r = await axios.get(`https://price.jup.ag/v4/price?ids=${SKR_TOKEN_MINT}`, { timeout: 5000 });
+            const p = r.data?.data?.[SKR_TOKEN_MINT]?.price;
+            if (p > 0) return parseFloat(p);
+        },
+        async () => {
+            const r = await axios.get('https://api.dexscreener.com/latest/dex/tokens/' + SKR_TOKEN_MINT, { timeout: 5000 });
+            const pairs = r.data?.pairs || [];
+            for (const pair of pairs) {
+                const p = parseFloat(pair?.priceUsd);
+                if (p > 0) return p;
+            }
+        },
+    ];
+    for (const src of sources) {
+        try {
+            const price = await src();
+            if (price && price > 0) {
+                _cachedSkrPrice = price;
+                _skrPriceFetchedAt = now;
+                return price;
+            }
+        } catch (_) { }
+    }
+    return null;
+}
+
+// SOL price proxy - avoids CORS when fetching from browser
+app.get('/sol-price', async (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    const price = await fetchSolPriceUsd();
+    if (price && price > 0) return res.json({ solana: { usd: price } });
+    res.status(503).json({ error: 'Price unavailable' });
+});
+
+// SKR price proxy
+app.get('/skr-price', async (req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    const price = await fetchSkrPriceUsd();
+    if (price && price > 0) return res.json({ skr: { usd: price } });
     res.status(503).json({ error: 'Price unavailable' });
 });
 
