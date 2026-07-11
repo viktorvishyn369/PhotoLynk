@@ -307,7 +307,7 @@ const CLOUD_DIR = process.env.CLOUD_DIR || path.join(AUX_ROOT, 'cloud'); // NVMe
 const CHUNKS_DIR = process.env.CHUNKS_DIR || null; // HDD RAID10: chunks only (if set)
 const CAPACITY_JSON_PATH = process.env.CAPACITY_JSON_PATH || path.join(AUX_ROOT, '.well-known', 'photolynk-capacity.json');
 
-const SUBSCRIPTION_GRACE_DAYS = Number.parseInt(process.env.SUBSCRIPTION_GRACE_DAYS || '3', 10);
+const SUBSCRIPTION_GRACE_DAYS = Number.parseInt(process.env.SUBSCRIPTION_GRACE_DAYS || '7', 10);
 const TRIAL_DAYS = Number.parseInt(process.env.TRIAL_DAYS || '7', 10);
 const TRIAL_COMPLIMENTARY_DAYS = Number.parseInt(process.env.TRIAL_COMPLIMENTARY_DAYS || '3', 10);
 const COMPLIMENTARY_PURGE_INTERVAL_MS = Number.parseInt(process.env.COMPLIMENTARY_PURGE_INTERVAL_MS || String(6 * 60 * 60 * 1000), 10);
@@ -965,6 +965,43 @@ app.post('/admin/api/user/plan', adminAuth, async (req, res) => {
     }
 });
 
+// Admin API: one-time migration for expired paid plans that were kept 'active' by the old bug.
+// Sets them to 'grace' with grace_until = now + SUBSCRIPTION_GRACE_DAYS, preserving the original expires_at.
+// This gives existing users a courtesy grace window from the migration date, after which the normal rules apply.
+app.post('/admin/api/migrate-expired-active-plans', adminAuth, async (req, res) => {
+    try {
+        const now = Date.now();
+        const graceMs = Math.max(0, SUBSCRIPTION_GRACE_DAYS) * 24 * 60 * 60 * 1000;
+        const graceUntil = now + graceMs;
+
+        const rows = await dbAllAsync(
+            `SELECT user_id, expires_at FROM user_plans WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?`,
+            [now]
+        );
+
+        let migrated = 0;
+        const details = [];
+        for (const row of rows) {
+            try {
+                await dbRunAsync(
+                    `UPDATE user_plans SET status = 'grace', grace_until = ?, updated_at = ? WHERE user_id = ?`,
+                    [graceUntil, now, row.user_id]
+                );
+                migrated++;
+                details.push({ userId: row.user_id, expiresAt: row.expires_at, graceUntil });
+            } catch (e) {
+                console.error(`[Admin] migrate failed for user ${row.user_id}:`, e);
+            }
+        }
+
+        console.log(`[Admin] Migrated ${migrated} expired active plans to grace (graceDays=${SUBSCRIPTION_GRACE_DAYS})`);
+        return res.json({ ok: true, migrated, graceDays: SUBSCRIPTION_GRACE_DAYS, graceUntil, details });
+    } catch (e) {
+        console.error('[Admin] migrate expired active plans error', e);
+        return res.status(500).json({ error: 'Server error' });
+    }
+});
+
 const ADMIN_BASE58_WALLET_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 
 const normalizeStoredSeekerId = (value) => {
@@ -1090,7 +1127,13 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
             const complimentaryUntil = trialUntil ? (trialUntil + complimentaryMs) : null;
             const graceMs = Math.max(0, SUBSCRIPTION_GRACE_DAYS) * 24 * 60 * 60 * 1000;
 
-            if (dbStatus === 'active') return 'active';
+            // Active paid plans still expire. Expired active accounts go through grace → expired like everyone else.
+            if (dbStatus === 'active' || dbStatus === 'grace') {
+                if (!expiresAt || expiresAt > now) return 'active';
+                const gu = graceUntil && graceUntil > 0 ? graceUntil : (expiresAt + graceMs);
+                const inGrace = gu && gu > 0 ? now <= gu : false;
+                return premGb > 0 ? 'premium_only' : (inGrace ? 'grace' : 'expired');
+            }
             if (trialUntil && trialUntil > now) return 'trial';
             if (dbStatus === 'trial' && trialUntil && trialUntil > 0 && complimentaryUntil && now <= complimentaryUntil) {
                 return premGb > 0 ? 'premium_only' : 'trial_complimentary';
@@ -1770,29 +1813,6 @@ const resolveSubscriptionState = async (userId) => {
             usedBytes,
             quotaBytes,
         };
-    }
-
-    if (row.status === 'active' && expiresAt && expiresAt > 0 && expiresAt <= now) {
-        try {
-            if (updatedAt && updatedAt > expiresAt) {
-                const now2 = Date.now();
-                await dbRunAsync(
-                    `UPDATE user_plans SET expires_at = NULL, grace_until = NULL, updated_at = ? WHERE user_id = ?`,
-                    [now2, userId]
-                );
-                return {
-                    allowed: true,
-                    status: 'active',
-                    expiresAt: null,
-                    graceUntil: null,
-                    planGb: planGb || null,
-                    premiumGb,
-                    paymentType: row.payment_type || null,
-                    usedBytes,
-                    quotaBytes,
-                };
-            }
-        } catch (e) { }
     }
 
     if (expiresAt && expiresAt > 0 && expiresAt <= now) {

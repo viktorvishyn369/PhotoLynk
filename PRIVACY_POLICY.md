@@ -1,6 +1,6 @@
 # PhotoLynk Privacy Policy
 
-**Last Updated**: March 10, 2026
+**Last Updated**: July 11, 2026
 
 **StealthLynk LLC** ("Company," "we," "us," or "our") operates the PhotoLynk application (the "Service"). This Privacy Policy explains how we collect, use, disclose, and safeguard your information when you use our Service.
 
@@ -50,7 +50,7 @@ When you make in-app purchases, we collect and process:
 
 - **Purchase Receipts**: Transaction receipts from Apple App Store or Google Play Store for verification purposes
 - **Account Balance**: Credit balance and transaction history for photo certification services
-- **Premium Status**: Whether you have purchased the Premium tier ($49.99 USD one-time) and associated feature entitlements (1TB encrypted cloud storage for 1 year, 100 completely free certifications)
+- **Premium Status**: Whether you have purchased the Premium add-on ($49.99 USD one-time) and associated feature entitlements (1,000 GB encrypted cloud storage for 1 year, 100 free Web3 Album entries with Auth Records, discounted mint fees)
 - **Verification Credit**: Photo Verification Credit purchases ($15.00 USD consumable) that add to your account balance for photo certification services
 - **Platform Information**: The platform (iOS or Android) where the purchase was made
 
@@ -137,7 +137,7 @@ Data retention is entirely under your control. We do not retain any data from Lo
 
 ### 6.2 StealthCloud Mode
 
-- **Encrypted Data**: Retained while your subscription is active, plus a grace period after expiration
+- **Encrypted Data**: Retained while your subscription is active, plus a 7-day grace period after expiration. After the grace period, uploads are paused but all backed-up data remains accessible for download and restore. Data is only deleted if you explicitly delete your account
 - **Account Information**: Retained until you request deletion
 - **Logs**: Retained for up to 90 days for security and debugging purposes
 
@@ -236,7 +236,7 @@ FOR STEALTHCLOUD MODE, YOU ACKNOWLEDGE AND AGREE THAT:
 - Loss of your credentials may result in permanent loss of access to your data
 - StealthLynk LLC is not liable for data loss due to encryption key loss
 - StealthLynk LLC is not liable for service interruptions due to force majeure events
-- StealthLynk LLC is not liable for data loss during the grace period after subscription expiration
+- StealthLynk LLC is not liable for data loss during the grace period or after subscription expiration. Uploads are paused but all backed-up data remains accessible
 
 ### 12.5 Force Majeure
 
