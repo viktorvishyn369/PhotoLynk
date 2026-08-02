@@ -1,4 +1,4 @@
-# PhotoLynk — Self‑Hosted. Encrypted Cloud. iOS ↔ Android ↔ Desktop.
+# PhotoLynk — Self‑Hosted. Encrypted Cloud. Android ↔ Desktop.
 
 **A project by <a href="https://stealthlynk.io" target="_blank">StealthLynk LLC</a>** — Building secure, privacy-respecting infrastructure for real-world digital systems.
 
@@ -15,16 +15,15 @@ Back up photos/videos to your own server or StealthCloud, and restore on any pho
 
 | Platform | Status | Payment Method |
 |----------|--------|----------------|
-| **iOS** | ✅ Live on App Store | In-App Purchase |
+| **iOS** | 🌅 Sunset — no longer available for new downloads | In-App Purchase |
 | **Android** | ✅ Live on Google Play | In-App Purchase |
 | **Wallet-enabled Android variant** | ✅ Available in ecosystem distribution | On-chain wallet payment flow |
 
 The PhotoLynk mobile apps feature end-to-end encryption, self-hosted or cloud backup options, and seamless cross-platform restore.
 
-**iOS, Android, and the wallet-enabled Android variant are live.**
+**Android and the wallet-enabled Android variant are live.** iOS is sunset — existing installs continue to work but the app is no longer available for new downloads on the App Store.
 
 Store links:
-- iOS (App Store): [Download PhotoLynk](https://apps.apple.com/app/id6748285696)
 - Android (Google Play): [Download PhotoLynk](https://play.google.com/store/apps/details?id=com.photosync.app)
 - Wallet-enabled Android variant: available in its ecosystem distribution channel
 
