@@ -1778,22 +1778,6 @@ const resolveSubscriptionState = async (userId) => {
         };
     };
 
-    if (deletedAt && deletedAt > 0) {
-        if (premiumGb > 0) return await resolvePremiumState('premium_over_capacity', { deletedAt });
-        return {
-            allowed: false,
-            status: 'deleted',
-            expiresAt: expiresAt || null,
-            graceUntil: graceUntil || null,
-            deletedAt,
-            planGb: null,
-            premiumGb,
-            paymentType: row.payment_type || null,
-            usedBytes,
-            quotaBytes,
-        };
-    }
-
     if (paidPlanActive) {
         return {
             allowed: true,
@@ -1851,6 +1835,22 @@ const resolveSubscriptionState = async (userId) => {
             complimentaryUntil,
             expiresAt: null,
             graceUntil: null,
+            planGb: null,
+            premiumGb,
+            paymentType: row.payment_type || null,
+            usedBytes,
+            quotaBytes,
+        };
+    }
+
+    if (deletedAt && deletedAt > 0) {
+        if (premiumGb > 0) return await resolvePremiumState('premium_over_capacity', { deletedAt });
+        return {
+            allowed: false,
+            status: 'deleted',
+            expiresAt: expiresAt || null,
+            graceUntil: graceUntil || null,
+            deletedAt,
             planGb: null,
             premiumGb,
             paymentType: row.payment_type || null,
