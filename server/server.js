@@ -4727,6 +4727,7 @@ app.post('/api/solana/verify-payment', async (req, res) => {
                 payment_type = 'solana',
                 payment_at = excluded.updated_at,
                 grace_until = NULL,
+                deleted_at = NULL,
                 updated_at = excluded.updated_at`,
             [user.id, normalizedTier, expiresAt, solanaExpiry.trialCarryoverAppliedAt, now]
         );
@@ -4847,6 +4848,7 @@ app.post('/api/solana/verify-skr-payment', async (req, res) => {
                 payment_type = 'skr',
                 payment_at = excluded.updated_at,
                 grace_until = NULL,
+                deleted_at = NULL,
                 updated_at = excluded.updated_at`,
             [user.id, normalizedTier, expiresAt, solanaExpiry.trialCarryoverAppliedAt, now]
         );
