@@ -4614,7 +4614,7 @@ const SOLANA_PAYMENT_WALLET = 'HttTZkUG8xn5A1uJPjRDJqqufdwvHmNQroEGmST8iimU';
 const SKR_TOKEN_MINT = 'SKRbvo6Gf7GondiT3BbTfuRDPqLWei4j2Qy2NPGZhW3';
 const SKR_TOKEN_SYMBOL = 'SKR';
 const SKR_TOKEN_DECIMALS = 6;
-const SOLANA_RPC_ENDPOINT = process.env.SOLANA_RPC_ENDPOINT || 'https://api.mainnet-beta.solana.com';
+const SOLANA_RPC_ENDPOINT = process.env.SOLANA_RPC_ENDPOINT || 'https://solana-rpc.publicnode.com';
 const LAMPORTS_PER_SOL = 1000000000;
 
 // Plan durations in milliseconds
@@ -9987,8 +9987,8 @@ app.post('/solana-rpc', async (req, res) => {
 
     const rpcEndpoints = [
         process.env.SOLANA_RPC_ENDPOINT,          // Custom RPC if configured (highest priority)
-        'https://api.mainnet-beta.solana.com',
         'https://solana-rpc.publicnode.com',       // PublicNode - reliable free tier
+        'https://api.mainnet-beta.solana.com',
         'https://rpc.ankr.com/solana',
         'https://solana.drpc.org',                 // dRPC public
         (process.env.HELIUS_RPC_KEY || process.env.HELIUS_API_KEY) ? `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_RPC_KEY || process.env.HELIUS_API_KEY}` : null, // Helius (env)
@@ -10991,7 +10991,7 @@ app.get('/nft-payment', (req, res) => {
           const metaUrl = qs.get('metadataUrl') || '';
           
           const dasKeys = [
-            '${process.env.HELIUS_API_KEY ? `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}` : 'https://api.mainnet-beta.solana.com'}',
+            '${process.env.HELIUS_API_KEY ? `https://mainnet.helius-rpc.com/?api-key=${process.env.HELIUS_API_KEY}` : 'https://solana-rpc.publicnode.com'}',
           ];
           for (let dasAttempt = 0; dasAttempt < 5; dasAttempt++) {
             await new Promise(r => setTimeout(r, dasAttempt === 0 ? 2000 : 3000));
