@@ -112,6 +112,7 @@ jobs:
           path: |
             server-tray/dist/release/*
           if-no-files-found: warn
+          retention-days: 1
 
   build-macos-arm64:
     runs-on: macos-14
@@ -218,6 +219,7 @@ jobs:
           path: |
             server-tray/dist/release/*
           if-no-files-found: warn
+          retention-days: 1
 
   build-windows:
     runs-on: windows-2022
@@ -276,6 +278,7 @@ jobs:
           path: |
             server-tray/dist/release/*
           if-no-files-found: warn
+          retention-days: 1
 
   build-linux:
     runs-on: ubuntu-latest
@@ -341,6 +344,7 @@ jobs:
           path: |
             server-tray/dist/release/*
           if-no-files-found: warn
+          retention-days: 1
 
   create-release:
     needs: [build-macos-x64, build-macos-arm64, build-windows, build-linux]

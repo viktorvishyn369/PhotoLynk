@@ -1,0 +1,74 @@
+name: Cleanup Old Workflow Runs
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Weekly on Sunday at midnight UTC
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Delete old workflow runs
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000); // 7 days ago
+
+            // Delete old completed runs (keeps last 7 days)
+            for (const workflow of ['build-server-tray.yml', 'test-apple-notary.yml']) {
+              let page = 1;
+              while (true) {
+                const runs = await github.rest.actions.listWorkflowRuns({
+                  owner, repo,
+                  workflow_id: workflow,
+                  per_page: 100,
+                  page,
+                  status: 'completed',
+                });
+                if (runs.data.workflow_runs.length === 0) break;
+                for (const run of runs.data.workflow_runs) {
+                  if (new Date(run.created_at) < cutoff) {
+                    try {
+                      await github.rest.actions.deleteWorkflowRun({ owner, repo, run_id: run.id });
+                      console.log(`Deleted run ${run.id} (${workflow} ${run.created_at})`);
+                    } catch (e) {
+                      console.log(`Skip run ${run.id}: ${e.message}`);
+                    }
+                  }
+                }
+                page++;
+              }
+            }
+
+            // Delete old pages-build-deployment runs (keep last 3)
+            let page = 1;
+            let deleted = 0;
+            while (deleted < 500) {
+              const runs = await github.rest.actions.listWorkflowRunsForRepo({
+                owner, repo,
+                per_page: 100,
+                page,
+                status: 'completed',
+              });
+              if (runs.data.workflow_runs.length === 0) break;
+              const pagesRuns = runs.data.workflow_runs
+                .filter(r => r.name === 'pages build and deployment')
+                .sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+              // Skip the 3 most recent, delete the rest
+              for (const run of pagesRuns.slice(3)) {
+                if (new Date(run.created_at) < cutoff) {
+                  try {
+                    await github.rest.actions.deleteWorkflowRun({ owner, repo, run_id: run.id });
+                    deleted++;
+                  } catch (e) {}
+                }
+              }
+              page++;
+            }
+            console.log(`Deleted ${deleted} old pages-build-deployment runs`);
