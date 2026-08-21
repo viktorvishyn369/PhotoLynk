@@ -350,10 +350,23 @@ const DOWNLOADS_DIR = process.env.DOWNLOADS_DIR || path.join(AUX_ROOT, 'download
 if (!fs.existsSync(DOWNLOADS_DIR)) { try { fs.mkdirSync(DOWNLOADS_DIR, { recursive: true }); } catch (_) { } }
 
 // Serve .well-known directory for capacity JSON and Digital Asset Links (MWA wallet identity verification)
+// Disable helmet security headers for .well-known so wallet apps (Phantom, Solflare) can fetch assetlinks.json
+// without being blocked by CORP or CSP headers.
+app.use('/.well-known', (req, res, next) => {
+    res.removeHeader('Cross-Origin-Resource-Policy');
+    res.removeHeader('Cross-Origin-Embedder-Policy');
+    res.removeHeader('Cross-Origin-Opener-Policy');
+    res.removeHeader('Content-Security-Policy');
+    next();
+});
 app.use('/.well-known', express.static(path.join(AUX_ROOT, '.well-known')));
 
 // Fallback: serve assetlinks.json from repo public dir if not in AUX_ROOT
 app.get('/.well-known/assetlinks.json', (req, res) => {
+    res.removeHeader('Cross-Origin-Resource-Policy');
+    res.removeHeader('Cross-Origin-Embedder-Policy');
+    res.removeHeader('Cross-Origin-Opener-Policy');
+    res.removeHeader('Content-Security-Policy');
     const primaryPath = path.join(AUX_ROOT, '.well-known', 'assetlinks.json');
     if (fs.existsSync(primaryPath)) {
         res.setHeader('Content-Type', 'application/json');
