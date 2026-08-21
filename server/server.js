@@ -2411,7 +2411,12 @@ db.serialize(() => {
         });
     }, 1000); // Wait 1 second after startup
 
-    setTimeout(() => {
+    setTimeout(async () => {
+        try {
+            await migrateStalePlanStates();
+        } catch (e) {
+            console.error('[Migration] Startup migration failed:', e.message);
+        }
         purgeExpiredComplimentaryUsers().catch((e) => {
             console.error('[AutoPurge] Startup purge failed:', e.message);
         });
@@ -2716,6 +2721,92 @@ const purgeUserEverywhere = async (userId, options = {}) => {
 
     console.log(`[UserPurge] Completed user=${uid} reason=${reason} files=${deleteFiles ? 'yes' : 'no'}`);
     return { ok: true, deleted };
+};
+
+const migrateStalePlanStates = async () => {
+    const now = Date.now();
+    const complimentaryMs = Math.max(0, TRIAL_COMPLIMENTARY_DAYS) * 24 * 60 * 60 * 1000;
+    const graceMs = Math.max(0, SUBSCRIPTION_GRACE_DAYS) * 24 * 60 * 60 * 1000;
+    let fixed = 0;
+
+    // 1. Trial users whose complimentary period has ended → set status='expired', deleted_at
+    //    Old code left them stuck as 'trial' with no deleted_at
+    //    Skip users with active premium storage (1-year protection)
+    const staleTrials = await dbAllAsync(
+        `SELECT user_id, trial_until, deleted_at FROM user_plans
+         WHERE status = 'trial' AND trial_until IS NOT NULL AND trial_until > 0
+           AND (trial_until + ?) < ?
+           AND (premium_gb IS NULL OR premium_gb = 0 OR premium_expires_at IS NULL OR premium_expires_at < ?)`,
+        [complimentaryMs, now, now]
+    );
+    for (const row of staleTrials) {
+        const complimentaryEnd = Number(row.trial_until) + complimentaryMs;
+        const deletedAt = (row.deleted_at && Number(row.deleted_at) > 0) ? Number(row.deleted_at) : complimentaryEnd;
+        try {
+            await dbRunAsync(
+                `UPDATE user_plans SET status = 'expired', deleted_at = ?, updated_at = ? WHERE user_id = ?`,
+                [deletedAt, now, row.user_id]
+            );
+            fixed++;
+        } catch (e) {
+            console.error(`[Migration] Failed to fix stale trial user ${row.user_id}:`, e.message);
+        }
+    }
+    if (staleTrials.length > 0) {
+        console.log(`[Migration] Fixed ${staleTrials.length} stale trial→expired users`);
+    }
+
+    // 2. Expired users without deleted_at → set deleted_at to now (start 30-day retention)
+    //    Skip users with active premium storage
+    const staleExpired = await dbAllAsync(
+        `SELECT user_id FROM user_plans
+         WHERE status = 'expired' AND (deleted_at IS NULL OR deleted_at <= 0)
+           AND (premium_gb IS NULL OR premium_gb = 0 OR premium_expires_at IS NULL OR premium_expires_at < ?)`,
+        [now]
+    );
+    for (const row of staleExpired) {
+        try {
+            await dbRunAsync(
+                `UPDATE user_plans SET deleted_at = ?, updated_at = ? WHERE user_id = ?`,
+                [now, now, row.user_id]
+            );
+            fixed++;
+        } catch (e) {
+            console.error(`[Migration] Failed to set deleted_at for expired user ${row.user_id}:`, e.message);
+        }
+    }
+    if (staleExpired.length > 0) {
+        console.log(`[Migration] Set deleted_at for ${staleExpired.length} expired users (starting 30-day retention)`);
+    }
+
+    // 3. Active users with expired expires_at → migrate to grace
+    //    (premium users are handled separately — they keep access via premium storage)
+    const staleActive = await dbAllAsync(
+        `SELECT user_id, expires_at, grace_until FROM user_plans
+         WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?`,
+        [now]
+    );
+    for (const row of staleActive) {
+        const expiresAt = Number(row.expires_at);
+        const graceUntil = (row.grace_until && Number(row.grace_until) > 0) ? Number(row.grace_until) : (expiresAt + graceMs);
+        try {
+            await dbRunAsync(
+                `UPDATE user_plans SET status = 'grace', grace_until = ?, updated_at = ? WHERE user_id = ?`,
+                [graceUntil, now, row.user_id]
+            );
+            fixed++;
+        } catch (e) {
+            console.error(`[Migration] Failed to migrate active→grace for user ${row.user_id}:`, e.message);
+        }
+    }
+    if (staleActive.length > 0) {
+        console.log(`[Migration] Migrated ${staleActive.length} expired active→grace users`);
+    }
+
+    if (fixed > 0) {
+        console.log(`[Migration] Total stale plan states fixed: ${fixed}`);
+    }
+    return fixed;
 };
 
 const purgeExpiredComplimentaryUsers = async () => {
