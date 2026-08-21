@@ -349,8 +349,23 @@ app.use('/paceseeker', express.static(path.join(__dirname, 'public', 'paceseeker
 const DOWNLOADS_DIR = process.env.DOWNLOADS_DIR || path.join(AUX_ROOT, 'downloads');
 if (!fs.existsSync(DOWNLOADS_DIR)) { try { fs.mkdirSync(DOWNLOADS_DIR, { recursive: true }); } catch (_) { } }
 
-// Serve .well-known directory for capacity JSON
+// Serve .well-known directory for capacity JSON and Digital Asset Links (MWA wallet identity verification)
 app.use('/.well-known', express.static(path.join(AUX_ROOT, '.well-known')));
+
+// Fallback: serve assetlinks.json from repo public dir if not in AUX_ROOT
+app.get('/.well-known/assetlinks.json', (req, res) => {
+    const primaryPath = path.join(AUX_ROOT, '.well-known', 'assetlinks.json');
+    if (fs.existsSync(primaryPath)) {
+        res.setHeader('Content-Type', 'application/json');
+        return res.sendFile(primaryPath);
+    }
+    const fallbackPath = path.join(__dirname, 'public', '.well-known', 'assetlinks.json');
+    if (fs.existsSync(fallbackPath)) {
+        res.setHeader('Content-Type', 'application/json');
+        return res.sendFile(fallbackPath);
+    }
+    res.status(404).json({ error: 'assetlinks.json not found' });
+});
 
 // Basic IP allowlist helper
 const isIpAllowed = (ip) => {
