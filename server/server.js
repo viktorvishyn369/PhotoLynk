@@ -2747,7 +2747,7 @@ const purgeExpiredComplimentaryUsers = async () => {
         try {
             // Re-check current state to prevent race condition:
             // user may have paid between the initial query and now
-            const currentPlan = await dbGetAsync(`SELECT status, deleted_at, expires_at FROM user_plans WHERE user_id = ?`, [uid]);
+            const currentPlan = await dbGetAsync(`SELECT status, deleted_at, expires_at, premium_gb, premium_expires_at FROM user_plans WHERE user_id = ?`, [uid]);
             if (!currentPlan) continue;
             if (currentPlan.status === 'active' || currentPlan.status === 'trial' || currentPlan.status === 'grace') {
                 console.log(`[AutoPurge] Skipping user ${uid} — status is now '${currentPlan.status}' (renewed during purge)`);
@@ -2760,6 +2760,13 @@ const purgeExpiredComplimentaryUsers = async () => {
             // Double-check deleted_at is still past cutoff
             if (Number(currentPlan.deleted_at) >= cutoff) {
                 console.log(`[AutoPurge] Skipping user ${uid} — deleted_at no longer past cutoff`);
+                continue;
+            }
+            // Re-check premium storage is not active (1-year protection)
+            const premGb = Number(currentPlan.premium_gb) || 0;
+            const premExp = Number(currentPlan.premium_expires_at) || 0;
+            if (premGb > 0 && premExp > 0 && premExp > now) {
+                console.log(`[AutoPurge] Skipping user ${uid} — premium storage active until ${new Date(premExp).toISOString()}`);
                 continue;
             }
 
