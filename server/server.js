@@ -311,6 +311,7 @@ const SUBSCRIPTION_GRACE_DAYS = Number.parseInt(process.env.SUBSCRIPTION_GRACE_D
 const TRIAL_DAYS = Number.parseInt(process.env.TRIAL_DAYS || '7', 10);
 const TRIAL_COMPLIMENTARY_DAYS = Number.parseInt(process.env.TRIAL_COMPLIMENTARY_DAYS || '3', 10);
 const COMPLIMENTARY_PURGE_INTERVAL_MS = Number.parseInt(process.env.COMPLIMENTARY_PURGE_INTERVAL_MS || String(6 * 60 * 60 * 1000), 10);
+const PURGE_RETENTION_DAYS = Number.parseInt(process.env.PURGE_RETENTION_DAYS || '30', 10);
 const REVENUECAT_WEBHOOK_SECRET = process.env.REVENUECAT_WEBHOOK_SECRET || '';
 const USER_QUOTA_MARGIN_BYTES = Number.parseInt(process.env.USER_QUOTA_MARGIN_BYTES || String(50 * 1024 * 1024), 10);
 const GB_BYTES = 1000 * 1000 * 1000;
@@ -1828,6 +1829,14 @@ const resolveSubscriptionState = async (userId) => {
 
     if (row.status === 'trial' && trialUntil && trialUntil > 0 && complimentaryUntil && complimentaryUntil < now) {
         if (premiumGb > 0) return await resolvePremiumState('premium_over_capacity', { complimentaryUntil });
+        if (!deletedAt || deletedAt <= 0) {
+            try {
+                await dbRunAsync(
+                    `UPDATE user_plans SET deleted_at = ?, updated_at = ? WHERE user_id = ?`,
+                    [now, now, userId]
+                );
+            } catch (e) { }
+        }
         return {
             allowed: true,
             status: 'trial_complimentary_expired',
@@ -1873,8 +1882,8 @@ const resolveSubscriptionState = async (userId) => {
             try {
                 const nextUpdatedAt = Date.now();
                 await dbRunAsync(
-                    `UPDATE user_plans SET status = ?, updated_at = ? WHERE user_id = ?`,
-                    ['expired', nextUpdatedAt, userId]
+                    `UPDATE user_plans SET status = ?, deleted_at = COALESCE(deleted_at, ?), updated_at = ? WHERE user_id = ?`,
+                    ['expired', nextUpdatedAt, nextUpdatedAt, userId]
                 );
             } catch (e) { }
         }
@@ -2391,14 +2400,14 @@ db.serialize(() => {
 
     setTimeout(() => {
         purgeExpiredComplimentaryUsers().catch((e) => {
-            console.error('[ComplimentaryCleanup] Startup purge failed:', e.message);
+            console.error('[AutoPurge] Startup purge failed:', e.message);
         });
     }, 1500);
 
     if (COMPLIMENTARY_PURGE_INTERVAL_MS > 0) {
         setInterval(() => {
             purgeExpiredComplimentaryUsers().catch((e) => {
-                console.error('[ComplimentaryCleanup] Scheduled purge failed:', e.message);
+                console.error('[AutoPurge] Scheduled purge failed:', e.message);
             });
         }, COMPLIMENTARY_PURGE_INTERVAL_MS);
     }
@@ -2697,7 +2706,89 @@ const purgeUserEverywhere = async (userId, options = {}) => {
 };
 
 const purgeExpiredComplimentaryUsers = async () => {
-    return { scanned: 0, purged: 0 };
+    const now = Date.now();
+    const retentionMs = PURGE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    const cutoff = now - retentionMs;
+
+    const expiredRows = await dbAllAsync(
+        `SELECT up.user_id, up.deleted_at, up.status, u.email, u.user_uuid, u.storage_uuid
+         FROM user_plans up
+         JOIN users u ON u.id = up.user_id
+         WHERE up.deleted_at IS NOT NULL AND up.deleted_at > 0 AND up.deleted_at < ?
+           AND up.status NOT IN ('active', 'trial')
+           AND (up.premium_gb IS NULL OR up.premium_gb = 0 OR up.premium_expires_at IS NULL OR up.premium_expires_at < ?)`,
+        [cutoff, now]
+    );
+
+    if (!expiredRows || expiredRows.length === 0) {
+        return { scanned: 0, purged: 0, cutoff: new Date(cutoff).toISOString() };
+    }
+
+    console.log(`[AutoPurge] Found ${expiredRows.length} users past ${PURGE_RETENTION_DAYS}-day retention cutoff`);
+
+    let purged = 0;
+    let errors = 0;
+
+    for (const row of expiredRows) {
+        const uid = Number(row.user_id);
+        try {
+            const user = await dbGetAsync(`SELECT * FROM users WHERE id = ?`, [uid]);
+            if (!user) continue;
+
+            const possibleKeys = new Set(getStealthCloudAllPossibleUserKeys(user));
+            possibleKeys.add(String(uid));
+            const devices = await dbAllAsync(`SELECT * FROM devices WHERE user_id = ?`, [uid]);
+            for (const device of devices) {
+                if (device && device.device_uuid) {
+                    const safe = sanitizeUserKey(device.device_uuid);
+                    if (safe) possibleKeys.add(safe);
+                }
+            }
+
+            const dirsToDelete = new Set();
+            for (const key of possibleKeys) {
+                if (!key) continue;
+                const cloudDir = path.join(CLOUD_DIR, 'users', key);
+                if (fs.existsSync(cloudDir)) dirsToDelete.add(cloudDir);
+                if (CHUNKS_DIR) {
+                    const chunksDir = path.join(CHUNKS_DIR, 'users', key);
+                    if (fs.existsSync(chunksDir)) dirsToDelete.add(chunksDir);
+                }
+            }
+            for (const device of devices) {
+                if (!device || !device.device_uuid) continue;
+                const deviceDir = path.join(UPLOAD_DIR, device.device_uuid);
+                if (fs.existsSync(deviceDir)) dirsToDelete.add(deviceDir);
+            }
+
+            clearStealthCloudDedupCachesForKeys(Array.from(possibleKeys));
+
+            for (const dir of dirsToDelete) {
+                try {
+                    fs.rmSync(dir, { recursive: true, force: true });
+                } catch (e) {
+                    console.error(`[AutoPurge] Failed to remove ${dir}:`, e.message);
+                }
+            }
+
+            await safeDeleteFromTable('cloud_chunks', 'user_id = ?', [uid]);
+            await safeDeleteFromTable('cloud_device_state', 'user_id = ?', [uid]);
+            await safeDeleteFromTable('files', 'user_id = ?', [uid]);
+            await safeDeleteFromTable('platform_hashes', 'user_id = ?', [uid]);
+
+            const deletedAtStr = new Date(Number(row.deleted_at)).toISOString();
+            const ageDays = Math.floor((now - Number(row.deleted_at)) / (24 * 60 * 60 * 1000));
+            console.log(`[AutoPurge] Purged cloud data for user ${uid} (${row.email || row.user_uuid}) — expired ${ageDays}d ago, deleted_at=${deletedAtStr}. NFTs/certs preserved.`);
+
+            purged++;
+        } catch (e) {
+            console.error(`[AutoPurge] Failed to purge user ${uid}:`, e.message);
+            errors++;
+        }
+    }
+
+    console.log(`[AutoPurge] Complete: ${purged} purged, ${errors} errors`);
+    return { scanned: expiredRows.length, purged, errors, cutoff: new Date(cutoff).toISOString() };
 };
 
 const getStealthCloudStorageKey = (user) => {
