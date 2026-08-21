@@ -469,6 +469,7 @@ tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowr
 .payment-apple{background:rgba(255,255,255,.08);color:#e2e8f0}
 .payment-google{background:rgba(59,130,246,.15);color:#60a5fa}
 .payment-solana{background:rgba(139,92,246,.15);color:#a78bfa}
+.payment-skr{background:rgba(34,197,94,.12);color:#4ade80}
 .nft-premium{background:rgba(153,69,255,.15);color:#b794f6}
 .nft-deposit{background:rgba(34,197,94,.12);color:#4ade80}
 .storage-bar{width:80px;height:6px;background:rgba(255,255,255,.06);border-radius:3px;display:inline-block;vertical-align:middle;margin-left:6px}
@@ -590,7 +591,7 @@ function storageCell(used,quota){var usedStr=fmtBytes(used);var quotaStr=quota>0
 
 function statusBadge(st){var c='badge-'+(st||'none').replace(/\\s/g,'_');return'<span class="badge '+c+'">'+(st||'none')+'</span>'}
 
-function paymentBadges(u){var tags=[];if(u.payment_type){tags.push('<span class="payment-badge payment-'+(u.payment_type||'').toLowerCase()+'">'+u.payment_type+'</span>')}if(u.nft_is_premium){tags.push('<span class="payment-badge nft-premium">Premium</span>')}if(u.nft_payments&&u.nft_payments.length>0){var types={};u.nft_payments.forEach(function(p){var k=(p.platform||'iap')+':'+(p.type||'');types[k]=(types[k]||0)+1});Object.keys(types).forEach(function(k){var parts=k.split(':');tags.push('<span class="mini-tag">'+parts[0]+' x'+types[k]+'</span>')})}if(u.sol_payments&&u.sol_payments.length>0){tags.push('<span class="payment-badge payment-solana">SOL x'+u.sol_payments.length+'</span>')}return tags.length?tags.join(' '):'<span class="date-cell">-</span>'}
+function paymentBadges(u){var tags=[];if(u.payment_type){var pt=(u.payment_type||'').toLowerCase();var label=pt==='solana'?'SOL':pt==='skr'?'SKR':pt;tags.push('<span class="payment-badge payment-'+pt+'">'+label+'</span>')}if(u.nft_is_premium){tags.push('<span class="payment-badge nft-premium">Premium</span>')}if(u.nft_payments&&u.nft_payments.length>0){var types={};u.nft_payments.forEach(function(p){var k=(p.platform||'iap')+':'+(p.type||'');types[k]=(types[k]||0)+1});Object.keys(types).forEach(function(k){var parts=k.split(':');tags.push('<span class="mini-tag">'+parts[0]+' x'+types[k]+'</span>')})}if(u.sol_payments&&u.sol_payments.length>0){var solCount=0,skrCount=0;u.sol_payments.forEach(function(p){if(p.payment_token==='SKR'||(p.skr&&Number(p.skr)>0)){skrCount++}else{solCount++}});if(solCount>0)tags.push('<span class="payment-badge payment-solana">SOL x'+solCount+'</span>');if(skrCount>0)tags.push('<span class="payment-badge payment-skr">SKR x'+skrCount+'</span>')}return tags.length?tags.join(' '):'<span class="date-cell">-</span>'}
 
 function totalPaidCell(u){var parts=[];var totalUsd=u.total_usd_realtime||0;if(totalUsd>0)parts.push('$'+totalUsd.toFixed(2));var sol=u.sol_total_paid||0;var skr=u.skr_total_paid||0;if(sol>0)parts.push(sol.toFixed(4)+' SOL');if(skr>0)parts.push(skr.toFixed(2)+' SKR');if(!parts.length)return'<span class="money-cell zero">-</span>';return'<span class="money-cell">'+parts.join('<br>')+'</span>'}
 
