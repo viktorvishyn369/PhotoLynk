@@ -1832,18 +1832,19 @@ const resolveSubscriptionState = async (userId) => {
         if (!deletedAt || deletedAt <= 0) {
             try {
                 await dbRunAsync(
-                    `UPDATE user_plans SET deleted_at = ?, updated_at = ? WHERE user_id = ?`,
+                    `UPDATE user_plans SET status = 'expired', deleted_at = ?, updated_at = ? WHERE user_id = ?`,
                     [now, now, userId]
                 );
             } catch (e) { }
         }
         return {
-            allowed: true,
+            allowed: false,
             status: 'trial_complimentary_expired',
             trialUntil,
             complimentaryUntil,
             expiresAt: null,
             graceUntil: null,
+            deletedAt: deletedAt || now,
             planGb: null,
             premiumGb,
             paymentType: row.payment_type || null,
