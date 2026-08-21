@@ -927,6 +927,18 @@ app.post('/admin/api/user/plan', adminAuth, async (req, res) => {
                     updates.push('grace_until = ?');
                     params.push(null);
                 }
+                updates.push('deleted_at = ?');
+                params.push(null);
+            } else if (String(status) === 'trial') {
+                if (!hasRequestValue(graceUntil)) {
+                    updates.push('grace_until = ?');
+                    params.push(null);
+                }
+                updates.push('deleted_at = ?');
+                params.push(null);
+            } else if (String(status) === 'grace') {
+                updates.push('deleted_at = ?');
+                params.push(null);
             } else if (String(status) === 'expired' || String(status) === 'none') {
                 if (!hasRequestValue(trialUntil) && !hasRequestValue(extendTrialDays)) {
                     updates.push('trial_until = ?');
@@ -2716,7 +2728,7 @@ const purgeExpiredComplimentaryUsers = async () => {
          FROM user_plans up
          JOIN users u ON u.id = up.user_id
          WHERE up.deleted_at IS NOT NULL AND up.deleted_at > 0 AND up.deleted_at < ?
-           AND up.status NOT IN ('active', 'trial')
+           AND up.status NOT IN ('active', 'trial', 'grace')
            AND (up.premium_gb IS NULL OR up.premium_gb = 0 OR up.premium_expires_at IS NULL OR up.premium_expires_at < ?)`,
         [cutoff, now]
     );
@@ -2733,6 +2745,24 @@ const purgeExpiredComplimentaryUsers = async () => {
     for (const row of expiredRows) {
         const uid = Number(row.user_id);
         try {
+            // Re-check current state to prevent race condition:
+            // user may have paid between the initial query and now
+            const currentPlan = await dbGetAsync(`SELECT status, deleted_at, expires_at FROM user_plans WHERE user_id = ?`, [uid]);
+            if (!currentPlan) continue;
+            if (currentPlan.status === 'active' || currentPlan.status === 'trial' || currentPlan.status === 'grace') {
+                console.log(`[AutoPurge] Skipping user ${uid} — status is now '${currentPlan.status}' (renewed during purge)`);
+                continue;
+            }
+            if (!currentPlan.deleted_at || Number(currentPlan.deleted_at) <= 0) {
+                console.log(`[AutoPurge] Skipping user ${uid} — deleted_at cleared (renewed during purge)`);
+                continue;
+            }
+            // Double-check deleted_at is still past cutoff
+            if (Number(currentPlan.deleted_at) >= cutoff) {
+                console.log(`[AutoPurge] Skipping user ${uid} — deleted_at no longer past cutoff`);
+                continue;
+            }
+
             const user = await dbGetAsync(`SELECT * FROM users WHERE id = ?`, [uid]);
             if (!user) continue;
 
