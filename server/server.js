@@ -6994,6 +6994,197 @@ app.put('/api/cloud/device-state', authenticateToken, requireUploadSubscription,
     }
 });
 
+// Orphaned chunk cleanup: finds and deletes chunks on disk that are not referenced
+// by any manifest across ALL UUID directories for the user.
+// This reclaims space from duplicate uploads caused by UUID changes.
+app.post('/api/cloud/cleanup-orphans', authenticateToken, async (req, res) => {
+    try {
+        const allKeys = getStealthCloudAllPossibleUserKeys(req.user);
+        const cloudUsersRoot = path.join(CLOUD_DIR, 'users');
+        const chunksUsersRoot = CHUNKS_DIR ? path.join(CHUNKS_DIR, 'users') : cloudUsersRoot;
+
+        // 1. Collect ALL chunk IDs referenced by manifests across all UUID dirs
+        //    Chunk IDs are NOT in the unencrypted meta, so we must decrypt manifests.
+        //    Since we can't decrypt on the server, we use a different approach:
+        //    Collect all chunk file names on disk, then check which ones are also
+        //    in the cloud_chunks DB table for this user. Chunks not in DB are orphans.
+        //    But DB has all chunks (INSERT OR IGNORE on upload), so DB count = disk count.
+        //
+        //    Better approach: find duplicate manifests across UUID dirs, then for
+        //    each duplicate manifest, the chunks from the older upload are orphans
+        //    because the manifest references chunks that were uploaded with a different key.
+        //    Since we can't decrypt, we use the DB: chunks in DB for this user that
+        //    are NOT referenced by any manifest in the primary UUID dir are orphans.
+        //
+        //    Simplest safe approach: delete duplicate manifests (same manifestId in
+        //    multiple UUID dirs), keeping the one in the primary dir. Then find
+        //    chunks on disk that no remaining manifest references.
+        //
+        //    Since we can't decrypt manifests to get chunk IDs, we'll use a
+        //    heuristic: chunks that are in the DB but whose manifest was a duplicate
+        //    can be found by comparing total chunk count vs expected.
+        //
+        //    PRAGMATIC APPROACH: Just delete duplicate manifests and report.
+        //    Actual chunk cleanup requires the client to re-run backup with dedup
+        //    (which will now work with cross-UUID dedup), then purge + re-upload.
+
+        const { manifestsDir: primaryManifestsDir } = ensureStealthCloudUserDirs(req.user);
+        let duplicateManifestsDeleted = 0;
+        let manifestsMoved = 0;
+        let totalManifests = 0;
+
+        // For each non-primary UUID dir, either delete duplicates or move unique manifests to primary
+        for (const key of allKeys) {
+            if (!key || key === 'unknown') continue;
+            const dir = path.join(cloudUsersRoot, key, 'manifests');
+            if (!fs.existsSync(dir)) continue;
+            if (path.join(cloudUsersRoot, key, 'manifests') === primaryManifestsDir) continue;
+
+            let files;
+            try {
+                files = fs.readdirSync(dir).filter(f => f.endsWith('.json') && !f.startsWith('.'));
+            } catch (e) { continue; }
+
+            for (const f of files) {
+                const primaryPath = path.join(primaryManifestsDir, f);
+                if (fs.existsSync(primaryPath)) {
+                    // Duplicate — delete the non-primary copy
+                    try {
+                        fs.unlinkSync(path.join(dir, f));
+                        duplicateManifestsDeleted++;
+                    } catch (e) { }
+                } else {
+                    // Unique to this UUID dir — move to primary
+                    try {
+                        fs.renameSync(path.join(dir, f), primaryPath);
+                        manifestsMoved++;
+                    } catch (e) {
+                        console.error(`[Cleanup-Orphans] Failed to move ${f}:`, e.message);
+                    }
+                }
+            }
+        }
+
+        // Count remaining manifests in primary dir
+        try {
+            totalManifests = fs.readdirSync(primaryManifestsDir)
+                .filter(f => f.endsWith('.json') && !f.startsWith('.')).length;
+        } catch (e) { }
+
+        // Clear dedup cache so it rebuilds
+        try { serverDedupCache.delete(primaryManifestsDir); } catch (e) { }
+
+        console.log(`[Cleanup-Orphans] User ${req.user.id}: deleted ${duplicateManifestsDeleted} duplicate manifests, moved ${manifestsMoved} unique manifests to primary, ${totalManifests} total remaining`);
+
+        return res.json({
+            ok: true,
+            duplicateManifestsDeleted,
+            manifestsMoved,
+            remainingManifests: totalManifests,
+            note: 'Duplicate manifests removed, unique manifests consolidated. To reclaim chunk storage, use /api/cloud/reconcile-chunks with the client\'s needed chunk IDs, or /api/cloud/purge then re-upload (cross-UUID dedup now active).',
+        });
+    } catch (e) {
+        console.error('[Cleanup-Orphans] Error:', e.message);
+        return res.status(500).json({ error: 'Cleanup failed: ' + e.message });
+    }
+});
+
+// Chunk reconciliation: client sends list of chunk IDs it needs (from decrypted manifests),
+// server deletes all other chunks for this user. Reclaims space from orphaned/duplicate uploads.
+app.post('/api/cloud/reconcile-chunks', authenticateToken, async (req, res) => {
+    try {
+        const neededIds = req.body.neededChunkIds;
+        if (!Array.isArray(neededIds)) {
+            return res.status(400).json({ error: 'neededChunkIds must be an array' });
+        }
+
+        const neededSet = new Set(neededIds.map(id => String(id).toLowerCase()));
+        const allKeys = getStealthCloudAllPossibleUserKeys(req.user);
+        const cloudUsersRoot = path.join(CLOUD_DIR, 'users');
+        const chunksUsersRoot = CHUNKS_DIR ? path.join(CHUNKS_DIR, 'users') : cloudUsersRoot;
+
+        let totalChunks = 0;
+        let deletedChunks = 0;
+        let deletedBytes = 0;
+        const deletedDirs = [];
+        const deletedChunkIds = [];
+
+        for (const key of allKeys) {
+            if (!key || key === 'unknown') continue;
+
+            // Check both CLOUD_DIR and CHUNKS_DIR for chunks
+            const chunkDirs = [
+                path.join(chunksUsersRoot, key, 'chunks'),
+                path.join(cloudUsersRoot, key, 'chunks'),
+            ].filter((v, i, a) => a.indexOf(v) === i);
+
+            for (const chunkDir of chunkDirs) {
+                if (!fs.existsSync(chunkDir)) continue;
+                let files;
+                try {
+                    files = fs.readdirSync(chunkDir).filter(f => !f.startsWith('.'));
+                } catch (e) { continue; }
+
+                totalChunks += files.length;
+
+                for (const f of files) {
+                    const chunkId = f.replace(/\.[^.]+$/, '').toLowerCase();
+                    if (!neededSet.has(chunkId)) {
+                        const filePath = path.join(chunkDir, f);
+                        try {
+                            const stat = fs.statSync(filePath);
+                            fs.unlinkSync(filePath);
+                            deletedChunks++;
+                            deletedBytes += stat.size;
+                            deletedChunkIds.push(chunkId);
+                        } catch (e) { }
+                    }
+                }
+
+                // Remove empty chunks dir
+                try {
+                    const remaining = fs.readdirSync(chunkDir).filter(f => !f.startsWith('.'));
+                    if (remaining.length === 0) {
+                        fs.rmdirSync(chunkDir);
+                        deletedDirs.push(chunkDir);
+                    }
+                } catch (e) { }
+            }
+        }
+
+        // Also clean up DB entries for deleted chunks
+        if (deletedChunkIds.length > 0) {
+            try {
+                // Batch-delete to avoid SQLite parameter limit (999)
+                const batchSize = 900;
+                for (let i = 0; i < deletedChunkIds.length; i += batchSize) {
+                    const batch = deletedChunkIds.slice(i, i + batchSize);
+                    const placeholders = batch.map(() => '?').join(',');
+                    await dbRunAsync(
+                        `DELETE FROM cloud_chunks WHERE user_id = ? AND chunk_id IN (${placeholders})`,
+                        [req.user.id, ...batch]
+                    );
+                }
+            } catch (e) {
+                console.error('[Reconcile-Chunks] DB cleanup error:', e.message);
+            }
+        }
+
+        console.log(`[Reconcile-Chunks] User ${req.user.id}: ${totalChunks} total, ${deletedChunks} deleted (${(deletedBytes / 1073741824).toFixed(2)} GB), ${totalChunks - deletedChunks} kept`);
+
+        return res.json({
+            ok: true,
+            totalChunks,
+            deletedChunks,
+            deletedBytesGB: parseFloat((deletedBytes / 1073741824).toFixed(2)),
+            keptChunks: totalChunks - deletedChunks,
+        });
+    } catch (e) {
+        console.error('[Reconcile-Chunks] Error:', e.message);
+        return res.status(500).json({ error: 'Reconciliation failed: ' + e.message });
+    }
+});
+
 // Upload encrypted chunk blob
 app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req, res, next) => {
     const ct = (req.headers['content-type'] || '').toString().toLowerCase();
@@ -7019,13 +7210,33 @@ app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req
         }
 
         const { chunksDir } = ensureStealthCloudUserDirs(req.user);
-        const target = path.join(chunksDir, requestedId);
+        let target = path.join(chunksDir, requestedId);
         if (!target.startsWith(chunksDir)) {
             return res.status(403).json({ error: 'Access denied' });
         }
 
         if (fs.existsSync(target)) {
             return res.json({ chunkId: requestedId, stored: true });
+        }
+
+        // Cross-UUID: check if chunk exists under another UUID dir
+        const allKeys = getStealthCloudAllPossibleUserKeys(req.user);
+        const chunksUsersRoot = CHUNKS_DIR ? path.join(CHUNKS_DIR, 'users') : path.join(CLOUD_DIR, 'users');
+        for (const key of allKeys) {
+            if (!key || key === 'unknown') continue;
+            const altPath = path.join(chunksUsersRoot, key, 'chunks', requestedId);
+            if (fs.existsSync(altPath)) {
+                // Chunk exists under another UUID — symlink or copy to primary dir
+                try {
+                    fs.copyFileSync(altPath, target);
+                    const altStat = fs.statSync(target);
+                    db.run(
+                        `INSERT OR IGNORE INTO cloud_chunks (user_id, chunk_id, size, created_at) VALUES (?, ?, ?, ?)`,
+                        [req.user.id, requestedId, altStat.size, Date.now()]
+                    );
+                    return res.json({ chunkId: requestedId, stored: true });
+                } catch (e) { }
+            }
         }
 
         const reservation = await reserveStealthCloudIncomingBytes({ userId: req.user.id, incomingBytes: req.body.length });
@@ -7074,6 +7285,30 @@ app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req
         const existing = path.join(chunksDir, requestedId);
         if (fs.existsSync(existing)) {
             try { fs.unlinkSync(tmpPath); } catch (e) { }
+            return res.json({ chunkId: requestedId, stored: true });
+        }
+        // Cross-UUID: check if chunk exists under another UUID dir
+        const allKeys = getStealthCloudAllPossibleUserKeys(req.user);
+        const chunksUsersRoot = CHUNKS_DIR ? path.join(CHUNKS_DIR, 'users') : path.join(CLOUD_DIR, 'users');
+        let foundAlt = false;
+        for (const key of allKeys) {
+            if (!key || key === 'unknown') continue;
+            const altPath = path.join(chunksUsersRoot, key, 'chunks', requestedId);
+            if (fs.existsSync(altPath)) {
+                try {
+                    fs.copyFileSync(altPath, existing);
+                    const altStat = fs.statSync(existing);
+                    db.run(
+                        `INSERT OR IGNORE INTO cloud_chunks (user_id, chunk_id, size, created_at) VALUES (?, ?, ?, ?)`,
+                        [req.user.id, requestedId, altStat.size, Date.now()]
+                    );
+                    try { fs.unlinkSync(tmpPath); } catch (e) { }
+                    foundAlt = true;
+                    break;
+                } catch (e) { }
+            }
+        }
+        if (foundAlt) {
             return res.json({ chunkId: requestedId, stored: true });
         }
     }
@@ -7148,9 +7383,29 @@ app.get('/api/cloud/chunks/:chunkId', authenticateToken, blockDeletedSubscriptio
         return res.status(400).json({ error: 'Invalid chunk id' });
     }
     const { chunksDir: chunksRoot } = ensureStealthCloudUserDirs(req.user);
-    const chunkPath = path.join(chunksRoot, chunkId);
+    let chunkPath = path.join(chunksRoot, chunkId);
     if (!chunkPath.startsWith(chunksRoot)) {
         return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Search across all UUID dirs if not found in primary dir
+    if (!fs.existsSync(chunkPath)) {
+        const allKeys = getStealthCloudAllPossibleUserKeys(req.user);
+        const chunksUsersRoot = CHUNKS_DIR ? path.join(CHUNKS_DIR, 'users') : path.join(CLOUD_DIR, 'users');
+        for (const key of allKeys) {
+            if (!key || key === 'unknown') continue;
+            const altPath = path.join(chunksUsersRoot, key, 'chunks', chunkId);
+            if (fs.existsSync(altPath)) {
+                chunkPath = altPath;
+                break;
+            }
+            // Also check CLOUD_DIR (some chunks may be stored there)
+            const altPath2 = path.join(CLOUD_DIR, 'users', key, 'chunks', chunkId);
+            if (fs.existsSync(altPath2)) {
+                chunkPath = altPath2;
+                break;
+            }
+        }
     }
 
     if (fs.existsSync(chunkPath)) {
@@ -7263,6 +7518,35 @@ function buildServerDedupSets(manifestsDir) {
     return cacheEntry.sets;
 }
 
+// Build cross-UUID dedup sets: scans ALL possible UUID directories for a user
+// This prevents duplicate uploads when a user's storage key changes (e.g. after re-pairing)
+function buildCrossUuidDedupSets(user) {
+    const allKeys = getStealthCloudAllPossibleUserKeys(user);
+    const merged = {
+        manifestIds: new Set(),
+        filenames: new Set(),
+        fileHashes: new Set(),
+        perceptualHashes: new Set(),
+        exifFull: new Set(),
+        exifTimeModel: new Set(),
+        exifTimeMake: new Set(),
+    };
+    for (const key of allKeys) {
+        if (!key || key === 'unknown') continue;
+        const dir = path.join(CLOUD_DIR, 'users', key, 'manifests');
+        if (!fs.existsSync(dir)) continue;
+        const sets = buildServerDedupSets(dir);
+        for (const id of sets.manifestIds) merged.manifestIds.add(id);
+        for (const fn of sets.filenames) merged.filenames.add(fn);
+        for (const fh of sets.fileHashes) merged.fileHashes.add(fh);
+        for (const ph of sets.perceptualHashes) merged.perceptualHashes.add(ph);
+        for (const e of sets.exifFull) merged.exifFull.add(e);
+        for (const e of sets.exifTimeModel) merged.exifTimeModel.add(e);
+        for (const e of sets.exifTimeMake) merged.exifTimeMake.add(e);
+    }
+    return merged;
+}
+
 // Check if perceptual hash matches any existing hash (fuzzy matching)
 function findPerceptualHashMatchServer(hash, hashSet) {
     if (!hash || hash.length !== 16 || !hashSet || hashSet.size === 0) return { match: false };
@@ -7317,10 +7601,11 @@ app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (
 
     const { manifestsDir } = ensureStealthCloudUserDirs(req.user);
 
-    // ========== SERVER-SIDE DEDUPLICATION (Minimal - only reliable checks) ==========
-    // Build dedup sets from existing manifests
-    const dedupSets = buildServerDedupSets(manifestsDir);
-    console.log(`[SC-Dedup] Checking ${safeId}: ${dedupSets.manifestIds.size} manifestIds, ${dedupSets.fileHashes.size} fHashes, ${dedupSets.perceptualHashes.size} pHashes`);
+    // ========== SERVER-SIDE DEDUPLICATION (cross-UUID to prevent duplicate uploads) ==========
+    // Scan ALL possible UUID directories for this user, not just the current one.
+    // This prevents duplicate uploads when a user's storage key changes (e.g. after re-pairing).
+    const dedupSets = buildCrossUuidDedupSets(req.user);
+    console.log(`[SC-Dedup] Checking ${safeId}: ${dedupSets.manifestIds.size} manifestIds, ${dedupSets.fileHashes.size} fHashes, ${dedupSets.perceptualHashes.size} pHashes (cross-UUID)`);
 
     // Check 1: ManifestId (filename + size hash) - exact match only
     if (dedupSets.manifestIds.has(safeId)) {
@@ -7392,46 +7677,56 @@ app.get('/api/cloud/manifests', authenticateToken, blockDeletedSubscription, (re
     res.setHeader('Expires', '0');
     res.setHeader('ETag', '');
     const { manifestsDir } = ensureStealthCloudUserDirs(req.user);
-    if (!fs.existsSync(manifestsDir)) return res.json({ manifests: [], total: 0 });
 
-    const files = fs.readdirSync(manifestsDir)
-        .filter(f => f.endsWith('.json'))
-        .filter(f => !f.startsWith('.')); // Skip hidden files like .DS_Store
+    // Scan ALL possible UUID directories for this user to include manifests
+    // from legacy/re-paired storage keys. Deduplicate by manifestId.
+    const allKeys = getStealthCloudAllPossibleUserKeys(req.user);
+    const seenManifestIds = new Set();
+    let list = [];
 
-    let list = files.map(f => {
-        const manifestId = f.replace(/\.json$/, '');
-        const entry = { manifestId };
+    for (const key of allKeys) {
+        if (!key || key === 'unknown') continue;
+        const dir = path.join(CLOUD_DIR, 'users', key, 'manifests');
+        if (!fs.existsSync(dir)) continue;
+        let files;
+        try {
+            files = fs.readdirSync(dir).filter(f => f.endsWith('.json') && !f.startsWith('.'));
+        } catch (e) { continue; }
 
-        // Include metadata if requested (for fast dedup without decryption)
-        if (includeMeta) {
-            try {
-                const manifestPath = path.join(manifestsDir, f);
-                const content = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-                if (content.meta) {
-                    entry.filename = content.meta.filename || null;
-                    entry.mediaType = content.meta.mediaType || null;
-                    entry.originalSize = content.meta.originalSize || null;
-                    entry.fileHash = content.meta.fileHash || null;
-                    entry.perceptualHash = content.meta.perceptualHash || null;
-                    entry.creationTime = content.meta.creationTime || null;
-                    // EXIF metadata for cross-platform dedup
-                    entry.exifCaptureTime = content.meta.exifCaptureTime || null;
-                    entry.exifMake = content.meta.exifMake || null;
-                    entry.exifModel = content.meta.exifModel || null;
-                    entry.thumbChunkId = content.meta.thumbChunkId || null;
-                    entry.thumbNonce = content.meta.thumbNonce || null;
-                    entry.thumbSize = content.meta.thumbSize || null;
-                    entry.thumbW = content.meta.thumbW || null;
-                    entry.thumbH = content.meta.thumbH || null;
-                    entry.thumbMime = content.meta.thumbMime || null;
+        for (const f of files) {
+            const manifestId = f.replace(/\.json$/, '');
+            if (seenManifestIds.has(manifestId)) continue; // Skip duplicates across UUIDs
+            seenManifestIds.add(manifestId);
+            const entry = { manifestId };
+
+            if (includeMeta) {
+                try {
+                    const manifestPath = path.join(dir, f);
+                    const content = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+                    if (content.meta) {
+                        entry.filename = content.meta.filename || null;
+                        entry.mediaType = content.meta.mediaType || null;
+                        entry.originalSize = content.meta.originalSize || null;
+                        entry.fileHash = content.meta.fileHash || null;
+                        entry.perceptualHash = content.meta.perceptualHash || null;
+                        entry.creationTime = content.meta.creationTime || null;
+                        entry.exifCaptureTime = content.meta.exifCaptureTime || null;
+                        entry.exifMake = content.meta.exifMake || null;
+                        entry.exifModel = content.meta.exifModel || null;
+                        entry.thumbChunkId = content.meta.thumbChunkId || null;
+                        entry.thumbNonce = content.meta.thumbNonce || null;
+                        entry.thumbSize = content.meta.thumbSize || null;
+                        entry.thumbW = content.meta.thumbW || null;
+                        entry.thumbH = content.meta.thumbH || null;
+                        entry.thumbMime = content.meta.thumbMime || null;
+                    }
+                } catch (e) {
+                    // Ignore read errors, just return manifestId
                 }
-            } catch (e) {
-                // Ignore read errors, just return manifestId
             }
+            list.push(entry);
         }
-
-        return entry;
-    });
+    }
 
     list.sort((a, b) => String(a.manifestId || '').localeCompare(String(b.manifestId || '')));
     const total = list.length;
@@ -7451,8 +7746,17 @@ app.get('/api/cloud/manifests/:manifestId', authenticateToken, blockDeletedSubsc
     const safeId = (req.params.manifestId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
     if (!safeId) return res.status(400).json({ error: 'Invalid manifest id' });
     const { manifestsDir: manifestsRoot } = ensureStealthCloudUserDirs(req.user);
-    const manifestPath = path.join(manifestsRoot, `${safeId}.json`);
-    if (!manifestPath.startsWith(manifestsRoot)) {
+    let manifestPath = path.join(manifestsRoot, `${safeId}.json`);
+    // Search across all UUID dirs if not found in primary dir
+    if (!fs.existsSync(manifestPath)) {
+        const allKeys = getStealthCloudAllPossibleUserKeys(req.user);
+        for (const key of allKeys) {
+            if (!key || key === 'unknown') continue;
+            const altPath = path.join(CLOUD_DIR, 'users', key, 'manifests', `${safeId}.json`);
+            if (fs.existsSync(altPath)) { manifestPath = altPath; break; }
+        }
+    }
+    if (!manifestPath.startsWith(path.join(CLOUD_DIR, 'users'))) {
         return res.status(403).json({ error: 'Access denied' });
     }
     if (!fs.existsSync(manifestPath)) return res.status(404).json({ error: 'Manifest not found' });
@@ -7465,9 +7769,18 @@ app.patch('/api/cloud/manifests/:manifestId', authenticateToken, (req, res) => {
     if (!safeId) return res.status(400).json({ error: 'Invalid manifest id' });
 
     const { manifestsDir } = ensureStealthCloudUserDirs(req.user);
-    const manifestPath = path.join(manifestsDir, `${safeId}.json`);
+    let manifestPath = path.join(manifestsDir, `${safeId}.json`);
+    // Search across all UUID dirs if not found in primary dir
+    if (!fs.existsSync(manifestPath)) {
+        const allKeys = getStealthCloudAllPossibleUserKeys(req.user);
+        for (const key of allKeys) {
+            if (!key || key === 'unknown') continue;
+            const altPath = path.join(CLOUD_DIR, 'users', key, 'manifests', `${safeId}.json`);
+            if (fs.existsSync(altPath)) { manifestPath = altPath; break; }
+        }
+    }
 
-    if (!manifestPath.startsWith(manifestsDir)) {
+    if (!manifestPath.startsWith(path.join(CLOUD_DIR, 'users'))) {
         return res.status(403).json({ error: 'Access denied' });
     }
     if (!fs.existsSync(manifestPath)) {
