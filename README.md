@@ -15,13 +15,12 @@ Back up photos/videos to your own server or StealthCloud, and restore on any pho
 
 | Platform | Status | Payment Method |
 |----------|--------|----------------|
-| **iOS** | 🌅 Sunset — no longer available for new downloads | In-App Purchase |
 | **Android** | ✅ Live on Google Play | In-App Purchase |
 | **Wallet-enabled Android variant** | ✅ Available in ecosystem distribution | On-chain wallet payment flow |
 
 The PhotoLynk mobile apps feature end-to-end encryption, self-hosted or cloud backup options, and seamless cross-platform restore.
 
-**Android and the wallet-enabled Android variant are live.** iOS is sunset — existing installs continue to work but the app is no longer available for new downloads on the App Store.
+**Android and the wallet-enabled Android variant are live.**
 
 Store links:
 - Android (Google Play): [Download PhotoLynk](https://play.google.com/store/apps/details?id=com.photosync.app)
@@ -288,7 +287,7 @@ When properly configured with HTTPS:
 | **Key Derivation** | Master key derived on-device, never transmitted |
 | **Chunk Encryption** | Each 2MB chunk encrypted independently with unique nonce |
 | **Manifest Encryption** | File metadata also encrypted — server sees only opaque blobs |
-| **Key Storage** | iOS Keychain / Android Keystore (hardware-backed on supported devices) |
+| **Key Storage** | Android Keystore (hardware-backed on supported devices) |
 
 **How it compares to industry leaders:**
 
@@ -338,7 +337,7 @@ We provide a transparent security audit for StealthCloud backup mode. You can:
 
 The audit script dynamically analyzes the codebase and generates a report based on actual code findings. It verifies:
 - Encryption algorithms and key derivation
-- Secure token storage (iOS Keychain / Android Keystore)
+- Secure token storage (Android Keystore)
 - Device binding and authentication
 - Vulnerability scanning (eval, XSS, password logging, etc.)
 - OWASP Mobile Top 10 compliance
@@ -361,11 +360,8 @@ How it works:
 Limitations:
 
 - Clean Duplicates works in the installed app (development builds and production builds). It is not supported in **Expo Go** because it relies on native file hashing.
-- On iOS, items that are not available as a local file (for example when iCloud Photos is enabled with “Optimize iPhone Storage”) may be skipped during analysis. For best results, download originals to the device and grant Photos “Full Access”.
-
 Deletion behavior:
 
-- **iOS**: deleted items go to **Photos → Recently Deleted**.
 - **Android**: deleted items go to **Photos → Trash** or are removed from the device (behavior depends on OEM/OS).
 
 ## Requirements
@@ -382,7 +378,6 @@ Deletion behavior:
 
 ### Mobile
 - **Android:** 10+ (API 29+) — HEIC/HEIF support requires Android 10+
-- **iOS:** 15.0+
 - Network access to server
 
 ### Supported File Formats
@@ -449,33 +444,30 @@ EXIF extraction is format-dependent:
 PhotoLynk restores the original file bytes first. Metadata write-back is a second step used only when the restored file is missing embedded metadata and the platform has a writer for that target format.
 
 - Android uses native `androidx.exifinterface:exifinterface:1.3.7`
-- iOS uses native ImageIO (`CGImageSource` / `CGImageDestination`) plus native save-to-library paths
 - Desktop uses bundled `exiftool-vendored` first, with `sharp` only as a narrower fallback when `exiftool` is unavailable
 
 PhotoLynk also avoids unnecessary rewrites:
 
 - If the restored file already contains metadata, the app skips write-back
 - If the platform can save the original file bytes directly to the photo library, the original container is preserved even when no rewrite is needed
-- On iOS specifically, restore uses native save paths because the generic media-library save path can re-encode JPEGs and strip metadata
-
 Because there are two different concerns, the practical behavior is:
 
 - **Byte-preserving restore:** whether the original file/container can be restored and saved back without conversion
 - **Explicit metadata rewrite:** whether PhotoLynk has an implemented writer that can inject metadata back into that format when needed
 
-| Format | Android explicit metadata rewrite | iOS explicit metadata rewrite | Desktop explicit metadata rewrite |
-|--------|:--------------------------------:|:-----------------------------:|:---------------------------------:|
-| JPEG/JPG | ✅ | ✅ | ✅ |
-| PNG | ✅ | ✅ | ✅ |
-| WebP | ✅ | ✅ | ✅ |
-| HEIC/HEIF | ⚠️ | ✅ | ✅ |
-| TIFF/TIF | ⚠️ | ✅ | ✅ |
-| GIF | ⚠️ | ✅ | ✅ |
-| BMP | ⚠️ | ⚠️ | ✅ |
-| AVIF | ⚠️ | ⚠️ | ✅ |
-| PSD/PSB | ❌ | ❌ | ✅ |
-| EXR/HDR | ❌ | ❌ | ✅ |
-| RAW formats (`.raw`, `.cr2`, `.cr3`, `.nef`, `.arw`, `.dng`, `.orf`, `.rw2`, `.pef`, `.srw`, `.raf`) | ⚠️ | ⚠️ | ✅ |
+| Format | Android explicit metadata rewrite | Desktop explicit metadata rewrite |
+|--------|:--------------------------------:|:---------------------------------:|
+| JPEG/JPG | ✅ | ✅ |
+| PNG | ✅ | ✅ |
+| WebP | ✅ | ✅ |
+| HEIC/HEIF | ⚠️ | ✅ |
+| TIFF/TIF | ⚠️ | ✅ |
+| GIF | ⚠️ | ✅ |
+| BMP | ⚠️ | ✅ |
+| AVIF | ⚠️ | ✅ |
+| PSD/PSB | ❌ | ✅ |
+| EXR/HDR | ❌ | ✅ |
+| RAW formats (`.raw`, `.cr2`, `.cr3`, `.nef`, `.arw`, `.dng`, `.orf`, `.rw2`, `.pef`, `.srw`, `.raf`) | ⚠️ | ✅ |
 
 - ✅ = implemented writer path exists in current code for that platform/format family
 - ⚠️ = depends on what the native platform metadata APIs can successfully open and finalize for that specific container; original-file restore may still work even if rewrite is not guaranteed
@@ -490,13 +482,6 @@ What the restore writers actually write also differs by platform:
   - Falls back to `sharp` only for JPEG/TIFF if `exiftool` is unavailable, and that fallback re-encodes pixels
   - Only writes EXIF when the restored file is missing embedded metadata (checks via `exiftool` read first)
 
-- **iOS**
-  - `writeExif` writes broad EXIF, GPS, TIFF, and IPTC fields through ImageIO
-  - Current iOS write path includes IPTC caption, copyright, keywords, creator, title, city, country, credit, and source
-  - Current iOS write path does **not** implement XMP field write-back in the native module
-  - `saveFileToLibrary` preserves original file bytes for normal file restore
-  - `saveRawToLibrary` preserves RAW/DNG originals by storing the original RAW as an alternate photo resource with a generated JPEG preview for Photos
-
 - **Android**
   - `writeExif` uses `ExifInterface` and writes core EXIF/GPS fields plus IPTC-equivalent mappings through EXIF tags
   - Current Android write path includes capture time, timezone/subsecond fields, make/model, exposure settings, focal length, orientation, GPS, software, lens make/model, plus caption/copyright/creator through `ImageDescription`, `Copyright`, and `Artist`
@@ -506,7 +491,6 @@ What the restore writers actually write also differs by platform:
 Important RAW caveat:
 
 - **Desktop:** implemented RAW metadata write-back is broad because restore uses bundled `exiftool-vendored` which writes in-place without re-encoding
-- **iOS:** RAW originals are preserved in the library via `saveRawToLibrary`, but the current code should be understood as **RAW-preserving restore**, not a blanket guarantee of native metadata rewrite for every RAW container
 - **Android:** RAW rewrite remains conditional on what `ExifInterface` can successfully open and save for the specific file
 
 #### 4. Certify Original
@@ -581,7 +565,7 @@ PhotoLynk offers two optional in-app purchases to unlock additional features:
 - Pay with SOL or SKR via hardware wallet
 - Subscription auto-renews monthly. Cancel anytime in Settings.
 
-All purchases are processed through the respective platform's payment system (Apple App Store or Google Play Store). Listed prices are base prices; Apple or Google may automatically add applicable taxes, fees, or regional price adjustments at checkout for one-time purchases and subscriptions. PhotoLynk does not directly handle payment card information. Both purchases are final and non-refundable except as required by applicable law.
+All purchases are processed through the Google Play Store. Listed prices are base prices; Google may automatically add applicable taxes, fees, or regional price adjustments at checkout for one-time purchases and subscriptions. PhotoLynk does not directly handle payment card information. Both purchases are final and non-refundable except as required by applicable law.
 
 ### Build Requirements (for building from source)
 - Node.js 20 LTS
@@ -606,8 +590,6 @@ Password reset on Android is tied to your device's unique identifier. **If you u
 - Password reset will no longer work for accounts registered before the upgrade
 - If you forget your password after an OS upgrade, you may lose access to your backed-up data
 - **Always remember your password** or store it securely before upgrading your Android OS
-
-This limitation does not apply to iOS devices.
 
 ## Troubleshooting
 
