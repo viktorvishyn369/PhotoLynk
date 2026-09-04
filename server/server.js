@@ -3182,6 +3182,98 @@ app.get('/photolynk-remote-config.json', (req, res) => {
 });
 
 
+// ─── PaceSeeker AI Federation: crowd-sourced learning data ───
+// Users' DCA AI engines learn from real LIVE trade outcomes. This endpoint
+// receives anonymized learned state (weights, pattern memory, learning params)
+// and stores it per-token for later aggregation into pre-trained bundles.
+const AI_UPLOADS_DIR = process.env.AI_UPLOADS_DIR
+    ? path.resolve(process.env.AI_UPLOADS_DIR)
+    : path.join(__dirname, 'ai-uploads');
+try { fs.mkdirSync(AI_UPLOADS_DIR, { recursive: true }); } catch (e) {}
+
+app.post('/ai-federation/upload', (req, res) => {
+    try {
+        const { tokenMint, tokenSymbol, aiState, appVersion } = req.body || {};
+        if (!tokenMint || typeof tokenMint !== 'string' || tokenMint.length < 32) {
+            return res.status(400).json({ error: 'Invalid or missing tokenMint' });
+        }
+        if (!aiState || typeof aiState !== 'object') {
+            return res.status(400).json({ error: 'Missing aiState' });
+        }
+        if (!aiState.weights || typeof aiState.weights !== 'object') {
+            return res.status(400).json({ error: 'aiState missing weights' });
+        }
+        if (!aiState.totalTrades || aiState.totalTrades < 1) {
+            return res.status(400).json({ error: 'No LIVE trades — nothing to contribute' });
+        }
+
+        // Sanitize token mint for folder name (use first 12 chars + hash for safety)
+        const crypto = require('crypto');
+        const mintHash = crypto.createHash('sha256').update(tokenMint).digest('hex').slice(0, 16);
+        const tokenDir = path.join(AI_UPLOADS_DIR, mintHash);
+        try { fs.mkdirSync(tokenDir, { recursive: true }); } catch (e) {}
+
+        // Store with timestamp + random suffix to avoid collisions
+        const timestamp = Date.now();
+        const suffix = crypto.randomBytes(4).toString('hex');
+        const filename = `${timestamp}_${suffix}.json`;
+        const filepath = path.join(tokenDir, filename);
+
+        // Strip any potential PII — only keep learning data, no positions/history
+        const sanitized = {
+            tokenMint: tokenMint,
+            tokenSymbol: tokenSymbol || null,
+            appVersion: appVersion || null,
+            uploadedAt: new Date().toISOString(),
+            weights: aiState.weights,
+            totalTrades: aiState.totalTrades || 0,
+            winningTrades: aiState.winningTrades || 0,
+            losingTrades: aiState.losingTrades || 0,
+            totalPnlPct: aiState.totalPnlPct || 0,
+            patternMemory: aiState.patternMemory || [],
+            amountLearning: aiState.amountLearning || null,
+            dynamicThreshold: aiState.dynamicThreshold || null,
+            thresholdStats: aiState.thresholdStats || null,
+            divergenceLearning: aiState.divergenceLearning || null,
+            exitLearning: aiState.exitLearning || null,
+            patternMatchWeights: aiState.patternMatchWeights || null,
+            regimeTransitionLearning: aiState.regimeTransitionLearning || null,
+            safetyOrderLearning: aiState.safetyOrderLearning || null,
+            sequenceLearning: aiState.sequenceLearning || null,
+            patternAccuracy: aiState.patternAccuracy || null,
+        };
+
+        fs.writeFileSync(filepath, JSON.stringify(sanitized, null, 2), 'utf8');
+
+        // Count uploads for this token
+        const uploadCount = fs.readdirSync(tokenDir).filter(f => f.endsWith('.json')).length;
+        console.log(`[AI Federation] Upload stored: ${mintHash}/${filename} (${sanitized.totalTrades} trades, ${uploadCount} total for this token)`);
+
+        res.json({ ok: true, uploadCount });
+    } catch (e) {
+        console.error('[AI Federation] Upload error:', e.message);
+        res.status(500).json({ error: 'Failed to store AI state' });
+    }
+});
+
+// Stats endpoint — shows how many uploads per token
+app.get('/ai-federation/stats', (_req, res) => {
+    try {
+        const stats = {};
+        const tokenDirs = fs.existsSync(AI_UPLOADS_DIR)
+            ? fs.readdirSync(AI_UPLOADS_DIR).filter(f => fs.statSync(path.join(AI_UPLOADS_DIR, f)).isDirectory())
+            : [];
+        for (const dir of tokenDirs) {
+            const files = fs.readdirSync(path.join(AI_UPLOADS_DIR, dir)).filter(f => f.endsWith('.json'));
+            stats[dir] = files.length;
+        }
+        res.json({ tokens: Object.keys(stats).length, uploads: stats });
+    } catch (e) {
+        res.status(500).json({ error: 'Failed to read stats' });
+    }
+});
+
+
 // ─── PaceSeeker invite code tracker ───
 const USED_CODES_PATH = path.join(__dirname, 'used-invite-codes.json');
 let usedInviteCodes = new Set();
