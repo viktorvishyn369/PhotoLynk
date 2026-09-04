@@ -16,11 +16,11 @@ Back up photos/videos to your own server or StealthCloud, and restore on any pho
 | Platform | Status | Payment Method |
 |----------|--------|----------------|
 | **Android** | ✅ Live on Google Play | In-App Purchase |
-| **Wallet-enabled Android variant** | ✅ Available in ecosystem distribution | On-chain wallet payment flow |
+| **Solana Mobile dApp Store** | ✅ Available on Solana Mobile | On-chain wallet payment flow |
 
 The PhotoLynk mobile apps feature end-to-end encryption, self-hosted or cloud backup options, and seamless cross-platform restore.
 
-**Android and the wallet-enabled Android variant are live.**
+**Android (Google Play) and Solana Mobile dApp Store are live.**
 
 Store links:
 - Android (Google Play): [Download PhotoLynk](https://play.google.com/store/apps/details?id=com.photosync.app)
