@@ -24,7 +24,7 @@ The PhotoLynk mobile apps feature end-to-end encryption, self-hosted or cloud ba
 
 Store links:
 - Android (Google Play): [Download PhotoLynk](https://play.google.com/store/apps/details?id=com.photosync.app)
-- Wallet-enabled Android variant: available in its ecosystem distribution channel
+- Solana Mobile dApp Store: `solanadappstore://details?id=com.photolynk.solana`
 
 ---
 
@@ -558,12 +558,12 @@ PhotoLynk offers two optional in-app purchases to unlock additional features:
 - Multiple purchases are cumulative — each adds to your total balance
 
 ### Premium — $49.99 USD (One-Time)
-- Unlocks 1TB of end-to-end encrypted cloud storage for 1 year
-- Includes 100 completely free photo certifications
-- $0.02 USDC per NFT beyond 100 (covers all on-chain expenses)
+- Unlocks 1 TB of end-to-end encrypted cloud storage for 1 year
+- Includes 100 completely free Web3 Album additions (no app commission, no network fees)
+- $0.01 USDC per NFT beyond 100, up to 10,000 total (covers all on-chain expenses)
 - Full access across all platforms and devices linked to your account
-- Pay with SOL or SKR via hardware wallet
-- Subscription auto-renews monthly. Cancel anytime in Settings.
+- Pay with SOL or SKR via Solana wallet
+- One-time payment — no recurring charges, no auto-renewal
 
 All purchases are processed through the Google Play Store. Listed prices are base prices; Google may automatically add applicable taxes, fees, or regional price adjustments at checkout for one-time purchases and subscriptions. PhotoLynk does not directly handle payment card information. Both purchases are final and non-refundable except as required by applicable law.
 
