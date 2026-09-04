@@ -3191,9 +3191,25 @@ const AI_UPLOADS_DIR = process.env.AI_UPLOADS_DIR
     : path.join(__dirname, 'ai-uploads');
 try { fs.mkdirSync(AI_UPLOADS_DIR, { recursive: true }); } catch (e) {}
 
-app.post('/ai-federation/upload', (req, res) => {
+// In-memory rate limit: tokenHash → lastUploadTimestamp
+// Prevents same client from uploading more than once per 5 minutes
+const _federationRateLimit = new Map();
+const FEDERATION_RATE_LIMIT_MS = 5 * 60 * 1000; // 5 minutes
+
+// Clean up rate limit entries older than 1 hour (runs every 10 minutes)
+let _lastRateLimitCleanup = 0;
+function _cleanupRateLimit() {
+    const now = Date.now();
+    if (now - _lastRateLimitCleanup < 10 * 60 * 1000) return;
+    _lastRateLimitCleanup = now;
+    for (const [key, ts] of _federationRateLimit) {
+        if (now - ts > 60 * 60 * 1000) _federationRateLimit.delete(key);
+    }
+}
+
+app.post('/ai-federation/upload', async (req, res) => {
     try {
-        const { tokenMint, tokenSymbol, aiState, appVersion } = req.body || {};
+        const { tokenMint, tokenSymbol, aiState, appVersion, force } = req.body || {};
         if (!tokenMint || typeof tokenMint !== 'string' || tokenMint.length < 32) {
             return res.status(400).json({ error: 'Invalid or missing tokenMint' });
         }
@@ -3207,8 +3223,17 @@ app.post('/ai-federation/upload', (req, res) => {
             return res.status(400).json({ error: 'No LIVE trades — nothing to contribute' });
         }
 
-        // Sanitize token mint for folder name (use first 12 chars + hash for safety)
-        const crypto = require('crypto');
+        // Rate limit per token: prevent duplicate uploads within 5 minutes
+        // (unless force=true — pre-eviction safety upload)
+        _cleanupRateLimit();
+        const rateKey = tokenMint;
+        const lastRate = _federationRateLimit.get(rateKey);
+        if (!force && lastRate && Date.now() - lastRate < FEDERATION_RATE_LIMIT_MS) {
+            return res.status(429).json({ error: 'Rate limited — too soon since last upload for this token' });
+        }
+        _federationRateLimit.set(rateKey, Date.now());
+
+        // Sanitize token mint for folder name (use first 16 chars of hash for safety)
         const mintHash = crypto.createHash('sha256').update(tokenMint).digest('hex').slice(0, 16);
         const tokenDir = path.join(AI_UPLOADS_DIR, mintHash);
         try { fs.mkdirSync(tokenDir, { recursive: true }); } catch (e) {}
@@ -3243,10 +3268,12 @@ app.post('/ai-federation/upload', (req, res) => {
             patternAccuracy: aiState.patternAccuracy || null,
         };
 
-        fs.writeFileSync(filepath, JSON.stringify(sanitized, null, 2), 'utf8');
+        // Async write to avoid blocking the event loop under concurrent uploads
+        await fs.promises.writeFile(filepath, JSON.stringify(sanitized, null, 2), 'utf8');
 
-        // Count uploads for this token
-        const uploadCount = fs.readdirSync(tokenDir).filter(f => f.endsWith('.json')).length;
+        // Count uploads for this token (async readdir)
+        const files = await fs.promises.readdir(tokenDir);
+        const uploadCount = files.filter(f => f.endsWith('.json')).length;
         console.log(`[AI Federation] Upload stored: ${mintHash}/${filename} (${sanitized.totalTrades} trades, ${uploadCount} total for this token)`);
 
         res.json({ ok: true, uploadCount });
@@ -3257,15 +3284,17 @@ app.post('/ai-federation/upload', (req, res) => {
 });
 
 // Stats endpoint — shows how many uploads per token
-app.get('/ai-federation/stats', (_req, res) => {
+app.get('/ai-federation/stats', async (_req, res) => {
     try {
         const stats = {};
-        const tokenDirs = fs.existsSync(AI_UPLOADS_DIR)
-            ? fs.readdirSync(AI_UPLOADS_DIR).filter(f => fs.statSync(path.join(AI_UPLOADS_DIR, f)).isDirectory())
-            : [];
-        for (const dir of tokenDirs) {
-            const files = fs.readdirSync(path.join(AI_UPLOADS_DIR, dir)).filter(f => f.endsWith('.json'));
-            stats[dir] = files.length;
+        if (!fs.existsSync(AI_UPLOADS_DIR)) {
+            return res.json({ tokens: 0, uploads: {} });
+        }
+        const entries = await fs.promises.readdir(AI_UPLOADS_DIR, { withFileTypes: true });
+        for (const entry of entries) {
+            if (!entry.isDirectory()) continue;
+            const files = await fs.promises.readdir(path.join(AI_UPLOADS_DIR, entry.name));
+            stats[entry.name] = files.filter(f => f.endsWith('.json')).length;
         }
         res.json({ tokens: Object.keys(stats).length, uploads: stats });
     } catch (e) {
