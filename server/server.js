@@ -3266,6 +3266,8 @@ app.post('/ai-federation/upload', async (req, res) => {
             safetyOrderLearning: aiState.safetyOrderLearning || null,
             sequenceLearning: aiState.sequenceLearning || null,
             patternAccuracy: aiState.patternAccuracy || null,
+            tradeHistory: Array.isArray(aiState.tradeHistory) ? aiState.tradeHistory : [],
+            contextWeights: aiState.contextWeights || null,
         };
 
         // Async write to avoid blocking the event loop under concurrent uploads
@@ -3283,25 +3285,186 @@ app.post('/ai-federation/upload', async (req, res) => {
     }
 });
 
-// Stats endpoint — shows how many uploads per token
+// Stats endpoint — enhanced with per-token details
 app.get('/ai-federation/stats', async (_req, res) => {
     try {
-        const stats = {};
         if (!fs.existsSync(AI_UPLOADS_DIR)) {
-            return res.json({ tokens: 0, uploads: {} });
+            return res.json({ tokens: 0, totalUploads: 0, qualifyingContributors: 0, tokens: [] });
         }
         const entries = await fs.promises.readdir(AI_UPLOADS_DIR, { withFileTypes: true });
+        const tokenStats = [];
+        let totalUploads = 0;
+
         for (const entry of entries) {
             if (!entry.isDirectory()) continue;
-            const files = await fs.promises.readdir(path.join(AI_UPLOADS_DIR, entry.name));
-            stats[entry.name] = files.filter(f => f.endsWith('.json')).length;
+            const tokenDir = path.join(AI_UPLOADS_DIR, entry.name);
+            const files = (await fs.promises.readdir(tokenDir)).filter(f => f.endsWith('.json'));
+            const uploadCount = files.length;
+            totalUploads += uploadCount;
+            if (uploadCount === 0) continue;
+
+            files.sort();
+            let latest = null, firstUploadAt = null;
+            try {
+                latest = JSON.parse(await fs.promises.readFile(path.join(tokenDir, files[files.length - 1]), 'utf8'));
+            } catch (e) {}
+            try {
+                const first = JSON.parse(await fs.promises.readFile(path.join(tokenDir, files[0]), 'utf8'));
+                firstUploadAt = first.uploadedAt || null;
+            } catch (e) {}
+
+            const trades = latest?.totalTrades || 0;
+            const wins = latest?.winningTrades || 0;
+            const lossesCount = latest?.losingTrades || 0;
+            const pnl = latest?.totalPnlPct || 0;
+            const winRate = trades > 0 ? Math.round((wins / trades) * 1000) / 10 : 0;
+            const patternCount = Array.isArray(latest?.patternMemory) ? latest.patternMemory.length : 0;
+
+            tokenStats.push({
+                mintHash: entry.name,
+                tokenMint: latest?.tokenMint || null,
+                tokenSymbol: latest?.tokenSymbol || null,
+                uploadCount,
+                totalTrades: trades,
+                winningTrades: wins,
+                losingTrades: lossesCount,
+                winRate,
+                totalPnlPct: Math.round(pnl * 100) / 100,
+                patternMemorySize: patternCount,
+                appVersion: latest?.appVersion || null,
+                firstUploadAt,
+                lastUploadAt: latest?.uploadedAt || null,
+                passesAggregationFilter: trades >= 5 && winRate >= 30,
+            });
         }
-        res.json({ tokens: Object.keys(stats).length, uploads: stats });
+
+        tokenStats.sort((a, b) => b.uploadCount - a.uploadCount);
+        const qualifying = tokenStats.filter(t => t.passesAggregationFilter).length;
+
+        res.json({ tokens: tokenStats.length, totalUploads, qualifyingContributors: qualifying, tokens: tokenStats });
     } catch (e) {
+        console.error('[AI Federation] Stats error:', e.message);
         res.status(500).json({ error: 'Failed to read stats' });
     }
 });
 
+
+// Export all uploads for a specific token (for local aggregation)
+app.get('/ai-federation/export/:mintHash', async (req, res) => {
+    try {
+        const { mintHash } = req.params;
+        if (!mintHash || !/^[a-f0-9]{16}$/.test(mintHash)) {
+            return res.status(400).json({ error: 'Invalid mint hash (expected 16 hex chars)' });
+        }
+        const tokenDir = path.join(AI_UPLOADS_DIR, mintHash);
+        if (!fs.existsSync(tokenDir)) {
+            return res.status(404).json({ error: 'No uploads found for this token' });
+        }
+        const files = await fs.promises.readdir(tokenDir);
+        const jsonFiles = files.filter(f => f.endsWith('.json')).sort(); // sort by filename (timestamp-based) for chronological order
+        const uploads = [];
+        for (const f of jsonFiles) {
+            try {
+                const raw = await fs.promises.readFile(path.join(tokenDir, f), 'utf8');
+                uploads.push(JSON.parse(raw));
+            } catch (e) { /* skip corrupt files */ }
+        }
+        res.json({ mintHash, count: uploads.length, uploads });
+    } catch (e) {
+        console.error('[AI Federation] Export error:', e.message);
+        res.status(500).json({ error: 'Failed to export uploads' });
+    }
+});
+
+// Export all uploads for all tokens (bulk download for aggregation)
+app.get('/ai-federation/export-all', async (_req, res) => {
+    try {
+        if (!fs.existsSync(AI_UPLOADS_DIR)) {
+            return res.json({ tokens: 0, data: {} });
+        }
+        const entries = await fs.promises.readdir(AI_UPLOADS_DIR, { withFileTypes: true });
+        const data = {};
+        let totalUploads = 0;
+        for (const entry of entries) {
+            if (!entry.isDirectory()) continue;
+            const tokenDir = path.join(AI_UPLOADS_DIR, entry.name);
+            const files = await fs.promises.readdir(tokenDir);
+            const jsonFiles = files.filter(f => f.endsWith('.json')).sort();
+            const uploads = [];
+            for (const f of jsonFiles) {
+                try {
+                    const raw = await fs.promises.readFile(path.join(tokenDir, f), 'utf8');
+                    uploads.push(JSON.parse(raw));
+                } catch (e) { /* skip corrupt files */ }
+            }
+            data[entry.name] = uploads;
+            totalUploads += uploads.length;
+        }
+        res.json({ tokens: Object.keys(data).length, totalUploads, data });
+    } catch (e) {
+        console.error('[AI Federation] Export-all error:', e.message);
+        res.status(500).json({ error: 'Failed to export all uploads' });
+    }
+});
+
+// Dashboard endpoint — comprehensive monitoring view
+app.get('/ai-federation/dashboard', async (_req, res) => {
+    try {
+        if (!fs.existsSync(AI_UPLOADS_DIR)) {
+            return res.json({ tokens: 0, totalUploads: 0, timeline: [], tokens: [] });
+        }
+        const entries = await fs.promises.readdir(AI_UPLOADS_DIR, { withFileTypes: true });
+        const tokenSummaries = [];
+        const timelineMap = new Map();
+        let totalUploads = 0;
+
+        for (const entry of entries) {
+            if (!entry.isDirectory()) continue;
+            const tokenDir = path.join(AI_UPLOADS_DIR, entry.name);
+            const files = (await fs.promises.readdir(tokenDir)).filter(f => f.endsWith('.json'));
+            if (files.length === 0) continue;
+            totalUploads += files.length;
+
+            let latest = null;
+            for (const f of files) {
+                try {
+                    const u = JSON.parse(await fs.promises.readFile(path.join(tokenDir, f), 'utf8'));
+                    if (u.uploadedAt) {
+                        const dk = u.uploadedAt.slice(0, 10);
+                        timelineMap.set(dk, (timelineMap.get(dk) || 0) + 1);
+                    }
+                    if (!latest || (u.uploadedAt && (!latest.uploadedAt || u.uploadedAt > latest.uploadedAt))) latest = u;
+                } catch (e) {}
+            }
+
+            const trades = latest?.totalTrades || 0;
+            const wins = latest?.winningTrades || 0;
+            const wr = trades > 0 ? Math.round((wins / trades) * 1000) / 10 : 0;
+            const weights = latest?.weights || {};
+            const topIndicators = Object.entries(weights).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => ({ indicator: k, weight: Math.round(v * 100) / 100 }));
+
+            tokenSummaries.push({
+                mintHash: entry.name, tokenMint: latest?.tokenMint || null,
+                tokenSymbol: latest?.tokenSymbol || null, uploadCount: files.length,
+                totalTrades: trades, winningTrades: wins, winRate: wr,
+                totalPnlPct: Math.round((latest?.totalPnlPct || 0) * 100) / 100,
+                patternMemorySize: Array.isArray(latest?.patternMemory) ? latest.patternMemory.length : 0,
+                lastUploadAt: latest?.uploadedAt || null,
+                passesAggregationFilter: trades >= 5 && wr >= 30,
+                topIndicators,
+            });
+        }
+
+        tokenSummaries.sort((a, b) => b.uploadCount - a.uploadCount);
+        const timeline = [...timelineMap.entries()].sort();
+        const qualifying = tokenSummaries.filter(t => t.passesAggregationFilter).length;
+
+        res.json({ tokens: tokenSummaries.length, totalUploads, qualifyingContributors: qualifying, timeline, tokens: tokenSummaries });
+    } catch (e) {
+        console.error('[AI Federation] Dashboard error:', e.message);
+        res.status(500).json({ error: 'Failed to read dashboard' });
+    }
+});
 
 // ─── PaceSeeker invite code tracker ───
 const USED_CODES_PATH = path.join(__dirname, 'used-invite-codes.json');
