@@ -4227,6 +4227,110 @@ app.post('/api/login', authRateLimiter, async (req, res) => {
     });
 });
 
+// Wallet login challenge store (login_version 2). The v2 client signs
+// "PhotoLynk-Login-v1\nwallet:<addr>\nnonce:<n>" — never the master-key
+// message — so the server never receives material that derives encryption keys.
+const WALLET_LOGIN_CHALLENGE_TTL_MS = 5 * 60 * 1000;
+const WALLET_LOGIN_CHALLENGE_MAX = 10000;
+const walletLoginChallenges = new Map(); // nonce -> { wallet, expiresAt }
+
+const purgeExpiredWalletChallenges = (now) => {
+    for (const [nonce, entry] of walletLoginChallenges) {
+        if (!entry || entry.expiresAt <= now) walletLoginChallenges.delete(nonce);
+    }
+};
+
+/**
+ * Pure validator for the /api/wallet-login signed message. Exported (guarded)
+ * for tests.
+ * @param {Object} params
+ * @param {string} params.messageText - UTF-8 decoded signed message
+ * @param {string} params.walletAddress - Wallet address from the request
+ * @param {*} params.loginVersion - req.body.login_version (2 = challenge-response)
+ * @param {Map} params.challengeMap - nonce -> { wallet, expiresAt }
+ * @param {boolean} params.allowLegacy - accept the old fixed master-key message
+ * @param {number} [params.now]
+ * @returns {{ok: boolean, legacy?: boolean, error?: string}}
+ */
+const validateWalletLoginMessage = ({ messageText, walletAddress, loginVersion, challengeMap, allowLegacy, now = Date.now() }) => {
+    if (Number(loginVersion) === 2) {
+        const walletNorm = String(walletAddress || '').trim();
+        if (typeof messageText !== 'string' || !messageText.startsWith('PhotoLynk-Login-v1')) {
+            return { ok: false, error: 'Invalid sign-in message content' };
+        }
+        if (!messageText.includes(`wallet:${walletNorm}`)) {
+            return { ok: false, error: 'Invalid sign-in message content' };
+        }
+        const m = messageText.match(/nonce:([0-9a-fA-F]{64})/);
+        const nonce = m ? m[1] : null;
+        const entry = nonce && challengeMap ? challengeMap.get(nonce) : null;
+        if (!entry) {
+            return { ok: false, error: 'Unknown or expired challenge' };
+        }
+        if (entry.expiresAt <= now) {
+            challengeMap.delete(nonce);
+            return { ok: false, error: 'Challenge expired' };
+        }
+        if (String(entry.wallet).toLowerCase() !== walletNorm.toLowerCase()) {
+            return { ok: false, error: 'Challenge wallet mismatch' };
+        }
+        challengeMap.delete(nonce); // single use
+        return { ok: true };
+    }
+
+    // Legacy clients sign the fixed master-key SIWS message. Accepted behind a
+    // flag so the operator can disable it once clients have updated.
+    if (allowLegacy && typeof messageText === 'string'
+        && messageText.includes('stealthlynk.io')
+        && messageText.includes('PhotoLynk-MasterKey-v1')) {
+        console.log('[WalletLogin] DEPRECATED legacy master-key message accepted for', walletAddress);
+        return { ok: true, legacy: true };
+    }
+    return { ok: false, error: 'Invalid sign-in message content' };
+};
+
+// Look up a user by linked wallet address or any wallet-derived email/name
+// variant produced by previous builds. Shared by /api/wallet-login and the
+// challenge endpoint (which reports only whether an account is linked).
+const findUserByWalletAddress = async (walletAddressNorm) => {
+    const walletAddressLower = String(walletAddressNorm).toLowerCase();
+    const walletDerivedEmails = [
+        `${walletAddressLower}@seeker.photolynk.local`,
+        `${walletAddressLower}@photolynk.local`,
+        `${walletAddressLower}.skr`,
+    ];
+    return dbGetAsync(
+        `SELECT * FROM users WHERE wallet_address = ? OR LOWER(email) = ? OR LOWER(email) IN (?, ?, ?) OR LOWER(alias_email) = ? OR LOWER(alias_email) IN (?, ?, ?)`,
+        [walletAddressNorm, walletAddressLower, ...walletDerivedEmails, walletAddressLower, ...walletDerivedEmails]
+    );
+};
+
+// GET /api/wallet-login/challenge — issue a single-use nonce for wallet login v2.
+// `linked` tells the client whether an account exists for this wallet, so a
+// brand-new wallet can skip the wallet-signing prompt entirely.
+app.get('/api/wallet-login/challenge', authRateLimiter, async (req, res) => {
+    const wallet = String(req.query.wallet_address || '').trim();
+    if (!wallet) {
+        return res.status(400).json({ error: 'wallet_address required' });
+    }
+    const now = Date.now();
+    purgeExpiredWalletChallenges(now);
+    // Cap the map — Map preserves insertion order, so the oldest entry is first.
+    while (walletLoginChallenges.size >= WALLET_LOGIN_CHALLENGE_MAX) {
+        const oldest = walletLoginChallenges.keys().next().value;
+        walletLoginChallenges.delete(oldest);
+    }
+    const nonce = crypto.randomBytes(32).toString('hex');
+    walletLoginChallenges.set(nonce, { wallet, expiresAt: now + WALLET_LOGIN_CHALLENGE_TTL_MS });
+    let linked = false;
+    try {
+        linked = !!(await findUserByWalletAddress(wallet));
+    } catch (e) {
+        console.log('[WalletLogin] Challenge linked-check failed:', e.message);
+    }
+    res.json({ nonce, expires_in: 300, linked });
+});
+
 // Wallet Login
 // Allows users with a wallet-linked account to log in by proving ownership of the
 // wallet via a SIWS signature. The client sends the wallet address, the signed
@@ -4241,18 +4345,9 @@ app.post('/api/wallet-login', authRateLimiter, async (req, res) => {
         const walletAddressNorm = String(wallet_address).trim();
         const walletAddressLower = walletAddressNorm.toLowerCase();
         const walletDomain = wallet_domain ? String(wallet_domain).toLowerCase().trim() : null;
-        // Wallet-derived email/name variants that may exist from previous builds.
-        const walletDerivedEmails = [
-            `${walletAddressLower}@seeker.photolynk.local`,
-            `${walletAddressLower}@photolynk.local`,
-            `${walletAddressLower}.skr`,
-        ];
 
         // Look up the user by linked wallet address or any wallet-derived email/name.
-        let user = await dbGetAsync(
-            `SELECT * FROM users WHERE wallet_address = ? OR LOWER(email) = ? OR LOWER(email) IN (?, ?, ?) OR LOWER(alias_email) = ? OR LOWER(alias_email) IN (?, ?, ?)`,
-            [walletAddressNorm, walletAddressLower, ...walletDerivedEmails, walletAddressLower, ...walletDerivedEmails]
-        );
+        let user = await findUserByWalletAddress(walletAddressNorm);
         if (!user) {
             console.log('[WalletLogin] No account linked to wallet:', wallet_address);
             return res.status(401).json({ error: 'No account linked to this wallet' });
@@ -4289,11 +4384,21 @@ app.post('/api/wallet-login', authRateLimiter, async (req, res) => {
             return res.status(401).json({ error: 'Invalid wallet signature' });
         }
 
-        // Basic SIWS message content validation.
+        // Message validation: v2 is nonce-bound challenge-response (the
+        // master-key signature is never sent); the legacy fixed message is
+        // accepted behind WALLET_LOGIN_ALLOW_LEGACY (default on) so older
+        // clients keep working until the flag is flipped.
         const messageText = naclUtil.encodeUTF8(messageBytes);
-        if (!messageText.includes('stealthlynk.io') || !messageText.includes('PhotoLynk-MasterKey-v1')) {
-            console.log('[WalletLogin] SIWS message content rejected for wallet:', wallet_address);
-            return res.status(401).json({ error: 'Invalid sign-in message content' });
+        const msgCheck = validateWalletLoginMessage({
+            messageText,
+            walletAddress: walletAddressNorm,
+            loginVersion: req.body.login_version,
+            challengeMap: walletLoginChallenges,
+            allowLegacy: process.env.WALLET_LOGIN_ALLOW_LEGACY !== '0',
+        });
+        if (!msgCheck.ok) {
+            console.log('[WalletLogin] Message rejected for wallet:', wallet_address, '-', msgCheck.error);
+            return res.status(401).json({ error: msgCheck.error || 'Invalid sign-in message content' });
         }
 
         // Register/Update device.
@@ -4321,7 +4426,7 @@ app.post('/api/wallet-login', authRateLimiter, async (req, res) => {
             { expiresIn: '30d' }
         );
         console.log('[WalletLogin] Successful login for user', user.id, 'wallet:', wallet_address);
-        res.json({ token, userId: user.id });
+        res.json({ token, userId: user.id, email: user.email });
     } catch (e) {
         console.error('[WalletLogin] Error:', e.message);
         res.status(500).json({ error: e.message || 'Wallet login failed' });
@@ -4581,6 +4686,9 @@ app.post('/api/migrate-credentials', authenticateToken, async (req, res) => {
         // Store the old email as alias so the user can still login with legacy credentials
         const currentUser = await dbGetAsync(`SELECT email FROM users WHERE id = ?`, [userId]);
         const aliasEmail = currentUser ? currentUser.email : null;
+        // Same-email calls are wallet login-password rotations, not migrations —
+        // storage_uuid stays identical (it is HMAC-derived from the email).
+        const isPasswordRotation = !!(currentUser && String(currentUser.email).toLowerCase() === normalizedNewEmail);
 
         // Update user record in-place (same user_id!)
         await dbRunAsync(
@@ -4608,6 +4716,9 @@ app.post('/api/migrate-credentials', authenticateToken, async (req, res) => {
             { expiresIn: '30d' }
         );
 
+        if (isPasswordRotation) {
+            console.log(`[Migrate] User ${userId} password rotation (email unchanged): ${normalizedNewEmail}`);
+        }
         console.log(`[Migrate] User ${userId} credentials migrated: ${req.user.email} → ${normalizedNewEmail}`);
         res.json({ token, userId, message: 'Credentials migrated successfully' });
     } catch (e) {
@@ -13142,6 +13253,7 @@ if (require.main === module) {
 module.exports = {
     evaluatePaymentAmount,
     getPriceBand,
+    validateWalletLoginMessage,
     PLAN_PRICES_USD,
     PREMIUM_PRICE_USD,
 };
