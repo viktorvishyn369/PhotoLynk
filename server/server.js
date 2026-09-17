@@ -338,6 +338,9 @@ app.use(helmet({
 }));
 app.use(cors());
 app.use(morgan('common')); // Logging
+// IPFS pinning proxy needs the exact request bytes — mount its raw parser
+// before express.json so 'application/json' file bodies are not re-serialized.
+app.use('/api/nft/ipfs-pin', express.raw({ type: '*/*', limit: '40mb' }));
 // Allow larger JSON payloads (on-chain SVG data URIs for NFT payment image tokens)
 app.use(express.json({ limit: '25mb' }));
 
@@ -9092,6 +9095,32 @@ const checkNftStorageEligibility = async (userId, fileSizeBytes) => {
 };
 
 // Upload NFT image to StealthCloud (authenticated)
+// ─── Pinata JWT helpers (module scope — shared by ipfs-pin + clear-all) ─────
+// Keys are configured on the SERVER ONLY (env or nft-service/config) — mobile
+// clients proxy pin requests through POST /api/nft/ipfs-pin instead of
+// embedding JWTs in the app bundle.
+let nftConfig = null;
+try { nftConfig = require('../nft-service/config'); } catch (_) { }
+
+const parseJwtList = (value) => String(value || '').split(/[\s,]+/).map(v => v.trim()).filter(Boolean);
+
+const getPinataJwtCandidates = () => {
+    const dynamicEnvValues = Object.keys(process.env)
+        .filter(key => /^PINATA_JWT($|_)/.test(key))
+        .sort()
+        .flatMap(key => parseJwtList(process.env[key]));
+    return [...new Set([
+        nftConfig?.PINATA_JWT,
+        nftConfig?.PINATA_JWT_FALLBACK,
+        process.env.PINATA_JWT,
+        process.env.PINATA_JWT_FALLBACK,
+        process.env.PINATA_JWT_EXTRA,
+        ...(nftConfig?.PINATA_JWT_LIST ? parseJwtList(nftConfig.PINATA_JWT_LIST) : []),
+        ...parseJwtList(process.env.PINATA_JWT_LIST),
+        ...dynamicEnvValues,
+    ].filter(Boolean))];
+};
+
 // POST /api/nft/upload
 // Body: multipart form with 'image' file
 // Returns: { success, imageId, publicUrl }
@@ -9167,6 +9196,105 @@ app.post('/api/nft/upload', authenticateToken, (req, res, next) => {
     } catch (error) {
         console.error('[NFT] Upload error:', error);
         res.status(500).json({ error: 'Failed to upload NFT image' });
+    }
+});
+
+// POST /api/nft/ipfs-pin — proxy IPFS pinning through StealthCloud so Pinata
+// JWTs never ship inside the app bundle.
+// Body: raw file bytes (express.raw mounted for this path before express.json)
+// Query: filename=<name>   Header Content-Type: the file's MIME type
+// Allowed types: image/*, application/json, application/octet-stream
+// Returns: { success, IpfsHash, PinSize }
+const ipfsPinRateLimit = new Map(); // userKey -> [timestamps]
+const IPFS_PIN_RATE_LIMIT = 60;      // pins per hour per user
+const IPFS_PIN_RATE_WINDOW_MS = 60 * 60 * 1000;
+
+// Multipart body for Pinata's pinFileToIPFS — same wire shape the mobile
+// client builds (nftOperations.js uploadToPinata): header / file / footer.
+const buildPinataMultipart = (fileBuffer, filename, contentType) => {
+    const boundary = '----FormBoundary' + crypto.randomBytes(12).toString('hex');
+    const headerStr = `--${boundary}\r\n` +
+        `Content-Disposition: form-data; name="file"; filename="${filename}"\r\n` +
+        `Content-Type: ${contentType}\r\n\r\n`;
+    const footerStr = `\r\n--${boundary}--\r\n`;
+    return {
+        boundary,
+        body: Buffer.concat([Buffer.from(headerStr, 'utf8'), fileBuffer, Buffer.from(footerStr, 'utf8')]),
+    };
+};
+
+// Rotate to the next JWT on auth/quota/rate-limit errors — mirrors the
+// client's shouldTryPinataFallback status list.
+const shouldRotatePinataJwt = (status) => [401, 402, 403, 429].includes(Number(status));
+
+app.post('/api/nft/ipfs-pin', authenticateToken, async (req, res) => {
+    try {
+        const fileBuffer = Buffer.isBuffer(req.body) ? req.body : null;
+        if (!fileBuffer || fileBuffer.length === 0) {
+            return res.status(400).json({ error: 'Empty file body' });
+        }
+
+        const contentType = String(req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+        const typeAllowed = contentType.startsWith('image/')
+            || contentType === 'application/json'
+            || contentType === 'application/octet-stream';
+        if (!typeAllowed) {
+            return res.status(400).json({ error: `Unsupported content type: ${contentType || 'none'}` });
+        }
+
+        const filename = (String(req.query.filename || 'file').replace(/[^\w.\-]/g, '_') || 'file').slice(0, 128);
+
+        // Per-user in-memory rate limit: 60 pins/hour
+        const rateKey = String(req.user?.id || req.user?.email || 'unknown');
+        const now = Date.now();
+        const stamps = (ipfsPinRateLimit.get(rateKey) || []).filter(ts => now - ts < IPFS_PIN_RATE_WINDOW_MS);
+        if (stamps.length >= IPFS_PIN_RATE_LIMIT) {
+            return res.status(429).json({ error: 'IPFS pin rate limit exceeded (60 per hour)', code: 'PIN_RATE_LIMITED' });
+        }
+        stamps.push(now);
+        ipfsPinRateLimit.set(rateKey, stamps);
+        if (ipfsPinRateLimit.size > 10000) ipfsPinRateLimit.clear(); // bounded growth
+
+        const pinataJwts = getPinataJwtCandidates();
+        if (!pinataJwts.length) {
+            return res.status(503).json({ error: 'IPFS pinning not configured on this server', code: 'PIN_NOT_CONFIGURED' });
+        }
+
+        const { boundary, body } = buildPinataMultipart(fileBuffer, filename, contentType);
+
+        let lastStatus = 502;
+        let lastDetail = '';
+        for (let i = 0; i < pinataJwts.length; i++) {
+            try {
+                const pr = await axios.post('https://api.pinata.cloud/pinning/pinFileToIPFS', body, {
+                    headers: {
+                        Authorization: `Bearer ${pinataJwts[i]}`,
+                        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+                    },
+                    timeout: 60000,
+                    maxBodyLength: Infinity,
+                    maxContentLength: Infinity,
+                    validateStatus: () => true,
+                });
+                if (pr.status >= 200 && pr.status < 300 && pr.data?.IpfsHash) {
+                    console.log(`[NFT] ipfs-pin: user=${req.user.id} cid=${pr.data.IpfsHash} size=${fileBuffer.length} jwtIndex=${i}`);
+                    return res.json({ success: true, IpfsHash: pr.data.IpfsHash, PinSize: pr.data.PinSize });
+                }
+                lastStatus = pr.status;
+                lastDetail = typeof pr.data === 'string' ? pr.data : JSON.stringify(pr.data || {});
+                console.log(`[NFT] ipfs-pin JWT[${i}] failed: ${pr.status} ${String(lastDetail).slice(0, 200)}`);
+                if (i === pinataJwts.length - 1 || !shouldRotatePinataJwt(pr.status)) break;
+            } catch (e) {
+                lastStatus = e.response?.status || 502;
+                lastDetail = e.message;
+                if (i === pinataJwts.length - 1 || !shouldRotatePinataJwt(lastStatus)) break;
+            }
+        }
+
+        return res.status(502).json({ error: `IPFS pin failed (upstream ${lastStatus})`, detail: String(lastDetail).slice(0, 200) });
+    } catch (error) {
+        console.error('[NFT] ipfs-pin error:', error);
+        res.status(500).json({ error: 'IPFS pin failed' });
     }
 });
 
@@ -10079,7 +10207,6 @@ app.post('/api/nft/clear-all', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: 'walletAddress is required' });
         }
 
-        const parseJwtList = (value) => String(value || '').split(/[\s,]+/).map(v => v.trim()).filter(Boolean);
         const extractCid = (url) => {
             if (!url || typeof url !== 'string') return null;
             const m = url.match(/\b(Qm[1-9A-HJ-NP-Za-km-z]{44,}|bafy[a-z2-7]{50,})\b/);
@@ -10107,24 +10234,6 @@ app.post('/api/nft/clear-all', authenticateToken, async (req, res) => {
             }
             if (!folderKey || !filename) return null;
             return path.join(NFT_DIR, folderKey, filename);
-        };
-        const getPinataJwtCandidates = () => {
-            let nftConfig = null;
-            try { nftConfig = require('../nft-service/config'); } catch (_) { }
-            const dynamicEnvValues = Object.keys(process.env)
-                .filter(key => /^PINATA_JWT($|_)/.test(key))
-                .sort()
-                .flatMap(key => parseJwtList(process.env[key]));
-            return [...new Set([
-                nftConfig?.PINATA_JWT,
-                nftConfig?.PINATA_JWT_FALLBACK,
-                process.env.PINATA_JWT,
-                process.env.PINATA_JWT_FALLBACK,
-                process.env.PINATA_JWT_EXTRA,
-                ...(nftConfig?.PINATA_JWT_LIST ? parseJwtList(nftConfig.PINATA_JWT_LIST) : []),
-                ...parseJwtList(process.env.PINATA_JWT_LIST),
-                ...dynamicEnvValues,
-            ].filter(Boolean))];
         };
 
         const folderKeys = fs.readdirSync(NFT_DIR, { withFileTypes: true })
