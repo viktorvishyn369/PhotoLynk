@@ -4694,10 +4694,17 @@ app.post('/api/migrate-credentials', authenticateToken, async (req, res) => {
         const isPasswordRotation = !!(currentUser && String(currentUser.email).toLowerCase() === normalizedNewEmail);
 
         // Update user record in-place (same user_id!)
-        await dbRunAsync(
-            `UPDATE users SET email = ?, password = ?, storage_uuid = COALESCE(?, storage_uuid), alias_email = COALESCE(alias_email, ?) WHERE id = ?`,
-            [normalizedNewEmail, hashedPassword, newStorageUuid, aliasEmail, userId]
-        );
+        if (isPasswordRotation) {
+            // Rotation: ONLY the password hash changes. email / storage_uuid /
+            // alias_email stay exactly as they are so existing folders, JWT
+            // storage keys and alias logins are untouched.
+            await dbRunAsync(`UPDATE users SET password = ? WHERE id = ?`, [hashedPassword, userId]);
+        } else {
+            await dbRunAsync(
+                `UPDATE users SET email = ?, password = ?, storage_uuid = COALESCE(?, storage_uuid), alias_email = COALESCE(alias_email, ?) WHERE id = ?`,
+                [normalizedNewEmail, hashedPassword, newStorageUuid, aliasEmail, userId]
+            );
+        }
 
         // Update device_uuid in devices table if provided
         const effectiveDeviceUuid = device_uuid || req.user.device_uuid;
@@ -4711,8 +4718,11 @@ app.post('/api/migrate-credentials', authenticateToken, async (req, res) => {
             );
         }
 
-        // Issue new JWT with updated identity
-        const storageUuid = newStorageUuid || req.user.storage_uuid;
+        // Issue new JWT with updated identity. A rotation keeps the caller's
+        // existing storage_uuid claim (the DB value was not touched).
+        const storageUuid = isPasswordRotation
+            ? (req.user.storage_uuid || newStorageUuid)
+            : (newStorageUuid || req.user.storage_uuid);
         const token = jwt.sign(
             { id: userId, user_uuid: req.user.user_uuid, storage_uuid: storageUuid, email: normalizedNewEmail, device_uuid: effectiveDeviceUuid },
             JWT_SECRET,
