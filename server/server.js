@@ -1278,8 +1278,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
             const solUsdRealtime = totalSolPaid * (solPriceUsd || 0);
             const skrUsdRealtime = totalSkrPaid * (skrPriceUsd || 0);
             // Also compute plan-based USD for Apple/Google subscriptions (no crypto payment records)
-            const PLAN_PRICES_USD = { 100: 1.75, 200: 2.45, 400: 3.99, 1000: 7.99 };
-            const PREMIUM_PRICE_USD = 49.99;
+            // Uses the hoisted module-scope PLAN_PRICES_USD / PREMIUM_PRICE_USD
             const totalSolUsdEquivalent = solPayments.reduce((s, p) => {
                 const tierGb = Number(p.tier_gb || 0);
                 const duration = String(p.duration || 'monthly').toLowerCase();
@@ -5150,10 +5149,38 @@ const SKR_TOKEN_DECIMALS = 6;
 const SOLANA_RPC_ENDPOINT = process.env.SOLANA_RPC_ENDPOINT || 'https://solana-rpc.publicnode.com';
 const LAMPORTS_PER_SOL = 1000000000;
 
+// USD price of each subscription tier — MUST stay in sync with the client
+// constants in solanaPurchases.js (PLAN_PRICES_USD / PREMIUM_PRICE_USD /
+// SKR_SUBSCRIPTION_MULTIPLIER / SKR premium multiplier).
+const PLAN_PRICES_USD = { 100: 1.75, 200: 2.45, 400: 3.99, 1000: 7.99 };
+const PREMIUM_PRICE_USD = 49.99;
+const SKR_SUBSCRIPTION_MULTIPLIER = 1.0; // client: SKR_SUBSCRIPTION_MULTIPLIER
+const SKR_PREMIUM_MULTIPLIER = 1.0;      // client uses SKR_SUBSCRIPTION_MULTIPLIER for premium too
+
 // Plan durations in milliseconds
 const PLAN_DURATION_MS = {
     monthly: 30 * 24 * 60 * 60 * 1000,
     yearly: 365 * 24 * 60 * 60 * 1000,
+};
+
+// Map a verification failure to an HTTP response. Terminal codes answer 400
+// with { error, code, expected, received }; missing price band answers 503
+// (client treats it as retryable); everything else keeps the legacy 400
+// { error } shape so old clients behave as before.
+const respondVerificationFailure = (res, txVerification, fallbackError) => {
+    const code = txVerification.code;
+    if (code === 'PRICE_UNAVAILABLE') {
+        return res.status(503).json({ error: 'Price feed unavailable, retry later', code: 'PRICE_UNAVAILABLE' });
+    }
+    if (code) {
+        return res.status(400).json({
+            error: txVerification.error || fallbackError,
+            code,
+            expected: txVerification.expectedSol ?? txVerification.expectedSkr ?? txVerification.expectedUsd ?? null,
+            received: txVerification.receivedSol ?? txVerification.receivedSkr ?? null,
+        });
+    }
+    return res.status(400).json({ error: txVerification.error || fallbackError });
 };
 
 // Verify Solana payment transaction
@@ -5213,10 +5240,18 @@ app.post('/api/solana/verify-payment', async (req, res) => {
             }
         }
 
+        // Expected USD computed server-side — the client-claimed solAmount is
+        // only logged for diagnostics, never trusted.
+        const expectedUsd = (PLAN_PRICES_USD[normalizedTier] || 0) * (duration === 'yearly' ? 12 : 1);
+        if (!expectedUsd) {
+            return res.status(400).json({ error: 'Invalid tier' });
+        }
+        console.log('[Solana] Client-claimed solAmount (ignored for enforcement):', solAmount);
+
         // Verify transaction on Solana blockchain
-        const txVerification = await verifySolanaTransaction(txSignature, solAmount);
+        const txVerification = await verifySolanaTransaction(txSignature, expectedUsd);
         if (!txVerification.success) {
-            return res.status(400).json({ error: txVerification.error || 'Transaction verification failed' });
+            return respondVerificationFailure(res, txVerification, 'Transaction verification failed');
         }
 
         // Check if this transaction was already processed
@@ -5241,11 +5276,11 @@ app.post('/api/solana/verify-payment', async (req, res) => {
         });
         const expiresAt = solanaExpiry.expiresAt;
 
-        // Record the payment
+        // Record the payment — store the ON-CHAIN amount, not the client claim
         await dbRunAsync(
             `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, tier_gb, duration, created_at, verified_at)
              VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [user.id, txSignature, solAmount || 0, normalizedTier, duration || 'monthly', now, now]
+            [user.id, txSignature, txVerification.receivedAmount || 0, normalizedTier, duration || 'monthly', now, now]
         );
 
         // Activate subscription
@@ -5341,9 +5376,17 @@ app.post('/api/solana/verify-skr-payment', async (req, res) => {
             }
         }
 
-        const txVerification = await verifySkrTokenTransaction(txSignature, skrAmount, SKR_TOKEN_MINT);
+        // Expected USD computed server-side (with the SKR multiplier applied) —
+        // the client-claimed skrAmount is only logged for diagnostics.
+        const expectedUsd = (PLAN_PRICES_USD[normalizedTier] || 0) * (duration === 'yearly' ? 12 : 1) * SKR_SUBSCRIPTION_MULTIPLIER;
+        if (!expectedUsd) {
+            return res.status(400).json({ error: 'Invalid tier' });
+        }
+        console.log('[Solana SKR] Client-claimed skrAmount (ignored for enforcement):', skrAmount);
+
+        const txVerification = await verifySkrTokenTransaction(txSignature, expectedUsd, SKR_TOKEN_MINT);
         if (!txVerification.success) {
-            return res.status(400).json({ error: txVerification.error || 'SKR transaction verification failed' });
+            return respondVerificationFailure(res, txVerification, 'SKR transaction verification failed');
         }
 
         const existingTx = await dbGetAsync(
@@ -5367,7 +5410,7 @@ app.post('/api/solana/verify-skr-payment', async (req, res) => {
         await dbRunAsync(
             `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, skr_amount, payment_token, tier_gb, duration, created_at, verified_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [user.id, txSignature, 0, Number(skrAmount) || 0, 'SKR', normalizedTier, duration || 'monthly', now, now]
+            [user.id, txSignature, 0, txVerification.receivedAmount || 0, 'SKR', normalizedTier, duration || 'monthly', now, now]
         );
 
         await dbRunAsync(
@@ -5403,9 +5446,12 @@ app.post('/api/solana/verify-skr-payment', async (req, res) => {
     }
 });
 
-// Helper function to verify Solana transaction
-async function verifySolanaTransaction(txSignature, expectedSolAmount) {
-    console.log('[Solana] Verifying transaction:', txSignature, 'expected amount:', expectedSolAmount);
+// Helper function to verify Solana transaction.
+// Second arg is now the SERVER-computed expected USD value — the on-chain
+// amount is enforced against the recent SOL price band. Any client-supplied
+// amount is ignored for enforcement (logged by callers for diagnostics).
+async function verifySolanaTransaction(txSignature, expectedUsd) {
+    console.log('[Solana] Verifying transaction:', txSignature, 'expected USD:', expectedUsd);
 
     // Retry up to 5 times with 2 second intervals to allow tx to propagate
     const maxRetries = 5;
@@ -5452,7 +5498,13 @@ async function verifySolanaTransaction(txSignature, expectedSolAmount) {
 
     // Check if transaction explicitly failed (only if meta exists)
     if (tx.meta && tx.meta.err) {
-        return { success: false, error: 'Transaction failed on chain' };
+        return { success: false, code: 'TX_FAILED', error: 'Transaction failed on chain' };
+    }
+
+    // Reject stale transactions — client pending entries live 14 days and
+    // legacy builds may hold older ones, so allow up to 30 days.
+    if (tx.blockTime && (Date.now() - tx.blockTime * 1000) > 30 * 24 * 60 * 60 * 1000) {
+        return { success: false, code: 'TX_TOO_OLD', error: 'Transaction is older than 30 days' };
     }
 
     // Parse transfer instructions to find sender, receiver, and amount
@@ -5481,7 +5533,28 @@ async function verifySolanaTransaction(txSignature, expectedSolAmount) {
     // Verify the payment is TO our wallet
     if (receiver !== SOLANA_PAYMENT_WALLET) {
         console.log(`[Solana] Payment not to our wallet. Expected: ${SOLANA_PAYMENT_WALLET}, Got: ${receiver}`);
-        return { success: false, error: 'Payment not sent to correct wallet' };
+        return { success: false, code: 'WRONG_WALLET', error: 'Payment not sent to correct wallet' };
+    }
+
+    // Enforce the on-chain amount against the server-side USD expectation and
+    // the recent price band (protects against underpayment and replayed
+    // commission txs that share the payment wallet).
+    const band = await getPriceBand('sol');
+    if (!band) {
+        return { success: false, code: 'PRICE_UNAVAILABLE', retryable: true, error: 'Price feed unavailable, retry later' };
+    }
+    const evalResult = evaluatePaymentAmount({ receivedUnits: transferAmount, expectedUsd, band });
+    if (!evalResult.ok) {
+        console.log(`[Solana] Underpaid: received ${transferAmount} SOL, expected ~${evalResult.expectedAtLatest} SOL (min ${evalResult.minAcceptable}) for $${expectedUsd}`);
+        return {
+            success: false,
+            code: 'UNDERPAID',
+            error: `Received ${transferAmount} SOL but expected at least ${evalResult.minAcceptable} SOL ($${expectedUsd} USD)`,
+            receivedSol: transferAmount,
+            expectedSol: evalResult.expectedAtLatest,
+            minAcceptableSol: evalResult.minAcceptable,
+            expectedUsd,
+        };
     }
 
     console.log(`[Solana] Valid payment: ${transferAmount} SOL from ${sender} to ${receiver}`);
@@ -5496,17 +5569,17 @@ async function verifySolanaTransaction(txSignature, expectedSolAmount) {
     };
 }
 
-async function verifySkrTokenTransaction(txSignature, expectedSkrAmount, expectedTokenMint = SKR_TOKEN_MINT) {
-    console.log('[Solana SKR] Verifying transaction:', txSignature, 'expected amount:', expectedSkrAmount);
+// Second arg is the SERVER-computed expected USD value (SKR multiplier already
+// applied by the caller). The on-chain SKR amount is enforced against the
+// recent SKR price band; the client-supplied skrAmount is ignored for
+// enforcement.
+async function verifySkrTokenTransaction(txSignature, expectedUsd, expectedTokenMint = SKR_TOKEN_MINT) {
+    console.log('[Solana SKR] Verifying transaction:', txSignature, 'expected USD:', expectedUsd);
 
     const maxRetries = 7;
     const retryDelay = 2500;
     let tx = null;
     let matchedTransfer = null;
-
-    const expectedRawAmount = Number.isFinite(Number(expectedSkrAmount)) && Number(expectedSkrAmount) > 0
-        ? Math.ceil(Number(expectedSkrAmount) * Math.pow(10, SKR_TOKEN_DECIMALS))
-        : null;
 
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
         try {
@@ -5535,7 +5608,13 @@ async function verifySkrTokenTransaction(txSignature, expectedSkrAmount, expecte
             }
 
             if (tx.meta && tx.meta.err) {
-                return { success: false, error: 'Transaction failed on chain' };
+                return { success: false, code: 'TX_FAILED', error: 'Transaction failed on chain' };
+            }
+
+            // Client pending entries live 14 days and legacy builds may hold
+            // older ones — allow up to 30 days.
+            if (tx.blockTime && (Date.now() - tx.blockTime * 1000) > 30 * 24 * 60 * 60 * 1000) {
+                return { success: false, code: 'TX_TOO_OLD', error: 'Transaction is older than 30 days' };
             }
 
             // --- Approach 1: postTokenBalances (preferred) ---
@@ -5640,19 +5719,35 @@ async function verifySkrTokenTransaction(txSignature, expectedSkrAmount, expecte
 
     if (!matchedTransfer) {
         console.error('[Solana SKR] No valid transfer found. postTokenBalances:', JSON.stringify(tx.meta?.postTokenBalances || []));
-        return { success: false, error: 'No valid SKR transfer to the payment wallet was found in transaction' };
+        // Tx was found but carried no SKR transfer to the payment wallet —
+        // wrong receiver (terminal, not retryable).
+        return { success: false, code: 'WRONG_WALLET', error: 'No valid SKR transfer to the payment wallet was found in transaction' };
     }
 
-    if (expectedRawAmount && matchedTransfer.receivedRawAmount < expectedRawAmount) {
+    const receivedSkr = matchedTransfer.receivedRawAmount / Math.pow(10, SKR_TOKEN_DECIMALS);
+
+    const band = await getPriceBand('skr');
+    if (!band) {
+        return { success: false, code: 'PRICE_UNAVAILABLE', retryable: true, error: 'Price feed unavailable, retry later' };
+    }
+    const evalResult = evaluatePaymentAmount({ receivedUnits: receivedSkr, expectedUsd, band });
+    if (!evalResult.ok) {
+        console.log(`[Solana SKR] Underpaid: received ${receivedSkr} ${SKR_TOKEN_SYMBOL}, expected ~${evalResult.expectedAtLatest} (min ${evalResult.minAcceptable}) for $${expectedUsd}`);
         return {
             success: false,
-            error: `Received ${matchedTransfer.receivedRawAmount} raw ${SKR_TOKEN_SYMBOL} but expected at least ${expectedRawAmount}`,
+            code: 'UNDERPAID',
+            error: `Received ${receivedSkr} ${SKR_TOKEN_SYMBOL} but expected at least ${evalResult.minAcceptable} ($${expectedUsd} USD)`,
+            receivedSkr,
+            expectedSkr: evalResult.expectedAtLatest,
+            minAcceptableSkr: evalResult.minAcceptable,
+            expectedUsd,
         };
     }
 
     console.log(`[Solana SKR] Verified: ${matchedTransfer.receivedRawAmount} raw ${SKR_TOKEN_SYMBOL} to ${SOLANA_PAYMENT_WALLET}`);
     return {
         success: true,
+        receivedAmount: receivedSkr,
         ...matchedTransfer,
     };
 }
@@ -10678,10 +10773,14 @@ try {
                 return res.status(409).json({ error: 'Already premium', isPremium: true });
             }
 
+            // Expected USD computed server-side — client-claimed solAmount ignored
+            const expectedUsd = PREMIUM_PRICE_USD;
+            console.log('[Solana Premium] Client-claimed solAmount (ignored for enforcement):', solAmount);
+
             // Verify transaction on Solana blockchain
-            const txVerification = await verifySolanaTransaction(txSignature, solAmount);
+            const txVerification = await verifySolanaTransaction(txSignature, expectedUsd);
             if (!txVerification.success) {
-                return res.status(400).json({ error: txVerification.error || 'Transaction verification failed' });
+                return respondVerificationFailure(res, txVerification, 'Transaction verification failed');
             }
 
             // Check if this transaction was already processed
@@ -10693,12 +10792,12 @@ try {
                 return res.status(409).json({ error: 'Transaction already processed' });
             }
 
-            // Record the payment in solana_payments table
+            // Record the payment in solana_payments table — ON-CHAIN amount
             const now = Date.now();
             await dbRunAsync(
                 `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, tier_gb, duration, created_at, verified_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                [user.id, txSignature, solAmount || 0, 0, 'premium', now, now]
+                [user.id, txSignature, txVerification.receivedAmount || 0, 0, 'premium', now, now]
             );
 
             // Activate premium in nft-service DB
@@ -10772,9 +10871,14 @@ try {
                 return res.status(409).json({ error: 'Already premium', isPremium: true });
             }
 
-            const txVerification = await verifySkrTokenTransaction(txSignature, skrAmount, SKR_TOKEN_MINT);
+            // Expected USD computed server-side (with SKR premium multiplier) —
+            // client-claimed skrAmount ignored for enforcement
+            const expectedUsd = PREMIUM_PRICE_USD * SKR_PREMIUM_MULTIPLIER;
+            console.log('[Solana Premium SKR] Client-claimed skrAmount (ignored for enforcement):', skrAmount);
+
+            const txVerification = await verifySkrTokenTransaction(txSignature, expectedUsd, SKR_TOKEN_MINT);
             if (!txVerification.success) {
-                return res.status(400).json({ error: txVerification.error || 'SKR transaction verification failed' });
+                return respondVerificationFailure(res, txVerification, 'SKR transaction verification failed');
             }
 
             const existingTx = await dbGetAsync(
@@ -10789,7 +10893,7 @@ try {
             await dbRunAsync(
                 `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, skr_amount, payment_token, tier_gb, duration, created_at, verified_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [user.id, txSignature, 0, Number(skrAmount) || 0, 'SKR', 0, 'premium_skr', now, now]
+                [user.id, txSignature, 0, txVerification.receivedAmount || 0, 'SKR', 0, 'premium_skr', now, now]
             );
 
             const premiumResult = nftService.balance.setPremium(user.id, txSignature, 'skr');
@@ -10929,6 +11033,69 @@ let _solPriceFetchedAt = 0;
 let _skrPriceFetchedAt = 0;
 const PRICE_CACHE_MS = 60000;
 
+// Price band sampler — keeps {t, usd} samples for the last 20 minutes so
+// payment verification can accept amounts priced against any recent feed
+// value (old clients may have fetched a price up to ~60s earlier).
+const PRICE_BAND_WINDOW_MS = 20 * 60 * 1000;
+const _priceSamples = { sol: [], skr: [] };
+
+function recordPriceSample(kind, usd) {
+    if (!Number.isFinite(usd) || usd <= 0) return;
+    const now = Date.now();
+    const arr = _priceSamples[kind];
+    if (!arr) return;
+    arr.push({ t: now, usd });
+    while (arr.length && now - arr[0].t > PRICE_BAND_WINDOW_MS) arr.shift();
+}
+
+// Returns { latest, min, max, sampleCount } or null when no sample ≤20min old
+// is available and a live fetch failed.
+async function getPriceBand(kind) {
+    const arr = _priceSamples[kind];
+    if (!arr) return null;
+    const now = Date.now();
+    while (arr.length && now - arr[0].t > PRICE_BAND_WINDOW_MS) arr.shift();
+
+    const newest = arr.length ? arr[arr.length - 1] : null;
+    if (!newest || now - newest.t > 60000) {
+        const fetcher = kind === 'skr' ? fetchSkrPriceUsd : fetchSolPriceUsd;
+        try {
+            const usd = await fetcher();
+            if (Number.isFinite(usd) && usd > 0) recordPriceSample(kind, usd);
+        } catch (_) { }
+    }
+
+    const fresh = arr.filter(s => now - s.t <= PRICE_BAND_WINDOW_MS);
+    if (!fresh.length) return null;
+    const usds = fresh.map(s => s.usd);
+    return {
+        latest: usds[usds.length - 1],
+        min: Math.min(...usds),
+        max: Math.max(...usds),
+        sampleCount: fresh.length,
+    };
+}
+
+// === PAYMENT_EVALUATOR_BEGIN ===
+// Pure helper: decides whether a received on-chain amount covers the expected
+// USD value given the recent price band. Units of receivedUnits/minAcceptable/
+// expectedAtLatest are SOL or SKR depending on the band used.
+//   minAcceptable   = expectedUsd / band.max * (1 - tolerance)
+//   expectedAtLatest = expectedUsd / band.latest
+// Paying at the HIGHEST price seen in the window with `tolerance` headroom
+// still passes — that is what lets correctly-priced old clients through.
+function evaluatePaymentAmount({ receivedUnits, expectedUsd, band, tolerance = 0.08 }) {
+    if (!band || !Number.isFinite(band.max) || band.max <= 0 || !Number.isFinite(band.latest) || band.latest <= 0) {
+        return { ok: false, minAcceptable: null, expectedAtLatest: null };
+    }
+    const received = Number(receivedUnits);
+    const expectedAtLatest = expectedUsd / band.latest;
+    const minAcceptable = (expectedUsd / band.max) * (1 - tolerance);
+    const ok = Number.isFinite(received) && received >= minAcceptable;
+    return { ok, minAcceptable, expectedAtLatest };
+}
+// === PAYMENT_EVALUATOR_END ===
+
 async function fetchSolPriceUsd() {
     const now = Date.now();
     if (_cachedSolPrice && _cachedSolPrice > 0 && (now - _solPriceFetchedAt) < PRICE_CACHE_MS) return _cachedSolPrice;
@@ -10955,6 +11122,7 @@ async function fetchSolPriceUsd() {
             if (price && price > 0) {
                 _cachedSolPrice = price;
                 _solPriceFetchedAt = now;
+                recordPriceSample('sol', price);
                 return price;
             }
         } catch (_) { }
@@ -10966,15 +11134,12 @@ async function fetchSkrPriceUsd() {
     const now = Date.now();
     if (_cachedSkrPrice && _cachedSkrPrice > 0 && (now - _skrPriceFetchedAt) < PRICE_CACHE_MS) return _cachedSkrPrice;
     const sources = [
+        // Jupiter v3 — same primary source and response shape as the client
+        // (solanaPurchases.js fetchSkrPrice) so both sides price identically.
         async () => {
-            const r = await axios.get(`https://price.jup.ag/v6/price?ids=${SKR_TOKEN_MINT}`, { timeout: 5000 });
-            const p = r.data?.data?.[SKR_TOKEN_MINT]?.price;
-            if (p > 0) return parseFloat(p);
-        },
-        async () => {
-            const r = await axios.get(`https://price.jup.ag/v4/price?ids=${SKR_TOKEN_MINT}`, { timeout: 5000 });
-            const p = r.data?.data?.[SKR_TOKEN_MINT]?.price;
-            if (p > 0) return parseFloat(p);
+            const r = await axios.get(`https://api.jup.ag/price/v3?ids=${SKR_TOKEN_MINT}`, { timeout: 5000 });
+            const p = Number(r.data?.[SKR_TOKEN_MINT]?.usdPrice);
+            if (p > 0) return p;
         },
         async () => {
             const r = await axios.get('https://api.dexscreener.com/latest/dex/tokens/' + SKR_TOKEN_MINT, { timeout: 5000 });
@@ -10991,6 +11156,7 @@ async function fetchSkrPriceUsd() {
             if (price && price > 0) {
                 _cachedSkrPrice = price;
                 _skrPriceFetchedAt = now;
+                recordPriceSample('skr', price);
                 return price;
             }
         } catch (_) { }
@@ -12965,5 +13131,17 @@ const startHttps = () => {
     }
 };
 
-if (ENABLE_HTTPS) startHttps();
-else startHttp();
+// Only start listeners when run directly (node server.js) — requiring this
+// module (e.g. unit tests) must not bind ports.
+if (require.main === module) {
+    if (ENABLE_HTTPS) startHttps();
+    else startHttp();
+}
+
+// Guarded exports for unit tests (module never listens when required)
+module.exports = {
+    evaluatePaymentAmount,
+    getPriceBand,
+    PLAN_PRICES_USD,
+    PREMIUM_PRICE_USD,
+};
