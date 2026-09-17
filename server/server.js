@@ -9515,6 +9515,91 @@ app.delete('/api/nft/image/:imageId', authenticateToken, async (req, res) => {
 // NFT metadata storage file per user
 const getNftMetadataPath = (userKey) => path.join(NFT_DIR, String(userKey), 'nft-album.json');
 
+// Folder keys (device UUIDs / legacy keys) that belong to this account, plus the
+// devices paired to them. Destructive NFT operations (clear-all, unpin) must
+// never reach beyond these — the wallet address in a request is client-supplied.
+const NFT_CID_IN_VALUE_RE = /\b(Qm[1-9A-HJ-NP-Za-km-z]{44}|baf[a-z0-9]{50,})\b/;
+const extractIpfsCidFromValue = (value) => {
+    if (!value || typeof value !== 'string') return null;
+    const m = value.match(NFT_CID_IN_VALUE_RE);
+    return m ? m[1] : null;
+};
+const getUserOwnedNftFolderKeys = async (user) => {
+    const keys = new Set((getStealthCloudAllPossibleUserKeys(user) || []).map(k => sanitizeUserKey(k)).filter(Boolean));
+    try {
+        const rows = await dbAllAsync(`SELECT device_uuid FROM devices WHERE user_id = ?`, [user.id]);
+        for (const r of rows || []) {
+            const k = sanitizeUserKey(r.device_uuid);
+            if (k) keys.add(k);
+        }
+    } catch (_) { }
+    try {
+        const own = Array.from(keys);
+        if (own.length) {
+            const placeholders = own.map(() => '?').join(',');
+            const links = await dbAllAsync(
+                `SELECT device_uuid_a, device_uuid_b FROM linked_devices WHERE device_uuid_a IN (${placeholders}) OR device_uuid_b IN (${placeholders})`,
+                [...own, ...own]
+            );
+            for (const l of links || []) {
+                for (const v of [l.device_uuid_a, l.device_uuid_b]) {
+                    const k = sanitizeUserKey(v);
+                    if (k) keys.add(k);
+                }
+            }
+        }
+    } catch (_) { }
+    return Array.from(keys);
+};
+// CIDs of album records this account removed recently (burn flow: the app fires
+// the unpin request around the same time it removes the record, so the CID may
+// already be gone from the album when the unpin guard runs).
+const RECENTLY_REMOVED_NFT_CIDS_TTL_MS = 6 * 60 * 60 * 1000;
+const recentlyRemovedNftCidsByUser = new Map(); // userId -> Map<cid, removedAt>
+const rememberRemovedNftCids = (userId, removedRecords) => {
+    if (!userId || !Array.isArray(removedRecords) || !removedRecords.length) return;
+    const now = Date.now();
+    let bucket = recentlyRemovedNftCidsByUser.get(String(userId));
+    if (!bucket) {
+        bucket = new Map();
+        recentlyRemovedNftCidsByUser.set(String(userId), bucket);
+    }
+    for (const [cid, ts] of bucket) if (now - ts > RECENTLY_REMOVED_NFT_CIDS_TTL_MS) bucket.delete(cid);
+    for (const nft of removedRecords) {
+        for (const field of ['imageUrl', 'arweaveUrl', 'thumbnailUrl', 'ipfsThumbnailUrl', 'metadataUrl', 'metadataUri', 'encryptedThumbnailUrl', 'uri']) {
+            const cid = extractIpfsCidFromValue(nft && nft[field]);
+            if (cid) bucket.set(cid, now);
+        }
+    }
+    while (bucket.size > 500) bucket.delete(bucket.keys().next().value);
+    if (recentlyRemovedNftCidsByUser.size > 5000) recentlyRemovedNftCidsByUser.clear();
+};
+// Every IPFS CID referenced by the NFT album records this account owns (plus
+// the ones it removed in the last hours).
+const collectUserNftCids = async (user) => {
+    const cids = new Set();
+    const recent = recentlyRemovedNftCidsByUser.get(String(user && user.id));
+    if (recent) {
+        const now = Date.now();
+        for (const [cid, ts] of recent) if (now - ts <= RECENTLY_REMOVED_NFT_CIDS_TTL_MS) cids.add(cid);
+    }
+    for (const key of await getUserOwnedNftFolderKeys(user)) {
+        const metadataPath = getNftMetadataPath(key);
+        if (!fs.existsSync(metadataPath)) continue;
+        try {
+            const raw = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+            const nfts = Array.isArray(raw) ? raw : (raw.nfts || []);
+            for (const nft of nfts) {
+                for (const field of ['imageUrl', 'arweaveUrl', 'thumbnailUrl', 'ipfsThumbnailUrl', 'metadataUrl', 'metadataUri', 'encryptedThumbnailUrl', 'uri']) {
+                    const cid = extractIpfsCidFromValue(nft && nft[field]);
+                    if (cid) cids.add(cid);
+                }
+            }
+        } catch (_) { }
+    }
+    return cids;
+};
+
 // Helper functions for wallet-scoped filtering
 const normalizeWalletAddress = (wallet) => wallet ? String(wallet).trim() : '';
 const normalizeWalletMint = (m) => m ? String(m).replace(/^cnft_/, '') : '';
@@ -10062,6 +10147,7 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
             const mintMatchFn = (n) => normalizeWalletMint(n.mintAddress) === normMintTarget;
             const senderWallet = normalizeWalletAddress(ownerAddress);
             const before = data.nfts.length;
+            rememberRemovedNftCids(userId, data.nfts.filter(mintMatchFn));
             data.nfts = data.nfts.filter(n => !mintMatchFn(n));
             console.log(`[NFT] Album remove: user=${userId} mint=${mintAddress} removed=${before - data.nfts.length}`);
             // Also remove from ALL linked device folders so readNftsForWalletGlobal won't return it
@@ -10075,6 +10161,7 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
                     try {
                         const linkedData = JSON.parse(fs.readFileSync(linkedPath, 'utf8'));
                         const linkedBefore = (linkedData.nfts || []).length;
+                        rememberRemovedNftCids(userId, (linkedData.nfts || []).filter(mintMatchFn));
                         linkedData.nfts = (linkedData.nfts || []).filter(n => !mintMatchFn(n));
                         if (linkedData.nfts.length < linkedBefore) {
                             fs.writeFileSync(linkedPath, JSON.stringify(linkedData, null, 2));
@@ -10086,15 +10173,21 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
             if (senderWallet) {
                 let globalRemoved = 0;
                 try {
+                    // Only this account's own (and paired) folders — ownerAddress is
+                    // client-supplied and must not purge other users' album records
+                    // (a private NFT's record carries its encryptionData).
+                    const ownedKeys = new Set(await getUserOwnedNftFolderKeys(req.user));
                     const dirs = fs.readdirSync(NFT_DIR, { withFileTypes: true });
                     for (const d of dirs) {
                         if (!d.isDirectory()) continue;
                         const folderKey = String(d.name);
+                        if (!ownedKeys.has(folderKey)) continue;
                         const globalPath = getNftMetadataPath(folderKey);
                         if (!fs.existsSync(globalPath)) continue;
                         try {
                             const globalData = JSON.parse(fs.readFileSync(globalPath, 'utf8'));
                             const globalBefore = (globalData.nfts || []).length;
+                            rememberRemovedNftCids(userId, (globalData.nfts || []).filter(n => mintMatchFn(n) && normalizeWalletAddress(n.ownerAddress) === senderWallet));
                             globalData.nfts = (globalData.nfts || []).filter(n => {
                                 if (!mintMatchFn(n)) return true;
                                 return normalizeWalletAddress(n.ownerAddress) !== senderWallet;
@@ -10246,9 +10339,14 @@ app.post('/api/nft/clear-all', authenticateToken, async (req, res) => {
             return path.join(NFT_DIR, folderKey, filename);
         };
 
+        // Only folders this account (and its paired devices) owns. The wallet
+        // address is client-supplied — it selects records WITHIN those folders,
+        // it must never select other users' folders.
+        const ownedFolderKeys = new Set(await getUserOwnedNftFolderKeys(req.user));
         const folderKeys = fs.readdirSync(NFT_DIR, { withFileTypes: true })
             .filter(d => d.isDirectory())
-            .map(d => String(d.name));
+            .map(d => String(d.name))
+            .filter(name => ownedFolderKeys.has(name));
         const matchedFilePaths = new Set();
         const matchedCids = new Set();
         let nftsCleared = 0;
@@ -10830,11 +10928,79 @@ try {
         return { discountPct: 0 };
     });
 
+    // Routes that grant value or move assets WITHOUT on-chain / receipt proof.
+    // /credit and /upgrade-premium trust the client (no IAP receipt check) and
+    // /transfer re-mints ANY tree asset to a caller-chosen wallet with no
+    // ownership proof. Premium and credit are granted only by the verified
+    // Solana endpoints below; cNFT transfers are signed by the owner's wallet
+    // in the app. NFT_SERVICE_ALLOW_UNVERIFIED_IAP=1 re-opens the two IAP
+    // routes for the legacy mobile-v2 client (insecure — leave off).
+    const NFT_SERVICE_CLOSED_ROUTES = new Set(['/credit', '/upgrade-premium', '/transfer', '/transfer-estimate']);
+    const NFT_SERVICE_LEGACY_IAP_ROUTES = new Set(['/credit', '/upgrade-premium']);
+    const nftServiceMintInFlight = new Set(); // user id -> serialize /mint per account
+    const LOOPBACK_ADDRS = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+
     app.use('/api/nft-service', (req, res, next) => {
-        if (req.path === '/das-proxy' && (req.ip === '127.0.0.1' || req.ip === '::1' || req.ip === '::ffff:127.0.0.1')) {
+        // Local desktop/server callers may use the DAS read proxy without a token,
+        // but only on a direct loopback socket — never through a reverse proxy.
+        const directLoopback = LOOPBACK_ADDRS.has(String(req.socket?.remoteAddress || ''))
+            && !req.headers['x-forwarded-for'] && !req.headers['x-real-ip'];
+        if (req.path === '/das-proxy' && directLoopback) {
             return next();
         }
+        if (NFT_SERVICE_CLOSED_ROUTES.has(req.path)) {
+            const legacyIapAllowed = process.env.NFT_SERVICE_ALLOW_UNVERIFIED_IAP === '1' && NFT_SERVICE_LEGACY_IAP_ROUTES.has(req.path);
+            if (!legacyIapAllowed) {
+                console.warn(`[NFT Service] Blocked closed route ${req.method} ${req.path} from ${req.ip}`);
+                return res.status(403).json({ error: 'This endpoint is disabled on this server', code: 'ENDPOINT_DISABLED' });
+            }
+        }
         return authenticateToken(req, res, next);
+    }, async (req, res, next) => {
+        try {
+            // /mint: one in-flight mint per account. The free-mint counter is
+            // read before minting and incremented after, so parallel requests
+            // could otherwise all pass the "free mints remaining" check.
+            if (req.method === 'POST' && req.path === '/mint' && req.user?.id) {
+                const key = String(req.user.id);
+                if (nftServiceMintInFlight.has(key)) {
+                    return res.status(429).json({ error: 'A mint is already in progress for this account. Please wait for it to finish.', code: 'MINT_IN_PROGRESS' });
+                }
+                nftServiceMintInFlight.add(key);
+                const release = () => nftServiceMintInFlight.delete(key);
+                res.once('finish', release);
+                res.once('close', release);
+            }
+
+            // /unpin: only CIDs referenced by this account's own NFT records, and
+            // metadata fetches only from IPFS (the route fetches metadataUrl
+            // server-side — an arbitrary URL would be an SSRF vector).
+            if (req.method === 'POST' && req.path === '/unpin' && req.user?.id) {
+                const body = req.body && typeof req.body === 'object' ? req.body : {};
+                const owned = await collectUserNftCids(req.user);
+                const filterOwned = (arr) => (Array.isArray(arr) ? arr : [])
+                    .filter(v => typeof v === 'string')
+                    .filter(v => { const cid = extractIpfsCidFromValue(v); return cid && owned.has(cid); });
+                const cids = filterOwned(body.cids);
+                const urls = filterOwned(body.urls);
+                let metadataUrl = null;
+                if (typeof body.metadataUrl === 'string') {
+                    const cid = extractIpfsCidFromValue(body.metadataUrl);
+                    const isIpfsRef = /^ipfs:\/\//i.test(body.metadataUrl)
+                        || /^https:\/\/(ipfs\.io|gateway\.pinata\.cloud|[a-z0-9-]+\.mypinata\.cloud|cloudflare-ipfs\.com|dweb\.link)\/ipfs\//i.test(body.metadataUrl);
+                    if (cid && owned.has(cid) && isIpfsRef) metadataUrl = body.metadataUrl;
+                }
+                if (!cids.length && !urls.length && !metadataUrl) {
+                    console.warn(`[NFT Service] Unpin request from user ${req.user.id} referenced no CIDs owned by the account — rejected`);
+                    return res.status(403).json({ error: 'None of the requested CIDs belong to this account', code: 'CID_NOT_OWNED' });
+                }
+                req.body = { cids, urls, ...(metadataUrl ? { metadataUrl } : {}) };
+            }
+            return next();
+        } catch (e) {
+            console.error('[NFT Service] Guard error:', e.message);
+            return res.status(500).json({ error: 'NFT service guard failed' });
+        }
     }, nftService.routes);
 
     // After nft-service mounts, add a dedicated endpoint for client to confirm premium storage
