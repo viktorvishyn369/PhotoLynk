@@ -362,6 +362,17 @@ app.use('/.well-known', (req, res, next) => {
     res.removeHeader('Content-Security-Policy');
     next();
 });
+// Capacity JSON must always come from CAPACITY_JSON_PATH. Register these routes
+// before the static mount so a stale file under .well-known/ cannot shadow it
+// (CAPACITY_JSON_PATH lives outside .well-known on some installs, e.g. the Pi).
+const serveCapacityJson = (req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
+    const payload = readCapacityJson();
+    if (!payload) return res.status(404).json({ error: 'Capacity not available' });
+    return res.json(payload);
+};
+app.get('/.well-known/photolynk-capacity.json', serveCapacityJson);
+app.get('/.well-known/photosync-capacity.json', serveCapacityJson);
 app.use('/.well-known', express.static(path.join(AUX_ROOT, '.well-known')));
 
 // Fallback: serve assetlinks.json from repo public dir if not in AUX_ROOT
@@ -3939,20 +3950,8 @@ app.get('/api/capacity', (req, res) => {
     return res.json(payload);
 });
 
-// Public well-known capacity JSON (mobile app can call this directly)
-app.get('/.well-known/photolynk-capacity.json', (req, res) => {
-    res.setHeader('Cache-Control', 'no-store');
-    const payload = readCapacityJson();
-    if (!payload) return res.status(404).json({ error: 'Capacity not available' });
-    return res.json(payload);
-});
-
-app.get('/.well-known/photosync-capacity.json', (req, res) => {
-    res.setHeader('Cache-Control', 'no-store');
-    const payload = readCapacityJson();
-    if (!payload) return res.status(404).json({ error: 'Capacity not available' });
-    return res.json(payload);
-});
+// Public well-known capacity JSON routes are registered before the
+// /.well-known static mount (see serveCapacityJson above).
 
 app.get('/api/cloud/usage', authenticateToken, async (req, res) => {
     try {
