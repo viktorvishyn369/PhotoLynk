@@ -534,6 +534,10 @@ tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowr
   <div class="stats" id="header-stats"></div>
 </div>
 <div class="toolbar">
+  <div class="filter-pills" id="app-tabs" style="flex:0 0 auto">
+    <button class="pill app-tab active" data-app="photolynk" onclick="switchApp('photolynk')">PhotoLynk</button>
+    <button class="pill app-tab" data-app="paceseeker" onclick="switchApp('paceseeker')">PaceSeeker</button>
+  </div>
   <div class="search-box">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
     <input type="text" id="search" placeholder="Search by user, .skr, email, ID, status, plan..." oninput="applyFilters()"/>
@@ -563,6 +567,18 @@ tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowr
       <th>Actions</th>
     </tr></thead>
     <tbody id="tbody"></tbody>
+  </table>
+  <table id="ps-table" style="display:none">
+    <thead><tr>
+      <th data-col="device_hash" onclick="psSortBy('device_hash')">Device <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="status" onclick="psSortBy('status')">Status <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="trial_expires_at" onclick="psSortBy('trial_expires_at')">Trial Ends <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="first_seen" onclick="psSortBy('first_seen')">Registered <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="last_seen" onclick="psSortBy('last_seen')">Last Seen <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="version_code" onclick="psSortBy('version_code')">App <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="last_ip" onclick="psSortBy('last_ip')">Last IP <span class="sort-arrow">&#9650;</span></th>
+    </tr></thead>
+    <tbody id="ps-tbody"></tbody>
   </table>
   <div id="empty" class="empty-state" style="display:none">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M15.75 6a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0ZM4.501 20.118a7.5 7.5 0 0 1 14.998 0"/></svg>
@@ -622,6 +638,79 @@ tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowr
 
 <script>
 var allUsers=[];var filteredUsers=[];var sortCol='id';var sortDir='desc';var activeFilter='all';var serverTime='';var adminStats={photolynk_nfts_minted:0,photolynk_paid_nfts_minted:0,photolynk_free_premium_nfts_minted:0,photolynk_premium_users:0};
+var activeApp='photolynk';var psUsers=[];var psFiltered=[];var psLoaded=false;var psSortCol='last_seen';var psSortDir='desc';
+
+function switchApp(app){
+  activeApp=app;activeFilter='all';
+  document.querySelectorAll('.app-tab').forEach(function(t){t.classList.toggle('active',t.dataset.app===app)});
+  var ps=(app==='paceseeker');
+  document.getElementById('users-table').style.display='none';
+  document.getElementById('ps-table').style.display='none';
+  document.getElementById('empty').style.display='none';
+  document.getElementById('search').placeholder=ps?'Search device hash or IP...':'Search by user, .skr, email, ID, status, plan...';
+  if(ps){
+    if(psLoaded){document.getElementById('ps-table').style.display='';updateStats();buildFilters();applyFilters()}
+    else{document.getElementById('loading').style.display='';loadPsUsers()}
+  }else{
+    document.getElementById('loading').style.display='none';
+    if(allUsers.length)document.getElementById('users-table').style.display='';
+    updateStats();buildFilters();applyFilters();
+  }
+}
+
+async function loadPsUsers(){
+  try{
+    var r=await fetch('/admin/api/paceseeker-users');var d=await r.json();
+    if(!r.ok)throw new Error(d.error||'Failed');
+    serverTime=d.server_time||'';
+    psUsers=d.users||[];psLoaded=true;
+    document.getElementById('loading').style.display='none';
+    document.getElementById('ps-table').style.display='';
+    updateStats();buildFilters();applyFilters();
+  }catch(e){document.getElementById('loading').textContent='Error: '+e.message}
+}
+
+function psSortBy(col){
+  if(psSortCol===col)psSortDir=psSortDir==='asc'?'desc':'asc';
+  else{psSortCol=col;psSortDir=col==='last_seen'||col==='first_seen'||col==='trial_expires_at'?'desc':'asc'}
+  document.querySelectorAll('#ps-table thead th').forEach(function(th){th.classList.remove('sorted');if(th.dataset.col===col)th.classList.add('sorted')});
+  document.querySelectorAll('#ps-table .sort-arrow').forEach(function(a){a.innerHTML='&#9650;'});
+  var th=document.querySelector('#ps-table th[data-col="'+col+'"]');
+  if(th)th.querySelector('.sort-arrow').innerHTML=psSortDir==='asc'?'&#9650;':'&#9660;';
+  psDoSort();renderPsTable();
+}
+
+function psDoSort(){
+  psFiltered.sort(function(a,b){
+    var va=a[psSortCol],vb=b[psSortCol];
+    if(va==null)va='';if(vb==null)vb='';
+    if(typeof va==='number'&&typeof vb==='number')return psSortDir==='asc'?va-vb:vb-va;
+    va=String(va).toLowerCase();vb=String(vb).toLowerCase();
+    if(va<vb)return psSortDir==='asc'?-1:1;
+    if(va>vb)return psSortDir==='asc'?1:-1;
+    return 0;
+  });
+}
+
+function renderPsTable(){
+  var tbody=document.getElementById('ps-tbody');
+  var empty=document.getElementById('empty');
+  if(!psFiltered.length){tbody.innerHTML='';empty.style.display='';return}
+  empty.style.display='none';
+  var html='';
+  psFiltered.forEach(function(u){
+    html+='<tr>';
+    html+='<td class="uuid-cell" title="'+u.device_hash+'" onclick="copyUuid(this,&apos;'+u.device_hash+'&apos;)">'+(u.device_hash||'').substring(0,13)+'</td>';
+    html+='<td>'+statusBadge(u.status)+'</td>';
+    html+='<td>'+fmtDate(u.trial_expires_at_date)+'</td>';
+    html+='<td>'+fmtDate(u.first_seen_date)+'</td>';
+    html+='<td>'+fmtLogin(u.last_seen_date)+'</td>';
+    html+='<td>'+(u.version_code?'<span class="mini-tag">vc'+u.version_code+'</span>':'<span class="date-cell">-</span>')+'</td>';
+    html+='<td>'+(u.last_ip?'<span class="date-cell">'+u.last_ip+'</span>':'<span class="date-cell">-</span>')+'</td>';
+    html+='</tr>';
+  });
+  tbody.innerHTML=html;
+}
 
 function fmtDate(iso){if(!iso)return'<span class="date-cell">-</span>';var d=new Date(iso);var now=new Date();var diff=d-now;var s=d.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'2-digit'})+' '+d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});if(diff<0&&diff>-86400000*3)s='<span style="color:var(--warn)">'+s+'</span>';else if(diff<0)s='<span style="color:var(--danger)">'+s+'</span>';return'<span class="date-cell">'+s+'</span>'}
 
@@ -658,6 +747,14 @@ async function loadUsers(){
 }
 
 function updateStats(){
+  if(activeApp==='paceseeker'){
+    var ptotal=psUsers.length;
+    var ptrials=psUsers.filter(function(u){return u.status==='trial'}).length;
+    var precent=psUsers.filter(function(u){return u.last_seen&&(Date.now()-u.last_seen)<86400000*7}).length;
+    var pst=serverTime?'<span>Server: <b>'+new Date(serverTime).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+'</b></span>':'';
+    document.getElementById('header-stats').innerHTML=pst+'<span>Devices: <b>'+ptotal+'</b></span><span>In trial: <b>'+ptrials+'</b></span><span>Expired: <b>'+(ptotal-ptrials)+'</b></span><span>7d active: <b>'+precent+'</b></span>';
+    return;
+  }
   var total=allUsers.length;
   var active=allUsers.filter(function(u){return u.status==='active'}).length;
   var trial=allUsers.filter(function(u){return u.status==='trial'||u.status==='trial_complimentary'}).length;
@@ -674,6 +771,13 @@ function updateStats(){
 }
 
 function buildFilters(){
+  if(activeApp==='paceseeker'){
+    var pcounts={};psUsers.forEach(function(u){var s=u.status||'none';pcounts[s]=(pcounts[s]||0)+1});
+    var phtml='<button class="pill active" data-f="all" onclick="setFilter(this,&apos;all&apos;)">All<span class="count">'+psUsers.length+'</span></button>';
+    ['trial','expired'].forEach(function(s){if(pcounts[s])phtml+='<button class="pill" data-f="'+s+'" onclick="setFilter(this,&apos;'+s+'&apos;)">'+s+'<span class="count">'+pcounts[s]+'</span></button>'});
+    document.getElementById('status-filters').innerHTML=phtml;
+    return;
+  }
   var counts={};allUsers.forEach(function(u){var s=u.status||'none';counts[s]=(counts[s]||0)+1});
   var html='<button class="pill active" data-f="all" onclick="setFilter(this,&apos;all&apos;)">All<span class="count">'+allUsers.length+'</span></button>';
   var order=['active','trial','trial_complimentary','grace','expired','trial_expired','trial_complimentary_expired','none','deleted'];
@@ -694,6 +798,16 @@ function setFilter(el,f){
 }
 
 function applyFilters(){
+  if(activeApp==='paceseeker'){
+    var pq=(document.getElementById('search').value||'').toLowerCase().trim();
+    psFiltered=psUsers.filter(function(u){
+      if(activeFilter!=='all'&&u.status!==activeFilter)return false;
+      if(!pq)return true;
+      return(u.device_hash||'').toLowerCase().includes(pq)||(u.last_ip||'').toLowerCase().includes(pq)||(u.status||'').toLowerCase().includes(pq);
+    });
+    psDoSort();renderPsTable();
+    return;
+  }
   var q=(document.getElementById('search').value||'').toLowerCase().trim();
   filteredUsers=allUsers.filter(function(u){
     if(activeFilter==='premium')return u.nft_is_premium;
@@ -3568,6 +3682,77 @@ app.get('/ai-federation/dashboard', async (req, res) => {
     }
 });
 
+// ============================================================================
+// PACESEEKER — device-bound trial registry
+// ============================================================================
+
+const PS_TRIAL_DAYS = Number.parseInt(process.env.PS_TRIAL_DAYS || '7', 10);
+const psTrialBuckets = new Map();
+const PS_TRIAL_RATE_LIMIT = 30; // requests per IP per hour
+
+app.get('/api/paceseeker/trial', (req, res) => {
+    const id = String(req.query.id || '').trim();
+    if (!/^[A-Za-z0-9_-]{16,128}$/.test(id)) {
+        return res.status(400).json({ error: 'Invalid device id' });
+    }
+    const ip = String((req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '').replace(/[^0-9a-zA-Z:.\-]/g, '').slice(0, 45);
+    const bucket = psTrialBuckets.get(ip) || { count: 0, reset: Date.now() + 3600000 };
+    if (Date.now() > bucket.reset) { bucket.count = 0; bucket.reset = Date.now() + 3600000; }
+    if (++bucket.count > PS_TRIAL_RATE_LIMIT) {
+        return res.status(429).json({ error: 'Rate limited' });
+    }
+    psTrialBuckets.set(ip, bucket);
+
+    const now = Date.now();
+    const vc = Number.isFinite(Number(req.query.vc)) ? Math.floor(Number(req.query.vc)) : null;
+
+    db.get('SELECT * FROM paceseeker_devices WHERE device_hash = ?', [id], (err, row) => {
+        if (err) {
+            console.error('[PaceSeeker] trial lookup error:', err.message);
+            return res.status(500).json({ error: 'Database error' });
+        }
+        if (!row) {
+            const expires = now + PS_TRIAL_DAYS * 24 * 60 * 60 * 1000;
+            db.run(
+                'INSERT INTO paceseeker_devices (device_hash, first_seen, last_seen, trial_started_at, trial_expires_at, version_code, last_ip) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                [id, now, now, now, expires, vc, ip]
+            );
+            return res.json({ trial: true, startedAt: now, expiresAt: expires });
+        }
+        db.run(
+            'UPDATE paceseeker_devices SET last_seen = ?, version_code = COALESCE(?, version_code), last_ip = ? WHERE device_hash = ?',
+            [now, vc, ip, id]
+        );
+        res.json({ trial: true, startedAt: row.trial_started_at, expiresAt: row.trial_expires_at });
+    });
+});
+
+// Admin API: PaceSeeker trial devices
+app.get('/admin/api/paceseeker-users', adminAuth, (req, res) => {
+    const now = Date.now();
+    db.all('SELECT * FROM paceseeker_devices ORDER BY last_seen DESC', [], (err, rows) => {
+        if (err) {
+            return res.status(500).json({ error: err.message });
+        }
+        res.json({
+            server_time: new Date().toISOString(),
+            users: (rows || []).map(r => ({
+                device_hash: r.device_hash,
+                first_seen: r.first_seen,
+                last_seen: r.last_seen,
+                trial_started_at: r.trial_started_at,
+                trial_expires_at: r.trial_expires_at,
+                trial_expires_at_date: r.trial_expires_at ? new Date(r.trial_expires_at).toISOString() : null,
+                last_seen_date: r.last_seen ? new Date(r.last_seen).toISOString() : null,
+                first_seen_date: r.first_seen ? new Date(r.first_seen).toISOString() : null,
+                version_code: r.version_code,
+                last_ip: r.last_ip,
+                status: (r.trial_expires_at && r.trial_expires_at > now) ? 'trial' : 'expired',
+            })),
+        });
+    });
+});
+
 // ─── PaceSeeker invite code tracker ───
 const USED_CODES_PATH = path.join(__dirname, 'used-invite-codes.json');
 let usedInviteCodes = new Set();
@@ -5963,6 +6148,18 @@ async function verifySkrTokenTransaction(txSignature, expectedUsd, expectedToken
         ...matchedTransfer,
     };
 }
+
+// PaceSeeker device-bound trial registry. First-write-wins on trial start so a
+// reinstall keeps the original expiry instead of resetting the clock.
+db.run(`CREATE TABLE IF NOT EXISTS paceseeker_devices (
+    device_hash TEXT PRIMARY KEY,
+    first_seen INTEGER,
+    last_seen INTEGER,
+    trial_started_at INTEGER,
+    trial_expires_at INTEGER,
+    version_code INTEGER,
+    last_ip TEXT
+)`);
 
 // Create solana_payments table if not exists
 db.run(`CREATE TABLE IF NOT EXISTS solana_payments (
