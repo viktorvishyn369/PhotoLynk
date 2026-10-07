@@ -247,6 +247,7 @@ dietplanner-pages/
 # Remote config with API keys (pulled at runtime, never committed)
 server/remote-config.json
 server/photolynk-remote-config.json
+server/.ai-admin-key
 
 # Infrastructure scripts (private IP, SSH keys, server paths — never public)
 pull-from-backup.sh

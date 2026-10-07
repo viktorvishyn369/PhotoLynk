@@ -3208,6 +3208,57 @@ try { fs.mkdirSync(AI_UPLOADS_DIR, { recursive: true }); } catch (e) {}
 // Prevents same client from uploading more than once per 5 minutes
 const _federationRateLimit = new Map();
 const FEDERATION_RATE_LIMIT_MS = 5 * 60 * 1000; // 5 minutes
+const FEDERATION_FORCE_MIN_MS = 60 * 1000;      // force uploads still capped at 1/minute
+const _federationIpLimit = new Map();           // ip → [timestamps], 30 uploads/hour cap
+const FEDERATION_IP_HOURLY_CAP = 30;
+
+// Admin key for operator-only endpoints (export-all / dashboard / stats).
+// Set AI_ADMIN_KEY env or drop a server/.ai-admin-key file (single line) next
+// to server.js. export/:mintHash stays public — the app uses it for restore.
+function _loadAiAdminKey() {
+    if (process.env.AI_ADMIN_KEY) return process.env.AI_ADMIN_KEY;
+    try {
+        const kf = path.join(__dirname, '.ai-admin-key');
+        if (fs.existsSync(kf)) return fs.readFileSync(kf, 'utf8').trim();
+    } catch (e) {}
+    return null;
+}
+const AI_ADMIN_KEY = _loadAiAdminKey();
+if (!AI_ADMIN_KEY) console.warn('[AI Federation] WARNING: AI_ADMIN_KEY not configured — operator endpoints will 503');
+
+function _requireAiAdmin(req, res) {
+    if (!AI_ADMIN_KEY) {
+        res.status(503).json({ error: 'AI admin key not configured on server' });
+        return false;
+    }
+    const key = req.get('x-ai-admin-key') || req.query.key || '';
+    const ok = key.length === AI_ADMIN_KEY.length &&
+        crypto.timingSafeEqual(Buffer.from(String(key)), Buffer.from(AI_ADMIN_KEY));
+    if (!ok) {
+        res.status(403).json({ error: 'Forbidden' });
+        return false;
+    }
+    return true;
+}
+
+// Optional soft-auth for uploads (dormant until a build sends the header).
+// Set AI_UPLOAD_KEY on the server; AI_UPLOAD_ENFORCE=1 rejects missing keys.
+const AI_UPLOAD_KEY = process.env.AI_UPLOAD_KEY || null;
+const AI_UPLOAD_ENFORCE = process.env.AI_UPLOAD_ENFORCE === '1';
+
+const FEDERATION_STRATEGIES = ['classic', 'swing', 'breakout', 'meanreversion', 'momentum'];
+
+// Payload sanity bounds — federation uploads are a few hundred KB at most.
+function _federationPayloadOk(aiState) {
+    if (!aiState || typeof aiState !== 'object') return false;
+    if (!Number.isInteger(aiState.totalTrades) || aiState.totalTrades < 1 || aiState.totalTrades > 1000000) return false;
+    const w = aiState.weights;
+    if (!w || typeof w !== 'object' || Object.keys(w).length > 300) return false;
+    if (!Object.values(w).every(v => typeof v === 'number' && isFinite(v) && Math.abs(v) <= 1000)) return false;
+    if (Array.isArray(aiState.patternMemory) && aiState.patternMemory.length > 1500) return false;
+    if (Array.isArray(aiState.tradeHistory) && aiState.tradeHistory.length > 600) return false;
+    return true;
+}
 
 // Clean up rate limit entries older than 1 hour (runs every 10 minutes)
 let _lastRateLimitCleanup = 0;
@@ -3226,6 +3277,9 @@ app.post('/ai-federation/upload', async (req, res) => {
         if (!tokenMint || typeof tokenMint !== 'string' || tokenMint.length < 32) {
             return res.status(400).json({ error: 'Invalid or missing tokenMint' });
         }
+        if (tokenSymbol != null && (typeof tokenSymbol !== 'string' || tokenSymbol.length > 16)) {
+            return res.status(400).json({ error: 'Invalid tokenSymbol' });
+        }
         if (!aiState || typeof aiState !== 'object') {
             return res.status(400).json({ error: 'Missing aiState' });
         }
@@ -3235,13 +3289,38 @@ app.post('/ai-federation/upload', async (req, res) => {
         if (!aiState.totalTrades || aiState.totalTrades < 1) {
             return res.status(400).json({ error: 'No LIVE trades — nothing to contribute' });
         }
+        // Bounds check: reject oversized/garbage payloads before doing any work
+        if (Number(req.get('content-length')) > 2 * 1024 * 1024 || !_federationPayloadOk(aiState)) {
+            return res.status(400).json({ error: 'aiState out of bounds' });
+        }
+
+        // Optional soft-auth (dormant until AI_UPLOAD_KEY set on server +
+        // a build ships the header; AI_UPLOAD_ENFORCE=1 then rejects missing keys)
+        if (AI_UPLOAD_KEY) {
+            const uk = req.get('x-ai-upload-key') || '';
+            if (uk !== AI_UPLOAD_KEY && AI_UPLOAD_ENFORCE) {
+                return res.status(403).json({ error: 'Forbidden' });
+            }
+        }
+
+        // Per-IP hourly cap — rate limit by token alone is trivially bypassed
+        // by minting random mints
+        const ip = req.ip || req.socket?.remoteAddress || 'unknown';
+        const nowIp = Date.now();
+        const ipHits = (_federationIpLimit.get(ip) || []).filter(t => nowIp - t < 60 * 60 * 1000);
+        if (ipHits.length >= FEDERATION_IP_HOURLY_CAP) {
+            return res.status(429).json({ error: 'Rate limited — too many uploads from this IP' });
+        }
+        ipHits.push(nowIp);
+        _federationIpLimit.set(ip, ipHits);
 
         // Rate limit per token: prevent duplicate uploads within 5 minutes
-        // (unless force=true — pre-eviction safety upload)
+        // (force=true is the pre-eviction safety upload — still floored at 1/min)
         _cleanupRateLimit();
         const rateKey = tokenMint;
         const lastRate = _federationRateLimit.get(rateKey);
-        if (!force && lastRate && Date.now() - lastRate < FEDERATION_RATE_LIMIT_MS) {
+        const minInterval = force ? FEDERATION_FORCE_MIN_MS : FEDERATION_RATE_LIMIT_MS;
+        if (lastRate && Date.now() - lastRate < minInterval) {
             return res.status(429).json({ error: 'Rate limited — too soon since last upload for this token' });
         }
         _federationRateLimit.set(rateKey, Date.now());
@@ -3257,13 +3336,20 @@ app.post('/ai-federation/upload', async (req, res) => {
         const filename = `${timestamp}_${suffix}.json`;
         const filepath = path.join(tokenDir, filename);
 
-        // Strip any potential PII — only keep learning data, no positions/history
+        // Strip any potential PII — only keep learning data, no positions/history.
+        // strategy/tuningEpoch MUST be preserved: aggregate-ai groups uploads by
+        // them — dropping them folds swing/breakout/etc learning into classic.
         const sanitized = {
             tokenMint: tokenMint,
             tokenSymbol: tokenSymbol || null,
             appVersion: appVersion || null,
             uploadedAt: new Date().toISOString(),
+            strategy: FEDERATION_STRATEGIES.includes(aiState.strategy) ? aiState.strategy : 'classic',
+            tuningEpoch: aiState.tuningEpoch ?? null,
+            learningPolicy: typeof aiState.learningPolicy === 'string' ? aiState.learningPolicy : null,
             weights: aiState.weights,
+            strategyWeights: aiState.strategyWeights && typeof aiState.strategyWeights === 'object' ? aiState.strategyWeights : null,
+            regimeThresholdStats: aiState.regimeThresholdStats || null,
             totalTrades: aiState.totalTrades || 0,
             winningTrades: aiState.winningTrades || 0,
             losingTrades: aiState.losingTrades || 0,
@@ -3298,8 +3384,9 @@ app.post('/ai-federation/upload', async (req, res) => {
     }
 });
 
-// Stats endpoint — enhanced with per-token details
-app.get('/ai-federation/stats', async (_req, res) => {
+// Stats endpoint — enhanced with per-token details (operator-only)
+app.get('/ai-federation/stats', async (req, res) => {
+    if (!_requireAiAdmin(req, res)) return;
     try {
         if (!fs.existsSync(AI_UPLOADS_DIR)) {
             return res.json({ tokens: 0, totalUploads: 0, qualifyingContributors: 0, tokens: [] });
@@ -3389,8 +3476,9 @@ app.get('/ai-federation/export/:mintHash', async (req, res) => {
     }
 });
 
-// Export all uploads for all tokens (bulk download for aggregation)
-app.get('/ai-federation/export-all', async (_req, res) => {
+// Export all uploads for all tokens (bulk download for aggregation) — operator-only
+app.get('/ai-federation/export-all', async (req, res) => {
+    if (!_requireAiAdmin(req, res)) return;
     try {
         if (!fs.existsSync(AI_UPLOADS_DIR)) {
             return res.json({ tokens: 0, data: {} });
@@ -3420,8 +3508,9 @@ app.get('/ai-federation/export-all', async (_req, res) => {
     }
 });
 
-// Dashboard endpoint — comprehensive monitoring view
-app.get('/ai-federation/dashboard', async (_req, res) => {
+// Dashboard endpoint — comprehensive monitoring view (operator-only)
+app.get('/ai-federation/dashboard', async (req, res) => {
+    if (!_requireAiAdmin(req, res)) return;
     try {
         if (!fs.existsSync(AI_UPLOADS_DIR)) {
             return res.json({ tokens: 0, totalUploads: 0, timeline: [], tokens: [] });
