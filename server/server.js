@@ -3704,7 +3704,13 @@ app.get('/api/paceseeker/trial', (req, res) => {
     psTrialBuckets.set(ip, bucket);
 
     const now = Date.now();
-    const vc = Number.isFinite(Number(req.query.vc)) ? Math.floor(Number(req.query.vc)) : null;
+    const vcRaw = String(req.query.vc || '');
+    const vc = /^\d+$/.test(vcRaw) ? Math.floor(Number(vcRaw)) : null;
+    // Client-side startedAt from an offline first launch - clamp so a caller
+    // can only shorten (never extend) the trial: sa <= now and >= trial floor.
+    const saRaw = String(req.query.sa || '');
+    const trialMs = PS_TRIAL_DAYS * 24 * 60 * 60 * 1000;
+    const sa = /^\d+$/.test(saRaw) ? Math.min(now, Math.floor(Number(saRaw))) : null;
 
     db.get('SELECT * FROM paceseeker_devices WHERE device_hash = ?', [id], (err, row) => {
         if (err) {
@@ -3712,12 +3718,20 @@ app.get('/api/paceseeker/trial', (req, res) => {
             return res.status(500).json({ error: 'Database error' });
         }
         if (!row) {
-            const expires = now + PS_TRIAL_DAYS * 24 * 60 * 60 * 1000;
+            // INSERT OR IGNORE keeps first-write-wins atomic under concurrency;
+            // the SELECT after it returns the canonical row either way.
+            const started = sa !== null ? sa : now; // sa<=now: an already-expired local start yields an expired record, not a fresh trial
             db.run(
-                'INSERT INTO paceseeker_devices (device_hash, first_seen, last_seen, trial_started_at, trial_expires_at, version_code, last_ip) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                [id, now, now, now, expires, vc, ip]
+                'INSERT OR IGNORE INTO paceseeker_devices (device_hash, first_seen, last_seen, trial_started_at, trial_expires_at, version_code, last_ip) VALUES (?, ?, ?, ?, ?, ?, ?)',
+                [id, started, now, started, started + trialMs, vc, ip],
+                () => {
+                    db.get('SELECT * FROM paceseeker_devices WHERE device_hash = ?', [id], (e2, r2) => {
+                        if (e2 || !r2) return res.status(500).json({ error: 'Database error' });
+                        res.json({ trial: true, startedAt: r2.trial_started_at, expiresAt: r2.trial_expires_at });
+                    });
+                }
             );
-            return res.json({ trial: true, startedAt: now, expiresAt: expires });
+            return;
         }
         db.run(
             'UPDATE paceseeker_devices SET last_seen = ?, version_code = COALESCE(?, version_code), last_ip = ? WHERE device_hash = ?',
