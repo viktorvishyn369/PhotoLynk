@@ -663,7 +663,7 @@ function switchApp(app){
   document.getElementById('users-table').style.display='none';
   document.getElementById('ps-table').style.display='none';
   document.getElementById('empty').style.display='none';
-  document.getElementById('search').placeholder=ps?'Search device hash, IP, wallet or .skr...':'Search by user, .skr, email, ID, status, plan...';
+  document.getElementById('search').placeholder=ps?'Search device hash, IP, wallet or SNS name...':'Search by user, .skr, email, ID, status, plan...';
   if(ps){
     if(psLoaded){document.getElementById('ps-table').style.display='';updateStats();buildFilters();applyFilters()}
     else{document.getElementById('loading').style.display='';loadPsUsers()}
@@ -719,7 +719,7 @@ function renderPsTable(){
     html+='<td class="uuid-cell" title="'+u.device_hash+'" onclick="copyUuid(this,&apos;'+u.device_hash+'&apos;)">'+(u.device_hash||'').substring(0,13)+'</td>';
     html+='<td>'+(u.wallet_address
       ?(u.wallet_domain
-        ?'<span class="email-cell" style="cursor:pointer" title="'+u.wallet_address+' - click to copy" onclick="copyUuid(this,&apos;'+u.wallet_address+'&apos;)">'+u.wallet_domain+'.skr</span>'
+        ?'<span class="email-cell" style="cursor:pointer" title="'+u.wallet_address+' - click to copy" onclick="copyUuid(this,&apos;'+u.wallet_address+'&apos;)">'+u.wallet_domain+'</span>'
         :'<span class="uuid-cell" style="max-width:none" title="'+u.wallet_address+' - click to copy" onclick="copyUuid(this,&apos;'+u.wallet_address+'&apos;)">'+u.wallet_address.substring(0,6)+'…'+u.wallet_address.slice(-4)+'</span>')
       :'<span class="date-cell">-</span>')+'</td>';
     html+='<td>'+liveDot(u.last_seen)+'</td>';
@@ -877,7 +877,7 @@ function applyFilters(){
     psFiltered=psUsers.filter(function(u){
       if(activeFilter!=='all'&&u.status!==activeFilter)return false;
       if(!pq)return true;
-      return(u.device_hash||'').toLowerCase().includes(pq)||(u.last_ip||'').toLowerCase().includes(pq)||(u.status||'').toLowerCase().includes(pq)||(u.wallet_address||'').toLowerCase().includes(pq)||((u.wallet_domain||'')+'.skr').toLowerCase().includes(pq);
+      return(u.device_hash||'').toLowerCase().includes(pq)||(u.last_ip||'').toLowerCase().includes(pq)||(u.status||'').toLowerCase().includes(pq)||(u.wallet_address||'').toLowerCase().includes(pq)||((u.wallet_domain||'')).toLowerCase().includes(pq);
     });
     psDoSort();renderPsTable();
     return;
@@ -3848,25 +3848,70 @@ async function psUpdateGeo(id, ip) {
 // Resolve a wallet's SNS primary domain lazily (same pattern as geo): only
 // when the reported wallet is new/changed or the domain was never checked,
 // cached in-memory so minute pings don't re-hit the SNS proxy.
-const psDomainCache = new Map(); // wallet -> domain label ('' = none)
+const psDomainCache = new Map(); // wallet -> full domain 'label.tld' ('' = none)
+const psTldCache = new Map();    // parent name-account key -> tld label
+const SNS_ROOT_ACCOUNT = '58PwtjSDuFHuUkYjH9BYnnQKHfwo9reZhC2zMJv9JPkx';
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+function base58Encode(buf) {
+    let zeros = 0;
+    while (zeros < buf.length && buf[zeros] === 0) zeros++;
+    const digits = [0];
+    for (let i = zeros; i < buf.length; i++) {
+        let carry = buf[i];
+        for (let j = 0; j < digits.length; j++) {
+            carry = digits[j] * 256 + carry;
+            digits[j] = carry % 58;
+            carry = (carry / 58) | 0;
+        }
+        while (carry) { digits.push(carry % 58); carry = (carry / 58) | 0; }
+    }
+    return '1'.repeat(zeros) + digits.reverse().map(d => BASE58_ALPHABET[d]).join('');
+}
+// The name record's first 32 bytes are the parent name-account key. Names
+// directly under the SNS root resolve as .sns (the migrated .sol registry);
+// sub-names sit under their TLD's name account, which reverse-lookups to the
+// TLD label (e.g. 'skr', 'bonk').
+async function psResolveDomainTld(domainAcctKey) {
+    try {
+        const r = await axios.post(SOLANA_RPC_ENDPOINT, {
+            jsonrpc: '2.0', id: 1, method: 'getAccountInfo',
+            params: [domainAcctKey, { encoding: 'base64' }]
+        }, { timeout: 8000 });
+        const b64 = r.data?.result?.value?.data?.[0];
+        if (!b64) return '';
+        const parentKey = base58Encode(Buffer.from(b64, 'base64').subarray(0, 32));
+        if (parentKey === SNS_ROOT_ACCOUNT) return 'sns';
+        if (psTldCache.has(parentKey)) return psTldCache.get(parentKey);
+        let tld = '';
+        try {
+            const t = await axios.get(`https://sdk-proxy-v2.sns.id/reverse-lookup/${parentKey}`, { timeout: 5000 });
+            const lbl = t.data?.result || t.data?.label;
+            if (typeof lbl === 'string' && /^[a-z0-9_-]{1,32}$/.test(lbl.trim().toLowerCase())) tld = lbl.trim().toLowerCase();
+        } catch (e) { }
+        if (psTldCache.size > 500) psTldCache.clear();
+        psTldCache.set(parentKey, tld);
+        return tld;
+    } catch (e) { return ''; }
+}
 async function psUpdateDomain(id, wallet) {
     try {
         if (!wallet) return;
-        let label = psDomainCache.get(wallet);
-        if (label === undefined) {
-            label = '';
+        let domain = psDomainCache.get(wallet);
+        if (domain === undefined) {
+            domain = '';
             try {
                 const r = await axios.get(`https://sdk-proxy-v2.sns.id/primary-domain/${wallet}`, { timeout: 5000 });
                 const res = r.data?.result;
-                if (r.data?.s === 'ok' && res && typeof res.reverse === 'string' && !res.stale) {
-                    label = res.reverse.trim();
+                if (r.data?.s === 'ok' && res && typeof res.reverse === 'string' && typeof res.domain === 'string' && !res.stale) {
+                    const tld = await psResolveDomainTld(res.domain);
+                    domain = tld ? `${res.reverse.trim()}.${tld}` : res.reverse.trim();
                 }
             } catch (e) { }
             if (psDomainCache.size > 5000) psDomainCache.clear();
-            psDomainCache.set(wallet, label);
+            psDomainCache.set(wallet, domain);
         }
-        if (!label) return;
-        db.run('UPDATE paceseeker_devices SET wallet_domain = ? WHERE device_hash = ?', [label, id], () => { });
+        if (!domain) return;
+        db.run('UPDATE paceseeker_devices SET wallet_domain = ? WHERE device_hash = ?', [domain, id], () => { });
     } catch (e) { }
 }
 
@@ -3954,8 +3999,9 @@ app.get('/api/paceseeker/trial', (req, res) => {
             [now, vc, ip, st, se, paySig, payAt, payWith, payPlan, payUsd, payAmt, wallet, id]
         );
         if (ip && (row.last_ip !== ip || !row.last_country_code)) psUpdateGeo(id, ip); // IP moved or unresolved
-        // Wallet switched or domain never checked - resolve primary SNS name.
-        if (wallet && (row.wallet_address !== wallet || (row.wallet_domain === null || row.wallet_domain === undefined || row.wallet_domain === ''))) psUpdateDomain(id, wallet);
+        // Wallet switched, domain never checked, or stored value predates TLD
+        // suffixes (legacy bare label) - resolve primary SNS name.
+        if (wallet && (row.wallet_address !== wallet || !row.wallet_domain || String(row.wallet_domain).indexOf('.') === -1)) psUpdateDomain(id, wallet);
         res.json({ trial: true, startedAt: row.trial_started_at, expiresAt: row.trial_expires_at });
     });
 });
