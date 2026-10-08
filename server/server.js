@@ -585,6 +585,7 @@ table{min-width:100%;width:auto}
   <table id="ps-table" style="display:none">
     <thead><tr>
       <th data-col="device_hash" onclick="psSortBy('device_hash')">Device <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="wallet_domain" onclick="psSortBy('wallet_domain')">Wallet <span class="sort-arrow">&#9650;</span></th>
       <th data-col="last_seen" onclick="psSortBy('last_seen')">Live <span class="sort-arrow">&#9650;</span></th>
       <th data-col="status" onclick="psSortBy('status')">Status <span class="sort-arrow">&#9650;</span></th>
       <th data-col="sub_status" onclick="psSortBy('sub_status')">Sub <span class="sort-arrow">&#9650;</span></th>
@@ -662,7 +663,7 @@ function switchApp(app){
   document.getElementById('users-table').style.display='none';
   document.getElementById('ps-table').style.display='none';
   document.getElementById('empty').style.display='none';
-  document.getElementById('search').placeholder=ps?'Search device hash or IP...':'Search by user, .skr, email, ID, status, plan...';
+  document.getElementById('search').placeholder=ps?'Search device hash, IP, wallet or .skr...':'Search by user, .skr, email, ID, status, plan...';
   if(ps){
     if(psLoaded){document.getElementById('ps-table').style.display='';updateStats();buildFilters();applyFilters()}
     else{document.getElementById('loading').style.display='';loadPsUsers()}
@@ -716,6 +717,11 @@ function renderPsTable(){
   psFiltered.forEach(function(u){
     html+='<tr>';
     html+='<td class="uuid-cell" title="'+u.device_hash+'" onclick="copyUuid(this,&apos;'+u.device_hash+'&apos;)">'+(u.device_hash||'').substring(0,13)+'</td>';
+    html+='<td>'+(u.wallet_address
+      ?(u.wallet_domain
+        ?'<span class="email-cell" style="cursor:pointer" title="'+u.wallet_address+' - click to copy" onclick="copyUuid(this,&apos;'+u.wallet_address+'&apos;)">'+u.wallet_domain+'.skr</span>'
+        :'<span class="uuid-cell" style="max-width:none" title="'+u.wallet_address+' - click to copy" onclick="copyUuid(this,&apos;'+u.wallet_address+'&apos;)">'+u.wallet_address.substring(0,6)+'…'+u.wallet_address.slice(-4)+'</span>')
+      :'<span class="date-cell">-</span>')+'</td>';
     html+='<td>'+liveDot(u.last_seen)+'</td>';
     html+='<td>'+statusBadge(u.status)+'</td>';
     html+='<td>'+subBadge(u.sub_status,u.sub_until_date,u)+'</td>';
@@ -871,7 +877,7 @@ function applyFilters(){
     psFiltered=psUsers.filter(function(u){
       if(activeFilter!=='all'&&u.status!==activeFilter)return false;
       if(!pq)return true;
-      return(u.device_hash||'').toLowerCase().includes(pq)||(u.last_ip||'').toLowerCase().includes(pq)||(u.status||'').toLowerCase().includes(pq);
+      return(u.device_hash||'').toLowerCase().includes(pq)||(u.last_ip||'').toLowerCase().includes(pq)||(u.status||'').toLowerCase().includes(pq)||(u.wallet_address||'').toLowerCase().includes(pq)||((u.wallet_domain||'')+'.skr').toLowerCase().includes(pq);
     });
     psDoSort();renderPsTable();
     return;
@@ -3839,6 +3845,31 @@ async function psUpdateGeo(id, ip) {
     } catch (e) { }
 }
 
+// Resolve a wallet's SNS primary domain lazily (same pattern as geo): only
+// when the reported wallet is new/changed or the domain was never checked,
+// cached in-memory so minute pings don't re-hit the SNS proxy.
+const psDomainCache = new Map(); // wallet -> domain label ('' = none)
+async function psUpdateDomain(id, wallet) {
+    try {
+        if (!wallet) return;
+        let label = psDomainCache.get(wallet);
+        if (label === undefined) {
+            label = '';
+            try {
+                const r = await axios.get(`https://sdk-proxy-v2.sns.id/primary-domain/${wallet}`, { timeout: 5000 });
+                const res = r.data?.result;
+                if (r.data?.s === 'ok' && res && typeof res.reverse === 'string' && !res.stale) {
+                    label = res.reverse.trim();
+                }
+            } catch (e) { }
+            if (psDomainCache.size > 5000) psDomainCache.clear();
+            psDomainCache.set(wallet, label);
+        }
+        if (!label) return;
+        db.run('UPDATE paceseeker_devices SET wallet_domain = ? WHERE device_hash = ?', [label, id], () => { });
+    } catch (e) { }
+}
+
 app.get('/api/paceseeker/trial', (req, res) => {
     const id = String(req.query.id || '').trim();
     if (!/^[A-Za-z0-9_-]{16,128}$/.test(id)) {
@@ -3879,6 +3910,9 @@ app.get('/api/paceseeker/trial', (req, res) => {
     const payUsd = /^\d+(\.\d+)?$/.test(usdRaw) ? Number(usdRaw) : null;
     const amtRaw = String(req.query.amt || '');
     const payAmt = /^\d+$/.test(amtRaw) ? Math.floor(Number(amtRaw)) : null;
+    // Connected owner wallet (session/imported/MWA - always a real base58 addr)
+    const wRaw = String(req.query.w || '');
+    const wallet = /^[1-9A-HJ-NP-Za-km-z]{32,64}$/.test(wRaw) ? wRaw : null;
     if (paySig) {
         // Immutable revenue ledger - deduped by signature, recorded even if
         // the device row write below fails, survives device deletion.
@@ -3901,24 +3935,27 @@ app.get('/api/paceseeker/trial', (req, res) => {
                 const started = arch ? arch.trial_started_at : (sa !== null ? sa : now); // sa<=now: an already-expired local start yields an expired record, not a fresh trial
                 const expires = arch ? arch.trial_expires_at : started + trialMs;
                 db.run(
-                    'INSERT OR IGNORE INTO paceseeker_devices (device_hash, first_seen, last_seen, trial_started_at, trial_expires_at, version_code, last_ip, sub_status, sub_until, sub_signature, sub_paid_at, sub_paid_with, sub_plan, sub_usd, sub_amount_atomic) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                    [id, arch ? (arch.first_seen || started) : started, now, started, expires, vc, ip, st || 'none', se, paySig, payAt, payWith, payPlan, payUsd, payAmt],
+                    'INSERT OR IGNORE INTO paceseeker_devices (device_hash, first_seen, last_seen, trial_started_at, trial_expires_at, version_code, last_ip, sub_status, sub_until, sub_signature, sub_paid_at, sub_paid_with, sub_plan, sub_usd, sub_amount_atomic, wallet_address) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    [id, arch ? (arch.first_seen || started) : started, now, started, expires, vc, ip, st || 'none', se, paySig, payAt, payWith, payPlan, payUsd, payAmt, wallet],
                     () => {
                         db.get('SELECT * FROM paceseeker_devices WHERE device_hash = ?', [id], (e2, r2) => {
                             if (e2 || !r2) return res.status(500).json({ error: 'Database error' });
                             res.json({ trial: true, startedAt: r2.trial_started_at, expiresAt: r2.trial_expires_at });
                         });
                         psUpdateGeo(id, ip); // new device - resolve country async
+                        if (wallet) psUpdateDomain(id, wallet);
                     }
                 );
             });
             return;
         }
         db.run(
-            'UPDATE paceseeker_devices SET last_seen = ?, version_code = COALESCE(?, version_code), last_ip = ?, sub_status = COALESCE(?, sub_status), sub_until = COALESCE(?, sub_until), sub_signature = COALESCE(?, sub_signature), sub_paid_at = COALESCE(?, sub_paid_at), sub_paid_with = COALESCE(?, sub_paid_with), sub_plan = COALESCE(?, sub_plan), sub_usd = COALESCE(?, sub_usd), sub_amount_atomic = COALESCE(?, sub_amount_atomic) WHERE device_hash = ?',
-            [now, vc, ip, st, se, paySig, payAt, payWith, payPlan, payUsd, payAmt, id]
+            'UPDATE paceseeker_devices SET last_seen = ?, version_code = COALESCE(?, version_code), last_ip = ?, sub_status = COALESCE(?, sub_status), sub_until = COALESCE(?, sub_until), sub_signature = COALESCE(?, sub_signature), sub_paid_at = COALESCE(?, sub_paid_at), sub_paid_with = COALESCE(?, sub_paid_with), sub_plan = COALESCE(?, sub_plan), sub_usd = COALESCE(?, sub_usd), sub_amount_atomic = COALESCE(?, sub_amount_atomic), wallet_address = COALESCE(?, wallet_address) WHERE device_hash = ?',
+            [now, vc, ip, st, se, paySig, payAt, payWith, payPlan, payUsd, payAmt, wallet, id]
         );
         if (ip && (row.last_ip !== ip || !row.last_country_code)) psUpdateGeo(id, ip); // IP moved or unresolved
+        // Wallet switched or domain never checked - resolve primary SNS name.
+        if (wallet && (row.wallet_address !== wallet || (row.wallet_domain === null || row.wallet_domain === undefined || row.wallet_domain === ''))) psUpdateDomain(id, wallet);
         res.json({ trial: true, startedAt: row.trial_started_at, expiresAt: row.trial_expires_at });
     });
 });
@@ -3961,6 +3998,8 @@ app.get('/admin/api/paceseeker-users', adminAuth, (req, res) => {
                 sub_plan: r.sub_plan || '',
                 sub_usd: r.sub_usd || 0,
                 sub_amount_atomic: r.sub_amount_atomic || null,
+                wallet_address: r.wallet_address || '',
+                wallet_domain: r.wallet_domain || '',
                 sub_until_date: r.sub_until ? new Date(r.sub_until).toISOString() : null,
                 // An active paid/invite sub overrides trial state - 'active'
                 // means currently entitled, 'trial'/'expired' describe the
@@ -6392,6 +6431,9 @@ db.run(`ALTER TABLE paceseeker_devices ADD COLUMN sub_paid_with TEXT`, () => { }
 db.run(`ALTER TABLE paceseeker_devices ADD COLUMN sub_plan TEXT`, () => { });
 db.run(`ALTER TABLE paceseeker_devices ADD COLUMN sub_usd REAL`, () => { });
 db.run(`ALTER TABLE paceseeker_devices ADD COLUMN sub_amount_atomic INTEGER`, () => { });
+// Connected owner wallet + reverse-resolved SNS primary domain.
+db.run(`ALTER TABLE paceseeker_devices ADD COLUMN wallet_address TEXT`, () => { });
+db.run(`ALTER TABLE paceseeker_devices ADD COLUMN wallet_domain TEXT`, () => { });
 
 // Append-only revenue ledger keyed on the tx signature. Dedupes re-reports,
 // survives device hides/purges - "total earned" counts every payment ever
