@@ -638,7 +638,7 @@ table{min-width:100%;width:auto}
     <h2 style="color:var(--danger)">Delete User <span id="del-title" style="color:var(--danger)"></span>
       <button class="close-btn" onclick="closeDeleteModal()">&times;</button>
     </h2>
-    <p style="color:var(--muted);font-size:13px;margin-bottom:12px">This will permanently delete the user, their devices, plan, cloud chunks from DB, and optionally files from disk. This cannot be undone.</p>
+    <p style="color:var(--muted);font-size:13px;margin-bottom:12px">This will permanently delete the user, their devices, plan, cloud chunks from DB, and optionally files from disk. NFTs, certificates, thumbnails and mint records are always preserved. This cannot be undone.</p>
     <input type="hidden" id="del-id"/>
     <div class="form-group" style="flex-direction:row;align-items:center;gap:8px">
       <input type="checkbox" id="del-files" checked style="width:auto;accent-color:var(--danger)"/>
@@ -1586,6 +1586,7 @@ app.post('/admin/api/user/delete', adminAuth, async (req, res) => {
         const result = await purgeUserEverywhere(userId, {
             deleteFiles: !!deleteFiles,
             reason: 'admin_delete',
+            preserveNftData: true, // NFTs, certs, thumbs and mint records are never deleted
         });
 
         return res.json({
