@@ -2634,6 +2634,9 @@ db.serialize(() => {
         purgeExpiredComplimentaryUsers().catch((e) => {
             console.error('[AutoPurge] Startup purge failed:', e.message);
         });
+        purgeStalePaceSeekerDevices().catch((e) => {
+            console.error('[AutoPurge] Startup PaceSeeker purge failed:', e.message);
+        });
     }, 1500);
 
     if (COMPLIMENTARY_PURGE_INTERVAL_MS > 0) {
@@ -2645,6 +2648,9 @@ db.serialize(() => {
                 .finally(() => {
                     purgeExpiredComplimentaryUsers().catch((e) => {
                         console.error('[AutoPurge] Scheduled purge failed:', e.message);
+                    });
+                    purgeStalePaceSeekerDevices().catch((e) => {
+                        console.error('[AutoPurge] Scheduled PaceSeeker purge failed:', e.message);
                     });
                 });
         }, COMPLIMENTARY_PURGE_INTERVAL_MS);
@@ -3160,6 +3166,29 @@ const purgeExpiredComplimentaryUsers = async () => {
 
     console.log(`[AutoPurge] Complete: ${purged} purged, ${errors} errors`);
     return { scanned: expiredRows.length, purged, errors, cutoff: new Date(cutoff).toISOString() };
+};
+
+// PaceSeeker retention: devices silent past the retention window (and not on
+// an active paid/invite sub) are removed from the admin registry. Trial dates
+// are copied to paceseeker_trial_archive first so a returning device resumes
+// its original (usually expired) trial instead of getting a free reset.
+const purgeStalePaceSeekerDevices = async () => {
+    const now = Date.now();
+    const cutoff = now - PURGE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    const stale = await dbAllAsync(
+        `SELECT device_hash, first_seen, trial_started_at, trial_expires_at FROM paceseeker_devices
+         WHERE last_seen < ? AND (sub_until IS NULL OR sub_until < ?)`,
+        [cutoff, now]
+    );
+    for (const r of stale || []) {
+        await dbRunAsync(
+            `INSERT OR REPLACE INTO paceseeker_trial_archive (device_hash, first_seen, trial_started_at, trial_expires_at) VALUES (?, ?, ?, ?)`,
+            [r.device_hash, r.first_seen, r.trial_started_at, r.trial_expires_at]
+        );
+        await dbRunAsync('DELETE FROM paceseeker_devices WHERE device_hash = ?', [r.device_hash]);
+    }
+    if (stale && stale.length) console.log(`[AutoPurge] Removed ${stale.length} stale PaceSeeker device(s) (silent >${PURGE_RETENTION_DAYS}d)`);
+    return stale ? stale.length : 0;
 };
 
 const getStealthCloudStorageKey = (user) => {
@@ -3829,18 +3858,24 @@ app.get('/api/paceseeker/trial', (req, res) => {
         if (!row) {
             // INSERT OR IGNORE keeps first-write-wins atomic under concurrency;
             // the SELECT after it returns the canonical row either way.
-            const started = sa !== null ? sa : now; // sa<=now: an already-expired local start yields an expired record, not a fresh trial
-            db.run(
-                'INSERT OR IGNORE INTO paceseeker_devices (device_hash, first_seen, last_seen, trial_started_at, trial_expires_at, version_code, last_ip, sub_status, sub_until) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                [id, started, now, started, started + trialMs, vc, ip, st || 'none', se],
-                () => {
-                    db.get('SELECT * FROM paceseeker_devices WHERE device_hash = ?', [id], (e2, r2) => {
-                        if (e2 || !r2) return res.status(500).json({ error: 'Database error' });
-                        res.json({ trial: true, startedAt: r2.trial_started_at, expiresAt: r2.trial_expires_at });
-                    });
-                    psUpdateGeo(id, ip); // new device - resolve country async
-                }
-            );
+            // A device purged after 10d silence leaves a tombstone in
+            // paceseeker_trial_archive - it resumes its original (usually
+            // expired) trial instead of minting a fresh one.
+            db.get('SELECT * FROM paceseeker_trial_archive WHERE device_hash = ?', [id], (eA, arch) => {
+                const started = arch ? arch.trial_started_at : (sa !== null ? sa : now); // sa<=now: an already-expired local start yields an expired record, not a fresh trial
+                const expires = arch ? arch.trial_expires_at : started + trialMs;
+                db.run(
+                    'INSERT OR IGNORE INTO paceseeker_devices (device_hash, first_seen, last_seen, trial_started_at, trial_expires_at, version_code, last_ip, sub_status, sub_until) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    [id, arch ? (arch.first_seen || started) : started, now, started, expires, vc, ip, st || 'none', se],
+                    () => {
+                        db.get('SELECT * FROM paceseeker_devices WHERE device_hash = ?', [id], (e2, r2) => {
+                            if (e2 || !r2) return res.status(500).json({ error: 'Database error' });
+                            res.json({ trial: true, startedAt: r2.trial_started_at, expiresAt: r2.trial_expires_at });
+                        });
+                        psUpdateGeo(id, ip); // new device - resolve country async
+                    }
+                );
+            });
             return;
         }
         db.run(
@@ -3855,9 +3890,9 @@ app.get('/api/paceseeker/trial', (req, res) => {
 // Admin API: PaceSeeker trial devices
 app.get('/admin/api/paceseeker-users', adminAuth, (req, res) => {
     const now = Date.now();
-    // Devices silent for >24h stay in the DB (they resurface on next ping)
+    // Devices silent for >1h stay in the DB (they resurface on next ping)
     // but are hidden from the admin list so stale rows don't clutter the view.
-    const cutoff = now - 86400000;
+    const cutoff = now - 3600000;
     const showAll = req.query.all === '1'; // escape hatch: /admin/api/paceseeker-users?all=1 lists dormant devices too
     db.all(showAll ? 'SELECT * FROM paceseeker_devices ORDER BY last_seen DESC' : 'SELECT * FROM paceseeker_devices WHERE last_seen >= ? ORDER BY last_seen DESC', showAll ? [] : [cutoff], (err, rows) => {
         if (err) {
@@ -6297,6 +6332,16 @@ db.run(`CREATE TABLE IF NOT EXISTS paceseeker_devices (
 db.run(`ALTER TABLE paceseeker_devices ADD COLUMN sub_status TEXT`, () => { });
 db.run(`ALTER TABLE paceseeker_devices ADD COLUMN sub_until INTEGER`, () => { });
 db.run(`ALTER TABLE paceseeker_devices ADD COLUMN last_country_code TEXT`, () => { });
+
+// Purge tombstone: when a device row is deleted after 10d of silence we keep
+// only its trial timestamps, so a returning device resumes its ORIGINAL
+// (possibly expired) trial instead of minting a fresh one.
+db.run(`CREATE TABLE IF NOT EXISTS paceseeker_trial_archive (
+    device_hash TEXT PRIMARY KEY,
+    first_seen INTEGER,
+    trial_started_at INTEGER,
+    trial_expires_at INTEGER
+)`);
 
 // Create solana_payments table if not exists
 db.run(`CREATE TABLE IF NOT EXISTS solana_payments (
