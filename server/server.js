@@ -526,6 +526,10 @@ tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowr
 .login-inactive{color:var(--danger)}
 .detail-row{display:flex;gap:4px;flex-wrap:wrap;margin-top:2px}
 .mini-tag{font-size:10px;padding:1px 5px;border-radius:4px;background:rgba(255,255,255,.04);color:var(--muted);white-space:nowrap}
+.live-dot{display:inline-block;width:9px;height:9px;border-radius:50%}
+.live-on{background:var(--success);box-shadow:0 0 6px rgba(34,197,94,.7);animation:livepulse 1.6s ease-in-out infinite}
+.live-off{background:var(--danger)}
+@keyframes livepulse{0%,100%{opacity:1}50%{opacity:.3}}
 </style>
 </head>
 <body>
@@ -571,10 +575,11 @@ tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowr
   <table id="ps-table" style="display:none">
     <thead><tr>
       <th data-col="device_hash" onclick="psSortBy('device_hash')">Device <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="last_seen" onclick="psSortBy('last_seen')">Live <span class="sort-arrow">&#9650;</span></th>
       <th data-col="status" onclick="psSortBy('status')">Status <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="sub_status" onclick="psSortBy('sub_status')">Sub <span class="sort-arrow">&#9650;</span></th>
       <th data-col="trial_expires_at" onclick="psSortBy('trial_expires_at')">Trial Ends <span class="sort-arrow">&#9650;</span></th>
       <th data-col="first_seen" onclick="psSortBy('first_seen')">Registered <span class="sort-arrow">&#9650;</span></th>
-      <th data-col="last_seen" onclick="psSortBy('last_seen')">Last Seen <span class="sort-arrow">&#9650;</span></th>
       <th data-col="version_code" onclick="psSortBy('version_code')">App <span class="sort-arrow">&#9650;</span></th>
       <th data-col="last_ip" onclick="psSortBy('last_ip')">Last IP <span class="sort-arrow">&#9650;</span></th>
     </tr></thead>
@@ -701,10 +706,11 @@ function renderPsTable(){
   psFiltered.forEach(function(u){
     html+='<tr>';
     html+='<td class="uuid-cell" title="'+u.device_hash+'" onclick="copyUuid(this,&apos;'+u.device_hash+'&apos;)">'+(u.device_hash||'').substring(0,13)+'</td>';
+    html+='<td>'+liveDot(u.last_seen)+'</td>';
     html+='<td>'+statusBadge(u.status)+'</td>';
+    html+='<td>'+subBadge(u.sub_status)+'</td>';
     html+='<td>'+fmtDate(u.trial_expires_at_date)+'</td>';
     html+='<td>'+fmtDate(u.first_seen_date)+'</td>';
-    html+='<td>'+fmtLogin(u.last_seen_date)+'</td>';
     html+='<td>'+(u.version_code?'<span class="mini-tag">vc'+u.version_code+'</span>':'<span class="date-cell">-</span>')+'</td>';
     html+='<td>'+(u.last_ip?'<span class="date-cell">'+u.last_ip+'</span>':'<span class="date-cell">-</span>')+'</td>';
     html+='</tr>';
@@ -715,6 +721,12 @@ function renderPsTable(){
 function fmtDate(iso){if(!iso)return'<span class="date-cell">-</span>';var d=new Date(iso);var now=new Date();var diff=d-now;var s=d.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'2-digit'})+' '+d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'});if(diff<0&&diff>-86400000*3)s='<span style="color:var(--warn)">'+s+'</span>';else if(diff<0)s='<span style="color:var(--danger)">'+s+'</span>';return'<span class="date-cell">'+s+'</span>'}
 
 function fmtLogin(iso){if(!iso)return'<span class="date-cell login-inactive">Never</span>';var d=new Date(iso);var now=new Date();var ago=now-d;var mins=Math.floor(ago/60000);var hrs=Math.floor(ago/3600000);var days=Math.floor(ago/86400000);var label='';if(mins<5)label='Just now';else if(mins<60)label=mins+'m ago';else if(hrs<24)label=hrs+'h ago';else if(days<30)label=days+'d ago';else label=d.toLocaleDateString('en-GB',{day:'2-digit',month:'short',year:'2-digit'});var cls=ago<3600000?'login-active':ago<86400000*7?'login-stale':'login-inactive';return'<span class="date-cell '+cls+'" title="'+d.toLocaleString()+'">'+label+'</span>'}
+
+// PaceSeeker presence: client heartbeats every ~60s while the app process is
+// alive (foreground or trading in background). Online = seen within 150s.
+function liveDot(ts){if(!ts)return'<span class="live-dot live-off" title="Never seen"></span>';var ago=Date.now()-ts;var on=ago<150000;var d=new Date(ts);var tip=on?'Online (last ping '+Math.max(1,Math.floor(ago/1000))+'s ago)':'Offline since '+d.toLocaleString();return'<span class="live-dot '+(on?'live-on':'live-off')+'" title="'+tip+'"></span>'}
+
+function subBadge(st){var m={paid:{t:'Paid',c:'var(--success)'},invite:{t:'Invite',c:'var(--accent)'},trial:{t:'Trial',c:'var(--trial)'}};var s=m[st];if(!s)return'<span class="date-cell">-</span>';return'<span class="mini-tag" style="color:'+s.c+'">'+s.t+'</span>'}
 
 function fmtBytes(b){if(!b||b<=0)return'0';if(b<1048576)return(b/1024).toFixed(0)+' KB';if(b<1073741824)return(b/1048576).toFixed(1)+' MB';return(b/1073741824).toFixed(2)+' GB'}
 
@@ -751,8 +763,10 @@ function updateStats(){
     var ptotal=psUsers.length;
     var ptrials=psUsers.filter(function(u){return u.status==='trial'}).length;
     var precent=psUsers.filter(function(u){return u.last_seen&&(Date.now()-u.last_seen)<86400000*7}).length;
+    var ponline=psUsers.filter(function(u){return u.last_seen&&(Date.now()-u.last_seen)<150000}).length;
+    var psubs=psUsers.filter(function(u){return u.sub_status==='paid'||u.sub_status==='invite'}).length;
     var pst=serverTime?'<span>Server: <b>'+new Date(serverTime).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+'</b></span>':'';
-    document.getElementById('header-stats').innerHTML=pst+'<span>Devices: <b>'+ptotal+'</b></span><span>In trial: <b>'+ptrials+'</b></span><span>Expired: <b>'+(ptotal-ptrials)+'</b></span><span>7d active: <b>'+precent+'</b></span>';
+    document.getElementById('header-stats').innerHTML=pst+'<span>Devices: <b>'+ptotal+'</b></span><span>Online: <b>'+ponline+'</b></span><span>In trial: <b>'+ptrials+'</b></span><span>Subs: <b>'+psubs+'</b></span><span>Expired: <b>'+(ptotal-ptrials)+'</b></span><span>7d active: <b>'+precent+'</b></span>';
     return;
   }
   var total=allUsers.length;
@@ -941,6 +955,8 @@ async function confirmDelete(){
 function copyUuid(el,uuid){if(!uuid||uuid==='-')return;navigator.clipboard.writeText(uuid).then(function(){toast('UUID copied','success')}).catch(function(){var t=document.createElement('textarea');t.value=uuid;document.body.appendChild(t);t.select();document.execCommand('copy');document.body.removeChild(t);toast('UUID copied','success')})}
 document.addEventListener('keydown',function(e){if(e.key==='Escape'){closeModal();closeDeleteModal()}});
 loadUsers();
+// Keep PaceSeeker liveness dots moving while the admin watches that tab.
+setInterval(function(){if(activeApp==='paceseeker'&&psLoaded)loadPsUsers()},30000);
 </script>
 </body>
 </html>`;
@@ -3688,7 +3704,8 @@ app.get('/ai-federation/dashboard', async (req, res) => {
 
 const PS_TRIAL_DAYS = Number.parseInt(process.env.PS_TRIAL_DAYS || '7', 10);
 const psTrialBuckets = new Map();
-const PS_TRIAL_RATE_LIMIT = 30; // requests per IP per hour
+// Minute-level presence pings (~60/hr) + trial syncs + NAT headroom.
+const PS_TRIAL_RATE_LIMIT = 300; // requests per IP per hour
 
 app.get('/api/paceseeker/trial', (req, res) => {
     const id = String(req.query.id || '').trim();
@@ -3711,6 +3728,9 @@ app.get('/api/paceseeker/trial', (req, res) => {
     const saRaw = String(req.query.sa || '');
     const trialMs = PS_TRIAL_DAYS * 24 * 60 * 60 * 1000;
     const sa = /^\d+$/.test(saRaw) ? Math.min(now, Math.floor(Number(saRaw))) : null;
+    // Client-reported entitlement: paid sub, redeemed invite, trial, or none.
+    const stRaw = String(req.query.st || '');
+    const st = /^(none|trial|invite|paid)$/.test(stRaw) ? stRaw : null;
 
     db.get('SELECT * FROM paceseeker_devices WHERE device_hash = ?', [id], (err, row) => {
         if (err) {
@@ -3722,8 +3742,8 @@ app.get('/api/paceseeker/trial', (req, res) => {
             // the SELECT after it returns the canonical row either way.
             const started = sa !== null ? sa : now; // sa<=now: an already-expired local start yields an expired record, not a fresh trial
             db.run(
-                'INSERT OR IGNORE INTO paceseeker_devices (device_hash, first_seen, last_seen, trial_started_at, trial_expires_at, version_code, last_ip) VALUES (?, ?, ?, ?, ?, ?, ?)',
-                [id, started, now, started, started + trialMs, vc, ip],
+                'INSERT OR IGNORE INTO paceseeker_devices (device_hash, first_seen, last_seen, trial_started_at, trial_expires_at, version_code, last_ip, sub_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+                [id, started, now, started, started + trialMs, vc, ip, st || 'none'],
                 () => {
                     db.get('SELECT * FROM paceseeker_devices WHERE device_hash = ?', [id], (e2, r2) => {
                         if (e2 || !r2) return res.status(500).json({ error: 'Database error' });
@@ -3734,8 +3754,8 @@ app.get('/api/paceseeker/trial', (req, res) => {
             return;
         }
         db.run(
-            'UPDATE paceseeker_devices SET last_seen = ?, version_code = COALESCE(?, version_code), last_ip = ? WHERE device_hash = ?',
-            [now, vc, ip, id]
+            'UPDATE paceseeker_devices SET last_seen = ?, version_code = COALESCE(?, version_code), last_ip = ?, sub_status = COALESCE(?, sub_status) WHERE device_hash = ?',
+            [now, vc, ip, st, id]
         );
         res.json({ trial: true, startedAt: row.trial_started_at, expiresAt: row.trial_expires_at });
     });
@@ -3761,6 +3781,7 @@ app.get('/admin/api/paceseeker-users', adminAuth, (req, res) => {
                 first_seen_date: r.first_seen ? new Date(r.first_seen).toISOString() : null,
                 version_code: r.version_code,
                 last_ip: r.last_ip,
+                sub_status: r.sub_status || 'none',
                 status: (r.trial_expires_at && r.trial_expires_at > now) ? 'trial' : 'expired',
             })),
         });
@@ -6174,6 +6195,8 @@ db.run(`CREATE TABLE IF NOT EXISTS paceseeker_devices (
     version_code INTEGER,
     last_ip TEXT
 )`);
+// Presence/subscription column for the admin Sub column.
+db.run(`ALTER TABLE paceseeker_devices ADD COLUMN sub_status TEXT`, () => { });
 
 // Create solana_payments table if not exists
 db.run(`CREATE TABLE IF NOT EXISTS solana_payments (
