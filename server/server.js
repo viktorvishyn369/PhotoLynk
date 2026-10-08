@@ -2942,7 +2942,10 @@ const purgeUserEverywhere = async (userId, options = {}) => {
 
         for (const dir of dirsToDelete) {
             try {
-                fs.rmSync(dir, { recursive: true, force: true });
+                // Async rm - rmSync on large dirs froze the event loop for
+                // minutes during the first post-deploy backlog sweep,
+                // hanging every concurrent request (admin "Loading users...").
+                await fs.promises.rm(dir, { recursive: true, force: true });
                 deleted.directories.push(dir);
             } catch (e) {
                 console.error(`[UserPurge] Failed to remove ${dir}:`, e.message);
