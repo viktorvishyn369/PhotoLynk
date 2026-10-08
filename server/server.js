@@ -462,7 +462,8 @@ thead th .sort-arrow{margin-left:4px;opacity:.4;font-size:10px}
 thead th.sorted .sort-arrow{opacity:1;color:var(--accent)}
 tbody tr{transition:background .1s}
 tbody tr:hover{background:rgba(79,209,197,.04)}
-tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis}
+tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowrap;vertical-align:top}
+table{min-width:100%;width:auto}
 .badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;letter-spacing:.3px}
 .badge-active{background:rgba(34,197,94,.15);color:#4ade80}
 .badge-trial{background:rgba(139,92,246,.15);color:#a78bfa}
