@@ -530,6 +530,14 @@ tbody td{padding:8px 12px;border-bottom:1px solid var(--border);white-space:nowr
 .live-on{background:var(--success);box-shadow:0 0 6px rgba(34,197,94,.7);animation:livepulse 1.6s ease-in-out infinite}
 .live-off{background:var(--danger)}
 @keyframes livepulse{0%,100%{opacity:1}50%{opacity:.3}}
+.pay-col{min-width:210px;font-size:11px;line-height:1.5}
+.pay-line{display:grid;grid-template-columns:34px 76px 1fr 44px;gap:8px;align-items:baseline;white-space:nowrap}
+.pay-tok{font-weight:700;letter-spacing:.3px}
+.pay-sol{color:#a78bfa}.pay-skr{color:#4ade80}.pay-oth{color:var(--info)}
+.pay-amt{color:var(--text);font-variant-numeric:tabular-nums}
+.pay-dur{color:var(--muted)}
+.pay-date{color:var(--muted);text-align:right}
+.pay-until{margin-top:4px;padding-top:4px;border-top:1px dashed var(--border);color:var(--muted);font-size:10px}
 </style>
 </head>
 <body>
@@ -749,19 +757,19 @@ function paymentBadges(u){
   if(!evs.length&&u.payment_type){evs.push({tok:u.payment_type==='solana'?'SOL':String(u.payment_type).toUpperCase(),amt:0,dur:'',date:u.payment_at_date});}
   evs=evs.filter(function(e){return e.date}).sort(function(a,b){return new Date(b.date)-new Date(a.date)});
   if(!evs.length)return'<span class="date-cell">-</span>';
-  var html='';
+  var html='<div class="pay-col">';
   evs.slice(0,4).forEach(function(e){
-    var cls=e.tok==='SOL'?'payment-solana':e.tok==='SKR'?'payment-skr':'';
-    var amtTxt=e.usd?('$'+e.usd.toFixed(2)):(e.amt?(e.amt.toFixed(e.tok==='SKR'?2:4)+' '+e.tok):'');
-    html+='<div class="detail-row" style="margin-top:0;align-items:center">'
-      +'<span class="payment-badge '+cls+'">'+e.tok+'</span>'
-      +(amtTxt?'<span class="mini-tag" style="color:var(--text)">'+amtTxt+'</span>':'')
-      +(e.dur?'<span class="mini-tag">'+e.dur+'</span>':'')
-      +'<span class="date-cell" style="font-size:10px">'+new Date(e.date).toLocaleDateString('en-GB',{day:'2-digit',month:'short'})+'</span></div>';
+    var cls=e.tok==='SOL'?'pay-sol':e.tok==='SKR'?'pay-skr':'pay-oth';
+    var amtTxt=e.usd?('$'+e.usd.toFixed(2)):(e.amt?(e.amt.toFixed(e.tok==='SKR'?2:4)):'');
+    html+='<div class="pay-line">'
+      +'<span class="pay-tok '+cls+'">'+e.tok+'</span>'
+      +'<span class="pay-amt">'+amtTxt+'</span>'
+      +'<span class="pay-dur">'+e.dur+'</span>'
+      +'<span class="pay-date">'+new Date(e.date).toLocaleDateString('en-GB',{day:'2-digit',month:'short'})+'</span></div>';
   });
-  if(evs.length>4)html+='<div class="mini-tag">+'+(evs.length-4)+' more</div>';
-  if(u.expires_at_date)html+='<div class="mini-tag" style="color:var(--muted)">paid til '+new Date(u.expires_at_date).toLocaleDateString('en-GB',{day:'2-digit',month:'short'})+'</div>';
-  return html;
+  if(evs.length>4)html+='<div class="pay-line"><span class="pay-dur" style="grid-column:1/-1">+'+(evs.length-4)+' more</span></div>';
+  if(u.expires_at_date)html+='<div class="pay-until">paid til '+new Date(u.expires_at_date).toLocaleDateString('en-GB',{day:'2-digit',month:'short'})+'</div>';
+  return html+'</div>';
 }
 
 function totalPaidCell(u){var parts=[];var totalUsd=u.total_usd_realtime||0;if(totalUsd>0)parts.push('$'+totalUsd.toFixed(2));var sol=u.sol_total_paid||0;var skr=u.skr_total_paid||0;if(sol>0)parts.push(sol.toFixed(4)+' SOL');if(skr>0)parts.push(skr.toFixed(2)+' SKR');if(!parts.length)return'<span class="money-cell zero">-</span>';return'<span class="money-cell">'+parts.join('<br>')+'</span>'}
