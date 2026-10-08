@@ -722,7 +722,7 @@ function renderPsTable(){
     html+='<td>'+fmtDate(u.trial_expires_at_date)+'</td>';
     html+='<td>'+fmtDate(u.first_seen_date)+'</td>';
     html+='<td>'+(u.version_code?'<span class="mini-tag">vc'+u.version_code+'</span>':'<span class="date-cell">-</span>')+'</td>';
-    html+='<td>'+(u.last_ip?'<span class="date-cell">'+u.last_ip+'</span>':'<span class="date-cell">-</span>')+'</td>';
+    html+='<td>'+(u.last_ip?'<span class="date-cell">'+flagEmoji(u.last_country_code)+' '+u.last_ip+'</span>':'<span class="date-cell">-</span>')+'</td>';
     html+='</tr>';
   });
   tbody.innerHTML=html;
@@ -735,6 +735,9 @@ function fmtLogin(iso){if(!iso)return'<span class="date-cell login-inactive">Nev
 // PaceSeeker presence: client heartbeats every ~60s while the app process is
 // alive (foreground or trading in background). Online = seen within 150s.
 function liveDot(ts){if(!ts)return'<span class="live-dot live-off" title="Never seen"></span>';var ago=Date.now()-ts;var on=ago<150000;var d=new Date(ts);var tip=on?'Online (last ping '+Math.max(1,Math.floor(ago/1000))+'s ago)':'Offline since '+d.toLocaleString();return'<span class="live-dot '+(on?'live-on':'live-off')+'" title="'+tip+'"></span>'}
+
+// ISO country code -> flag emoji via regional indicator symbols.
+function flagEmoji(cc){if(!cc||cc.length!==2)return'';return String.fromCodePoint(0x1F1E6+cc.charCodeAt(0)-65,0x1F1E6+cc.charCodeAt(1)-65)}
 
 function subBadge(st,untilIso){var m={paid:{t:'Paid',c:'var(--success)'},invite:{t:'Invite',c:'var(--accent)'},trial:{t:'Trial',c:'var(--trial)'}};var s=m[st];if(!s)return'<span class="date-cell">-</span>';var tip=untilIso?new Date(untilIso).toLocaleDateString('en-GB',{day:'2-digit',month:'short'}):'';return'<span class="mini-tag" style="color:'+s.c+'" title="'+(untilIso?('until '+new Date(untilIso).toLocaleString()):'')+'">'+s.t+(tip?'&nbsp;'+tip:'')+'</span>'}
 
@@ -3773,6 +3776,23 @@ const psTrialBuckets = new Map();
 // Minute-level presence pings (~60/hr) + trial syncs + NAT headroom.
 const PS_TRIAL_RATE_LIMIT = 300; // requests per IP per hour
 
+// Resolve country for a device lazily: only when the IP is new/changed, cached
+// in-memory (pings run ~60s - a lookup per ping would exhaust ip-api limits).
+const psGeoCache = new Map(); // ip -> countryCode ('' = negative cached)
+async function psUpdateGeo(id, ip) {
+    try {
+        if (!ip) return;
+        let cc = psGeoCache.get(ip);
+        if (cc === undefined) {
+            const g = await getCountryFromIP(ip);
+            cc = (g && g.countryCode) ? String(g.countryCode) : '';
+            psGeoCache.set(ip, cc);
+        }
+        if (!cc) return;
+        db.run('UPDATE paceseeker_devices SET last_country_code = ? WHERE device_hash = ?', [cc, id], () => { });
+    } catch (e) { }
+}
+
 app.get('/api/paceseeker/trial', (req, res) => {
     const id = String(req.query.id || '').trim();
     if (!/^[A-Za-z0-9_-]{16,128}$/.test(id)) {
@@ -3817,6 +3837,7 @@ app.get('/api/paceseeker/trial', (req, res) => {
                         if (e2 || !r2) return res.status(500).json({ error: 'Database error' });
                         res.json({ trial: true, startedAt: r2.trial_started_at, expiresAt: r2.trial_expires_at });
                     });
+                    psUpdateGeo(id, ip); // new device - resolve country async
                 }
             );
             return;
@@ -3825,6 +3846,7 @@ app.get('/api/paceseeker/trial', (req, res) => {
             'UPDATE paceseeker_devices SET last_seen = ?, version_code = COALESCE(?, version_code), last_ip = ?, sub_status = COALESCE(?, sub_status), sub_until = COALESCE(?, sub_until) WHERE device_hash = ?',
             [now, vc, ip, st, se, id]
         );
+        if (ip && (row.last_ip !== ip || !row.last_country_code)) psUpdateGeo(id, ip); // IP moved or unresolved
         res.json({ trial: true, startedAt: row.trial_started_at, expiresAt: row.trial_expires_at });
     });
 });
@@ -3853,6 +3875,7 @@ app.get('/admin/api/paceseeker-users', adminAuth, (req, res) => {
                 first_seen_date: r.first_seen ? new Date(r.first_seen).toISOString() : null,
                 version_code: r.version_code,
                 last_ip: r.last_ip,
+                last_country_code: r.last_country_code || '',
                 sub_status: r.sub_status || 'none',
                 sub_until: r.sub_until || null,
                 sub_until_date: r.sub_until ? new Date(r.sub_until).toISOString() : null,
@@ -6272,6 +6295,7 @@ db.run(`CREATE TABLE IF NOT EXISTS paceseeker_devices (
 // Presence/subscription columns for the admin Sub column.
 db.run(`ALTER TABLE paceseeker_devices ADD COLUMN sub_status TEXT`, () => { });
 db.run(`ALTER TABLE paceseeker_devices ADD COLUMN sub_until INTEGER`, () => { });
+db.run(`ALTER TABLE paceseeker_devices ADD COLUMN last_country_code TEXT`, () => { });
 
 // Create solana_payments table if not exists
 db.run(`CREATE TABLE IF NOT EXISTS solana_payments (
