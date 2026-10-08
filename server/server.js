@@ -311,7 +311,7 @@ const SUBSCRIPTION_GRACE_DAYS = Number.parseInt(process.env.SUBSCRIPTION_GRACE_D
 const TRIAL_DAYS = Number.parseInt(process.env.TRIAL_DAYS || '7', 10);
 const TRIAL_COMPLIMENTARY_DAYS = Number.parseInt(process.env.TRIAL_COMPLIMENTARY_DAYS || '3', 10);
 const COMPLIMENTARY_PURGE_INTERVAL_MS = Number.parseInt(process.env.COMPLIMENTARY_PURGE_INTERVAL_MS || String(6 * 60 * 60 * 1000), 10);
-const PURGE_RETENTION_DAYS = Number.parseInt(process.env.PURGE_RETENTION_DAYS || '30', 10);
+const PURGE_RETENTION_DAYS = Number.parseInt(process.env.PURGE_RETENTION_DAYS || '1', 10); // fully expired users are purged 24h after expiry
 const REVENUECAT_WEBHOOK_SECRET = process.env.REVENUECAT_WEBHOOK_SECRET || '';
 const USER_QUOTA_MARGIN_BYTES = Number.parseInt(process.env.USER_QUOTA_MARGIN_BYTES || String(50 * 1024 * 1024), 10);
 const GB_BYTES = 1000 * 1000 * 1000;
@@ -2998,7 +2998,7 @@ const migrateStalePlanStates = async () => {
         console.log(`[Migration] Fixed ${staleTrials.length} stale trial→expired users`);
     }
 
-    // 2. Expired users without deleted_at → set deleted_at to now (start 30-day retention)
+    // 2. Expired users without deleted_at → set deleted_at to now (start retention window)
     //    Skip users with active premium storage
     const staleExpired = await dbAllAsync(
         `SELECT user_id FROM user_plans
@@ -3018,7 +3018,7 @@ const migrateStalePlanStates = async () => {
         }
     }
     if (staleExpired.length > 0) {
-        console.log(`[Migration] Set deleted_at for ${staleExpired.length} expired users (starting 30-day retention)`);
+        console.log(`[Migration] Set deleted_at for ${staleExpired.length} expired users (starting retention window)`);
     }
 
     // 3. Active users with expired expires_at → migrate to grace
