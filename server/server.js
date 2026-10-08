@@ -2617,6 +2617,25 @@ const isPrivateIp = (ip) => {
 };
 
 // Middleware: Verify Token & Device Binding
+// Throttled device presence: devices.last_seen was only written on login, so
+// session-token users showed "Never"/stale Last Login in admin. Bump it on
+// authenticated requests, at most once per 5min per user+device.
+const deviceSeenAt = new Map();
+function touchDeviceLastSeen(user, deviceUuid) {
+    try {
+        const uid = user && user.id;
+        const du = deviceUuid || (user && user.device_uuid);
+        if (!uid || !du) return;
+        const key = uid + '|' + du;
+        const now = Date.now();
+        if (now - (deviceSeenAt.get(key) || 0) < 5 * 60 * 1000) return;
+        deviceSeenAt.set(key, now);
+        db.run(`INSERT INTO devices (user_id, device_uuid, last_seen) VALUES (?, ?, ?)
+                 ON CONFLICT(user_id, device_uuid) DO UPDATE SET last_seen = ?`,
+            [uid, du, now, now], () => { });
+    } catch (e) { }
+}
+
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const deviceUuid = req.headers['x-device-uuid']; // Critical for security binding
@@ -2674,9 +2693,11 @@ const authenticateToken = (req, res, next) => {
                     const computed = computeStorageUuidFromEmail(user.email);
                     if (computed) req.user = { ...user, storage_uuid: computed };
                 }
+                touchDeviceLastSeen(req.user, deviceUuid);
                 next();
             });
         } else {
+            touchDeviceLastSeen(req.user, deviceUuid);
             next();
         }
     });
