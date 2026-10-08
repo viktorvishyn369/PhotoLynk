@@ -3870,28 +3870,40 @@ function base58Encode(buf) {
 // The name record's first 32 bytes are the parent name-account key. Names
 // directly under the SNS root resolve as .sns (the migrated .sol registry);
 // sub-names sit under their TLD's name account, which reverse-lookups to the
-// TLD label (e.g. 'skr', 'bonk').
+// TLD label (e.g. 'skr', 'bonk'). Returns null on transient failure so the
+// caller retries on the next ping instead of caching a broken result.
 async function psResolveDomainTld(domainAcctKey) {
-    try {
-        const r = await axios.post(SOLANA_RPC_ENDPOINT, {
-            jsonrpc: '2.0', id: 1, method: 'getAccountInfo',
-            params: [domainAcctKey, { encoding: 'base64' }]
-        }, { timeout: 8000 });
-        const b64 = r.data?.result?.value?.data?.[0];
-        if (!b64) return '';
-        const parentKey = base58Encode(Buffer.from(b64, 'base64').subarray(0, 32));
-        if (parentKey === SNS_ROOT_ACCOUNT) return 'sns';
-        if (psTldCache.has(parentKey)) return psTldCache.get(parentKey);
-        let tld = '';
+    const rpcEndpoints = [
+        process.env.SOLANA_RPC_ENDPOINT,
+        'https://solana-rpc.publicnode.com',
+        'https://api.mainnet-beta.solana.com',
+        'https://solana.drpc.org'
+    ].filter(Boolean);
+    let b64 = null;
+    for (const rpc of rpcEndpoints) {
         try {
-            const t = await axios.get(`https://sdk-proxy-v2.sns.id/reverse-lookup/${parentKey}`, { timeout: 5000 });
-            const lbl = t.data?.result || t.data?.label;
-            if (typeof lbl === 'string' && /^[a-z0-9_-]{1,32}$/.test(lbl.trim().toLowerCase())) tld = lbl.trim().toLowerCase();
+            const r = await axios.post(rpc, {
+                jsonrpc: '2.0', id: 1, method: 'getAccountInfo',
+                params: [domainAcctKey, { encoding: 'base64' }]
+            }, { timeout: 8000 });
+            b64 = r.data?.result?.value?.data?.[0];
+            if (b64) break;
+            if (r.data?.result && r.data.result.value === null) return ''; // account gone - not transient
         } catch (e) { }
-        if (psTldCache.size > 500) psTldCache.clear();
-        psTldCache.set(parentKey, tld);
-        return tld;
-    } catch (e) { return ''; }
+    }
+    if (!b64) return null; // all endpoints failed - retry next ping
+    const parentKey = base58Encode(Buffer.from(b64, 'base64').subarray(0, 32));
+    if (parentKey === SNS_ROOT_ACCOUNT) return 'sns';
+    if (psTldCache.has(parentKey)) return psTldCache.get(parentKey);
+    let tld = '';
+    try {
+        const t = await axios.get(`https://sdk-proxy-v2.sns.id/reverse-lookup/${parentKey}`, { timeout: 5000 });
+        const lbl = t.data?.result || t.data?.label;
+        if (typeof lbl === 'string' && /^[a-z0-9_-]{1,32}$/.test(lbl.trim().toLowerCase())) tld = lbl.trim().toLowerCase();
+    } catch (e) { return null; } // proxy failure - retry later
+    if (psTldCache.size > 500) psTldCache.clear();
+    psTldCache.set(parentKey, tld);
+    return tld;
 }
 async function psUpdateDomain(id, wallet) {
     try {
@@ -3904,6 +3916,7 @@ async function psUpdateDomain(id, wallet) {
                 const res = r.data?.result;
                 if (r.data?.s === 'ok' && res && typeof res.reverse === 'string' && typeof res.domain === 'string' && !res.stale) {
                     const tld = await psResolveDomainTld(res.domain);
+                    if (tld === null) return; // transient - keep uncached so next ping retries
                     domain = tld ? `${res.reverse.trim()}.${tld}` : res.reverse.trim();
                 }
             } catch (e) { }
