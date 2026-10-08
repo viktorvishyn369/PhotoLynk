@@ -2633,9 +2633,15 @@ db.serialize(() => {
 
     if (COMPLIMENTARY_PURGE_INTERVAL_MS > 0) {
         setInterval(() => {
-            purgeExpiredComplimentaryUsers().catch((e) => {
-                console.error('[AutoPurge] Scheduled purge failed:', e.message);
-            });
+            // Migrate stale states (grace→expired etc.) before each purge pass,
+            // otherwise dormant users never get deleted_at stamped between restarts.
+            migrateStalePlanStates()
+                .catch((e) => console.error('[Migration] Scheduled migration failed:', e.message))
+                .finally(() => {
+                    purgeExpiredComplimentaryUsers().catch((e) => {
+                        console.error('[AutoPurge] Scheduled purge failed:', e.message);
+                    });
+                });
         }, COMPLIMENTARY_PURGE_INTERVAL_MS);
     }
 });
@@ -3033,6 +3039,33 @@ const migrateStalePlanStates = async () => {
         console.log(`[Migration] Migrated ${staleActive.length} expired active→grace users`);
     }
 
+    // 4. Stored 'grace' users whose grace window already ended → expired.
+    //    Without this, a user who went dormant during grace kept status='grace'
+    //    forever (the resolver only transitions on an API call), and AutoPurge's
+    //    status!='grace' exclusion meant they were never purged. deleted_at is
+    //    stamped as grace_until - the retention clock starts when grace ended,
+    //    not when we happened to notice.
+    const staleGrace = await dbAllAsync(
+        `SELECT user_id, grace_until FROM user_plans
+         WHERE status = 'grace' AND grace_until IS NOT NULL AND grace_until > 0 AND grace_until <= ?
+           AND (premium_gb IS NULL OR premium_gb = 0 OR premium_expires_at IS NULL OR premium_expires_at < ?)`,
+        [now, now]
+    );
+    for (const row of staleGrace) {
+        try {
+            await dbRunAsync(
+                `UPDATE user_plans SET status = 'expired', deleted_at = COALESCE(NULLIF(deleted_at, 0), ?), updated_at = ? WHERE user_id = ?`,
+                [Number(row.grace_until), now, row.user_id]
+            );
+            fixed++;
+        } catch (e) {
+            console.error(`[Migration] Failed to expire grace user ${row.user_id}:`, e.message);
+        }
+    }
+    if (staleGrace.length > 0) {
+        console.log(`[Migration] Expired ${staleGrace.length} stale grace users`);
+    }
+
     if (fixed > 0) {
         console.log(`[Migration] Total stale plan states fixed: ${fixed}`);
     }
@@ -3091,53 +3124,22 @@ const purgeExpiredComplimentaryUsers = async () => {
                 continue;
             }
 
-            const user = await dbGetAsync(`SELECT * FROM users WHERE id = ?`, [uid]);
-            if (!user) continue;
-
-            const possibleKeys = new Set(getStealthCloudAllPossibleUserKeys(user));
-            possibleKeys.add(String(uid));
-            const devices = await dbAllAsync(`SELECT * FROM devices WHERE user_id = ?`, [uid]);
-            for (const device of devices) {
-                if (device && device.device_uuid) {
-                    const safe = sanitizeUserKey(device.device_uuid);
-                    if (safe) possibleKeys.add(safe);
-                }
-            }
-
-            const dirsToDelete = new Set();
-            for (const key of possibleKeys) {
-                if (!key) continue;
-                const cloudDir = path.join(CLOUD_DIR, 'users', key);
-                if (fs.existsSync(cloudDir)) dirsToDelete.add(cloudDir);
-                if (CHUNKS_DIR) {
-                    const chunksDir = path.join(CHUNKS_DIR, 'users', key);
-                    if (fs.existsSync(chunksDir)) dirsToDelete.add(chunksDir);
-                }
-            }
-            for (const device of devices) {
-                if (!device || !device.device_uuid) continue;
-                const deviceDir = path.join(UPLOAD_DIR, device.device_uuid);
-                if (fs.existsSync(deviceDir)) dirsToDelete.add(deviceDir);
-            }
-
-            clearStealthCloudDedupCachesForKeys(Array.from(possibleKeys));
-
-            for (const dir of dirsToDelete) {
-                try {
-                    fs.rmSync(dir, { recursive: true, force: true });
-                } catch (e) {
-                    console.error(`[AutoPurge] Failed to remove ${dir}:`, e.message);
-                }
-            }
-
-            await safeDeleteFromTable('cloud_chunks', 'user_id = ?', [uid]);
-            await safeDeleteFromTable('cloud_device_state', 'user_id = ?', [uid]);
-            await safeDeleteFromTable('files', 'user_id = ?', [uid]);
-            await safeDeleteFromTable('platform_hashes', 'user_id = ?', [uid]);
-
             const deletedAtStr = new Date(Number(row.deleted_at)).toISOString();
             const ageDays = Math.floor((now - Number(row.deleted_at)) / (24 * 60 * 60 * 1000));
-            console.log(`[AutoPurge] Purged cloud data for user ${uid} (${row.email || row.user_uuid}) — expired ${ageDays}d ago, deleted_at=${deletedAtStr}. NFTs/certs preserved.`);
+            // Full deletion: user row, plan, devices, payment rows, cloud dirs,
+            // upload dirs, files/chunks tables. NFT dirs, nft-service data and
+            // certificates are preserved via preserveNftData.
+            const result = await purgeUserEverywhere(uid, {
+                deleteFiles: true,
+                preserveNftData: true,
+                reason: 'autopurge_retention',
+            });
+            if (!result || !result.ok) {
+                console.error(`[AutoPurge] purgeUserEverywhere failed for user ${uid}`);
+                errors++;
+                continue;
+            }
+            console.log(`[AutoPurge] Purged user ${uid} (${row.email || row.user_uuid}) — expired ${ageDays}d ago, deleted_at=${deletedAtStr}. NFTs/certs preserved.`);
 
             purged++;
         } catch (e) {
