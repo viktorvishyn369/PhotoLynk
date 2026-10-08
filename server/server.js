@@ -653,7 +653,7 @@ table{min-width:100%;width:auto}
 
 <script>
 var allUsers=[];var filteredUsers=[];var sortCol='id';var sortDir='desc';var activeFilter='all';var serverTime='';var adminStats={photolynk_nfts_minted:0,photolynk_paid_nfts_minted:0,photolynk_free_premium_nfts_minted:0,photolynk_premium_users:0};
-var activeApp='photolynk';var psUsers=[];var psFiltered=[];var psLoaded=false;var psSortCol='last_seen';var psSortDir='desc';
+var activeApp='photolynk';var psUsers=[];var psFiltered=[];var psLoaded=false;var psSortCol='last_seen';var psSortDir='desc';var psRevenue={count:0,usd:0};
 
 function switchApp(app){
   activeApp=app;activeFilter='all';
@@ -678,7 +678,7 @@ async function loadPsUsers(){
     var r=await fetch('/admin/api/paceseeker-users');var d=await r.json();
     if(!r.ok)throw new Error(d.error||'Failed');
     serverTime=d.server_time||'';
-    psUsers=d.users||[];psLoaded=true;
+    psUsers=d.users||[];psRevenue=d.revenue||{count:0,usd:0};psLoaded=true;
     document.getElementById('loading').style.display='none';
     document.getElementById('ps-table').style.display='';
     updateStats();buildFilters();applyFilters();
@@ -718,7 +718,7 @@ function renderPsTable(){
     html+='<td class="uuid-cell" title="'+u.device_hash+'" onclick="copyUuid(this,&apos;'+u.device_hash+'&apos;)">'+(u.device_hash||'').substring(0,13)+'</td>';
     html+='<td>'+liveDot(u.last_seen)+'</td>';
     html+='<td>'+statusBadge(u.status)+'</td>';
-    html+='<td>'+subBadge(u.sub_status,u.sub_until_date)+'</td>';
+    html+='<td>'+subBadge(u.sub_status,u.sub_until_date,u)+'</td>';
     html+='<td>'+fmtDate(u.trial_expires_at_date)+'</td>';
     html+='<td>'+fmtDate(u.first_seen_date)+'</td>';
     html+='<td>'+(u.version_code?'<span class="mini-tag">vc'+u.version_code+'</span>':'<span class="date-cell">-</span>')+'</td>';
@@ -739,7 +739,21 @@ function liveDot(ts){if(!ts)return'<span class="live-dot live-off" title="Never 
 // ISO country code -> flag emoji via regional indicator symbols.
 function flagEmoji(cc){if(!cc||cc.length!==2)return'';return String.fromCodePoint(0x1F1E6+cc.charCodeAt(0)-65,0x1F1E6+cc.charCodeAt(1)-65)}
 
-function subBadge(st,untilIso){var m={paid:{t:'Paid',c:'var(--success)'},invite:{t:'Invite',c:'var(--accent)'},trial:{t:'Trial',c:'var(--trial)'}};var s=m[st];if(!s)return'<span class="date-cell">-</span>';var tip=untilIso?new Date(untilIso).toLocaleDateString('en-GB',{day:'2-digit',month:'short'}):'';return'<span class="mini-tag" style="color:'+s.c+'" title="'+(untilIso?('until '+new Date(untilIso).toLocaleString()):'')+'">'+s.t+(tip?'&nbsp;'+tip:'')+'</span>'}
+function payTip(u){var p=[];if(u.sub_paid_at_date)p.push('paid '+new Date(u.sub_paid_at_date).toLocaleString());if(u.sub_paid_with)p.push(u.sub_paid_with);if(u.sub_usd)p.push('$'+Number(u.sub_usd).toFixed(2));if(u.sub_plan)p.push('plan '+u.sub_plan);if(u.sub_signature)p.push('sig '+u.sub_signature.substring(0,20)+'…');return p.join(' · ')}
+
+function subBadge(st,untilIso,u){
+  var m={paid:{t:'Paid',c:'var(--success)'},invite:{t:'Invite',c:'var(--accent)'},trial:{t:'Trial',c:'var(--trial)'}};var s=m[st];
+  var pay=u&&u.sub_signature?u:null;
+  // Expired/no active sub but a past payment was recorded - keep provenance visible.
+  if(!s){
+    if(pay)return'<span class="mini-tag" style="color:var(--muted);cursor:pointer" title="'+payTip(pay)+' - click to copy sig" onclick="copyUuid(this,&apos;'+pay.sub_signature+'&apos;)">ex-paid</span>';
+    return'<span class="date-cell">-</span>';
+  }
+  var tip=untilIso?new Date(untilIso).toLocaleDateString('en-GB',{day:'2-digit',month:'short'}):'';
+  var copyable=pay&&st==='paid';
+  var title=(untilIso?('until '+new Date(untilIso).toLocaleString()):'')+(pay?('\n'+payTip(pay)+(copyable?' - click to copy sig':'')):'');
+  return'<span class="mini-tag" style="color:'+s.c+(copyable?';cursor:pointer':'')+'" title="'+title+'"'+(copyable?' onclick="copyUuid(this,&apos;'+pay.sub_signature+'&apos;)"':'')+'>'+s.t+(tip?'&nbsp;'+tip:'')+'</span>'
+}
 
 function fmtBytes(b){if(!b||b<=0)return'0';if(b<1048576)return(b/1024).toFixed(0)+' KB';if(b<1073741824)return(b/1048576).toFixed(1)+' MB';return(b/1073741824).toFixed(2)+' GB'}
 
@@ -806,7 +820,7 @@ function updateStats(){
     var ponline=psUsers.filter(function(u){return u.last_seen&&(Date.now()-u.last_seen)<150000}).length;
     var psubs=psUsers.filter(function(u){return u.sub_status==='paid'||u.sub_status==='invite'}).length;
     var pst=serverTime?'<span>Server: <b>'+new Date(serverTime).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+'</b></span>':'';
-    document.getElementById('header-stats').innerHTML=pst+'<span>Devices: <b>'+ptotal+'</b></span><span>Online: <b>'+ponline+'</b></span><span>In trial: <b>'+ptrials+'</b></span><span>Subs: <b>'+psubs+'</b></span><span>Expired: <b>'+(ptotal-ptrials)+'</b></span><span>7d active: <b>'+precent+'</b></span>';
+    document.getElementById('header-stats').innerHTML=pst+'<span>Devices: <b>'+ptotal+'</b></span><span>Online: <b>'+ponline+'</b></span><span>In trial: <b>'+ptrials+'</b></span><span>Subs: <b>'+psubs+'</b></span><span>Expired: <b>'+(ptotal-ptrials)+'</b></span><span>7d active: <b>'+precent+'</b></span><span>Revenue: <b>$'+(psRevenue.usd||0).toFixed(2)+'</b></span><span>Payments: <b>'+(psRevenue.count||0)+'</b></span>';
     return;
   }
   var total=allUsers.length;
@@ -3848,6 +3862,26 @@ app.get('/api/paceseeker/trial', (req, res) => {
     const st = /^(none|trial|invite|paid)$/.test(stRaw) ? stRaw : null;
     const seRaw = String(req.query.se || '');
     const se = /^\d+$/.test(seRaw) ? Math.floor(Number(seRaw)) : null;
+    // Payment provenance (self-reported with the sub status): tx signature,
+    // paid-at, token, plan, USD-at-checkout, atomic amount. All optional.
+    const sigRaw = String(req.query.sig || '');
+    const paySig = /^[1-9A-HJ-NP-Za-km-z]{32,128}$/.test(sigRaw) ? sigRaw : null;
+    const patRaw = String(req.query.pat || '');
+    const payAt = /^\d+$/.test(patRaw) ? Math.floor(Number(patRaw)) : null;
+    const pwRaw = String(req.query.pw || '');
+    const payWith = /^[A-Za-z0-9]{1,16}$/.test(pwRaw) ? pwRaw.toUpperCase() : null;
+    const plRaw = String(req.query.pl || '');
+    const payPlan = /^[A-Za-z0-9_-]{1,24}$/.test(plRaw) ? plRaw : null;
+    const usdRaw = String(req.query.usd || '');
+    const payUsd = /^\d+(\.\d+)?$/.test(usdRaw) ? Number(usdRaw) : null;
+    const amtRaw = String(req.query.amt || '');
+    const payAmt = /^\d+$/.test(amtRaw) ? Math.floor(Number(amtRaw)) : null;
+    if (paySig) {
+        // Immutable revenue ledger - deduped by signature, recorded even if
+        // the device row write below fails, survives device deletion.
+        db.run('INSERT OR IGNORE INTO paceseeker_revenue (signature, device_hash, paid_at, paid_with, plan, usd_at_checkout, amount_atomic, reported_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            [paySig, id, payAt, payWith, payPlan, payUsd, payAmt, now], () => { });
+    }
 
     db.get('SELECT * FROM paceseeker_devices WHERE device_hash = ?', [id], (err, row) => {
         if (err) {
@@ -3864,8 +3898,8 @@ app.get('/api/paceseeker/trial', (req, res) => {
                 const started = arch ? arch.trial_started_at : (sa !== null ? sa : now); // sa<=now: an already-expired local start yields an expired record, not a fresh trial
                 const expires = arch ? arch.trial_expires_at : started + trialMs;
                 db.run(
-                    'INSERT OR IGNORE INTO paceseeker_devices (device_hash, first_seen, last_seen, trial_started_at, trial_expires_at, version_code, last_ip, sub_status, sub_until) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
-                    [id, arch ? (arch.first_seen || started) : started, now, started, expires, vc, ip, st || 'none', se],
+                    'INSERT OR IGNORE INTO paceseeker_devices (device_hash, first_seen, last_seen, trial_started_at, trial_expires_at, version_code, last_ip, sub_status, sub_until, sub_signature, sub_paid_at, sub_paid_with, sub_plan, sub_usd, sub_amount_atomic) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    [id, arch ? (arch.first_seen || started) : started, now, started, expires, vc, ip, st || 'none', se, paySig, payAt, payWith, payPlan, payUsd, payAmt],
                     () => {
                         db.get('SELECT * FROM paceseeker_devices WHERE device_hash = ?', [id], (e2, r2) => {
                             if (e2 || !r2) return res.status(500).json({ error: 'Database error' });
@@ -3878,8 +3912,8 @@ app.get('/api/paceseeker/trial', (req, res) => {
             return;
         }
         db.run(
-            'UPDATE paceseeker_devices SET last_seen = ?, version_code = COALESCE(?, version_code), last_ip = ?, sub_status = COALESCE(?, sub_status), sub_until = COALESCE(?, sub_until) WHERE device_hash = ?',
-            [now, vc, ip, st, se, id]
+            'UPDATE paceseeker_devices SET last_seen = ?, version_code = COALESCE(?, version_code), last_ip = ?, sub_status = COALESCE(?, sub_status), sub_until = COALESCE(?, sub_until), sub_signature = COALESCE(?, sub_signature), sub_paid_at = COALESCE(?, sub_paid_at), sub_paid_with = COALESCE(?, sub_paid_with), sub_plan = COALESCE(?, sub_plan), sub_usd = COALESCE(?, sub_usd), sub_amount_atomic = COALESCE(?, sub_amount_atomic) WHERE device_hash = ?',
+            [now, vc, ip, st, se, paySig, payAt, payWith, payPlan, payUsd, payAmt, id]
         );
         if (ip && (row.last_ip !== ip || !row.last_country_code)) psUpdateGeo(id, ip); // IP moved or unresolved
         res.json({ trial: true, startedAt: row.trial_started_at, expiresAt: row.trial_expires_at });
@@ -3897,8 +3931,12 @@ app.get('/admin/api/paceseeker-users', adminAuth, (req, res) => {
         if (err) {
             return res.status(500).json({ error: err.message });
         }
+        // Lifetime revenue from the append-only ledger - counts every payment
+        // ever reported, including devices since hidden or purged.
+        db.get('SELECT COUNT(*) AS cnt, COALESCE(SUM(usd_at_checkout),0) AS usd FROM paceseeker_revenue', [], (eR, rev) => {
         res.json({
             server_time: new Date().toISOString(),
+            revenue: { count: (rev && rev.cnt) || 0, usd: (rev && rev.usd) || 0 },
             users: (rows || []).map(r => ({
                 device_hash: r.device_hash,
                 first_seen: r.first_seen,
@@ -3913,9 +3951,17 @@ app.get('/admin/api/paceseeker-users', adminAuth, (req, res) => {
                 last_country_code: r.last_country_code || '',
                 sub_status: r.sub_status || 'none',
                 sub_until: r.sub_until || null,
+                sub_signature: r.sub_signature || '',
+                sub_paid_at: r.sub_paid_at || null,
+                sub_paid_at_date: r.sub_paid_at ? new Date(r.sub_paid_at).toISOString() : null,
+                sub_paid_with: r.sub_paid_with || '',
+                sub_plan: r.sub_plan || '',
+                sub_usd: r.sub_usd || 0,
+                sub_amount_atomic: r.sub_amount_atomic || null,
                 sub_until_date: r.sub_until ? new Date(r.sub_until).toISOString() : null,
                 status: (r.trial_expires_at && r.trial_expires_at > now) ? 'trial' : 'expired',
             })),
+        });
         });
     });
 });
@@ -6331,6 +6377,27 @@ db.run(`CREATE TABLE IF NOT EXISTS paceseeker_devices (
 db.run(`ALTER TABLE paceseeker_devices ADD COLUMN sub_status TEXT`, () => { });
 db.run(`ALTER TABLE paceseeker_devices ADD COLUMN sub_until INTEGER`, () => { });
 db.run(`ALTER TABLE paceseeker_devices ADD COLUMN last_country_code TEXT`, () => { });
+// Client-reported payment provenance for the admin Sub column.
+db.run(`ALTER TABLE paceseeker_devices ADD COLUMN sub_signature TEXT`, () => { });
+db.run(`ALTER TABLE paceseeker_devices ADD COLUMN sub_paid_at INTEGER`, () => { });
+db.run(`ALTER TABLE paceseeker_devices ADD COLUMN sub_paid_with TEXT`, () => { });
+db.run(`ALTER TABLE paceseeker_devices ADD COLUMN sub_plan TEXT`, () => { });
+db.run(`ALTER TABLE paceseeker_devices ADD COLUMN sub_usd REAL`, () => { });
+db.run(`ALTER TABLE paceseeker_devices ADD COLUMN sub_amount_atomic INTEGER`, () => { });
+
+// Append-only revenue ledger keyed on the tx signature. Dedupes re-reports,
+// survives device hides/purges - "total earned" counts every payment ever
+// reported, forever.
+db.run(`CREATE TABLE IF NOT EXISTS paceseeker_revenue (
+    signature TEXT PRIMARY KEY,
+    device_hash TEXT,
+    paid_at INTEGER,
+    paid_with TEXT,
+    plan TEXT,
+    usd_at_checkout REAL,
+    amount_atomic INTEGER,
+    reported_at INTEGER
+)`);
 
 // Purge tombstone: when a device row is deleted after 10d of silence we keep
 // only its trial timestamps, so a returning device resumes its ORIGINAL
