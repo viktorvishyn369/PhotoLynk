@@ -3764,7 +3764,11 @@ app.get('/api/paceseeker/trial', (req, res) => {
 // Admin API: PaceSeeker trial devices
 app.get('/admin/api/paceseeker-users', adminAuth, (req, res) => {
     const now = Date.now();
-    db.all('SELECT * FROM paceseeker_devices ORDER BY last_seen DESC', [], (err, rows) => {
+    // Devices silent for >24h stay in the DB (they resurface on next ping)
+    // but are hidden from the admin list so stale rows don't clutter the view.
+    const cutoff = now - 86400000;
+    const showAll = req.query.all === '1'; // escape hatch: /admin/api/paceseeker-users?all=1 lists dormant devices too
+    db.all(showAll ? 'SELECT * FROM paceseeker_devices ORDER BY last_seen DESC' : 'SELECT * FROM paceseeker_devices WHERE last_seen >= ? ORDER BY last_seen DESC', showAll ? [] : [cutoff], (err, rows) => {
         if (err) {
             return res.status(500).json({ error: err.message });
         }
