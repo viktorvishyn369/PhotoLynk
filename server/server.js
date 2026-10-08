@@ -2905,9 +2905,14 @@ const purgeUserEverywhere = async (userId, options = {}) => {
             if (fs.existsSync(deviceDir)) dirsToDelete.add(deviceDir);
         }
 
-        const walletInboxDir = getWalletTransferInboxDir(user.wallet_address);
-        if (walletInboxDir && fs.existsSync(walletInboxDir)) {
-            dirsToDelete.add(walletInboxDir);
+        // Transfer inbox lives INSIDE NFT_DIR (_transfer_inbox_<walletHash>) and
+        // may hold in-flight assets for the wallet - never touch it when NFT
+        // data is preserved.
+        if (!preserveNftData) {
+            const walletInboxDir = getWalletTransferInboxDir(user.wallet_address);
+            if (walletInboxDir && fs.existsSync(walletInboxDir)) {
+                dirsToDelete.add(walletInboxDir);
+            }
         }
 
         clearStealthCloudDedupCachesForKeys(Array.from(possibleKeys));
