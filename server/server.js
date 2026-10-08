@@ -3962,7 +3962,12 @@ app.get('/admin/api/paceseeker-users', adminAuth, (req, res) => {
                 sub_usd: r.sub_usd || 0,
                 sub_amount_atomic: r.sub_amount_atomic || null,
                 sub_until_date: r.sub_until ? new Date(r.sub_until).toISOString() : null,
-                status: (r.trial_expires_at && r.trial_expires_at > now) ? 'trial' : 'expired',
+                // An active paid/invite sub overrides trial state - 'active'
+                // means currently entitled, 'trial'/'expired' describe the
+                // raw trial clock for unsubscribed devices.
+                status: ((r.sub_status === 'paid' || r.sub_status === 'invite') && (!r.sub_until || r.sub_until > now))
+                    ? 'active'
+                    : (r.trial_expires_at && r.trial_expires_at > now) ? 'trial' : 'expired',
             })),
         });
         });
