@@ -734,7 +734,35 @@ function storageCell(used,quota){var usedStr=fmtBytes(used);var quotaStr=quota>0
 
 function statusBadge(st){var c='badge-'+(st||'none').replace(/\\s/g,'_');return'<span class="badge '+c+'">'+(st||'none')+'</span>'}
 
-function paymentBadges(u){var tags=[];if(u.payment_type){var pt=(u.payment_type||'').toLowerCase();var label=pt==='solana'?'SOL':pt==='skr'?'SKR':pt;tags.push('<span class="payment-badge payment-'+pt+'">'+label+'</span>')}if(u.nft_is_premium){tags.push('<span class="payment-badge nft-premium">Premium</span>')}if(u.nft_payments&&u.nft_payments.length>0){var types={};u.nft_payments.forEach(function(p){var k=(p.platform||'iap')+':'+(p.type||'');types[k]=(types[k]||0)+1});Object.keys(types).forEach(function(k){var parts=k.split(':');tags.push('<span class="mini-tag">'+parts[0]+' x'+types[k]+'</span>')})}if(u.sol_payments&&u.sol_payments.length>0){var solCount=0,skrCount=0;u.sol_payments.forEach(function(p){if(p.payment_token==='SKR'||(p.skr&&Number(p.skr)>0)){skrCount++}else{solCount++}});if(solCount>0)tags.push('<span class="payment-badge payment-solana">SOL x'+solCount+'</span>');if(skrCount>0)tags.push('<span class="payment-badge payment-skr">SKR x'+skrCount+'</span>')}return tags.length?tags.join(' '):'<span class="date-cell">-</span>'}
+// Per-payment ledger for the Payments column: every sub purchase/renewal
+// renders as "TOKEN amount duration date" so a repeat payer's history reads
+// chronologically - what type, how much, when, and how far it extends cover.
+function paymentBadges(u){
+  var evs=[];
+  (u.sol_payments||[]).forEach(function(p){
+    var tok=p.payment_token==='SKR'||(p.skr&&Number(p.skr)>0)?'SKR':'SOL';
+    evs.push({tok:tok,amt:tok==='SKR'?Number(p.skr)||0:Number(p.sol)||0,dur:p.duration||'',date:p.date});
+  });
+  (u.nft_payments||[]).forEach(function(p){
+    evs.push({tok:String(p.platform||'IAP').toUpperCase(),usd:Number(p.amount)||0,dur:p.type||'',date:p.date});
+  });
+  if(!evs.length&&u.payment_type){evs.push({tok:u.payment_type==='solana'?'SOL':String(u.payment_type).toUpperCase(),amt:0,dur:'',date:u.payment_at_date});}
+  evs=evs.filter(function(e){return e.date}).sort(function(a,b){return new Date(b.date)-new Date(a.date)});
+  if(!evs.length)return'<span class="date-cell">-</span>';
+  var html='';
+  evs.slice(0,4).forEach(function(e){
+    var cls=e.tok==='SOL'?'payment-solana':e.tok==='SKR'?'payment-skr':'';
+    var amtTxt=e.usd?('$'+e.usd.toFixed(2)):(e.amt?(e.amt.toFixed(e.tok==='SKR'?2:4)+' '+e.tok):'');
+    html+='<div class="detail-row" style="margin-top:0;align-items:center">'
+      +'<span class="payment-badge '+cls+'">'+e.tok+'</span>'
+      +(amtTxt?'<span class="mini-tag" style="color:var(--text)">'+amtTxt+'</span>':'')
+      +(e.dur?'<span class="mini-tag">'+e.dur+'</span>':'')
+      +'<span class="date-cell" style="font-size:10px">'+new Date(e.date).toLocaleDateString('en-GB',{day:'2-digit',month:'short'})+'</span></div>';
+  });
+  if(evs.length>4)html+='<div class="mini-tag">+'+(evs.length-4)+' more</div>';
+  if(u.expires_at_date)html+='<div class="mini-tag" style="color:var(--muted)">paid til '+new Date(u.expires_at_date).toLocaleDateString('en-GB',{day:'2-digit',month:'short'})+'</div>';
+  return html;
+}
 
 function totalPaidCell(u){var parts=[];var totalUsd=u.total_usd_realtime||0;if(totalUsd>0)parts.push('$'+totalUsd.toFixed(2));var sol=u.sol_total_paid||0;var skr=u.skr_total_paid||0;if(sol>0)parts.push(sol.toFixed(4)+' SOL');if(skr>0)parts.push(skr.toFixed(2)+' SKR');if(!parts.length)return'<span class="money-cell zero">-</span>';return'<span class="money-cell">'+parts.join('<br>')+'</span>'}
 
