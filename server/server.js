@@ -751,7 +751,7 @@ function subBadge(st,untilIso,u){
   }
   var tip=untilIso?new Date(untilIso).toLocaleDateString('en-GB',{day:'2-digit',month:'short'}):'';
   var copyable=pay&&st==='paid';
-  var title=(untilIso?('until '+new Date(untilIso).toLocaleString()):'')+(pay?('\n'+payTip(pay)+(copyable?' - click to copy sig':'')):'');
+  var title=(untilIso?('until '+new Date(untilIso).toLocaleString()):'')+(pay?('\\n'+payTip(pay)+(copyable?' - click to copy sig':'')):'');
   return'<span class="mini-tag" style="color:'+s.c+(copyable?';cursor:pointer':'')+'" title="'+title+'"'+(copyable?' onclick="copyUuid(this,&apos;'+pay.sub_signature+'&apos;)"':'')+'>'+s.t+(tip?'&nbsp;'+tip:'')+'</span>'
 }
 
