@@ -539,6 +539,7 @@ table{min-width:100%;width:auto}
 .pay-dur{color:var(--muted)}
 .pay-date{color:var(--muted);text-align:right}
 .pay-until{margin-top:4px;padding-top:4px;border-top:1px dashed var(--border);color:var(--muted);font-size:10px}
+.pay-star{color:#facc15;text-shadow:0 0 4px rgba(250,204,21,.5)}
 </style>
 </head>
 <body>
@@ -759,16 +760,15 @@ function paymentBadges(u){
   evs=evs.filter(function(e){return e.date}).sort(function(a,b){return new Date(b.date)-new Date(a.date)});
   if(!evs.length)return'<span class="date-cell">-</span>';
   var html='<div class="pay-col">';
-  evs.slice(0,4).forEach(function(e){
+  evs.forEach(function(e,i){
     var cls=e.tok==='SOL'?'pay-sol':e.tok==='SKR'?'pay-skr':'pay-oth';
     var amtTxt=e.usd?('$'+e.usd.toFixed(2)):(e.amt?(e.amt.toFixed(e.tok==='SKR'?2:4)):'');
     html+='<div class="pay-line">'
       +'<span class="pay-tok '+cls+'">'+e.tok+'</span>'
-      +'<span class="pay-amt">'+amtTxt+'</span>'
+      +'<span class="pay-amt">'+amtTxt+(i===0?' <span class="pay-star" title="Latest payment">&#9733;</span>':'')+'</span>'
       +'<span class="pay-dur">'+e.dur+'</span>'
       +'<span class="pay-date">'+new Date(e.date).toLocaleDateString('en-GB',{day:'2-digit',month:'short'})+'</span></div>';
   });
-  if(evs.length>4)html+='<div class="pay-line"><span class="pay-dur" style="grid-column:1/-1">+'+(evs.length-4)+' more</span></div>';
   if(u.expires_at_date)html+='<div class="pay-until">paid til '+new Date(u.expires_at_date).toLocaleDateString('en-GB',{day:'2-digit',month:'short'})+'</div>';
   return html+'</div>';
 }
