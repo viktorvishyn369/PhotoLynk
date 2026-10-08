@@ -708,7 +708,7 @@ function renderPsTable(){
     html+='<td class="uuid-cell" title="'+u.device_hash+'" onclick="copyUuid(this,&apos;'+u.device_hash+'&apos;)">'+(u.device_hash||'').substring(0,13)+'</td>';
     html+='<td>'+liveDot(u.last_seen)+'</td>';
     html+='<td>'+statusBadge(u.status)+'</td>';
-    html+='<td>'+subBadge(u.sub_status)+'</td>';
+    html+='<td>'+subBadge(u.sub_status,u.sub_until_date)+'</td>';
     html+='<td>'+fmtDate(u.trial_expires_at_date)+'</td>';
     html+='<td>'+fmtDate(u.first_seen_date)+'</td>';
     html+='<td>'+(u.version_code?'<span class="mini-tag">vc'+u.version_code+'</span>':'<span class="date-cell">-</span>')+'</td>';
@@ -726,7 +726,7 @@ function fmtLogin(iso){if(!iso)return'<span class="date-cell login-inactive">Nev
 // alive (foreground or trading in background). Online = seen within 150s.
 function liveDot(ts){if(!ts)return'<span class="live-dot live-off" title="Never seen"></span>';var ago=Date.now()-ts;var on=ago<150000;var d=new Date(ts);var tip=on?'Online (last ping '+Math.max(1,Math.floor(ago/1000))+'s ago)':'Offline since '+d.toLocaleString();return'<span class="live-dot '+(on?'live-on':'live-off')+'" title="'+tip+'"></span>'}
 
-function subBadge(st){var m={paid:{t:'Paid',c:'var(--success)'},invite:{t:'Invite',c:'var(--accent)'},trial:{t:'Trial',c:'var(--trial)'}};var s=m[st];if(!s)return'<span class="date-cell">-</span>';return'<span class="mini-tag" style="color:'+s.c+'">'+s.t+'</span>'}
+function subBadge(st,untilIso){var m={paid:{t:'Paid',c:'var(--success)'},invite:{t:'Invite',c:'var(--accent)'},trial:{t:'Trial',c:'var(--trial)'}};var s=m[st];if(!s)return'<span class="date-cell">-</span>';var tip=untilIso?new Date(untilIso).toLocaleDateString('en-GB',{day:'2-digit',month:'short'}):'';return'<span class="mini-tag" style="color:'+s.c+'" title="'+(untilIso?('until '+new Date(untilIso).toLocaleString()):'')+'">'+s.t+(tip?'&nbsp;'+tip:'')+'</span>'}
 
 function fmtBytes(b){if(!b||b<=0)return'0';if(b<1048576)return(b/1024).toFixed(0)+' KB';if(b<1073741824)return(b/1048576).toFixed(1)+' MB';return(b/1073741824).toFixed(2)+' GB'}
 
@@ -3731,6 +3731,8 @@ app.get('/api/paceseeker/trial', (req, res) => {
     // Client-reported entitlement: paid sub, redeemed invite, trial, or none.
     const stRaw = String(req.query.st || '');
     const st = /^(none|trial|invite|paid)$/.test(stRaw) ? stRaw : null;
+    const seRaw = String(req.query.se || '');
+    const se = /^\d+$/.test(seRaw) ? Math.floor(Number(seRaw)) : null;
 
     db.get('SELECT * FROM paceseeker_devices WHERE device_hash = ?', [id], (err, row) => {
         if (err) {
@@ -3742,8 +3744,8 @@ app.get('/api/paceseeker/trial', (req, res) => {
             // the SELECT after it returns the canonical row either way.
             const started = sa !== null ? sa : now; // sa<=now: an already-expired local start yields an expired record, not a fresh trial
             db.run(
-                'INSERT OR IGNORE INTO paceseeker_devices (device_hash, first_seen, last_seen, trial_started_at, trial_expires_at, version_code, last_ip, sub_status) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-                [id, started, now, started, started + trialMs, vc, ip, st || 'none'],
+                'INSERT OR IGNORE INTO paceseeker_devices (device_hash, first_seen, last_seen, trial_started_at, trial_expires_at, version_code, last_ip, sub_status, sub_until) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [id, started, now, started, started + trialMs, vc, ip, st || 'none', se],
                 () => {
                     db.get('SELECT * FROM paceseeker_devices WHERE device_hash = ?', [id], (e2, r2) => {
                         if (e2 || !r2) return res.status(500).json({ error: 'Database error' });
@@ -3754,8 +3756,8 @@ app.get('/api/paceseeker/trial', (req, res) => {
             return;
         }
         db.run(
-            'UPDATE paceseeker_devices SET last_seen = ?, version_code = COALESCE(?, version_code), last_ip = ?, sub_status = COALESCE(?, sub_status) WHERE device_hash = ?',
-            [now, vc, ip, st, id]
+            'UPDATE paceseeker_devices SET last_seen = ?, version_code = COALESCE(?, version_code), last_ip = ?, sub_status = COALESCE(?, sub_status), sub_until = COALESCE(?, sub_until) WHERE device_hash = ?',
+            [now, vc, ip, st, se, id]
         );
         res.json({ trial: true, startedAt: row.trial_started_at, expiresAt: row.trial_expires_at });
     });
@@ -3786,6 +3788,8 @@ app.get('/admin/api/paceseeker-users', adminAuth, (req, res) => {
                 version_code: r.version_code,
                 last_ip: r.last_ip,
                 sub_status: r.sub_status || 'none',
+                sub_until: r.sub_until || null,
+                sub_until_date: r.sub_until ? new Date(r.sub_until).toISOString() : null,
                 status: (r.trial_expires_at && r.trial_expires_at > now) ? 'trial' : 'expired',
             })),
         });
@@ -6199,8 +6203,9 @@ db.run(`CREATE TABLE IF NOT EXISTS paceseeker_devices (
     version_code INTEGER,
     last_ip TEXT
 )`);
-// Presence/subscription column for the admin Sub column.
+// Presence/subscription columns for the admin Sub column.
 db.run(`ALTER TABLE paceseeker_devices ADD COLUMN sub_status TEXT`, () => { });
+db.run(`ALTER TABLE paceseeker_devices ADD COLUMN sub_until INTEGER`, () => { });
 
 // Create solana_payments table if not exists
 db.run(`CREATE TABLE IF NOT EXISTS solana_payments (
