@@ -701,11 +701,11 @@ async function loadAdClaims(){
   try{
     var r=await fetch('/admin/api/ad-claims');var d=await r.json();
     if(!r.ok)return;
-    var claims=d.claims||[];var pend=claims.filter(function(c){return c.status==='review'}).length;
+    var claims=d.claims||[];var pend=claims.filter(function(c){return c.status==='pending'||c.status==='review'}).length;
     document.getElementById('eco-claims-note').textContent=pend?(pend+' pending review'):'';
     var tb=document.getElementById('claims-tbody');var html='';
     claims.forEach(function(c){
-      var stc=c.status==='verified'?'var(--success)':c.status==='review'?'var(--warn)':c.status==='rejected'?'var(--danger)':'var(--muted)';
+      var stc=c.status==='verified'?'var(--success)':(c.status==='pending'||c.status==='review')?'var(--warn)':c.status==='rejected'?'var(--danger)':'var(--muted)';
       html+='<tr>';
       html+='<td><span class="mini-tag">w'+c.week_key+'</span></td>';
       html+='<td class="uuid-cell" title="'+c.account_id+'">'+String(c.account_id||'').substring(0,14)+'</td>';
@@ -714,7 +714,7 @@ async function loadAdClaims(){
       html+='<td><span class="mini-tag">'+(c.code||'')+'</span></td>';
       html+='<td><span class="date-cell">'+(c.author_handle?('@'+c.author_handle):'-')+'</span></td>';
       html+='<td><span class="mini-tag" style="color:'+stc+'">'+c.status+'</span></td>';
-      html+='<td>'+(c.status==='review'
+      html+='<td>'+(c.status==='pending'||c.status==='review'
         ?'<button class="btn btn-primary" style="padding:3px 10px;font-size:11px" onclick="reviewClaim('+c.id+',&apos;approve&apos;)">Approve</button> <button class="btn btn-red" style="padding:3px 10px;font-size:11px" onclick="reviewClaim('+c.id+',&apos;reject&apos;)">Reject</button>'
         :'<span class="date-cell">-</span>')+'</td>';
       html+='</tr>';
@@ -4035,6 +4035,10 @@ db.serialize(() => {
     db.run(`CREATE INDEX IF NOT EXISTS idx_eco_members_wallet ON ecosystem_members(wallet)`, (e) => { if (e) console.error('[Eco] idx wallet:', e.message); });
     db.run(`CREATE INDEX IF NOT EXISTS idx_eco_members_acct ON ecosystem_members(account_id)`, (e) => { if (e) console.error('[Eco] idx acct:', e.message); });
     db.run(`CREATE INDEX IF NOT EXISTS idx_ad_claims_status ON ad_claims(status)`, (e) => { if (e) console.error('[Eco] idx claims:', e.message); });
+    // ad_strict=1 -> account submitted a post that failed background re-checks;
+    // future weekly claims must auto-verify (no optimistic grant).
+    db.run(`ALTER TABLE ecosystem_accounts ADD COLUMN ad_strict INTEGER DEFAULT 0`, () => { });
+    db.run(`ALTER TABLE ad_claims ADD COLUMN verify_attempts INTEGER DEFAULT 0`, () => { });
 });
 
 const ECO_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -4215,6 +4219,128 @@ const ECO_AD_COPIES = {
 };
 const ECO_REQUIRED_TAG = '#stealthlynk';
 
+// Detect the platform from the post URL — the client's platform hint is ignored
+// (never trust caller-supplied classification).
+function ecoDetectPlatform(url) {
+    const u = String(url || '').toLowerCase();
+    if (/(^|\/\/)(www\.)?(x\.com|twitter\.com)\//.test(u)) return 'x';
+    if (/(^|\/\/)(www\.)?(t\.me|telegram\.me|telegram\.dog)\//.test(u)) return 'telegram';
+    if (/(^|\/\/)(www\.)?instagram\.com\//.test(u)) return 'instagram';
+    if (/(^|\/\/)(www\.)?(facebook\.com|fb\.watch|fb\.com)\//.test(u)) return 'facebook';
+    if (/(^|\/\/)(www\.)?(njump\.me|nostr\.com|iris\.to|snort\.social|primal\.net)\//.test(u)) return 'nostr';
+    return 'other';
+}
+
+function ecoTextHasCodeAndTag(text, code) {
+    const t = String(text || '');
+    return t.includes(code) && t.toLowerCase().includes(ECO_REQUIRED_TAG);
+}
+
+// Attempt to fetch + verify a public post. Returns:
+//   { verified:true, authorHandle }  — post fetched, contains code + tag
+//   { verified:false, reason:'content_mismatch' } — fetched fine but missing code/tag
+//   { verified:false, reason:'unreachable'|'fetch_failed' } — couldn't fetch (login wall, 404, down)
+// Callers decide whether 'fetch_failed' deserves an optimistic grant.
+async function ecoVerifyPost(platform, postUrl, code) {
+    try {
+        if (platform === 'x') {
+            if (!/^https:\/\/(www\.)?(x\.com|twitter\.com)\/[A-Za-z0-9_]{1,20}\/status\/\d+/.test(postUrl)) {
+                return { verified: false, reason: 'bad_url' };
+            }
+            const oe = await axios.get(`https://publish.twitter.com/oembed?url=${encodeURIComponent(postUrl)}`, { timeout: 8000 });
+            const html = String(oe.data?.html || '');
+            const text = html.replace(/<[^>]*>/g, ' ').replace(/&amp;/g, '&').replace(/&#39;|&apos;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+            const authorHandle = String(oe.data?.author_url || '').split('/').filter(Boolean).pop() || null;
+            return ecoTextHasCodeAndTag(text, code)
+                ? { verified: true, authorHandle }
+                : { verified: false, reason: 'content_mismatch', authorHandle };
+        }
+        if (platform === 'telegram') {
+            // t.me/s/<channel>/<msg> is the public server-rendered preview —
+            // only works for posts in PUBLIC channels (private groups can't be checked).
+            const m = postUrl.match(/t\.me\/([A-Za-z0-9_]{4,})\/(\d+)/);
+            if (!m) return { verified: false, reason: 'bad_url' };
+            const r = await axios.get(`https://t.me/s/${m[1]}/${m[2]}`, { timeout: 8000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+            const html = String(r.data || '');
+            // The preview page carries the message text in a widget div.
+            const text = html.replace(/<[^>]*>/g, ' ').replace(/&amp;/g, '&').replace(/&#39;/g, "'").replace(/&quot;/g, '"');
+            if (!/tgme_widget_message/i.test(html)) return { verified: false, reason: 'unreachable' }; // deleted/private channel
+            return ecoTextHasCodeAndTag(text, code)
+                ? { verified: true, authorHandle: m[1] }
+                : { verified: false, reason: 'content_mismatch', authorHandle: m[1] };
+        }
+        if (platform === 'instagram' || platform === 'facebook') {
+            // Meta serves og: tags to its link-preview crawler UA for PUBLIC posts.
+            // Private/friends-only posts return a login shell -> 'unreachable'.
+            const r = await axios.get(postUrl, {
+                timeout: 8000,
+                maxRedirects: 3,
+                headers: { 'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)' },
+            });
+            const html = String(r.data || '');
+            const og = (name) => {
+                const m = html.match(new RegExp(`<meta[^>]+(?:property|name)=["'](?:og:${name}|twitter:${name})["'][^>]+content=["']([^"']*)["']`, 'i'))
+                    || html.match(new RegExp(`<meta[^>]+content=["']([^"']*)["'][^>]+(?:property|name)=["'](?:og:${name}|twitter:${name})["']`, 'i'));
+                return m ? m[1] : '';
+            };
+            const text = `${og('title')} ${og('description')}`;
+            if (text.trim().length < 10) return { verified: false, reason: 'unreachable' }; // login wall / removed
+            const decoded = text.replace(/&amp;/g, '&').replace(/&#39;|&apos;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+            return ecoTextHasCodeAndTag(decoded, code)
+                ? { verified: true }
+                : { verified: false, reason: 'content_mismatch' };
+        }
+        if (platform === 'nostr') {
+            // njump.me renders notes server-side; other renderers (iris, primal)
+            // are SPAs and return a shell — treat as unreachable.
+            const r = await axios.get(postUrl, { timeout: 8000, headers: { 'User-Agent': 'Mozilla/5.0' } });
+            const html = String(r.data || '');
+            const text = html.replace(/<[^>]*>/g, ' ').replace(/&amp;/g, '&');
+            if (text.length < 50) return { verified: false, reason: 'unreachable' };
+            return ecoTextHasCodeAndTag(text, code)
+                ? { verified: true }
+                : { verified: false, reason: 'content_mismatch' };
+        }
+        return { verified: false, reason: 'unsupported_platform' };
+    } catch (e) {
+        return { verified: false, reason: 'fetch_failed' };
+    }
+}
+
+// Background re-checker: pending claims get retried a few times over ~2h.
+// Confirmed -> 'verified'. Still dead after the last attempt -> 'rejected' and
+// the account flips ad_strict so next week's claim must auto-verify.
+// The optimistic grant is NOT clawed back — max loss is one free week per
+// abusive account, and farming resets device/user identity anyway.
+const ECO_CLAIM_RECHECK_MS = 20 * 60 * 1000;
+const ECO_CLAIM_MAX_ATTEMPTS = 6;
+async function ecoRecheckPendingClaims() {
+    try {
+        const rows = await dbAllAsync(
+            `SELECT id, account_id, platform, post_url, code FROM ad_claims
+             WHERE status = 'pending' AND verify_attempts < ? ORDER BY created_at ASC LIMIT 25`,
+            [ECO_CLAIM_MAX_ATTEMPTS]);
+        for (const c of rows) {
+            try {
+                const v = await ecoVerifyPost(c.platform, c.post_url, c.code);
+                if (v.verified) {
+                    await dbRunAsync(`UPDATE ad_claims SET status='verified', author_handle=COALESCE(author_handle,?), verified_at=? WHERE id=?`,
+                        [v.authorHandle || null, Date.now(), c.id]);
+                } else {
+                    await dbRunAsync(`UPDATE ad_claims SET verify_attempts = verify_attempts + 1 WHERE id=?`, [c.id]);
+                    if ((c.verify_attempts || 0) + 1 >= ECO_CLAIM_MAX_ATTEMPTS) {
+                        await dbRunAsync(`UPDATE ad_claims SET status='rejected' WHERE id=?`, [c.id]);
+                        await dbRunAsync(`UPDATE ecosystem_accounts SET ad_strict=1 WHERE account_id=?`, [c.account_id]);
+                    }
+                }
+            } catch (e) {
+                await dbRunAsync(`UPDATE ad_claims SET verify_attempts = verify_attempts + 1 WHERE id=?`, [c.id]).catch(() => { });
+            }
+        }
+    } catch (e) { console.warn('[Eco] claim recheck failed:', e.message); }
+}
+setInterval(ecoRecheckPendingClaims, ECO_CLAIM_RECHECK_MS).unref?.();
+
 // Extract the caller's ecosystem account id from either app identity:
 //   app=ps&id=<device_hash>  (same trust model as the trial endpoint)
 //   app=pl + Bearer JWT      (authenticated PhotoLynk user)
@@ -4331,40 +4457,34 @@ app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
         if (existing && existing.status === 'verified') {
             return res.json({ ok: true, status: 'verified', already: true });
         }
-        if (existing && existing.status === 'review') {
-            return res.json({ ok: true, status: 'review', message: 'Claim is queued for review' });
+        if (existing && (existing.status === 'pending' || existing.status === 'review')) {
+            return res.json({ ok: true, status: 'pending', message: 'Claim already submitted — being confirmed in the background' });
         }
 
-        const rawPlatform = String(req.body?.platform || 'x').toLowerCase();
-        const platform = ['x', 'telegram', 'instagram', 'facebook', 'nostr', 'other'].includes(rawPlatform) ? rawPlatform : 'other';
         const postUrl = String(req.body?.postUrl || '').trim();
+        if (!/^https:\/\//.test(postUrl)) return res.status(400).json({ error: 'Paste the full https:// post URL' });
+        // Platform is detected server-side from the URL — never trust the client.
+        const platform = ecoDetectPlatform(postUrl);
         const code = ecoAdCode(who.accountId, wk);
-        let status = 'review';
-        let authorHandle = null;
-        let reason = null;
 
-        if (platform === 'x') {
-            if (!/^https:\/\/(www\.)?(x\.com|twitter\.com)\/[A-Za-z0-9_]{1,20}\/status\/\d+/.test(postUrl)) {
-                return res.status(400).json({ error: 'Paste the full post URL (x.com/…/status/…)' });
-            }
-            try {
-                const oe = await axios.get(`https://publish.twitter.com/oembed?url=${encodeURIComponent(postUrl)}`, { timeout: 8000 });
-                const html = String(oe.data?.html || '');
-                const text = html.replace(/<[^>]*>/g, ' ').replace(/&amp;/g, '&').replace(/&#39;|&apos;/g, "'").replace(/&quot;/g, '"').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
-                authorHandle = String(oe.data?.author_url || '').split('/').filter(Boolean).pop() || null;
-                const hasCode = text.includes(code);
-                const hasTag = text.toLowerCase().includes(ECO_REQUIRED_TAG);
-                if (hasCode && hasTag) {
-                    status = 'verified';
-                } else {
-                    return res.status(400).json({ error: `Post doesn't contain the required code ${code} and ${ECO_REQUIRED_TAG}` });
-                }
-            } catch (e) {
-                status = 'review'; reason = 'fetch_failed';
-            }
-        } else {
-            if (!/^https:\/\//.test(postUrl)) return res.status(400).json({ error: 'Paste the full https:// post URL' });
-            status = 'review'; reason = 'manual_platform';
+        // Strict accounts (a previous claim died in background re-checks) must
+        // auto-verify — no optimistic grant.
+        const acct = await dbGetAsync(`SELECT ad_strict FROM ecosystem_accounts WHERE account_id = ?`, [who.accountId]);
+        const strict = !!(acct && acct.ad_strict);
+
+        const v = await ecoVerifyPost(platform, postUrl, code);
+        let status = v.verified ? 'verified' : 'pending';
+        const authorHandle = v.authorHandle || null;
+
+        if (!v.verified && strict) {
+            return res.status(400).json({
+                error: `Post couldn't be verified automatically — make sure it's public and contains ${code} + ${ECO_REQUIRED_TAG}`,
+                platform,
+            });
+        }
+        if (v.verified === false && v.reason === 'content_mismatch' && !strict) {
+            // Post WAS fetched but lacks the code/tag — likely pasted a wrong link.
+            return res.status(400).json({ error: `Post doesn't contain the required code ${code} and ${ECO_REQUIRED_TAG}` });
         }
 
         // One claim per account+week; duplicate URL rejected by UNIQUE index.
@@ -4389,17 +4509,18 @@ app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
         if (status === 'verified' && authorHandle) {
             const prev = await dbGetAsync(`SELECT author_handle FROM ad_claims WHERE account_id = ? AND status = 'verified' AND author_handle IS NOT NULL LIMIT 1`, [who.accountId]);
             if (prev && prev.author_handle !== authorHandle) {
-                await dbRunAsync(`UPDATE ad_claims SET status = 'review' WHERE account_id = ? AND week_key = ?`, [who.accountId, wk]);
-                return res.json({ ok: true, status: 'review', message: 'Different account detected — queued for review' });
+                await dbRunAsync(`UPDATE ad_claims SET status = 'rejected' WHERE account_id = ? AND week_key = ?`, [who.accountId, wk]);
+                return res.status(400).json({ error: 'This post is from a different account than your previous posts' });
             }
         }
 
-        if (status === 'verified') {
-            await dbRunAsync(`UPDATE ad_claims SET verified_at = ? WHERE account_id = ? AND week_key = ?`, [Date.now(), who.accountId, wk]);
-            const subUntil = await ecoGrantSub(who.accountId, ECO_WEEK_MS, { sourceApp: who.app, kind: 'ad_claim', provenance: postUrl });
-            return res.json({ ok: true, status: 'verified', subUntil });
-        }
-        res.json({ ok: true, status: 'review', message: 'Could not verify automatically — queued for review' });
+        // Verified -> grant now. Pending -> OPTIMISTIC grant now, background
+        // re-checker confirms or rejects later (dead links flag the account
+        // ad_strict so next week must verify). User never waits.
+        await dbRunAsync(`UPDATE ad_claims SET verified_at = ? WHERE account_id = ? AND week_key = ?`, [Date.now(), who.accountId, wk]);
+        const subUntil = await ecoGrantSub(who.accountId, ECO_WEEK_MS, { sourceApp: who.app, kind: 'ad_claim', provenance: postUrl });
+        if (status === 'verified') return res.json({ ok: true, status: 'verified', subUntil });
+        return res.json({ ok: true, status: 'pending', subUntil, message: 'Week granted — post is being confirmed in the background' });
     } catch (e) {
         console.error('[Eco] ad-claim error:', e.message);
         res.status(500).json({ error: 'Claim failed' });
@@ -4419,11 +4540,15 @@ app.post('/admin/api/ad-claims/:id/review', adminAuth, async (req, res) => {
     if (row.status === 'verified') return res.json({ ok: true, status: 'verified', already: true });
     if (action === 'approve') {
         await dbRunAsync(`UPDATE ad_claims SET status = 'verified', verified_at = ? WHERE id = ?`, [Date.now(), id]);
+        // 'pending' claims were already granted optimistically — approving just
+        // confirms them, no second +7d. 'rejected' (dead link) get the grant now.
+        if (row.status === 'pending') return res.json({ ok: true, status: 'verified' });
         const subUntil = await ecoGrantSub(row.account_id, ECO_WEEK_MS, { sourceApp: 'admin', kind: 'ad_claim', provenance: row.post_url });
         return res.json({ ok: true, status: 'verified', subUntil });
     }
     if (action === 'reject') {
         await dbRunAsync(`UPDATE ad_claims SET status = 'rejected' WHERE id = ?`, [id]);
+        await dbRunAsync(`UPDATE ecosystem_accounts SET ad_strict=1 WHERE account_id=?`, [row.account_id]);
         return res.json({ ok: true, status: 'rejected' });
     }
     res.status(400).json({ error: 'action = approve|reject' });
