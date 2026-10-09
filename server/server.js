@@ -4209,6 +4209,8 @@ function ecoAdCode(accountId, weekKey) {
 const ECO_AD_COPIES = {
     x: 'PaceSeeker: private self-custodial AI trading on Solana. PhotoLynk: private encrypted photo backup. One subscription covers the whole StealthLynk ecosystem. #StealthLynk #PaceSeeker #PhotoLynk #Solana https://stealthlynk.io code: {CODE}',
     telegram: 'PaceSeeker — private self-custodial AI trading on Solana. PhotoLynk — private encrypted photo backup. One subscription covers the whole StealthLynk ecosystem. https://stealthlynk.io #StealthLynk code: {CODE}',
+    instagram: 'Private Solana apps. PaceSeeker — self-custodial AI trading. PhotoLynk — encrypted private photo backup. One subscription covers the whole StealthLynk ecosystem. #StealthLynk #PaceSeeker #PhotoLynk #Solana #CryptoTrading #PrivacyFirst | code: {CODE}',
+    facebook: 'Check out the StealthLynk ecosystem: PaceSeeker — private self-custodial AI trading on Solana, and PhotoLynk — private encrypted photo backup. One subscription covers all apps. https://stealthlynk.io #StealthLynk | code: {CODE}',
     generic: 'PaceSeeker (AI trading) + PhotoLynk (private photo backup) — one StealthLynk subscription covers all apps. https://stealthlynk.io #StealthLynk code: {CODE}',
 };
 const ECO_REQUIRED_TAG = '#stealthlynk';
@@ -4333,7 +4335,8 @@ app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
             return res.json({ ok: true, status: 'review', message: 'Claim is queued for review' });
         }
 
-        const platform = String(req.body?.platform || 'x').toLowerCase();
+        const rawPlatform = String(req.body?.platform || 'x').toLowerCase();
+        const platform = ['x', 'telegram', 'instagram', 'facebook', 'nostr', 'other'].includes(rawPlatform) ? rawPlatform : 'other';
         const postUrl = String(req.body?.postUrl || '').trim();
         const code = ecoAdCode(who.accountId, wk);
         let status = 'review';
