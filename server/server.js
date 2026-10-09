@@ -337,7 +337,20 @@ app.use(helmet({
     },
 }));
 app.use(cors());
-app.use(morgan('common')); // Logging
+// Device hashes, payment signatures, and wallet addresses travel as query
+// params — morgan's 'common' format logs full URLs, leaking bearer credentials
+// into the journal on every heartbeat. Sanitized variant keeps the params
+// that matter for ops while masking anything auth- or payment-shaped.
+morgan.token('safe-url', (req) => {
+    try {
+        const u = new URL(req.originalUrl || req.url || '/', 'http://local');
+        for (const k of ['id', 'sig', 'se', 'st', 'sa', 'pat', 'pw', 'pl', 'usd', 'amt', 'w', 'nonce', 'signature', 'token', 'key', 'code']) {
+            if (u.searchParams.has(k)) u.searchParams.set(k, '…');
+        }
+        return u.pathname + u.search;
+    } catch (e) { return req.originalUrl || req.url || '/'; }
+});
+app.use(morgan(':remote-addr - :remote-user [:date[clf]] ":method :safe-url HTTP/:http-version" :status :res[content-length] ":referrer" ":user-agent"'));
 // IPFS pinning proxy needs the exact request bytes — mount its raw parser
 // before express.json so 'application/json' file bodies are not re-serialized.
 app.use('/api/nft/ipfs-pin', express.raw({ type: '*/*', limit: '40mb' }));
@@ -4191,6 +4204,11 @@ db.serialize(() => {
     // verified wallets drive account matching — an unverified claim could
     // otherwise join a stranger's account by reporting their address.
     db.run(`ALTER TABLE ecosystem_members ADD COLUMN wallet_verified INTEGER DEFAULT 0`, () => { });
+    // When an unverified wallet claim last changed — a verified bind requires
+    // the claimed wallet to have been stable for a while, so a stolen device
+    // hash can't be used to overwrite-and-bind in one shot: the real device's
+    // next heartbeat reverts the unverified wallet long before the window ends.
+    db.run(`ALTER TABLE ecosystem_members ADD COLUMN wallet_changed_at INTEGER`, () => { });
     db.run(`UPDATE ecosystem_members SET wallet_verified = 1 WHERE app = 'photolynk' AND wallet IS NOT NULL`, () => { });
     db.run(`CREATE INDEX IF NOT EXISTS idx_eco_members_wallet ON ecosystem_members(wallet)`, (e) => { if (e) console.error('[Eco] idx wallet:', e.message); });
     db.run(`CREATE INDEX IF NOT EXISTS idx_eco_members_acct ON ecosystem_members(account_id)`, (e) => { if (e) console.error('[Eco] idx acct:', e.message); });
@@ -4199,6 +4217,11 @@ db.serialize(() => {
     // future weekly claims must auto-verify (no optimistic grant).
     db.run(`ALTER TABLE ecosystem_accounts ADD COLUMN ad_strict INTEGER DEFAULT 0`, () => { });
     db.run(`ALTER TABLE ad_claims ADD COLUMN verify_attempts INTEGER DEFAULT 0`, () => { });
+    // granted_at marks that this week's entitlement was already issued — the
+    // atomic UPDATE-guard below prevents double-grants on concurrent claims
+    // and on resubmits after a background rejection.
+    db.run(`ALTER TABLE ad_claims ADD COLUMN granted_at INTEGER`, () => { });
+    db.run(`UPDATE ad_claims SET granted_at = COALESCE(granted_at, created_at) WHERE granted_at IS NULL`, () => { });
     // One-time social requirements: X handle (bound from a verified post or
     // declared) + Telegram group membership (verified via bot getChatMember).
     // *_state: 'verified' | 'bound' | 'declared' | 'not_following' | null
@@ -4262,13 +4285,14 @@ function ecoSignGrant(accountId, subUntil) {
 // trigger joins or merges — otherwise anyone could claim a stranger's wallet.
 async function ecoEnsureAccount(app, identity, wallet, { verified = false } = {}) {
     const existing = await dbGetAsync(
-        `SELECT account_id, wallet, wallet_verified FROM ecosystem_members WHERE app = ? AND identity = ?`, [app, String(identity)]);
+        `SELECT account_id, wallet, wallet_verified, wallet_changed_at FROM ecosystem_members WHERE app = ? AND identity = ?`, [app, String(identity)]);
     if (existing) {
         if (wallet && (existing.wallet !== wallet || (verified && !existing.wallet_verified))) {
             // Unverified reports never overwrite a verified wallet binding.
             if (!verified && existing.wallet_verified) return existing.account_id;
-            await dbRunAsync(`UPDATE ecosystem_members SET wallet = ?, wallet_verified = ? WHERE app = ? AND identity = ?`,
-                [wallet, verified ? 1 : 0, app, String(identity)]);
+            const walletChangedAt = existing.wallet !== wallet ? Date.now() : existing.wallet_changed_at;
+            await dbRunAsync(`UPDATE ecosystem_members SET wallet = ?, wallet_verified = ?, wallet_changed_at = ? WHERE app = ? AND identity = ?`,
+                [wallet, verified ? 1 : 0, walletChangedAt, app, String(identity)]);
             if (verified) {
                 // This wallet may already anchor a different account (e.g. the
                 // other app verified it earlier) - merge into that one.
@@ -4306,19 +4330,52 @@ async function ecoEnsureAccount(app, identity, wallet, { verified = false } = {}
         await dbRunAsync(`INSERT INTO ecosystem_accounts (account_id, primary_wallet, created_at) VALUES (?, ?, ?)`,
             [accountId, wallet || null, Date.now()]);
     }
-    await dbRunAsync(`INSERT OR IGNORE INTO ecosystem_members (account_id, app, identity, wallet, wallet_verified, linked_at) VALUES (?, ?, ?, ?, ?, ?)`,
-        [accountId, app, String(identity), wallet || null, verified ? 1 : 0, Date.now()]);
+    await dbRunAsync(`INSERT OR IGNORE INTO ecosystem_members (account_id, app, identity, wallet, wallet_verified, wallet_changed_at, linked_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [accountId, app, String(identity), wallet || null, verified ? 1 : 0, wallet ? Date.now() : null, Date.now()]);
+    // Concurrent first-contact for the same (app, identity) can lose the
+    // INSERT race — the member row already points at the other winner's
+    // account. Always return the account the member row actually lives in.
+    const final = await dbGetAsync(
+        `SELECT account_id FROM ecosystem_members WHERE app = ? AND identity = ?`, [app, String(identity)]);
+    if (final && final.account_id !== accountId) return final.account_id;
     if (wallet && verified) db.run(`UPDATE ecosystem_accounts SET primary_wallet = COALESCE(primary_wallet, ?) WHERE account_id = ?`, [wallet, accountId], () => { });
     return accountId;
 }
 
 const ecoGetSub = (accountId) => dbGetAsync(`SELECT * FROM stealthlynk_subs WHERE account_id = ?`, [accountId]);
 
+// Legacy paid users who bought a PhotoLynk plan before the ecosystem layer
+// existed have a live user_plans.expires_at but no stealthlynk_subs row —
+// without this backfill installing PaceSeeker later would show them as
+// unsubscribed until their next renewal. Idempotent (floor semantics) and
+// only fires when the local plan would RAISE the shared expiry, so it never
+// rewrites provenance of a later ad claim or payment.
+async function ecoBackfillPhotolynkSub(accountId) {
+    try {
+        const members = await dbAllAsync(
+            `SELECT identity FROM ecosystem_members WHERE account_id = ? AND app = 'photolynk'`, [accountId]);
+        for (const m of members) {
+            const plan = await dbGetAsync(
+                `SELECT expires_at, payment_type FROM user_plans WHERE user_id = ? AND status = 'active' AND deleted_at IS NULL`,
+                [Number(m.identity)]);
+            const expiresAt = Number(plan?.expires_at) || 0;
+            if (expiresAt <= Date.now()) continue;
+            const cur = await ecoGetSub(accountId);
+            if (expiresAt <= (Number(cur?.sub_until) || 0)) continue;
+            const kind = plan.payment_type === 'ecosystem' ? 'link_sync' : 'payment';
+            await ecoFloorSub(accountId, expiresAt, { sourceApp: 'photolynk', kind, provenance: `plan:${plan.payment_type || 'legacy'}` });
+        }
+    } catch (e) { console.warn('[Eco] PL sub backfill failed:', e.message); }
+}
+
 // Merge source account into target: members move, sub_until takes the max.
+// Ordered for crash-safety instead of a transaction — a BEGIN/COMMIT on this
+// shared connection would swallow unrelated concurrent writes on ROLLBACK.
+// The shared sub is upserted FIRST (entitlement lands durably on target) and
+// the source account row is deleted LAST, so a crash mid-merge leaves the
+// source account intact enough for the next login/bind to merge again.
 async function ecoMergeAccounts(targetId, sourceId) {
     if (!targetId || !sourceId || targetId === sourceId) return targetId;
-    await dbRunAsync(`UPDATE OR IGNORE ecosystem_members SET account_id = ? WHERE account_id = ?`, [targetId, sourceId]);
-    await dbRunAsync(`DELETE FROM ecosystem_members WHERE account_id = ?`, [sourceId]); // PK collisions left behind
     const a = await ecoGetSub(targetId); const b = await ecoGetSub(sourceId);
     const maxUntil = Math.max(Number(a?.sub_until) || 0, Number(b?.sub_until) || 0);
     if (maxUntil > 0) {
@@ -4327,6 +4384,8 @@ async function ecoMergeAccounts(targetId, sourceId) {
             ON CONFLICT(account_id) DO UPDATE SET sub_until = excluded.sub_until, updated_at = excluded.updated_at`,
             [targetId, maxUntil, 'merge', 'merge', '', Date.now()]);
     }
+    await dbRunAsync(`UPDATE OR IGNORE ecosystem_members SET account_id = ? WHERE account_id = ?`, [targetId, sourceId]);
+    await dbRunAsync(`DELETE FROM ecosystem_members WHERE account_id = ?`, [sourceId]); // PK collisions left behind
     await dbRunAsync(`UPDATE ad_claims SET account_id = ? WHERE account_id = ?`, [targetId, sourceId]);
     await dbRunAsync(`DELETE FROM ecosystem_accounts WHERE account_id = ?`, [sourceId]);
     return targetId;
@@ -4337,12 +4396,23 @@ async function ecoMergeAccounts(targetId, sourceId) {
 // PS: sub_until (the signed grant reaches the client on its next ping).
 async function ecoApplySub(accountId, subUntil, { sourceApp, kind, provenance } = {}) {
     const now = Date.now();
-    await dbRunAsync(`INSERT INTO stealthlynk_subs (account_id, sub_until, source_app, source_kind, provenance, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(account_id) DO UPDATE SET
-            sub_until = excluded.sub_until, source_app = excluded.source_app,
-            source_kind = excluded.source_kind, provenance = excluded.provenance, updated_at = excluded.updated_at`,
-        [accountId, subUntil, sourceApp || null, kind || null, provenance || null, now]);
+    // 'link_sync' is a propagation-only rewrite — it must never overwrite the
+    // provenance columns, or every heartbeat would erase the real source
+    // (payment sig / ad claim URL) from the shared record.
+    if (kind === 'link_sync') {
+        await dbRunAsync(`INSERT INTO stealthlynk_subs (account_id, sub_until, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(account_id) DO UPDATE SET
+                sub_until = excluded.sub_until, updated_at = excluded.updated_at`,
+            [accountId, subUntil, now]);
+    } else {
+        await dbRunAsync(`INSERT INTO stealthlynk_subs (account_id, sub_until, source_app, source_kind, provenance, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_id) DO UPDATE SET
+                sub_until = excluded.sub_until, source_app = excluded.source_app,
+                source_kind = excluded.source_kind, provenance = excluded.provenance, updated_at = excluded.updated_at`,
+            [accountId, subUntil, sourceApp || null, kind || null, provenance || null, now]);
+    }
     const members = await dbAllAsync(`SELECT app, identity FROM ecosystem_members WHERE account_id = ?`, [accountId]);
     for (const m of members) {
         try {
@@ -4386,8 +4456,21 @@ async function ecoFloorSub(accountId, untilMs, meta = {}) {
 // When a member joins an account that already has a sub, propagate the shared
 // entitlement to its app row immediately (don't wait for a payment/ping).
 async function ecoSyncMemberEntitlement(accountId) {
+    // Pull first: a PhotoLynk member's live plan is authoritative and can lift
+    // the shared sub (legacy paid users, missed mirrors, manual admin edits).
+    await ecoBackfillPhotolynkSub(accountId);
     const sub = await ecoGetSub(accountId);
     if (!sub || !(Number(sub.sub_until) > Date.now())) return;
+    // Skip the write when nothing changed — every heartbeat used to rewrite
+    // subs + member rows even though MAX() is a no-op, churning updated_at.
+    const stale = await dbAllAsync(
+        `SELECT m.app, m.identity FROM ecosystem_members m
+         WHERE m.account_id = ? AND (
+            (m.app = 'paceseeker' AND COALESCE((SELECT d.sub_until FROM paceseeker_devices d WHERE d.device_hash = m.identity), 0) < ?)
+            OR (m.app = 'photolynk' AND COALESCE((SELECT p.expires_at FROM user_plans p WHERE p.user_id = CAST(m.identity AS INTEGER)), 0) < ?)
+         ) LIMIT 1`,
+        [accountId, Number(sub.sub_until), Number(sub.sub_until)]).catch(() => []);
+    if (stale.length === 0) return;
     await ecoApplySub(accountId, Number(sub.sub_until), { kind: 'link_sync' });
 }
 
@@ -4776,9 +4859,9 @@ async function ecoCallerAccount(req) {
     if (app === 'ps' || app === 'paceseeker') {
         const id = String(req.query.id || req.body?.id || '').trim();
         if (!/^[A-Za-z0-9_-]{16,128}$/.test(id)) return { error: 'Invalid device id' };
-        const row = await dbGetAsync(`SELECT account_id, wallet FROM ecosystem_members WHERE app = 'paceseeker' AND identity = ?`, [id]);
+        const row = await dbGetAsync(`SELECT account_id, wallet, wallet_verified FROM ecosystem_members WHERE app = 'paceseeker' AND identity = ?`, [id]);
         if (!row) return { error: 'Device not registered yet — open PaceSeeker once first' };
-        return { accountId: row.account_id, app: 'paceseeker', identity: id, wallet: row.wallet };
+        return { accountId: row.account_id, app: 'paceseeker', identity: id, wallet: row.wallet, walletVerified: !!row.wallet_verified };
     }
     if (app === 'pl' || app === 'photolynk') {
         // authenticateToken already ran: req.user.id is the PhotoLynk user.
@@ -4945,7 +5028,15 @@ app.post('/api/ecosystem/bind-wallet', ecoMaybeAuth, async (req, res) => {
             return res.status(400).json({ error: 'Public key does not match wallet address' });
         }
 
-        const accountId = await ecoEnsureAccount(who.app, who.identity, String(wallet_address).trim(), { verified: true });
+        // The device hash is a bearer credential — a stolen hash must not be
+        // enough to graft an attacker's wallet onto the member row. If a
+        // wallet is already recorded, the bound wallet must match it; wallet
+        // rotation goes through connect (which re-reports w=) first.
+        const newWallet = String(wallet_address).trim();
+        if (who.wallet && who.wallet !== newWallet) {
+            return res.status(409).json({ error: `A different wallet is already linked to this ${who.app === 'paceseeker' ? 'device' : 'account'} — connect that wallet in the app first` });
+        }
+        const accountId = await ecoEnsureAccount(who.app, who.identity, newWallet, { verified: true });
         await ecoSyncMemberEntitlement(accountId);
         const members = await dbAllAsync(`SELECT app FROM ecosystem_members WHERE account_id = ?`, [accountId]);
         res.json({ ok: true, accountId, linkedApps: members.map(m => m.app) });
@@ -5105,7 +5196,8 @@ app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
                  ON CONFLICT(account_id, week_key) DO UPDATE SET
                     post_url = excluded.post_url, platform = excluded.platform,
                     code = excluded.code, author_handle = excluded.author_handle,
-                    status = excluded.status, created_at = excluded.created_at`,
+                    status = excluded.status, created_at = excluded.created_at,
+                    verified_at = NULL, verify_attempts = 0`,
                 [who.accountId, wk, platform, postUrl, code, authorHandle, status, Date.now()]);
         } catch (e) {
             if (/UNIQUE.*post_url/i.test(e.message || '')) {
@@ -5128,7 +5220,15 @@ app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
         // re-checker confirms or rejects later (dead links flag the account
         // ad_strict so next week must verify). User never waits.
         await dbRunAsync(`UPDATE ad_claims SET verified_at = ? WHERE account_id = ? AND week_key = ?`, [Date.now(), who.accountId, wk]);
-        const subUntil = await ecoGrantSub(who.accountId, ECO_WEEK_MS, { sourceApp: who.app, kind: 'ad_claim', provenance: postUrl });
+        // Atomic grant-guard: only the request that flips granted_at actually
+        // grants — concurrent claims and resubmits of the same week can't
+        // stack a second +7d on top.
+        const g = await dbRunAsync(
+            `UPDATE ad_claims SET granted_at = ? WHERE account_id = ? AND week_key = ? AND granted_at IS NULL`,
+            [Date.now(), who.accountId, wk]);
+        const subUntil = g.changes > 0
+            ? await ecoGrantSub(who.accountId, ECO_WEEK_MS, { sourceApp: who.app, kind: 'ad_claim', provenance: postUrl })
+            : Number((await ecoGetSub(who.accountId))?.sub_until) || 0;
         if (status === 'verified') return res.json({ ok: true, status: 'verified', subUntil });
         return res.json({ ok: true, status: 'pending', subUntil, message: 'Week granted — post is being confirmed in the background' });
     } catch (e) {
@@ -5150,9 +5250,11 @@ app.post('/admin/api/ad-claims/:id/review', adminAuth, async (req, res) => {
     if (row.status === 'verified') return res.json({ ok: true, status: 'verified', already: true });
     if (action === 'approve') {
         await dbRunAsync(`UPDATE ad_claims SET status = 'verified', verified_at = ? WHERE id = ?`, [Date.now(), id]);
-        // 'pending' claims were already granted optimistically — approving just
-        // confirms them, no second +7d. 'rejected' (dead link) get the grant now.
-        if (row.status === 'pending') return res.json({ ok: true, status: 'verified' });
+        // Grant-guard: if this week's entitlement was already issued (optimistic
+        // grant at claim time), approving just confirms — no second +7d.
+        const g = await dbRunAsync(
+            `UPDATE ad_claims SET granted_at = ? WHERE id = ? AND granted_at IS NULL`, [Date.now(), id]);
+        if (g.changes === 0) return res.json({ ok: true, status: 'verified', alreadyGranted: true });
         const subUntil = await ecoGrantSub(row.account_id, ECO_WEEK_MS, { sourceApp: 'admin', kind: 'ad_claim', provenance: row.post_url });
         return res.json({ ok: true, status: 'verified', subUntil });
     }
@@ -5301,7 +5403,7 @@ app.get('/api/paceseeker/trial', (req, res) => {
                 // account. Fire-and-forget: response must not wait on it.
                 try {
                     if (this.changes > 0) {
-                        ecoMirrorPsPayment(id, wallet, paySig, payPlan).catch(() => { });
+                        ecoMirrorPsPayment(id, wallet, paySig).catch(() => { });
                     }
                 } catch (e) { }
             });
@@ -5342,14 +5444,20 @@ app.get('/api/paceseeker/trial', (req, res) => {
         );
         // Paid device carrying a reported payment signature that predates the
         // ecosystem layer (or a re-link): verify the signature on-chain, then
-        // floor the shared sub at its reported expiry so the other app lights
-        // up too. Never mirrors unverified self-reported claims.
+        // floor the shared sub so the other app lights up too. Two client-
+        // reported fields are untrusted: `se` is clamped to paidAt (tx
+        // blockTime) + one plan period, and the mirror only applies when the
+        // tx fee payer equals the member's verified wallet.
         if (st === 'paid' && se && se > now && row.sub_signature) {
             (async () => {
-                const ok = await verifyPsPaymentTx(row.sub_signature);
-                if (!ok) return;
-                const acct = await ecoEnsureAccount('paceseeker', id, wallet || null);
-                await ecoFloorSub(acct, se, { sourceApp: 'paceseeker', kind: 'payment', provenance: row.sub_signature });
+                const v = await verifyPsPaymentTx(row.sub_signature);
+                if (!v.ok) return;
+                const member = await dbGetAsync(
+                    `SELECT account_id, wallet, wallet_verified FROM ecosystem_members WHERE app = 'paceseeker' AND identity = ?`, [String(id)]);
+                if (!member?.wallet_verified || !member.wallet || member.wallet !== v.payer) return;
+                const capBase = v.paidAt || Date.now();
+                const cappedUntil = Math.min(Number(se) || 0, capBase + PS_ECO_PLAN_MS + 12 * 60 * 60 * 1000);
+                await ecoFloorSub(member.account_id, cappedUntil, { sourceApp: 'paceseeker', kind: 'payment', provenance: row.sub_signature });
             })().catch(() => { });
         }
         if (ip && (row.last_ip !== ip || !row.last_country_code)) psUpdateGeo(id, ip); // IP moved or unresolved
@@ -5376,9 +5484,17 @@ const PS_ECO_STABLE_MINTS = {
 };
 const PS_ECO_SKR_MINT = 'SKRbvo6Gf7GondiT3BbTfuRDPqLWei4j2Qy2NPGZhW3';
 
-const _psPayVerifyCache = new Map(); // sig -> bool (verified results only)
+const _psPayVerifyCache = new Map(); // sig -> {ok, payer, usd, at} — negatives cached briefly to stop RPC hammering
+const PS_VERIFY_NEG_TTL_MS = 10 * 60 * 1000;
+// A verified payment can only legitimately extend the shared sub by one plan
+// period — never trust client-reported expiry/plan strings.
+const PS_ECO_PLAN_MS = 30 * 24 * 60 * 60 * 1000;
 async function verifyPsPaymentTx(signature) {
-    if (_psPayVerifyCache.has(signature)) return _psPayVerifyCache.get(signature);
+    const cached = _psPayVerifyCache.get(signature);
+    if (cached) {
+        if (cached.ok || Date.now() - cached.at < PS_VERIFY_NEG_TTL_MS) return cached;
+        _psPayVerifyCache.delete(signature);
+    }
     const rpcs = [
         process.env.SOLANA_RPC_ENDPOINT,
         'https://solana-rpc.publicnode.com',
@@ -5395,7 +5511,13 @@ async function verifyPsPaymentTx(signature) {
             if (r.data?.result) { tx = r.data.result; break; }
         } catch (e) { }
     }
-    if (!tx || (tx.meta && tx.meta.err)) return false;
+    const fail = (extra = {}) => {
+        const rec = { ok: false, payer: extra.payer || null, usd: 0, at: Date.now() };
+        if (_psPayVerifyCache.size > 2000) _psPayVerifyCache.clear();
+        _psPayVerifyCache.set(signature, rec);
+        return rec;
+    };
+    if (!tx || (tx.meta && tx.meta.err)) return fail();
 
     // Must carry a PS1| memo (format check only - the HMAC pepper is client-side)
     const msg = tx.transaction?.message || {};
@@ -5405,7 +5527,7 @@ async function verifyPsPaymentTx(signature) {
         const data = typeof ix.parsed === 'string' ? ix.parsed : (ix.data ? Buffer.from(ix.data, 'base64').toString('utf8') : '');
         return (pid === 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr' || pid === 'Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo') && data.startsWith('PS1|');
     });
-    if (!hasMemo) return false;
+    if (!hasMemo) return fail();
 
     // Treasury inflow: native SOL transfers + SPL token deltas owned by treasury.
     let solIn = 0;
@@ -5427,6 +5549,9 @@ async function verifyPsPaymentTx(signature) {
     }
     // Native SOL balance delta on the treasury account itself (covers non-parsed paths)
     const keys = (msg.accountKeys || []).map(k => typeof k === 'string' ? k : k.pubkey);
+    // Fee payer is accountKeys[0] — binds this payment to a specific wallet so
+    // a public tx signature can't be replayed as someone else's subscription.
+    const payer = keys[0] || null;
     const tIdx = keys.indexOf(PS_TREASURY_WALLET);
     if (tIdx >= 0 && tx.meta?.preBalances && tx.meta?.postBalances) {
         const delta = ((tx.meta.postBalances[tIdx] || 0) - (tx.meta.preBalances[tIdx] || 0)) / 1e9;
@@ -5446,27 +5571,39 @@ async function verifyPsPaymentTx(signature) {
         if (band?.latest > 0) usd += solIn * band.latest;
     }
     const ok = usd >= PS_ECO_MIN_PAYMENT_USD;
-    if (ok) {
-        if (_psPayVerifyCache.size > 2000) _psPayVerifyCache.clear();
-        _psPayVerifyCache.set(signature, true);
-    }
-    console.log(`[Eco] PS payment verify ${signature.slice(0, 16)}… memo=${hasMemo} usd≈${usd.toFixed(2)} -> ${ok}`);
-    return ok;
+    if (_psPayVerifyCache.size > 2000) _psPayVerifyCache.clear();
+    // blockTime anchors the real payment moment — reported expiries get
+    // clamped to paidAt + one plan period so a faked far-future `se` can't
+    // roll the shared sub forward forever.
+    const rec = { ok, payer, usd, paidAt: tx.blockTime ? tx.blockTime * 1000 : null, at: Date.now() };
+    _psPayVerifyCache.set(signature, rec);
+    console.log(`[Eco] PS payment verify ${signature.slice(0, 16)}… memo=${hasMemo} usd≈${usd.toFixed(2)} payer=${(payer || '').slice(0, 8)} -> ${ok}`);
+    return rec;
 }
 
 // Verify (or confirm previously-verified) a reported PS payment, then mirror
 // it onto the ecosystem account. Deduped by the revenue ledger's sig UNIQUE.
-async function ecoMirrorPsPayment(deviceHash, wallet, sig, plan) {
+// Two bindings stop replay abuse: the tx fee payer must equal the member's
+// VERIFIED wallet (a public sig can't be claimed by a stranger), and the grant
+// duration is fixed server-side — the client-reported plan string is ignored.
+async function ecoMirrorPsPayment(deviceHash, wallet, sig) {
     if (!sig) return;
-    const acct = await ecoEnsureAccount('paceseeker', deviceHash, wallet || null);
-    const ok = await verifyPsPaymentTx(sig);
-    if (!ok) {
+    // Ensure the member row exists first — the revenue insert fires before
+    // _psTrialRespond creates it on a brand-new device's first ping.
+    await ecoEnsureAccount('paceseeker', deviceHash, wallet || null);
+    const v = await verifyPsPaymentTx(sig);
+    if (!v.ok) {
         console.warn(`[Eco] unverified payment sig ${sig.slice(0, 16)}… from ${deviceHash.slice(0, 10)} - NOT mirrored`);
         return;
     }
+    const member = await dbGetAsync(
+        `SELECT account_id, wallet, wallet_verified FROM ecosystem_members WHERE app = 'paceseeker' AND identity = ?`, [String(deviceHash)]);
+    if (!member?.wallet_verified || !member.wallet || member.wallet !== v.payer) {
+        console.warn(`[Eco] payment sig ${sig.slice(0, 16)}… payer ${String(v.payer || '').slice(0, 8)} not bound-verified on device ${deviceHash.slice(0, 10)} - NOT mirrored`);
+        return;
+    }
     db.run(`UPDATE paceseeker_revenue SET eco_verified = 1 WHERE signature = ?`, [sig], () => { });
-    const durMs = plan === 'yearly' ? 365 * 24 * 60 * 60 * 1000 : 30 * 24 * 60 * 60 * 1000;
-    await ecoGrantSub(acct, durMs, { sourceApp: 'paceseeker', kind: 'payment', provenance: sig });
+    await ecoGrantSub(member.account_id, PS_ECO_PLAN_MS, { sourceApp: 'paceseeker', kind: 'payment', provenance: sig });
 }
 
 // Respond to a PaceSeeker heartbeat: trial fields plus, when the device's
