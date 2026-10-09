@@ -3422,8 +3422,8 @@ const purgeStalePaceSeekerDevices = async () => {
     const cutoff = now - PURGE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
     const stale = await dbAllAsync(
         `SELECT device_hash, first_seen, trial_started_at, trial_expires_at FROM paceseeker_devices
-         WHERE last_seen < ? AND (sub_until IS NULL OR sub_until < ?)`,
-        [cutoff, now]
+         WHERE last_seen < ? AND (sub_until IS NULL OR sub_until < ?) AND (ad_until IS NULL OR ad_until < ?)`,
+        [cutoff, now, now]
     );
     for (const r of stale || []) {
         await dbRunAsync(
@@ -4226,6 +4226,11 @@ db.serialize(() => {
     // tier it was claimed for (100/200GB only — free access never binds).
     db.run(`ALTER TABLE ad_claims ADD COLUMN app TEXT`, () => { });
     db.run(`ALTER TABLE ad_claims ADD COLUMN tier_gb INTEGER`, () => { });
+    // Server-written ad weeks for a PS device. Deliberately a SEPARATE column
+    // from sub_until: that field is COALESCE-overwritten by client-reported
+    // `se` on every heartbeat (untrusted), while ad_until is only ever written
+    // by server grant paths — it is safe to include in a signed eco grant.
+    db.run(`ALTER TABLE paceseeker_devices ADD COLUMN ad_until INTEGER`, () => { });
     // One-time social requirements: X handle (bound from a verified post or
     // declared) + Telegram group membership (verified via bot getChatMember).
     // *_state: 'verified' | 'bound' | 'declared' | 'not_following' | null
@@ -4528,34 +4533,68 @@ async function ecoFloorSub(accountId, untilMs, meta = {}) {
 }
 
 // Weekly ad reward — APP-LOCAL by design ("free access never binds").
-// PaceSeeker: the shared row feeds the signed grant but ad_claim propagation
-// is scoped to paceseeker members only. PhotoLynk: write only the user's own
-// user_plans row — the shared sub stays untouched so no other app lights up.
-// Stacks from the current expiry like ecoGrantSub, and never shrinks a
-// bigger paid plan (plan_gb/expiry are MAX()ed).
+// PaceSeeker: the week lands on the device's own ad_until column (server-only
+// writes) and reaches the client via the signed grant — stealthlynk_subs is
+// never touched, so ad time can't leak into the shared entitlement. PhotoLynk:
+// writes only the user's own user_plans row. Stacks from the current expiry
+// like ecoGrantSub, and never shrinks a bigger paid plan (MAX semantics).
 async function ecoAdWeekGrant(who, { planGb = 100, provenance = '' } = {}) {
     const now = Date.now();
+    // Revoked accounts can't re-earn via ads (same gate ecoGrantSub applies
+    // on the PS path — admin must lift the revoke or grant explicitly).
+    const cur = await ecoGetSub(who.accountId);
+    if (cur?.source_kind === 'revoke') return 0;
     if (who.app === 'paceseeker') {
-        return ecoGrantSub(who.accountId, ECO_WEEK_MS, {
-            sourceApp: 'paceseeker', kind: 'ad_claim', provenance,
-            onlyApp: 'paceseeker',
-        });
+        // PS ad weeks live ONLY on the caller's own device row — never in
+        // stealthlynk_subs. The shared row stays binding-only, so a later
+        // payment floor can never re-tag mixed paid+ad time as 'payment'
+        // and leak the ad week into the other app. The signed grant in
+        // _psTrialRespond signs max(shared, device) so the week still
+        // reaches the client. Stacks from max(now, local entitlement) so
+        // paid time is never shortened and ad time piles after it.
+        const sharedApplies = !ecoLocalAdApp(cur) || ecoLocalAdApp(cur) === 'paceseeker';
+        const dev = await dbGetAsync(`SELECT ad_until FROM paceseeker_devices WHERE device_hash = ?`, [String(who.identity)]);
+        const base = Math.max(now, Number(dev?.ad_until) || 0, sharedApplies ? (Number(cur?.sub_until) || 0) : 0);
+        const until = base + ECO_WEEK_MS;
+        // Upsert: the device row could be missing if it was purged for silence
+        // between its last ping and this claim.
+        await dbRunAsync(
+            `INSERT INTO paceseeker_devices (device_hash, ad_until, first_seen, last_seen)
+             VALUES (?, ?, ?, ?)
+             ON CONFLICT(device_hash) DO UPDATE SET ad_until = MAX(COALESCE(ad_until, 0), excluded.ad_until), last_seen = excluded.last_seen`,
+            [String(who.identity), until, now, now]);
+        return until;
     }
-    const cur = await dbGetAsync(`SELECT expires_at FROM user_plans WHERE user_id = ?`, [Number(who.identity)]);
-    const until = Math.max(now, Number(cur?.expires_at) || 0) + ECO_WEEK_MS;
+    if (!who.identity) return 0;
+    const plan = await dbGetAsync(`SELECT expires_at FROM user_plans WHERE user_id = ?`, [Number(who.identity)]);
+    const until = Math.max(now, Number(plan?.expires_at) || 0) + ECO_WEEK_MS;
     const gb = Math.min(Math.max(Number(planGb) || 100, 1), ECO_AD_MAX_TIER_GB);
+    // expires_at is MAX()ed (not overwritten) so a payment landing between the
+    // SELECT and the upsert can't be shrunk. payment_type flips to 'ad_claim'
+    // whenever the ad grant is what extends the row — CRITICAL: that marker is
+    // what keeps ecoBackfillPhotolynkSub from re-binding a stacked ad week
+    // (paid 400GB + ad week would otherwise look like a paid plan and leak
+    // the ad time into the shared sub).
     await dbRunAsync(
         `INSERT INTO user_plans (user_id, plan_gb, status, expires_at, payment_type, updated_at)
          VALUES (?, ?, 'active', ?, 'ad_claim', ?)
          ON CONFLICT(user_id) DO UPDATE SET
             plan_gb = MAX(COALESCE(user_plans.plan_gb, 0), excluded.plan_gb),
             status = 'active',
-            expires_at = excluded.expires_at,
-            payment_type = CASE WHEN COALESCE(user_plans.expires_at, 0) <= ? THEN 'ad_claim' ELSE user_plans.payment_type END,
+            expires_at = MAX(COALESCE(user_plans.expires_at, 0), excluded.expires_at),
+            payment_type = CASE WHEN excluded.expires_at > COALESCE(user_plans.expires_at, 0) THEN 'ad_claim' ELSE user_plans.payment_type END,
             grace_until = NULL, deleted_at = NULL, updated_at = excluded.updated_at`,
-        [Number(who.identity), gb, until, now, now]);
+        [Number(who.identity), gb, until, now]);
     return until;
 }
+
+// An ad_claim shared row is app-local only when its source_app is a real app.
+// Legacy rows ('cherry', 'admin', 'merge'…) predate the app column and were
+// granted under the account-wide model — keep them account-scoped so members
+// don't lose a week that was already promised (they expire within 7d anyway).
+const ECO_AD_LOCAL_APPS = new Set(['photolynk', 'paceseeker']);
+const ecoLocalAdApp = (sub) =>
+    (sub && sub.source_kind === 'ad_claim' && ECO_AD_LOCAL_APPS.has(sub.source_app)) ? sub.source_app : null;
 
 // When a member joins an account that already has a sub, propagate the shared
 // entitlement to its app row immediately (don't wait for a payment/ping).
@@ -4568,7 +4607,7 @@ async function ecoSyncMemberEntitlement(accountId) {
     // Ad weeks are app-local: they propagate only within the claiming app and
     // materialize at the ad tier, never the bind tier.
     const adKind = sub.source_kind === 'ad_claim';
-    const targetApp = adKind ? sub.source_app : null;
+    const targetApp = ecoLocalAdApp(sub); // null for legacy account-wide rows
     // Skip the write when nothing changed — every heartbeat used to rewrite
     // subs + member rows even though MAX() is a no-op, churning updated_at.
     const stale = await dbAllAsync(
@@ -4881,8 +4920,21 @@ async function ecoCherryHandleCode(code, senderWallet) {
         `INSERT INTO ad_claims (account_id, week_key, platform, post_url, code, author_handle, status, app, tier_gb, created_at, verified_at)
          VALUES (?, ?, 'cherry', ?, ?, ?, 'verified', ?, ?, ?, ?)`,
         [member.account_id, wk, CHERRY_GROUP_URL, code, senderWallet, member.app, member.app === 'photolynk' ? 100 : null, Date.now(), Date.now()]).catch(() => { });
-    // App-local grant like any ad claim (never binds the ecosystem).
-    const who = { accountId: member.account_id, app: member.app || 'paceseeker', identity: member.identity };
+    // Same atomic grant-guard as the claim endpoint: only the writer that
+    // flipped granted_at issues the week — a racing manual claim can't
+    // stack a second +7d, and admin approve can't grant twice.
+    const g = await dbRunAsync(
+        `UPDATE ad_claims SET granted_at = ? WHERE account_id = ? AND week_key = ? AND granted_at IS NULL`,
+        [Date.now(), member.account_id, wk]).catch(() => null);
+    if (!g || g.changes === 0) return;
+    // App-local grant like any ad claim (never binds the ecosystem). Route it
+    // by the claim row's stored app — when our INSERT lost a race to a manual
+    // claim, the row's app is authoritative, not this member lookup.
+    const row = await dbGetAsync(`SELECT app FROM ad_claims WHERE account_id = ? AND week_key = ?`, [member.account_id, wk]).catch(() => null);
+    const grantApp = row?.app || member.app;
+    const mem = await dbGetAsync(`SELECT identity FROM ecosystem_members WHERE account_id = ? AND app = ? LIMIT 1`, [member.account_id, grantApp]).catch(() => null);
+    if (!mem?.identity) return;
+    const who = { accountId: member.account_id, app: grantApp || 'paceseeker', identity: mem.identity };
     await ecoAdWeekGrant(who, { planGb: 100, provenance: CHERRY_GROUP_URL }).catch(() => { });
     console.log(`[Eco] Cherry: verified claim for ${member.account_id} (wallet ${senderWallet.slice(0, 8)}…)`);
 }
@@ -5019,6 +5071,10 @@ app.get('/api/ecosystem/status', ecoMaybeAuth, async (req, res) => {
     try {
         const who = await ecoCallerAccount(req);
         if (who.error) return res.status(403).json({ error: who.error });
+        // Self-heal: pulls a live local plan (incl. store/IAP payments that
+        // never mirror directly) into the shared sub, and materializes the
+        // shared sub onto member rows. Idempotent — no-op when in sync.
+        await ecoSyncMemberEntitlement(who.accountId).catch(() => { });
         const members = await dbAllAsync(`SELECT app FROM ecosystem_members WHERE account_id = ?`, [who.accountId]);
         const sub = await ecoGetSub(who.accountId);
         const wk = ecoWeekKey();
@@ -5029,9 +5085,21 @@ app.get('/api/ecosystem/status', ecoMaybeAuth, async (req, res) => {
         const walletRow = await dbGetAsync(`SELECT wallet, wallet_verified FROM ecosystem_members WHERE account_id = ? AND wallet IS NOT NULL LIMIT 1`, [who.accountId]).catch(() => null);
         const myMember = await dbGetAsync(`SELECT wallet_verified FROM ecosystem_members WHERE app = ? AND identity = ?`, [who.app, String(who.identity)]).catch(() => null);
         // Ad weeks are app-local — a claim made in another app does not make
-        // THIS caller subscribed (paid/binding kinds still span the account).
-        const appliesHere = !sub || sub.source_kind !== 'ad_claim' || sub.source_app === who.app;
-        const localUntil = appliesHere ? (Number(sub?.sub_until) || 0) : 0;
+        // THIS caller subscribed (paid/binding kinds still span the account;
+        // legacy rows without an app stay account-wide). For PaceSeeker the
+        // device's own ad_until (server-written ad weeks) counts too.
+        const localApp = ecoLocalAdApp(sub);
+        const appliesHere = !sub || !localApp || localApp === who.app;
+        let localUntil = appliesHere ? (Number(sub?.sub_until) || 0) : 0;
+        if (who.app === 'paceseeker') {
+            const dev = await dbGetAsync(`SELECT ad_until FROM paceseeker_devices WHERE device_hash = ?`, [String(who.identity)]).catch(() => null);
+            localUntil = Math.max(localUntil, Number(dev?.ad_until) || 0);
+        } else if (who.app === 'photolynk') {
+            // PL ad weeks materialize straight into user_plans — include the
+            // caller's own plan expiry so a claimed week shows as subscribed.
+            const plan = await dbGetAsync(`SELECT expires_at FROM user_plans WHERE user_id = ?`, [Number(who.identity)]).catch(() => null);
+            localUntil = Math.max(localUntil, Number(plan?.expires_at) || 0);
+        }
         res.json({
             accountId: who.accountId,
             linkedApps: members.map(m => m.app),
@@ -5368,11 +5436,18 @@ app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
         // Grant is app-local: PS gets a shared row scoped to paceseeker
         // members; PL writes only the user's own plan row (ad weeks never
         // bind the ecosystem).
-        const subUntil = g.changes > 0
-            ? await ecoAdWeekGrant(who, { planGb: tierGb, provenance: postUrl })
-            : who.app === 'paceseeker'
-                ? Number((await ecoGetSub(who.accountId))?.sub_until) || 0
-                : Number((await dbGetAsync(`SELECT expires_at FROM user_plans WHERE user_id = ?`, [Number(who.identity)]))?.expires_at) || 0;
+        let subUntil = 0;
+        if (g.changes > 0) {
+            subUntil = await ecoAdWeekGrant(who, { planGb: tierGb, provenance: postUrl });
+        } else if (who.app === 'paceseeker') {
+            const sub = await ecoGetSub(who.accountId);
+            const la = ecoLocalAdApp(sub);
+            const sharedUntil = (!la || la === 'paceseeker') ? (Number(sub?.sub_until) || 0) : 0;
+            const dev = await dbGetAsync(`SELECT ad_until FROM paceseeker_devices WHERE device_hash = ?`, [String(who.identity)]);
+            subUntil = Math.max(sharedUntil, Number(dev?.ad_until) || 0);
+        } else {
+            subUntil = Number((await dbGetAsync(`SELECT expires_at FROM user_plans WHERE user_id = ?`, [Number(who.identity)]))?.expires_at) || 0;
+        }
         if (status === 'verified') return res.json({ ok: true, status: 'verified', subUntil });
         return res.json({ ok: true, status: 'pending', subUntil, message: 'Week granted — post is being confirmed in the background' });
     } catch (e) {
@@ -5406,12 +5481,9 @@ app.post('/admin/api/ad-claims/:id/review', adminAuth, async (req, res) => {
         if (!row.app) {
             subUntil = await ecoGrantSub(row.account_id, ECO_WEEK_MS, { sourceApp: 'admin', kind: 'ad_claim', provenance: row.post_url });
         } else {
-            const who = { accountId: row.account_id, app: row.app };
-            if (row.app === 'photolynk') {
-                const mem = await dbGetAsync(`SELECT identity FROM ecosystem_members WHERE account_id = ? AND app = 'photolynk' LIMIT 1`, [row.account_id]);
-                if (!mem?.identity) return res.status(400).json({ error: 'No photolynk member on this account' });
-                who.identity = mem.identity;
-            }
+            const mem = await dbGetAsync(`SELECT identity FROM ecosystem_members WHERE account_id = ? AND app = ? LIMIT 1`, [row.account_id, row.app]);
+            if (!mem?.identity) return res.status(400).json({ error: `No ${row.app} member on this account` });
+            const who = { accountId: row.account_id, app: row.app, identity: mem.identity };
             subUntil = await ecoAdWeekGrant(who, { planGb: Number(row.tier_gb) || 100, provenance: row.post_url });
         }
         return res.json({ ok: true, status: 'verified', subUntil });
@@ -5483,7 +5555,7 @@ app.post('/admin/api/eco-account/sub', adminAuth, async (req, res) => {
             const ms = await dbAllAsync(`SELECT app, identity FROM ecosystem_members WHERE account_id = ?`, [accountId]);
             for (const m of ms) {
                 if (m.app === 'paceseeker') {
-                    await dbRunAsync(`UPDATE paceseeker_devices SET sub_until = NULL WHERE device_hash = ?`, [String(m.identity)]);
+                    await dbRunAsync(`UPDATE paceseeker_devices SET sub_until = NULL, ad_until = NULL WHERE device_hash = ?`, [String(m.identity)]);
                 } else if (m.app === 'photolynk') {
                     await dbRunAsync(`UPDATE user_plans SET expires_at = ?, status = 'expired' WHERE user_id = ? AND payment_type = 'ecosystem'`, [Date.now(), Number(m.identity)]);
                 }
@@ -5780,8 +5852,11 @@ async function _psTrialRespond(res, row, id, wallet) {
         await ecoSyncMemberEntitlement(accountId);
         const sub = await ecoGetSub(accountId);
         // Ad weeks are app-local: a claim made in another app stays there.
-        const appliesToPs = sub && (sub.source_kind !== 'ad_claim' || sub.source_app === 'paceseeker');
-        const subUntil = appliesToPs ? (Number(sub.sub_until) || 0) : 0;
+        // PS ad weeks live on ad_until (server-written only — sub_until is
+        // client-reported `se` and must never feed a signed grant).
+        const localApp = ecoLocalAdApp(sub);
+        const sharedUntil = (!localApp || localApp === 'paceseeker') ? (Number(sub?.sub_until) || 0) : 0;
+        const subUntil = Math.max(sharedUntil, Number(row.ad_until) || 0);
         const g = subUntil > Date.now() ? ecoSignGrant(accountId, subUntil) : null;
         out.eco = { account: accountId, subUntil, grant: g ? g.grant : null, sig: g ? g.sig : null };
     } catch (e) {
@@ -5828,6 +5903,8 @@ app.get('/admin/api/paceseeker-users', adminAuth, (req, res) => {
                 sub_status: r.sub_status || 'none',
                 sub_until: r.sub_until || null,
                 sub_signature: r.sub_signature || '',
+                ad_until: r.ad_until || null,
+                ad_until_date: r.ad_until ? new Date(r.ad_until).toISOString() : null,
                 sub_paid_at: r.sub_paid_at || null,
                 sub_paid_at_date: r.sub_paid_at ? new Date(r.sub_paid_at).toISOString() : null,
                 sub_paid_with: r.sub_paid_with || '',
@@ -5844,7 +5921,7 @@ app.get('/admin/api/paceseeker-users', adminAuth, (req, res) => {
                 // An active paid/invite/ecosystem sub overrides trial state -
                 // 'active' means currently entitled, 'trial'/'expired' describe
                 // the raw trial clock for unsubscribed devices.
-                status: (ecoUntil > now || ((r.sub_status === 'paid' || r.sub_status === 'invite') && (!r.sub_until || r.sub_until > now)))
+                status: (ecoUntil > now || (r.ad_until && r.ad_until > now) || ((r.sub_status === 'paid' || r.sub_status === 'invite') && (!r.sub_until || r.sub_until > now)))
                     ? 'active'
                     : (r.trial_expires_at && r.trial_expires_at > now) ? 'trial' : 'expired',
             }; }),
