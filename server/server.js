@@ -4039,6 +4039,14 @@ db.serialize(() => {
     // future weekly claims must auto-verify (no optimistic grant).
     db.run(`ALTER TABLE ecosystem_accounts ADD COLUMN ad_strict INTEGER DEFAULT 0`, () => { });
     db.run(`ALTER TABLE ad_claims ADD COLUMN verify_attempts INTEGER DEFAULT 0`, () => { });
+    // One-time social requirements: X handle (bound from a verified post or
+    // declared) + Telegram group membership (verified via bot getChatMember).
+    // *_state: 'verified' | 'bound' | 'declared' | 'not_following' | null
+    db.run(`ALTER TABLE ecosystem_accounts ADD COLUMN x_handle TEXT`, () => { });
+    db.run(`ALTER TABLE ecosystem_accounts ADD COLUMN x_state TEXT`, () => { });
+    db.run(`ALTER TABLE ecosystem_accounts ADD COLUMN tg_user_id TEXT`, () => { });
+    db.run(`ALTER TABLE ecosystem_accounts ADD COLUMN tg_username TEXT`, () => { });
+    db.run(`ALTER TABLE ecosystem_accounts ADD COLUMN tg_state TEXT`, () => { });
 });
 
 const ECO_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -4341,6 +4349,119 @@ async function ecoRecheckPendingClaims() {
 }
 setInterval(ecoRecheckPendingClaims, ECO_CLAIM_RECHECK_MS).unref?.();
 
+// ─── One-time social requirements ───────────────────────────────────────────
+// X follow: hard-checked only when TWITTER_BEARER_TOKEN is configured (free
+// tier can't read followers). Otherwise the user's X handle is bound from their
+// first verified post and every weekly claim must post from the same account.
+// TG join: hard-checked via bot getChatMember when TELEGRAM_BOT_TOKEN is set;
+// user taps a deep link once. Without it, TG username is recorded as declared.
+const ECO_X_HANDLE = process.env.ECO_X_HANDLE || 'stealthlynkio';
+const ECO_TG_GROUP = process.env.ECO_TG_GROUP || 'StealthLynk_IO';
+const ECO_TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const ECO_X_BEARER = process.env.TWITTER_BEARER_TOKEN || '';
+
+async function ecoCheckXFollow(xHandle) {
+    if (!ECO_X_BEARER || !xHandle) return null; // can't check -> caller decides
+    try {
+        const h = { Authorization: `Bearer ${ECO_X_BEARER}` };
+        const [me, target] = await Promise.all([
+            axios.get(`https://api.twitter.com/2/users/by/username/${encodeURIComponent(xHandle)}`, { headers: h, timeout: 8000 }),
+            axios.get(`https://api.twitter.com/2/users/by/username/${ECO_X_HANDLE}`, { headers: h, timeout: 8000 }),
+        ]);
+        const meId = me.data?.data?.id, targetId = target.data?.data?.id;
+        if (!meId || !targetId) return null;
+        // Paginate their following list looking for our handle (cap 3 pages).
+        let cursor;
+        for (let page = 0; page < 3; page++) {
+            const r = await axios.get(`https://api.twitter.com/2/users/${meId}/following`, {
+                headers: h, timeout: 8000,
+                params: { max_results: 1000, ...(cursor ? { pagination_token: cursor } : {}) },
+            });
+            if ((r.data?.data || []).some(u => u.id === targetId)) return true;
+            cursor = r.data?.meta?.next_token;
+            if (!cursor) break;
+        }
+        return false;
+    } catch (e) { return null; } // API down / rate-limited -> don't block
+}
+
+async function ecoCheckTgMember(tgUserId) {
+    if (!ECO_TG_BOT_TOKEN || !tgUserId) return null;
+    try {
+        const r = await axios.get(`https://api.telegram.org/bot${ECO_TG_BOT_TOKEN}/getChatMember`, {
+            params: { chat_id: `@${ECO_TG_GROUP}`, user_id: tgUserId }, timeout: 8000,
+        });
+        return ['member', 'administrator', 'creator'].includes(r.data?.result?.status);
+    } catch (e) {
+        // getChatMember errors when the user is not in the group
+        if (e.response?.status === 400) return false;
+        return null;
+    }
+}
+
+// TG deep-link pairing: /api/ecosystem/tg-link issues a code; the user opens
+// t.me/<bot>?start=<code>; the bot long-poll loop below resolves it.
+async function ecoIssueTgLinkCode(accountId) {
+    const code = 'TG-' + crypto.randomBytes(3).toString('hex').toUpperCase();
+    await dbRunAsync(`INSERT INTO ecosystem_link_codes (code, account_id, expires_at) VALUES (?, ?, ?)`,
+        [code, accountId, Date.now() + ECO_LINK_CODE_TTL_MS]);
+    return code;
+}
+
+async function ecoTgApi(method, params) {
+    const r = await axios.post(`https://api.telegram.org/bot${ECO_TG_BOT_TOKEN}/${method}`, params || {}, { timeout: 10000 });
+    return r.data?.result;
+}
+
+// Long-poll the bot for /start <code>. Resolves the code's ecosystem account,
+// verifies group membership via getChatMember, marks tg_state, replies to the
+// user. Runs only when TELEGRAM_BOT_TOKEN is set; harmless if two servers poll
+// (each marks its own DB — that's what failover means).
+async function ecoTgBotLoop() {
+    if (!ECO_TG_BOT_TOKEN) return;
+    let offset = 0;
+    // Reuse the same bot for other bots' updates? No — dedicated bot assumed.
+    for (;;) {
+        try {
+            const updates = await ecoTgApi('getUpdates', { offset, timeout: 25, allowed_updates: ['message'] });
+            for (const u of updates || []) {
+                offset = u.update_id + 1;
+                const msg = u.message;
+                const text = String(msg?.text || '');
+                if (!msg?.from?.id || !text.startsWith('/start')) continue;
+                const code = text.split(/\s+/)[1] || '';
+                const chatId = msg.chat.id;
+                if (!/^TG-[0-9A-F]{6}$/.test(code)) {
+                    ecoTgApi('sendMessage', { chat_id: chatId, text: `Welcome! To link your StealthLynk account, open the link from the app's Settings > StealthLynk Ecosystem card.` }).catch(() => { });
+                    continue;
+                }
+                const row = await dbGetAsync(`SELECT * FROM ecosystem_link_codes WHERE code = ?`, [code]).catch(() => null);
+                if (!row || row.used || row.expires_at < Date.now()) {
+                    ecoTgApi('sendMessage', { chat_id: chatId, text: 'This link expired. Get a fresh one from the app (Settings > StealthLynk Ecosystem).' }).catch(() => { });
+                    continue;
+                }
+                const member = await ecoCheckTgMember(msg.from.id);
+                if (member === false) {
+                    ecoTgApi('sendMessage', { chat_id: chatId, text: `You're not in @${ECO_TG_GROUP} yet — join it first, then tap the link again.` }).catch(() => { });
+                    continue;
+                }
+                if (member === null) {
+                    ecoTgApi('sendMessage', { chat_id: chatId, text: 'Could not check membership right now — try again in a minute.' }).catch(() => { });
+                    continue;
+                }
+                await dbRunAsync(`UPDATE ecosystem_link_codes SET used = 1 WHERE code = ?`, [code]);
+                await dbRunAsync(`UPDATE ecosystem_accounts SET tg_user_id = ?, tg_username = ?, tg_state = 'verified' WHERE account_id = ?`,
+                    [String(msg.from.id), msg.from.username || null, row.account_id]);
+                ecoTgApi('sendMessage', { chat_id: chatId, text: `Linked! Your Telegram is verified for the StealthLynk ecosystem.` }).catch(() => { });
+            }
+        } catch (e) {
+            await new Promise(r => setTimeout(r, 5000)); // poll errors - back off
+        }
+    }
+}
+ecoTgBotLoop().catch(() => { });
+
+
 // Extract the caller's ecosystem account id from either app identity:
 //   app=ps&id=<device_hash>  (same trust model as the trial endpoint)
 //   app=pl + Bearer JWT      (authenticated PhotoLynk user)
@@ -4385,6 +4506,7 @@ app.get('/api/ecosystem/status', ecoMaybeAuth, async (req, res) => {
         const sub = await ecoGetSub(who.accountId);
         const wk = ecoWeekKey();
         const claim = await dbGetAsync(`SELECT status, platform, post_url FROM ad_claims WHERE account_id = ? AND week_key = ?`, [who.accountId, wk]);
+        const social = await dbGetAsync(`SELECT x_handle, x_state, tg_username, tg_state FROM ecosystem_accounts WHERE account_id = ?`, [who.accountId]);
         res.json({
             accountId: who.accountId,
             linkedApps: members.map(m => m.app),
@@ -4392,8 +4514,58 @@ app.get('/api/ecosystem/status', ecoMaybeAuth, async (req, res) => {
             subscribed: !!(sub && Number(sub.sub_until) > Date.now()),
             weekKey: wk,
             adClaim: claim ? { status: claim.status, platform: claim.platform, postUrl: claim.post_url } : null,
+            social: {
+                xHandle: social?.x_handle || null,
+                xState: social?.x_state || null,
+                tgUsername: social?.tg_username || null,
+                tgState: social?.tg_state || null,
+                tgBotConfigured: !!ECO_TG_BOT_TOKEN,
+                xFollowChecked: !!ECO_X_BEARER,
+                xHandleRequired: ECO_X_HANDLE,
+                tgGroup: ECO_TG_GROUP,
+            },
         });
     } catch (e) { res.status(500).json({ error: 'Status failed' }); }
+});
+
+// Declare social handles when a verifier isn't configured. X handle is also
+// bound automatically by a verified X post; this endpoint is for accounts that
+// only post elsewhere. Once set, the handle is pinned - it can't be changed
+// (prevents farming: same social identity required every week).
+app.post('/api/ecosystem/bind-social', ecoMaybeAuth, async (req, res) => {
+    try {
+        const who = await ecoCallerAccount(req);
+        if (who.error) return res.status(403).json({ error: who.error });
+        const xHandle = String(req.body?.xHandle || '').trim().replace(/^@/, '');
+        const tgUsername = String(req.body?.tgUsername || '').trim().replace(/^@/, '');
+        if (xHandle && !/^[A-Za-z0-9_]{1,15}$/.test(xHandle)) return res.status(400).json({ error: 'Invalid X handle' });
+        if (tgUsername && !/^[A-Za-z0-9_]{5,32}$/.test(tgUsername)) return res.status(400).json({ error: 'Invalid Telegram username' });
+        const acct = await dbGetAsync(`SELECT x_handle, tg_username FROM ecosystem_accounts WHERE account_id = ?`, [who.accountId]);
+        if (xHandle) {
+            if (acct?.x_handle && acct.x_handle !== xHandle) {
+                return res.status(400).json({ error: `X handle is already pinned to @${acct.x_handle}` });
+            }
+            const follows = await ecoCheckXFollow(xHandle); // null when unconfigured
+            await dbRunAsync(`UPDATE ecosystem_accounts SET x_handle = ?, x_state = ? WHERE account_id = ?`,
+                [xHandle, follows === false ? 'not_following' : (follows === true ? 'verified' : 'bound'), who.accountId]);
+        }
+        if (tgUsername && !acct?.tg_username) {
+            await dbRunAsync(`UPDATE ecosystem_accounts SET tg_username = ?, tg_state = 'declared' WHERE account_id = ?`, [tgUsername, who.accountId]);
+        }
+        res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: 'Bind failed' }); }
+});
+
+// Issues a t.me/<bot>?start=TG-XXXXXX deep link for TG membership verification.
+app.post('/api/ecosystem/tg-link', ecoMaybeAuth, async (req, res) => {
+    try {
+        if (!ECO_TG_BOT_TOKEN) return res.status(503).json({ error: 'Telegram verification not configured' });
+        const who = await ecoCallerAccount(req);
+        if (who.error) return res.status(403).json({ error: who.error });
+        const code = await ecoIssueTgLinkCode(who.accountId);
+        const botName = process.env.TELEGRAM_BOT_USERNAME || '';
+        res.json({ code, deepLink: botName ? `https://t.me/${botName}?start=${code}` : null });
+    } catch (e) { res.status(500).json({ error: 'TG link failed' }); }
 });
 
 // Link code: issue (10min TTL) on one app, redeem on the other.
@@ -4469,12 +4641,62 @@ app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
 
         // Strict accounts (a previous claim died in background re-checks) must
         // auto-verify — no optimistic grant.
-        const acct = await dbGetAsync(`SELECT ad_strict FROM ecosystem_accounts WHERE account_id = ?`, [who.accountId]);
+        const acct = await dbGetAsync(`SELECT ad_strict, x_handle, x_state, tg_user_id, tg_username, tg_state FROM ecosystem_accounts WHERE account_id = ?`, [who.accountId]);
         const strict = !!(acct && acct.ad_strict);
 
         const v = await ecoVerifyPost(platform, postUrl, code);
         let status = v.verified ? 'verified' : 'pending';
         const authorHandle = v.authorHandle || null;
+
+        // ── One-time social requirements (follow X + join TG, once per account) ──
+        // X handle binds automatically from a verified X post's author. Other
+        // platforms need a handle declared via /api/ecosystem/bind-social.
+        // With TWITTER_BEARER_TOKEN the follow is hard-checked on every claim —
+        // without it the pinned handle + weekly post is the standing proof.
+        // TG: with TELEGRAM_BOT_TOKEN membership is re-checked on every claim
+        // (leave the group -> next claim bounces). Without it a declared
+        // username is recorded best-effort.
+        if (platform === 'x' && v.verified && authorHandle) {
+            if (!acct?.x_handle) {
+                const follows = await ecoCheckXFollow(authorHandle); // null when unconfigured
+                await dbRunAsync(`UPDATE ecosystem_accounts SET x_handle = ?, x_state = ? WHERE account_id = ?`,
+                    [authorHandle, follows === false ? 'not_following' : (follows === true ? 'verified' : 'bound'), who.accountId]);
+                acct.x_handle = authorHandle;
+                if (follows === false) {
+                    return res.status(428).json({ error: 'social_required', missing: ['x_follow'], xHandle: ECO_X_HANDLE, message: `Post found — now follow @${ECO_X_HANDLE} on X and resubmit.` });
+                }
+            } else if (authorHandle.toLowerCase() !== acct.x_handle.toLowerCase()) {
+                return res.status(400).json({ error: `This post is from @${authorHandle} — weekly ads must come from your linked account @${acct.x_handle}` });
+            }
+        }
+        const needX = !acct?.x_handle && !(platform === 'x' && v.verified);
+        const needTg = ECO_TG_BOT_TOKEN ? !acct?.tg_user_id : !acct?.tg_username;
+        if (needX || needTg) {
+            return res.status(428).json({
+                error: 'social_required',
+                missing: [needX ? 'x_follow' : null, needTg ? 'tg_join' : null].filter(Boolean),
+                xHandle: ECO_X_HANDLE,
+                tgGroup: ECO_TG_GROUP,
+                tgBotConfigured: !!ECO_TG_BOT_TOKEN,
+                message: 'One-time setup: follow @' + ECO_X_HANDLE + ' on X and join @' + ECO_TG_GROUP + ' on Telegram, then resubmit.',
+            });
+        }
+        // Hard re-checks on every claim when credentials exist. A null result
+        // (API down) never blocks — we only block on a definitive "not a member".
+        if (ECO_TG_BOT_TOKEN && acct?.tg_user_id) {
+            const member = await ecoCheckTgMember(acct.tg_user_id);
+            if (member === false) {
+                await dbRunAsync(`UPDATE ecosystem_accounts SET tg_state = 'not_member' WHERE account_id = ?`, [who.accountId]);
+                return res.status(428).json({ error: 'social_required', missing: ['tg_join'], tgGroup: ECO_TG_GROUP, message: `Rejoin @${ECO_TG_GROUP} on Telegram, then resubmit.` });
+            }
+        }
+        if (ECO_X_BEARER && acct?.x_handle) {
+            const follows = await ecoCheckXFollow(acct.x_handle);
+            if (follows === false) {
+                await dbRunAsync(`UPDATE ecosystem_accounts SET x_state = 'not_following' WHERE account_id = ?`, [who.accountId]);
+                return res.status(428).json({ error: 'social_required', missing: ['x_follow'], xHandle: ECO_X_HANDLE, message: `Follow @${ECO_X_HANDLE} on X, then resubmit.` });
+            }
+        }
 
         if (!v.verified && strict) {
             return res.status(400).json({
