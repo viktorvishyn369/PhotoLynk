@@ -4032,6 +4032,12 @@ db.serialize(() => {
         expires_at INTEGER,
         used INTEGER DEFAULT 0
     )`, (e) => { if (e) console.error('[Eco] link_codes table:', e.message); });
+    // wallet_verified=1 means the wallet was proven by an Ed25519 signature
+    // (PhotoLynk: wallet-login; PaceSeeker: /api/ecosystem/bind-wallet). Only
+    // verified wallets drive account matching — an unverified claim could
+    // otherwise join a stranger's account by reporting their address.
+    db.run(`ALTER TABLE ecosystem_members ADD COLUMN wallet_verified INTEGER DEFAULT 0`, () => { });
+    db.run(`UPDATE ecosystem_members SET wallet_verified = 1 WHERE app = 'photolynk' AND wallet IS NOT NULL`, () => { });
     db.run(`CREATE INDEX IF NOT EXISTS idx_eco_members_wallet ON ecosystem_members(wallet)`, (e) => { if (e) console.error('[Eco] idx wallet:', e.message); });
     db.run(`CREATE INDEX IF NOT EXISTS idx_eco_members_acct ON ecosystem_members(account_id)`, (e) => { if (e) console.error('[Eco] idx acct:', e.message); });
     db.run(`CREATE INDEX IF NOT EXISTS idx_ad_claims_status ON ad_claims(status)`, (e) => { if (e) console.error('[Eco] idx claims:', e.message); });
@@ -4095,37 +4101,44 @@ function ecoSignGrant(accountId, subUntil) {
     } catch (e) { return null; }
 }
 
-// Resolve-or-create the ecosystem account for an app identity. Wallet-matching
-// is the auto-link: if another app's member already carries this wallet, the
-// new member joins THAT account.
-async function ecoEnsureAccount(app, identity, wallet) {
+// Resolve-or-create the ecosystem account for an app identity. Verified-wallet
+// matching is the auto-link: if another app's member carries this wallet AND
+// proved it by signature, the new member joins THAT account. Unverified wallet
+// claims (the PS device ping's w= param) are stored for display but never
+// trigger joins or merges — otherwise anyone could claim a stranger's wallet.
+async function ecoEnsureAccount(app, identity, wallet, { verified = false } = {}) {
     const existing = await dbGetAsync(
-        `SELECT account_id, wallet FROM ecosystem_members WHERE app = ? AND identity = ?`, [app, String(identity)]);
+        `SELECT account_id, wallet, wallet_verified FROM ecosystem_members WHERE app = ? AND identity = ?`, [app, String(identity)]);
     if (existing) {
-        if (wallet && existing.wallet !== wallet) {
-            db.run(`UPDATE ecosystem_members SET wallet = ? WHERE app = ? AND identity = ?`, [wallet, app, String(identity)], () => { });
-            // This wallet may already anchor a different account (e.g. the
-            // other app registered it earlier) - merge into that one.
-            const other = await dbGetAsync(
-                `SELECT account_id FROM ecosystem_members WHERE wallet = ? AND NOT (app = ? AND identity = ?) LIMIT 1`,
-                [wallet, app, String(identity)]);
-            if (other && other.account_id !== existing.account_id) {
-                const conflict = await dbGetAsync(
-                    `SELECT 1 AS x FROM ecosystem_members WHERE account_id = ? AND app = ? LIMIT 1`,
-                    [other.account_id, app]);
-                if (!conflict) {
-                    await dbRunAsync(`UPDATE ecosystem_members SET account_id = ? WHERE app = ? AND identity = ?`,
-                        [other.account_id, app, String(identity)]);
-                    await ecoMergeAccounts(other.account_id, existing.account_id);
-                    return other.account_id;
+        if (wallet && (existing.wallet !== wallet || (verified && !existing.wallet_verified))) {
+            // Unverified reports never overwrite a verified wallet binding.
+            if (!verified && existing.wallet_verified) return existing.account_id;
+            await dbRunAsync(`UPDATE ecosystem_members SET wallet = ?, wallet_verified = ? WHERE app = ? AND identity = ?`,
+                [wallet, verified ? 1 : 0, app, String(identity)]);
+            if (verified) {
+                // This wallet may already anchor a different account (e.g. the
+                // other app verified it earlier) - merge into that one.
+                const other = await dbGetAsync(
+                    `SELECT account_id FROM ecosystem_members WHERE wallet = ? AND wallet_verified = 1 AND NOT (app = ? AND identity = ?) LIMIT 1`,
+                    [wallet, app, String(identity)]);
+                if (other && other.account_id !== existing.account_id) {
+                    const conflict = await dbGetAsync(
+                        `SELECT 1 AS x FROM ecosystem_members WHERE account_id = ? AND app = ? LIMIT 1`,
+                        [other.account_id, app]);
+                    if (!conflict) {
+                        await dbRunAsync(`UPDATE ecosystem_members SET account_id = ? WHERE app = ? AND identity = ?`,
+                            [other.account_id, app, String(identity)]);
+                        await ecoMergeAccounts(other.account_id, existing.account_id);
+                        return other.account_id;
+                    }
                 }
             }
         }
         return existing.account_id;
     }
     let accountId = null;
-    if (wallet) {
-        const w = await dbGetAsync(`SELECT account_id FROM ecosystem_members WHERE wallet = ? LIMIT 1`, [wallet]);
+    if (wallet && verified) {
+        const w = await dbGetAsync(`SELECT account_id FROM ecosystem_members WHERE wallet = ? AND wallet_verified = 1 LIMIT 1`, [wallet]);
         if (w) {
             // One instance per app per account: only join when this app is not
             // already registered on that account (e.g. a second phone with the
@@ -4139,9 +4152,9 @@ async function ecoEnsureAccount(app, identity, wallet) {
         await dbRunAsync(`INSERT INTO ecosystem_accounts (account_id, primary_wallet, created_at) VALUES (?, ?, ?)`,
             [accountId, wallet || null, Date.now()]);
     }
-    await dbRunAsync(`INSERT OR IGNORE INTO ecosystem_members (account_id, app, identity, wallet, linked_at) VALUES (?, ?, ?, ?, ?)`,
-        [accountId, app, String(identity), wallet || null, Date.now()]);
-    if (wallet) db.run(`UPDATE ecosystem_accounts SET primary_wallet = COALESCE(primary_wallet, ?) WHERE account_id = ?`, [wallet, accountId], () => { });
+    await dbRunAsync(`INSERT OR IGNORE INTO ecosystem_members (account_id, app, identity, wallet, wallet_verified, linked_at) VALUES (?, ?, ?, ?, ?, ?)`,
+        [accountId, app, String(identity), wallet || null, verified ? 1 : 0, Date.now()]);
+    if (wallet && verified) db.run(`UPDATE ecosystem_accounts SET primary_wallet = COALESCE(primary_wallet, ?) WHERE account_id = ?`, [wallet, accountId], () => { });
     return accountId;
 }
 
@@ -4612,7 +4625,7 @@ async function ecoCallerAccount(req) {
         const row = await dbGetAsync(`SELECT account_id, wallet FROM ecosystem_members WHERE app = 'photolynk' AND identity = ?`, [String(req.user.id)]);
         if (!row) {
             const u = await dbGetAsync(`SELECT wallet_address FROM users WHERE id = ?`, [req.user.id]);
-            const acct = await ecoEnsureAccount('photolynk', req.user.id, u?.wallet_address || null);
+            const acct = await ecoEnsureAccount('photolynk', req.user.id, u?.wallet_address || null, { verified: true });
             return { accountId: acct, app: 'photolynk', identity: String(req.user.id), wallet: u?.wallet_address || null };
         }
         return { accountId: row.account_id, app: 'photolynk', identity: String(req.user.id), wallet: row.wallet };
@@ -4641,10 +4654,12 @@ app.get('/api/ecosystem/status', ecoMaybeAuth, async (req, res) => {
         const social = await dbGetAsync(`SELECT x_handle, x_state, tg_username, tg_state, cherry_state FROM ecosystem_accounts WHERE account_id = ?`, [who.accountId]);
         // Cherry identity is the wallet itself — expose it so clients can show
         // the user exactly which wallet the room check looks for.
-        const walletRow = await dbGetAsync(`SELECT wallet FROM ecosystem_members WHERE account_id = ? AND wallet IS NOT NULL LIMIT 1`, [who.accountId]).catch(() => null);
+        const walletRow = await dbGetAsync(`SELECT wallet, wallet_verified FROM ecosystem_members WHERE account_id = ? AND wallet IS NOT NULL LIMIT 1`, [who.accountId]).catch(() => null);
+        const myMember = await dbGetAsync(`SELECT wallet_verified FROM ecosystem_members WHERE app = ? AND identity = ?`, [who.app, String(who.identity)]).catch(() => null);
         res.json({
             accountId: who.accountId,
             linkedApps: members.map(m => m.app),
+            walletVerified: !!(myMember && myMember.wallet_verified),
             subUntil: sub?.sub_until || 0,
             subscribed: !!(sub && Number(sub.sub_until) > Date.now()),
             weekKey: wk,
@@ -4707,42 +4722,73 @@ app.post('/api/ecosystem/tg-link', ecoMaybeAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'TG link failed' }); }
 });
 
-// Link code: issue (10min TTL) on one app, redeem on the other. Needed for
-// users whose PaceSeeker wallet (imported/session) differs from the PhotoLynk
-// wallet — same-wallet accounts already auto-link via ecoEnsureAccount.
-// A merge is rejected if both accounts already contain the same app so one
-// ecosystem account never holds two instances of the same app.
+// Link codes removed — replaced by signature-verified wallet binding below.
+// Stubs return 410 so older app builds get a clean error instead of a merge.
 app.post('/api/ecosystem/link-code', ecoMaybeAuth, async (req, res) => {
-    try {
-        const who = await ecoCallerAccount(req);
-        if (who.error) return res.status(403).json({ error: who.error });
-        const code = 'LNK-' + crypto.randomBytes(3).toString('hex').toUpperCase();
-        await dbRunAsync(`INSERT INTO ecosystem_link_codes (code, account_id, expires_at) VALUES (?, ?, ?)`,
-            [code, who.accountId, Date.now() + ECO_LINK_CODE_TTL_MS]);
-        res.json({ code, expiresInMs: ECO_LINK_CODE_TTL_MS });
-    } catch (e) { res.status(500).json({ error: 'Link code failed' }); }
+    res.status(410).json({ error: 'Link codes removed — apps link automatically once the wallet is verified.' });
 });
 
 app.post('/api/ecosystem/link', ecoMaybeAuth, async (req, res) => {
+    res.status(410).json({ error: 'Link codes removed — apps link automatically once the wallet is verified.' });
+});
+
+// Verified wallet binding: a single-use nonce challenge signed by the wallet's
+// Ed25519 key proves ownership. This is what lets a PaceSeeker member on an
+// imported/session wallet bind the REAL wallet (returned by MWA authorize) so
+// it auto-links with PhotoLynk — the only safe "same user" proof for
+// different-address wallets.
+const ecoBindChallenges = new Map(); // nonce -> { accountId, expiresAt }
+const ECO_BIND_CHALLENGE_TTL_MS = 5 * 60 * 1000;
+
+app.get('/api/ecosystem/bind-challenge', ecoMaybeAuth, async (req, res) => {
     try {
         const who = await ecoCallerAccount(req);
         if (who.error) return res.status(403).json({ error: who.error });
-        const code = String(req.body?.code || '').trim().toUpperCase();
-        if (!/^LNK-[0-9A-F]{6}$/.test(code)) return res.status(400).json({ error: 'Invalid code' });
-        const row = await dbGetAsync(`SELECT * FROM ecosystem_link_codes WHERE code = ?`, [code]);
-        if (!row || row.used || row.expires_at < Date.now()) return res.status(400).json({ error: 'Code expired or invalid' });
-        if (row.account_id === who.accountId) return res.status(400).json({ error: 'Already linked' });
-        const theirApps = (await dbAllAsync(`SELECT DISTINCT app FROM ecosystem_members WHERE account_id = ?`, [row.account_id])).map(m => m.app);
-        const myApps = (await dbAllAsync(`SELECT DISTINCT app FROM ecosystem_members WHERE account_id = ?`, [who.accountId])).map(m => m.app);
-        if (theirApps.some(a => myApps.includes(a))) {
-            return res.status(409).json({ error: 'That account already has this app linked' });
+        const now = Date.now();
+        for (const [n, e] of ecoBindChallenges) if (!e || e.expiresAt <= now) ecoBindChallenges.delete(n);
+        if (ecoBindChallenges.size >= 10000) return res.status(429).json({ error: 'Too many challenges' });
+        const nonce = crypto.randomBytes(32).toString('hex');
+        ecoBindChallenges.set(nonce, { accountId: who.accountId, expiresAt: now + ECO_BIND_CHALLENGE_TTL_MS });
+        res.json({ nonce, message: `StealthLynk-EcoBind-v1\nnonce:${nonce}`, expires_in: 300 });
+    } catch (e) { res.status(500).json({ error: 'Challenge failed' }); }
+});
+
+app.post('/api/ecosystem/bind-wallet', ecoMaybeAuth, async (req, res) => {
+    try {
+        const who = await ecoCallerAccount(req);
+        if (who.error) return res.status(403).json({ error: who.error });
+        const { wallet_address, signature, public_key_b64, nonce } = req.body || {};
+        if (!wallet_address || !signature || !public_key_b64 || !nonce) {
+            return res.status(400).json({ error: 'Missing bind parameters' });
         }
-        const merged = await ecoMergeAccounts(row.account_id, who.accountId);
-        await dbRunAsync(`UPDATE ecosystem_link_codes SET used = 1 WHERE code = ?`, [code]);
-        await ecoSyncMemberEntitlement(merged);
-        const members = await dbAllAsync(`SELECT app FROM ecosystem_members WHERE account_id = ?`, [merged]);
-        res.json({ ok: true, accountId: merged, linkedApps: members.map(m => m.app) });
-    } catch (e) { res.status(500).json({ error: 'Link failed' }); }
+        const chal = ecoBindChallenges.get(String(nonce));
+        ecoBindChallenges.delete(String(nonce)); // single use
+        if (!chal || chal.expiresAt <= Date.now()) return res.status(400).json({ error: 'Challenge expired — retry' });
+        if (chal.accountId !== who.accountId) return res.status(403).json({ error: 'Challenge not issued to this account' });
+
+        let publicKeyBytes, signatureBytes;
+        try {
+            publicKeyBytes = naclUtil.decodeBase64(public_key_b64);
+            signatureBytes = naclUtil.decodeBase64(signature);
+        } catch (e) { return res.status(400).json({ error: 'Invalid encoding' }); }
+        if (publicKeyBytes.length !== nacl.sign.publicKeyLength || signatureBytes.length !== nacl.sign.signatureLength) {
+            return res.status(400).json({ error: 'Invalid key or signature length' });
+        }
+        // The signed message is the challenge message; verify signature and
+        // that the public key matches the claimed wallet address.
+        const messageBytes = naclUtil.decodeUTF8(`StealthLynk-EcoBind-v1\nnonce:${nonce}`);
+        if (!nacl.sign.detached.verify(messageBytes, signatureBytes, publicKeyBytes)) {
+            return res.status(401).json({ error: 'Invalid wallet signature' });
+        }
+        if (base58Encode(publicKeyBytes) !== String(wallet_address).trim()) {
+            return res.status(400).json({ error: 'Public key does not match wallet address' });
+        }
+
+        const accountId = await ecoEnsureAccount(who.app, who.identity, String(wallet_address).trim(), { verified: true });
+        await ecoSyncMemberEntitlement(accountId);
+        const members = await dbAllAsync(`SELECT app FROM ecosystem_members WHERE account_id = ?`, [accountId]);
+        res.json({ ok: true, accountId, linkedApps: members.map(m => m.app) });
+    } catch (e) { res.status(500).json({ error: 'Bind failed' }); }
 });
 
 app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
@@ -6194,7 +6240,7 @@ app.post('/api/wallet-login', authRateLimiter, async (req, res) => {
         // Ecosystem membership: the wallet is cryptographically proven here
         // (SIWS), so wallet-matched auto-linking uses it as the identity root.
         try {
-            const acct = await ecoEnsureAccount('photolynk', user.id, walletAddressNorm);
+            const acct = await ecoEnsureAccount('photolynk', user.id, walletAddressNorm, { verified: true });
             await ecoSyncMemberEntitlement(acct);
         } catch (e) { console.warn('[Eco] wallet-login membership failed:', e.message); }
 
@@ -7212,7 +7258,7 @@ app.post('/api/solana/verify-payment', async (req, res) => {
         // future member apps) under the shared StealthLynk account.
         try {
             const uw = await dbGetAsync(`SELECT wallet_address FROM users WHERE id = ?`, [user.id]);
-            const acct = await ecoEnsureAccount('photolynk', user.id, uw?.wallet_address || null);
+            const acct = await ecoEnsureAccount('photolynk', user.id, uw?.wallet_address || null, { verified: true });
             await ecoFloorSub(acct, expiresAt, { sourceApp: 'photolynk', kind: 'payment', provenance: txSignature });
         } catch (e) { console.warn('[Eco] payment mirror failed:', e.message); }
 
@@ -7348,7 +7394,7 @@ app.post('/api/solana/verify-skr-payment', async (req, res) => {
         // Ecosystem mirror (same as SOL path).
         try {
             const uw = await dbGetAsync(`SELECT wallet_address FROM users WHERE id = ?`, [user.id]);
-            const acct = await ecoEnsureAccount('photolynk', user.id, uw?.wallet_address || null);
+            const acct = await ecoEnsureAccount('photolynk', user.id, uw?.wallet_address || null, { verified: true });
             await ecoFloorSub(acct, expiresAt, { sourceApp: 'photolynk', kind: 'payment', provenance: txSignature });
         } catch (e) { console.warn('[Eco] SKR payment mirror failed:', e.message); }
 
