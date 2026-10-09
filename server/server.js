@@ -4218,12 +4218,56 @@ function ecoAdCode(accountId, weekKey) {
     const h = crypto.createHmac('sha256', ECO_AD_SECRET).update(`${accountId}|${weekKey}`).digest('hex');
     return 'SLK-' + h.slice(0, 6).toUpperCase();
 }
+// Ad copies. Rules: {CODE} + #stealthlynk are REQUIRED (verifier looks for both),
+// keep X copy under 280 chars. Mention stores (Google Play + Solana dApp Store),
+// Apple on demand, stealthlynk.io, and the core feature set of each app.
 const ECO_AD_COPIES = {
-    x: 'PaceSeeker: private self-custodial AI trading on Solana. PhotoLynk: private encrypted photo backup. One subscription covers the whole StealthLynk ecosystem. #StealthLynk #PaceSeeker #PhotoLynk #Solana https://stealthlynk.io code: {CODE}',
-    telegram: 'PaceSeeker — private self-custodial AI trading on Solana. PhotoLynk — private encrypted photo backup. One subscription covers the whole StealthLynk ecosystem. https://stealthlynk.io #StealthLynk code: {CODE}',
-    instagram: 'Private Solana apps. PaceSeeker — self-custodial AI trading. PhotoLynk — encrypted private photo backup. One subscription covers the whole StealthLynk ecosystem. #StealthLynk #PaceSeeker #PhotoLynk #Solana #CryptoTrading #PrivacyFirst | code: {CODE}',
-    facebook: 'Check out the StealthLynk ecosystem: PaceSeeker — private self-custodial AI trading on Solana, and PhotoLynk — private encrypted photo backup. One subscription covers all apps. https://stealthlynk.io #StealthLynk | code: {CODE}',
-    generic: 'PaceSeeker (AI trading) + PhotoLynk (private photo backup) — one StealthLynk subscription covers all apps. https://stealthlynk.io #StealthLynk code: {CODE}',
+    // ≤280 chars including code — counted: 251.
+    x: 'StealthLynk — private Solana apps, one sub:\nPaceSeeker: self-custody DCA AI autotrader, 37 indicators\nPhotoLynk: zero-knowledge encrypted photo vault\nGoogle Play + Solana dApp Store\nstealthlynk.io\n#Solana #SolanaMobile #StealthLynk {CODE}',
+    telegram: `StealthLynk Ecosystem — private Solana apps, one subscription covers everything.
+
+🤖 PaceSeeker — self-custody AI autotrading on Solana. DCA AI with 3 strategies + 4 substrategies, 37 indicators, pretrained on 4 years of history with live auto-tuning, safety module, bank-level security, 3 wallet connection types. On-chain, 24/7.
+
+📸 PhotoLynk — stealth zero-knowledge cloud photo vault. On-device encryption, exact + burst dedup, bit-for-bit original preservation, cross-platform (desktop builds on GitHub), NFT albums with authenticity proofs for your rights.
+
+📲 Google Play + Solana Mobile dApp Store. Want it on Apple Store? Reply "Apple" — we ship when demand is there.
+
+https://stealthlynk.io
+#Solana #SolanaMobile #StealthLynk
+{CODE}`,
+    instagram: `StealthLynk Ecosystem — private Solana apps, one subscription.
+
+PaceSeeker: self-custody AI autotrading on-chain, 24/7. DCA AI — 3 strategies + 4 substrategies, 37 indicators, pretrained on 4 years of market history, live auto-tuning, safety module, bank-level security, 3 wallet types. Self-custody always.
+
+PhotoLynk: stealth zero-knowledge cloud vault. On-device encryption, exact + burst dedup, bit-for-bit original preservation, cross-platform (desktop apps on GitHub), NFT albums with authenticity proofs.
+
+Get both on Google Play + Solana Mobile dApp Store. Reply "Apple" if you want an Apple Store release.
+
+https://stealthlynk.io
+#Solana #SolanaMobile #StealthLynk #CryptoTrading #PhotoBackup #PrivacyFirst #SelfCustody
+{CODE}`,
+    facebook: `StealthLynk Ecosystem — two private Solana apps, one subscription covers everything.
+
+PaceSeeker — self-custodial AI autotrading on Solana, on-chain and 24/7: DCA AI with 3 strategies and 4 substrategies, 37 indicators, pretrained on 4 years of history, live auto-tuning, safety module, bank-level app security, 3 wallet connection types.
+
+PhotoLynk — stealth zero-knowledge cloud photo backup: on-device encryption, exact + burst deduplication, bit-for-bit original preservation, cross-platform (desktop apps on GitHub), Web3 NFT albums with authenticity proofs to protect your rights.
+
+Available on Google Play and the Solana Mobile dApp Store. Interested in an Apple Store release? Comment "Apple" — we'll ship it when demand is there.
+
+https://stealthlynk.io
+#Solana #SolanaMobile #StealthLynk
+Code: {CODE}`,
+    generic: `StealthLynk Ecosystem — private Solana apps, one subscription.
+
+PaceSeeker: self-custody DCA AI autotrader — 3 strategies + 4 substrategies, 37 indicators, pretrained on 4 years of history, safety module, bank-level security.
+
+PhotoLynk: zero-knowledge encrypted photo vault — on-device encryption, exact + burst dedup, bit-for-bit originals, cross-platform, NFT albums with authenticity proofs.
+
+Google Play + Solana Mobile dApp Store. Apple Store on demand — reply "Apple".
+
+https://stealthlynk.io
+#Solana #SolanaMobile #StealthLynk
+{CODE}`,
 };
 const ECO_REQUIRED_TAG = '#stealthlynk';
 
