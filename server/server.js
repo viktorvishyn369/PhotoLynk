@@ -4707,15 +4707,42 @@ app.post('/api/ecosystem/tg-link', ecoMaybeAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'TG link failed' }); }
 });
 
-// Link code: issue (10min TTL) on one app, redeem on the other.
-// Link codes removed — accounts link automatically by wallet (ecoEnsureAccount).
-// Stubs return 410 so older app builds get a clean error instead of a merge.
+// Link code: issue (10min TTL) on one app, redeem on the other. Needed for
+// users whose PaceSeeker wallet (imported/session) differs from the PhotoLynk
+// wallet — same-wallet accounts already auto-link via ecoEnsureAccount.
+// A merge is rejected if both accounts already contain the same app so one
+// ecosystem account never holds two instances of the same app.
 app.post('/api/ecosystem/link-code', ecoMaybeAuth, async (req, res) => {
-    res.status(410).json({ error: 'Link codes removed — the same wallet links apps automatically.' });
+    try {
+        const who = await ecoCallerAccount(req);
+        if (who.error) return res.status(403).json({ error: who.error });
+        const code = 'LNK-' + crypto.randomBytes(3).toString('hex').toUpperCase();
+        await dbRunAsync(`INSERT INTO ecosystem_link_codes (code, account_id, expires_at) VALUES (?, ?, ?)`,
+            [code, who.accountId, Date.now() + ECO_LINK_CODE_TTL_MS]);
+        res.json({ code, expiresInMs: ECO_LINK_CODE_TTL_MS });
+    } catch (e) { res.status(500).json({ error: 'Link code failed' }); }
 });
 
 app.post('/api/ecosystem/link', ecoMaybeAuth, async (req, res) => {
-    res.status(410).json({ error: 'Link codes removed — the same wallet links apps automatically.' });
+    try {
+        const who = await ecoCallerAccount(req);
+        if (who.error) return res.status(403).json({ error: who.error });
+        const code = String(req.body?.code || '').trim().toUpperCase();
+        if (!/^LNK-[0-9A-F]{6}$/.test(code)) return res.status(400).json({ error: 'Invalid code' });
+        const row = await dbGetAsync(`SELECT * FROM ecosystem_link_codes WHERE code = ?`, [code]);
+        if (!row || row.used || row.expires_at < Date.now()) return res.status(400).json({ error: 'Code expired or invalid' });
+        if (row.account_id === who.accountId) return res.status(400).json({ error: 'Already linked' });
+        const theirApps = (await dbAllAsync(`SELECT DISTINCT app FROM ecosystem_members WHERE account_id = ?`, [row.account_id])).map(m => m.app);
+        const myApps = (await dbAllAsync(`SELECT DISTINCT app FROM ecosystem_members WHERE account_id = ?`, [who.accountId])).map(m => m.app);
+        if (theirApps.some(a => myApps.includes(a))) {
+            return res.status(409).json({ error: 'That account already has this app linked' });
+        }
+        const merged = await ecoMergeAccounts(row.account_id, who.accountId);
+        await dbRunAsync(`UPDATE ecosystem_link_codes SET used = 1 WHERE code = ?`, [code]);
+        await ecoSyncMemberEntitlement(merged);
+        const members = await dbAllAsync(`SELECT app FROM ecosystem_members WHERE account_id = ?`, [merged]);
+        res.json({ ok: true, accountId: merged, linkedApps: members.map(m => m.app) });
+    } catch (e) { res.status(500).json({ error: 'Link failed' }); }
 });
 
 app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
