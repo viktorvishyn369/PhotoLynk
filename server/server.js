@@ -4628,6 +4628,9 @@ app.get('/api/ecosystem/status', ecoMaybeAuth, async (req, res) => {
         const wk = ecoWeekKey();
         const claim = await dbGetAsync(`SELECT status, platform, post_url FROM ad_claims WHERE account_id = ? AND week_key = ?`, [who.accountId, wk]);
         const social = await dbGetAsync(`SELECT x_handle, x_state, tg_username, tg_state, cherry_state FROM ecosystem_accounts WHERE account_id = ?`, [who.accountId]);
+        // Cherry identity is the wallet itself — expose it so clients can show
+        // the user exactly which wallet the room check looks for.
+        const walletRow = await dbGetAsync(`SELECT wallet FROM ecosystem_members WHERE account_id = ? AND wallet IS NOT NULL LIMIT 1`, [who.accountId]).catch(() => null);
         res.json({
             accountId: who.accountId,
             linkedApps: members.map(m => m.app),
@@ -4647,6 +4650,7 @@ app.get('/api/ecosystem/status', ecoMaybeAuth, async (req, res) => {
                 cherryGroup: CHERRY_GROUP_URL,
                 cherryConfigured: !!(CHERRY_APP_KEY || CHERRY_BOT_KEY),
                 cherryState: social?.cherry_state || null,
+                cherryWallet: walletRow?.wallet || null,
             },
         });
     } catch (e) { res.status(500).json({ error: 'Status failed' }); }
