@@ -4298,6 +4298,13 @@ https://stealthlynk.io
 };
 const ECO_REQUIRED_TAG = '#stealthlynk';
 
+// Weekly platform rotation — only ONE social counts each week, cycling
+// X -> Telegram -> Instagram -> Facebook so posts spread across channels
+// instead of always landing on the same one. Deterministic per week, so
+// the ad-kit and the claim verifier always agree.
+const ECO_AD_PLATFORMS = ['x', 'telegram', 'instagram', 'facebook'];
+const ecoWeekPlatform = (wk) => ECO_AD_PLATFORMS[Math.abs(Number(wk) || 0) % ECO_AD_PLATFORMS.length];
+
 // Detect the platform from the post URL — the client's platform hint is ignored
 // (never trust caller-supplied classification).
 function ecoDetectPlatform(url) {
@@ -4791,6 +4798,26 @@ app.post('/api/ecosystem/bind-wallet', ecoMaybeAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Bind failed' }); }
 });
 
+// Weekly ad kit: the unique code + ready-to-paste copies. Deterministic code
+// so re-opening the kit shows the same one all week. `platform` is this week's
+// required network — the claim verifier rejects posts on any other.
+app.get('/api/ecosystem/ad-kit', ecoMaybeAuth, async (req, res) => {
+    try {
+        const who = await ecoCallerAccount(req);
+        if (who.error) return res.status(403).json({ error: who.error });
+        const wk = ecoWeekKey();
+        const code = ecoAdCode(who.accountId, wk);
+        const claim = await dbGetAsync(`SELECT status FROM ad_claims WHERE account_id = ? AND week_key = ?`, [who.accountId, wk]);
+        const copies = {};
+        for (const [k, v] of Object.entries(ECO_AD_COPIES)) copies[k] = v.replace('{CODE}', code);
+        res.json({
+            weekKey: wk, code, copies, requiredTag: ECO_REQUIRED_TAG,
+            platform: ecoWeekPlatform(wk), nextPlatform: ecoWeekPlatform(wk + 1),
+            alreadyClaimed: !!claim, claimStatus: claim?.status || null,
+        });
+    } catch (e) { res.status(500).json({ error: 'Ad kit failed' }); }
+});
+
 app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
     try {
         const who = await ecoCallerAccount(req);
@@ -4813,6 +4840,12 @@ app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
         if (!/^https:\/\//.test(postUrl)) return res.status(400).json({ error: 'Paste the full https:// post URL' });
         // Platform is detected server-side from the URL — never trust the client.
         const platform = ecoDetectPlatform(postUrl);
+        // Weekly rotation: only the week's platform counts, so posts spread
+        // across networks instead of always landing on one.
+        const weekPlatform = ecoWeekPlatform(wk);
+        if (platform !== weekPlatform) {
+            return res.status(400).json({ error: `This week's platform is ${weekPlatform} — post there (it rotates weekly)` });
+        }
         const code = ecoAdCode(who.accountId, wk);
 
         // Strict accounts (a previous claim died in background re-checks) must
