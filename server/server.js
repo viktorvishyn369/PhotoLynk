@@ -4047,6 +4047,9 @@ db.serialize(() => {
     db.run(`ALTER TABLE ecosystem_accounts ADD COLUMN tg_user_id TEXT`, () => { });
     db.run(`ALTER TABLE ecosystem_accounts ADD COLUMN tg_username TEXT`, () => { });
     db.run(`ALTER TABLE ecosystem_accounts ADD COLUMN tg_state TEXT`, () => { });
+    // Cherry room membership is wallet-based — no binding needed, we check the
+    // account's member wallets against the room's member list via Cherry's API.
+    db.run(`ALTER TABLE ecosystem_accounts ADD COLUMN cherry_state TEXT`, () => { });
 });
 
 const ECO_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
@@ -4403,6 +4406,9 @@ const ECO_X_HANDLE = process.env.ECO_X_HANDLE || 'stealthlynkio';
 const ECO_TG_GROUP = process.env.ECO_TG_GROUP || 'StealthLynk_IO';
 const ECO_TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const ECO_X_BEARER = process.env.TWITTER_BEARER_TOKEN || '';
+const CHERRY_APP_KEY = process.env.CHERRY_APP_KEY || '';
+const CHERRY_ROOM_ID = process.env.CHERRY_ROOM_ID || 'KJz2UvNqFjKzRQqdZGbJ';
+const CHERRY_GROUP_URL = `https://chat.cherry.fun/g/${CHERRY_ROOM_ID}`;
 
 async function ecoCheckXFollow(xHandle) {
     if (!ECO_X_BEARER || !xHandle) return null; // can't check -> caller decides
@@ -4441,6 +4447,25 @@ async function ecoCheckTgMember(tgUserId) {
         if (e.response?.status === 400) return false;
         return null;
     }
+}
+
+// Cherry membership: members are identified by wallet, so we check the
+// account's known member wallets against the room's member list.
+// true = wallet present, false = definitely absent, null = can't check
+// (no key, API down, or account has no wallet on file).
+async function ecoCheckCherryMember(accountId) {
+    if (!CHERRY_APP_KEY) return null;
+    const members = await dbAllAsync(`SELECT wallet FROM ecosystem_members WHERE account_id = ? AND wallet IS NOT NULL`, [accountId]).catch(() => []);
+    const wallets = (members || []).map(m => m.wallet).filter(Boolean);
+    if (!wallets.length) return null;
+    try {
+        const r = await axios.get(`https://chat.cherry.fun/api/v1/apps/groups/${CHERRY_ROOM_ID}/members`, {
+            headers: { Authorization: `Bearer ${CHERRY_APP_KEY}` }, timeout: 8000,
+        });
+        const list = r.data?.members || r.data?.data || r.data || [];
+        const roomWallets = new Set((Array.isArray(list) ? list : []).map(m => String(m.wallet || m.address || m.user || '').toLowerCase()));
+        return wallets.some(w => roomWallets.has(String(w).toLowerCase()));
+    } catch (e) { return null; }
 }
 
 // TG deep-link pairing: /api/ecosystem/tg-link issues a code; the user opens
@@ -4550,7 +4575,7 @@ app.get('/api/ecosystem/status', ecoMaybeAuth, async (req, res) => {
         const sub = await ecoGetSub(who.accountId);
         const wk = ecoWeekKey();
         const claim = await dbGetAsync(`SELECT status, platform, post_url FROM ad_claims WHERE account_id = ? AND week_key = ?`, [who.accountId, wk]);
-        const social = await dbGetAsync(`SELECT x_handle, x_state, tg_username, tg_state FROM ecosystem_accounts WHERE account_id = ?`, [who.accountId]);
+        const social = await dbGetAsync(`SELECT x_handle, x_state, tg_username, tg_state, cherry_state FROM ecosystem_accounts WHERE account_id = ?`, [who.accountId]);
         res.json({
             accountId: who.accountId,
             linkedApps: members.map(m => m.app),
@@ -4567,6 +4592,9 @@ app.get('/api/ecosystem/status', ecoMaybeAuth, async (req, res) => {
                 xFollowChecked: !!ECO_X_BEARER,
                 xHandleRequired: ECO_X_HANDLE,
                 tgGroup: ECO_TG_GROUP,
+                cherryGroup: CHERRY_GROUP_URL,
+                cherryConfigured: !!CHERRY_APP_KEY,
+                cherryState: social?.cherry_state || null,
             },
         });
     } catch (e) { res.status(500).json({ error: 'Status failed' }); }
@@ -4715,15 +4743,31 @@ app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
         }
         const needX = !acct?.x_handle && !(platform === 'x' && v.verified);
         const needTg = ECO_TG_BOT_TOKEN ? !acct?.tg_user_id : !acct?.tg_username;
-        if (needX || needTg) {
+        // Cherry: membership is wallet-bound. With a key configured we check the
+        // room's member list; the user needs at least one linked wallet, so an
+        // account with no wallet counts as "not joined" (they can't be verified
+        // otherwise). API errors (null) never block.
+        const hasWallet = !!(await dbGetAsync(`SELECT 1 FROM ecosystem_members WHERE account_id = ? AND wallet IS NOT NULL LIMIT 1`, [who.accountId]).catch(() => null));
+        const cherryMember = CHERRY_APP_KEY ? await ecoCheckCherryMember(who.accountId) : null;
+        const needCherry = CHERRY_APP_KEY ? (cherryMember === false || (cherryMember === null && !hasWallet)) : false;
+        if (needX || needTg || needCherry) {
             return res.status(428).json({
                 error: 'social_required',
-                missing: [needX ? 'x_follow' : null, needTg ? 'tg_join' : null].filter(Boolean),
+                missing: [
+                    needX ? 'x_follow' : null,
+                    needTg ? 'tg_join' : null,
+                    needCherry ? 'cherry_join' : null,
+                ].filter(Boolean),
                 xHandle: ECO_X_HANDLE,
                 tgGroup: ECO_TG_GROUP,
+                cherryGroup: CHERRY_GROUP_URL,
                 tgBotConfigured: !!ECO_TG_BOT_TOKEN,
-                message: 'One-time setup: follow @' + ECO_X_HANDLE + ' on X and join @' + ECO_TG_GROUP + ' on Telegram, then resubmit.',
+                message: 'One-time setup: follow @' + ECO_X_HANDLE + ' on X, join @' + ECO_TG_GROUP + ' on Telegram' + (CHERRY_APP_KEY ? ' and join the Cherry group' : '') + ', then resubmit.',
             });
+        }
+        if (cherryMember === false) { /* unreachable — needCherry covers it */ }
+        else if (cherryMember === true && acct?.cherry_state !== 'member') {
+            dbRunAsync(`UPDATE ecosystem_accounts SET cherry_state = 'member' WHERE account_id = ?`, [who.accountId]).catch(() => { });
         }
         // Hard re-checks on every claim when credentials exist. A null result
         // (API down) never blocks — we only block on a definitive "not a member".
