@@ -4250,8 +4250,8 @@ function ecoAdCode(accountId, weekKey) {
 // Apple on demand, stealthlynk.io, and the core feature set of each app.
 const ECO_AD_COPIES = {
     // ≤280 chars including code — counted: ~262.
-    x: 'StealthLynk — private Solana apps, one sub:\nPaceSeeker: self-custody trading — DEX/CEX + DCA AI, 37 indicators\nPhotoLynk: zero-knowledge encrypted photo vault\nSolana dApp Store (PhotoLynk also on Google Play)\nstealthlynk.io\n#Solana #SolanaMobile #StealthLynk {CODE}',
-    telegram: `StealthLynk Ecosystem — private Solana apps, one subscription covers everything.
+    x: 'StealthLynk — private Solana apps\n\nPaceSeeker: self-custody trading — DEX/CEX + DCA AI, 37 indicators\n\nPhotoLynk: zero-knowledge encrypted photo vault\nSolana dApp Store (PhotoLynk also on Google Play)\n\nstealthlynk.io\n#Solana #SolanaMobile #StealthLynk {CODE}',
+    telegram: `StealthLynk Ecosystem — private Solana apps.
 
 🤖 PaceSeeker — self-custody trading suite on Solana: DEX autotrading (Auto & Atomic modes), CEX live trading via your own API keys, and the DCA AI engine — 3 strategies + 4 substrategies, 37 indicators, pretrained on 4 years of history with live auto-tuning, safety module, bank-level security, 3 wallet connection types. On-chain, 24/7.
 
@@ -4262,7 +4262,7 @@ const ECO_AD_COPIES = {
 https://stealthlynk.io
 #Solana #SolanaMobile #StealthLynk
 {CODE}`,
-    instagram: `StealthLynk Ecosystem — private Solana apps, one subscription.
+    instagram: `StealthLynk Ecosystem — private Solana apps.
 
 PaceSeeker: self-custody trading suite, on-chain 24/7. DEX autotrading (Auto & Atomic), CEX live trading via your API keys, DCA AI — 3 strategies + 4 substrategies, 37 indicators, pretrained on 4 years of market history, live auto-tuning, safety module, bank-level security, 3 wallet types. Self-custody always.
 
@@ -4273,7 +4273,7 @@ Both on the Solana Mobile dApp Store; PhotoLynk also on Google Play (PaceSeeker 
 https://stealthlynk.io
 #Solana #SolanaMobile #StealthLynk #CryptoTrading #PhotoBackup #PrivacyFirst #SelfCustody
 {CODE}`,
-    facebook: `StealthLynk Ecosystem — two private Solana apps, one subscription covers everything.
+    facebook: `StealthLynk Ecosystem — two private Solana apps.
 
 PaceSeeker — self-custodial trading suite on Solana, on-chain and 24/7: DEX autotrading (Auto & Atomic modes), CEX live trading via your own API keys, and DCA AI with 3 strategies and 4 substrategies, 37 indicators, pretrained on 4 years of history, live auto-tuning, safety module, bank-level app security, 3 wallet connection types.
 
@@ -4284,7 +4284,7 @@ Both apps are on the Solana Mobile dApp Store; PhotoLynk is also on Google Play 
 https://stealthlynk.io
 #Solana #SolanaMobile #StealthLynk
 Code: {CODE}`,
-    generic: `StealthLynk Ecosystem — private Solana apps, one subscription.
+    generic: `StealthLynk Ecosystem — private Solana apps.
 
 PaceSeeker: self-custody trading suite — DEX autotrading (Auto & Atomic), CEX live via your API keys, DCA AI with 3 strategies + 4 substrategies, 37 indicators, pretrained on 4 years of history, safety module, bank-level security.
 
