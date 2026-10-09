@@ -551,6 +551,7 @@ table{min-width:100%;width:auto}
   <div class="filter-pills" id="app-tabs" style="flex:0 0 auto">
     <button class="pill app-tab active" data-app="photolynk" onclick="switchApp('photolynk')">PhotoLynk</button>
     <button class="pill app-tab" data-app="paceseeker" onclick="switchApp('paceseeker')">PaceSeeker</button>
+    <button class="pill app-tab" data-app="ecosystem" onclick="switchApp('ecosystem')">Ecosystem</button>
   </div>
   <div class="search-box">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
@@ -603,6 +604,19 @@ table{min-width:100%;width:auto}
       <tbody id="claims-tbody"></tbody>
     </table>
   </div>
+  <table id="eco-table" style="display:none">
+    <thead><tr>
+      <th>Account</th>
+      <th>Members</th>
+      <th>Wallets</th>
+      <th>Socials</th>
+      <th>Sub Source</th>
+      <th>Sub Until</th>
+      <th>Claims</th>
+      <th>Actions</th>
+    </tr></thead>
+    <tbody id="eco-tbody"></tbody>
+  </table>
   <div id="empty" class="empty-state" style="display:none">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M15.75 6a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0ZM4.501 20.118a7.5 7.5 0 0 1 14.998 0"/></svg>
     <p>No users match your search</p>
@@ -662,16 +676,24 @@ table{min-width:100%;width:auto}
 <script>
 var allUsers=[];var filteredUsers=[];var sortCol='id';var sortDir='desc';var activeFilter='all';var serverTime='';var adminStats={photolynk_nfts_minted:0,photolynk_paid_nfts_minted:0,photolynk_free_premium_nfts_minted:0,photolynk_premium_users:0};
 var activeApp='photolynk';var psUsers=[];var psFiltered=[];var psLoaded=false;var psSortCol='last_seen';var psSortDir='desc';var psRevenue={count:0,usd:0};
+var ecoAccounts=[];var ecoFiltered=[];var ecoLoaded=false;
 
 function switchApp(app){
   activeApp=app;activeFilter='all';
   document.querySelectorAll('.app-tab').forEach(function(t){t.classList.toggle('active',t.dataset.app===app)});
-  var ps=(app==='paceseeker');
+  var ps=(app==='paceseeker');var eco=(app==='ecosystem');
   document.getElementById('users-table').style.display='none';
   document.getElementById('ps-table').style.display='none';
+  document.getElementById('eco-table').style.display='none';
   document.getElementById('eco-claims').style.display='none';
   document.getElementById('empty').style.display='none';
-  document.getElementById('search').placeholder=ps?'Search device hash, IP, wallet or SNS name...':'Search by user, .skr, email, ID, status, plan...';
+  document.getElementById('search').placeholder=ps?'Search device hash, IP, wallet or SNS name...':eco?'Search account id, wallet, handle or identity...':'Search by user, .skr, email, ID, status, plan...';
+  if(eco){
+    if(ecoLoaded){document.getElementById('eco-table').style.display='';updateStats();buildFilters();applyFilters()}
+    else{document.getElementById('loading').style.display='';loadEcoAccounts()}
+    loadAdClaims();
+    return;
+  }
   if(ps){
     if(psLoaded){document.getElementById('ps-table').style.display='';updateStats();buildFilters();applyFilters()}
     else{document.getElementById('loading').style.display='';loadPsUsers()}
@@ -681,6 +703,75 @@ function switchApp(app){
     if(allUsers.length)document.getElementById('users-table').style.display='';
     updateStats();buildFilters();applyFilters();
   }
+}
+
+// Ecosystem accounts view - one row per shared account showing its member
+// apps, wallets, sub provenance (payment vs ad_claim) and admin controls.
+async function loadEcoAccounts(){
+  try{
+    var r=await fetch('/admin/api/eco-accounts');var d=await r.json();
+    if(!r.ok)throw new Error(d.error||'Failed');
+    serverTime=d.server_time||'';
+    ecoAccounts=d.accounts||[];ecoLoaded=true;
+    document.getElementById('loading').style.display='none';
+    document.getElementById('eco-table').style.display='';
+    updateStats();buildFilters();applyFilters();
+  }catch(e){document.getElementById('loading').textContent='Error: '+e.message}
+}
+
+function ecoSourceBadge(a){
+  if(!a.subscribed)return a.sub_until?'<span class="mini-tag" style="color:var(--warn)" title="Sub expired">expired</span>':'<span class="date-cell">-</span>';
+  var k=a.source_kind||'?';
+  var m={payment:{t:'Paid',c:'var(--success)'},ad_claim:{t:'Ad Week',c:'var(--accent)'},grant:{t:'Admin',c:'var(--accent)'},merge:{t:'Merged',c:'var(--muted)'},link_sync:{t:'Link Sync',c:'var(--muted)'},revoke:{t:'Revoked',c:'var(--danger)'}};
+  var s=m[k]||{t:k,c:'var(--muted)'};
+  var prov=a.provenance?('\\n'+(a.provenance||'').substring(0,80)):'';
+  return'<span class="mini-tag" style="color:'+s.c+'" title="'+(a.source_app||'?')+' via '+k+prov+'">'+s.t+'</span>';
+}
+
+function renderEcoTable(){
+  var tbody=document.getElementById('eco-tbody');
+  var empty=document.getElementById('empty');
+  if(!ecoFiltered.length){tbody.innerHTML='';empty.style.display='';return}
+  empty.style.display='none';
+  var html='';
+  ecoFiltered.forEach(function(a){
+    var mems=(a.members||[]).map(function(m){
+      var lab=m.app==='paceseeker'?'PS':'PL';
+      var vTag=m.wallet_verified?'':' <span style="color:var(--warn)" title="wallet not signature-verified">&#9888;</span>';
+      return'<div style="margin-bottom:2px"><span class="mini-tag" style="color:'+(m.app==='paceseeker'?'var(--accent)':'var(--success)')+'">'+lab+'</span> <span class="uuid-cell" title="'+m.identity+'">'+String(m.identity||'').substring(0,12)+'</span>'+vTag+'</div>';
+    }).join('')||'<span class="date-cell">-</span>';
+    var wals=(a.members||[]).filter(function(m){return m.wallet}).map(function(m){
+      return'<div style="margin-bottom:2px"><span class="uuid-cell" style="cursor:pointer" title="'+m.wallet+' - click to copy" onclick="copyUuid(this,&apos;'+m.wallet+'&apos;)">'+String(m.wallet).substring(0,6)+'&hellip;'+String(m.wallet).slice(-4)+'</span></div>';
+    }).join('')||'<span class="date-cell">-</span>';
+    var soc=[];
+    if(a.x_handle)soc.push('<span class="mini-tag" title="X">@'+a.x_handle+'</span>');
+    if(a.tg_username)soc.push('<span class="mini-tag" title="Telegram">@'+a.tg_username+'</span>');
+    if(a.cherry_state==='member')soc.push('<span class="mini-tag" title="Cherry member">cherry</span>');
+    var claimsTxt=a.claims_total?(a.claims_total+'&nbsp;'+(a.claims_verified?'<span style="color:var(--success)">ok</span>':'<span style="color:var(--warn)">none-ok</span>')):'-';
+    var strict=a.ad_strict?'<span class="mini-tag" style="color:var(--warn)" title="Failed a re-check - future claims must auto-verify">strict</span>':'';
+    html+='<tr>';
+    html+='<td class="uuid-cell" title="'+a.account_id+' - click to copy" onclick="copyUuid(this,&apos;'+a.account_id+'&apos;)">'+String(a.account_id).substring(0,12)+'</td>';
+    html+='<td>'+mems+'</td>';
+    html+='<td>'+wals+'</td>';
+    html+='<td>'+(soc.join(' ')||'<span class="date-cell">-</span>')+' '+strict+'</td>';
+    html+='<td>'+ecoSourceBadge(a)+'</td>';
+    html+='<td>'+(a.sub_until?fmtDate(new Date(Number(a.sub_until)).toISOString()):'<span class="date-cell">-</span>')+'</td>';
+    html+='<td><span class="date-cell">'+claimsTxt+'</span></td>';
+    html+='<td><button class="btn btn-primary" style="padding:3px 8px;font-size:11px" onclick="ecoSubAction(&apos;'+a.account_id+'&apos;,&apos;extend&apos;)" title="Add 7 days to the shared sub">+7d</button> '
+      +(a.subscribed?'<button class="btn btn-red" style="padding:3px 8px;font-size:11px" onclick="ecoSubAction(&apos;'+a.account_id+'&apos;,&apos;revoke&apos;)" title="Revoke the shared sub now">Revoke</button>':'<span class="date-cell">-</span>')
+      +'</td>';
+    html+='</tr>';
+  });
+  tbody.innerHTML=html;
+}
+
+function ecoSubAction(accountId,action){
+  if(action==='revoke'&&!confirm('Revoke this account\'s shared subscription now? Member entitlements written by the ecosystem will be stripped immediately.'))return;
+  var body={accountId:accountId,action:action};
+  if(action==='extend')body.days=7;
+  fetch('/admin/api/eco-account/sub',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
+    .then(function(r){return r.json().then(function(d){if(!r.ok)throw new Error(d.error||'Failed');toast(action==='revoke'?'Sub revoked':'Sub extended','success');ecoLoaded=false;loadEcoAccounts()})})
+    .catch(function(e){toast(e.message||'Action failed','error')});
 }
 
 async function loadPsUsers(){
@@ -806,8 +897,9 @@ function subBadge(st,untilIso,u){
   var tip=untilIso?new Date(untilIso).toLocaleDateString('en-GB',{day:'2-digit',month:'short'}):'';
   var copyable=pay&&st==='paid';
   var title=(untilIso?('until '+new Date(untilIso).toLocaleString()):'')+(pay?('\\n'+payTip(pay)+(copyable?' - click to copy sig':'')):'');
-  var ecoTag=eco?(' <span class="mini-tag" style="color:var(--accent)" title="StealthLynk ecosystem sub ('+(u.eco_source_kind||'?')+') until '+new Date(u.eco_sub_until_date||u.eco_sub_until).toLocaleString()+'">Eco</span>'):'';
-  if(!s&&eco)return'<span class="mini-tag" style="color:var(--success)">Ecosystem'+(u.eco_sub_until_date?'&nbsp;'+new Date(u.eco_sub_until_date).toLocaleDateString('en-GB',{day:'2-digit',month:'short'}):'')+'</span>';
+  var ecoKind=u&&u.eco_source_kind==='ad_claim'?'·Ad':u&&u.eco_source_kind==='payment'?'·Paid':'';
+  var ecoTag=eco?(' <span class="mini-tag" style="color:var(--accent)" title="StealthLynk ecosystem sub ('+(u.eco_source_kind||'?')+') until '+new Date(u.eco_sub_until_date||u.eco_sub_until).toLocaleString()+'">Eco'+ecoKind+'</span>'):'';
+  if(!s&&eco)return'<span class="mini-tag" style="color:var(--success)" title="'+(u.eco_source_kind||'ecosystem')+'">Eco'+(u.eco_source_kind==='ad_claim'?' Ad':'')+(u.eco_sub_until_date?'&nbsp;'+new Date(u.eco_sub_until_date).toLocaleDateString('en-GB',{day:'2-digit',month:'short'}):'')+'</span>';
   return'<span class="mini-tag" style="color:'+s.c+(copyable?';cursor:pointer':'')+'" title="'+title+'"'+(copyable?' onclick="copyUuid(this,&apos;'+pay.sub_signature+'&apos;)"':'')+'>'+s.t+(tip?'&nbsp;'+tip:'')+'</span>'+ecoTag
 }
 
@@ -861,7 +953,7 @@ async function loadUsers(){
     adminStats=d.admin_stats||adminStats;
     solPriceUsd=d.sol_price_usd||0;
     skrPriceUsd=d.skr_price_usd||0;
-    allUsers=d.users.map(function(u){return{id:u.id,email:u.email||'',alias_email:u.alias_email||'',display_handle:u.display_handle||'',user_uuid:u.user_uuid||'',device_uuids:u.device_uuids||'',last_login:u.last_login||0,last_login_date:u.last_login_date,storage_used:u.storage_used_bytes||0,storage_quota:u.storage_quota_bytes||0,file_count:u.file_count||0,plan_gb:u.plan.plan_gb||0,premium_gb:u.plan.premium_gb||0,status:u.plan.effective_status||u.plan.status||'none',trial_until:u.plan.trial_until,trial_until_date:u.plan.trial_until_date,expires_at:u.plan.expires_at,expires_at_date:u.plan.expires_at_date,grace_until:u.plan.grace_until,created_at:u.user_created_at,created_at_date:u.user_created_at_date,payment_type:u.plan.payment_type||'',payment_at:u.plan.payment_at,payment_at_date:u.plan.payment_at_date,updated_at:u.plan.updated_at,updated_at_date:u.plan.updated_at_date,nft_is_premium:u.nft.is_premium,nft_mints:u.nft.mint_count||0,nft_paid_mints:u.nft.paid_mint_count||0,nft_free_premium_mints:u.nft.free_premium_mint_count||0,nft_premium_total_mints:u.nft.premium_mint_count||0,nft_free_remaining:u.nft.free_mints_remaining||0,nft_balance:u.nft.balance_usd||0,nft_total_paid:u.nft.total_paid_usd||0,nft_total_purchased:u.nft.total_purchased_usd||0,nft_total_spent:u.nft.total_spent_usd||0,nft_payments:u.nft.payments||[],sol_payments:u.solana.payments||[],sol_total_paid:u.solana.total_paid_sol||0,skr_total_paid:u.solana.total_paid_skr||0,sol_usd_realtime:u.solana.sol_usd_realtime||0,skr_usd_realtime:u.solana.skr_usd_realtime||0,apple_google_usd:u.apple_google_usd||0,total_usd_realtime:u.total_usd_realtime||0,total_paid:(u.total_usd_realtime||0)}});
+    allUsers=d.users.map(function(u){return{id:u.id,email:u.email||'',alias_email:u.alias_email||'',display_handle:u.display_handle||'',user_uuid:u.user_uuid||'',device_uuids:u.device_uuids||'',last_login:u.last_login||0,last_login_date:u.last_login_date,storage_used:u.storage_used_bytes||0,storage_quota:u.storage_quota_bytes||0,file_count:u.file_count||0,plan_gb:u.plan.plan_gb||0,premium_gb:u.plan.premium_gb||0,status:u.plan.effective_status||u.plan.status||'none',trial_until:u.plan.trial_until,trial_until_date:u.plan.trial_until_date,expires_at:u.plan.expires_at,expires_at_date:u.plan.expires_at_date,grace_until:u.plan.grace_until,created_at:u.user_created_at,created_at_date:u.user_created_at_date,payment_type:u.plan.payment_type||'',payment_at:u.plan.payment_at,payment_at_date:u.plan.payment_at_date,updated_at:u.plan.updated_at,updated_at_date:u.plan.updated_at_date,nft_is_premium:u.nft.is_premium,nft_mints:u.nft.mint_count||0,nft_paid_mints:u.nft.paid_mint_count||0,nft_free_premium_mints:u.nft.free_premium_mint_count||0,nft_premium_total_mints:u.nft.premium_mint_count||0,nft_free_remaining:u.nft.free_mints_remaining||0,nft_balance:u.nft.balance_usd||0,nft_total_paid:u.nft.total_paid_usd||0,nft_total_purchased:u.nft.total_purchased_usd||0,nft_total_spent:u.nft.total_spent_usd||0,nft_payments:u.nft.payments||[],sol_payments:u.solana.payments||[],sol_total_paid:u.solana.total_paid_sol||0,skr_total_paid:u.solana.total_paid_skr||0,sol_usd_realtime:u.solana.sol_usd_realtime||0,skr_usd_realtime:u.solana.skr_usd_realtime||0,apple_google_usd:u.apple_google_usd||0,total_usd_realtime:u.total_usd_realtime||0,total_paid:(u.total_usd_realtime||0),eco_account_id:u.eco_account_id||null,eco_sub_until:u.eco_sub_until||0,eco_sub_until_date:u.eco_sub_until_date||null,eco_source_kind:u.eco_source_kind||'',eco_source_app:u.eco_source_app||''}});
     updateStats();buildFilters();applyFilters();
     document.getElementById('loading').style.display='none';
     if(activeApp==='photolynk')document.getElementById('users-table').style.display='';
@@ -869,6 +961,16 @@ async function loadUsers(){
 }
 
 function updateStats(){
+  if(activeApp==='ecosystem'){
+    var etotal=ecoAccounts.length;
+    var esubs=ecoAccounts.filter(function(a){return a.subscribed}).length;
+    var epaid=ecoAccounts.filter(function(a){return a.subscribed&&a.source_kind==='payment'}).length;
+    var eads=ecoAccounts.filter(function(a){return a.subscribed&&a.source_kind==='ad_claim'}).length;
+    var epend=ecoAccounts.filter(function(a){return a.claims_total&&!a.claims_verified}).length;
+    var est=serverTime?'<span>Server: <b>'+new Date(serverTime).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+'</b></span>':'';
+    document.getElementById('header-stats').innerHTML=est+'<span>Accounts: <b>'+etotal+'</b></span><span>Active subs: <b>'+esubs+'</b></span><span>Paid: <b>'+epaid+'</b></span><span>Ad-based: <b>'+eads+'</b></span><span>Claims w/o verified: <b>'+epend+'</b></span>';
+    return;
+  }
   if(activeApp==='paceseeker'){
     var ptotal=psUsers.length;
     var ptrials=psUsers.filter(function(u){return u.status==='trial'}).length;
@@ -895,6 +997,20 @@ function updateStats(){
 }
 
 function buildFilters(){
+  if(activeApp==='ecosystem'){
+    var ecounts={subscribed:0,paid:0,ad:0,nosub:0};
+    ecoAccounts.forEach(function(a){
+      if(a.subscribed){ecounts.subscribed++;if(a.source_kind==='payment')ecounts.paid++;else if(a.source_kind==='ad_claim')ecounts.ad++}
+      else ecounts.nosub++;
+    });
+    var ehtml='<button class="pill active" data-f="all" onclick="setFilter(this,&apos;all&apos;)">All<span class="count">'+ecoAccounts.length+'</span></button>';
+    if(ecounts.subscribed)ehtml+='<button class="pill" data-f="subscribed" onclick="setFilter(this,&apos;subscribed&apos;)">subscribed<span class="count">'+ecounts.subscribed+'</span></button>';
+    if(ecounts.paid)ehtml+='<button class="pill" data-f="paid" onclick="setFilter(this,&apos;paid&apos;)">paid<span class="count">'+ecounts.paid+'</span></button>';
+    if(ecounts.ad)ehtml+='<button class="pill" data-f="ad" onclick="setFilter(this,&apos;ad&apos;)">ad-based<span class="count">'+ecounts.ad+'</span></button>';
+    if(ecounts.nosub)ehtml+='<button class="pill" data-f="nosub" onclick="setFilter(this,&apos;nosub&apos;)">no sub<span class="count">'+ecounts.nosub+'</span></button>';
+    document.getElementById('status-filters').innerHTML=ehtml;
+    return;
+  }
   if(activeApp==='paceseeker'){
     var pcounts={};psUsers.forEach(function(u){var s=u.status||'none';pcounts[s]=(pcounts[s]||0)+1});
     var phtml='<button class="pill active" data-f="all" onclick="setFilter(this,&apos;all&apos;)">All<span class="count">'+psUsers.length+'</span></button>';
@@ -922,6 +1038,25 @@ function setFilter(el,f){
 }
 
 function applyFilters(){
+  if(activeApp==='ecosystem'){
+    var eq=(document.getElementById('search').value||'').toLowerCase().trim();
+    ecoFiltered=ecoAccounts.filter(function(a){
+      if(activeFilter==='subscribed'&&!a.subscribed)return false;
+      if(activeFilter==='paid'&&!(a.subscribed&&a.source_kind==='payment'))return false;
+      if(activeFilter==='ad'&&!(a.subscribed&&a.source_kind==='ad_claim'))return false;
+      if(activeFilter==='nosub'&&a.subscribed)return false;
+      if(!eq)return true;
+      if((a.account_id||'').toLowerCase().includes(eq))return true;
+      if((a.primary_wallet||'').toLowerCase().includes(eq))return true;
+      if((a.x_handle||'').toLowerCase().includes(eq))return true;
+      if((a.tg_username||'').toLowerCase().includes(eq))return true;
+      return(a.members||[]).some(function(m){
+        return(m.identity||'').toLowerCase().includes(eq)||(m.wallet||'').toLowerCase().includes(eq)||(m.app||'').toLowerCase().includes(eq);
+      });
+    });
+    renderEcoTable();
+    return;
+  }
   if(activeApp==='paceseeker'){
     var pq=(document.getElementById('search').value||'').toLowerCase().trim();
     psFiltered=psUsers.filter(function(u){
@@ -981,7 +1116,9 @@ function renderTable(){
     html+='<td>'+storageCell(u.storage_used,u.storage_quota)+'</td>';
     var planStr=planLabel(u.plan_gb);if(u.premium_gb)planStr+=' <span class="payment-badge nft-premium" style="font-size:9px">+'+u.premium_gb+'GB</span>';if(u.premium_expires_at)planStr+='<br><span class="mini-tag">expires '+fmtDate(u.premium_expires_at).replace(/<[^>]*>/g,'')+'</span>';
     html+='<td class="plan-cell">'+planStr+'</td>';
-    html+='<td>'+statusBadge(u.status)+'</td>';
+    var ecoPl=u.eco_sub_until&&u.eco_sub_until>Date.now()?u:null;
+    var ecoPlKind=u.eco_source_kind==='ad_claim'?'·Ad':u.eco_source_kind==='payment'?'·Paid':'';
+    html+='<td>'+statusBadge(u.status)+(ecoPl?' <span class="mini-tag" style="color:var(--accent)" title="Ecosystem sub ('+(u.eco_source_kind||'?')+') via '+(u.eco_source_app||'?')+' until '+new Date(u.eco_sub_until_date||u.eco_sub_until).toLocaleString()+'">Eco'+ecoPlKind+'</span>':'')+'</td>';
     var nftStr=u.nft_mints>0?'<span class="nft-count">'+u.nft_mints+'</span>':'<span class="date-cell">0</span>';
     html+='<td>'+nftStr+'</td>';
     var premStr=u.nft_is_premium?'<span class="badge badge-active">Active</span>':'<span class="badge badge-none">Inactive</span>';
@@ -1418,6 +1555,16 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
             }
         } catch (_) { }
 
+        // Ecosystem membership: photolynk member identity is the user id.
+        // Attaches the shared account's sub + provenance so the admin table can
+        // show whether a user's cover is direct-paid or comes from the eco sub
+        // (and if the latter, whether the eco grant was payment or ad_claim).
+        let ecoByUser = {};
+        try {
+            const ecoRows = await dbAllAsync(`SELECT m.identity, m.account_id, s.sub_until AS eco_sub_until, s.source_kind AS eco_source_kind, s.source_app AS eco_source_app FROM ecosystem_members m LEFT JOIN stealthlynk_subs s ON s.account_id = m.account_id WHERE m.app = 'photolynk'`);
+            for (const r of ecoRows) ecoByUser[String(r.identity)] = r;
+        } catch (_) { }
+
         // Compute effective subscription status from raw plan fields (read-only, mirrors resolveSubscriptionState)
         const computeEffectiveStatus = (u) => {
             const now = Date.now();
@@ -1561,6 +1708,8 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
 
             const effectiveStatus = computeEffectiveStatus(user);
             const displayHandle = deriveAdminDisplayHandle(user.seeker_id, user.alias_email, user.email);
+            const ecoRow = ecoByUser[String(user.id)] || null;
+            const ecoUntil = Number(ecoRow?.eco_sub_until) || 0;
 
             return {
                 id: user.id,
@@ -1621,6 +1770,11 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 },
                 apple_google_usd: appleGoogleUsd,
                 total_usd_realtime: totalUsdRealtime,
+                eco_account_id: ecoRow?.account_id || null,
+                eco_sub_until: ecoUntil || null,
+                eco_sub_until_date: ecoUntil ? new Date(ecoUntil).toISOString() : null,
+                eco_source_kind: ecoRow?.eco_source_kind || '',
+                eco_source_app: ecoRow?.eco_source_app || '',
             };
         });
 
@@ -5012,6 +5166,83 @@ app.post('/admin/api/ad-claims/:id/review', adminAuth, async (req, res) => {
 app.get('/admin/api/eco-links', adminAuth, async (req, res) => {
     const members = await dbAllAsync(`SELECT m.account_id, m.app, m.identity, m.wallet, m.linked_at, s.sub_until FROM ecosystem_members m LEFT JOIN stealthlynk_subs s ON s.account_id = m.account_id ORDER BY m.linked_at DESC LIMIT 500`);
     res.json({ members });
+});
+
+// Full ecosystem account view for admin control: each account with its member
+// apps (identity, wallet, verified flag), shared sub state + provenance, ad
+// claim history, and social bindings. The Ecosystem admin tab renders this.
+app.get('/admin/api/eco-accounts', adminAuth, async (req, res) => {
+    try {
+        const accounts = await dbAllAsync(`SELECT account_id, primary_wallet, created_at, x_handle, tg_username, cherry_state, ad_strict FROM ecosystem_accounts ORDER BY created_at DESC LIMIT 1000`);
+        const members = await dbAllAsync(`SELECT account_id, app, identity, wallet, wallet_verified, linked_at FROM ecosystem_members`);
+        const subs = await dbAllAsync(`SELECT account_id, sub_until, source_app, source_kind, provenance, updated_at FROM stealthlynk_subs`);
+        const claims = await dbAllAsync(`SELECT account_id, COUNT(*) AS n, MAX(CASE WHEN status='verified' THEN 1 ELSE 0 END) AS has_verified FROM ad_claims GROUP BY account_id`);
+        const memBy = {}, subBy = {}, claimBy = {};
+        for (const m of members) (memBy[m.account_id] = memBy[m.account_id] || []).push(m);
+        for (const s of subs) subBy[s.account_id] = s;
+        for (const c of claims) claimBy[c.account_id] = c;
+        const now = Date.now();
+        res.json({
+            server_time: new Date().toISOString(),
+            accounts: accounts.map(a => {
+                const s = subBy[a.account_id];
+                return {
+                    ...a,
+                    members: memBy[a.account_id] || [],
+                    claims_total: claimBy[a.account_id]?.n || 0,
+                    claims_verified: !!claimBy[a.account_id]?.has_verified,
+                    sub_until: s?.sub_until || 0,
+                    subscribed: !!(s && Number(s.sub_until) > now),
+                    source_app: s?.source_app || null,
+                    source_kind: s?.source_kind || null, // 'payment' | 'ad_claim' | 'merge' | 'link_sync' | 'admin'
+                    provenance: s?.provenance || null,
+                    sub_updated_at: s?.updated_at || null,
+                };
+            }),
+        });
+    } catch (e) { res.status(500).json({ error: 'Failed' }); }
+});
+
+// Admin control over a shared sub: revoke strips it now (member rows fall to
+// their own local entitlements), extend adds days, floor sets an absolute
+// expiry. Every action records provenance='admin'.
+app.post('/admin/api/eco-account/sub', adminAuth, async (req, res) => {
+    try {
+        const accountId = String(req.body?.accountId || '');
+        const action = String(req.body?.action || '');
+        if (!accountId) return res.status(400).json({ error: 'accountId required' });
+        const acct = await dbGetAsync(`SELECT account_id FROM ecosystem_accounts WHERE account_id = ?`, [accountId]);
+        if (!acct) return res.status(404).json({ error: 'Account not found' });
+        if (action === 'revoke') {
+            await dbRunAsync(`INSERT INTO stealthlynk_subs (account_id, sub_until, source_app, source_kind, provenance, updated_at)
+                VALUES (?, 0, 'admin', 'revoke', ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET sub_until = 0, source_kind = 'revoke', updated_at = excluded.updated_at`,
+                [accountId, 'admin-revoke', Date.now()]);
+            // Strip mirrored entitlements: PS device sub_until and PL user_plans
+            // rows that were written by the ecosystem (payment_type='ecosystem').
+            const ms = await dbAllAsync(`SELECT app, identity FROM ecosystem_members WHERE account_id = ?`, [accountId]);
+            for (const m of ms) {
+                if (m.app === 'paceseeker') {
+                    await dbRunAsync(`UPDATE paceseeker_devices SET sub_until = NULL WHERE device_hash = ?`, [String(m.identity)]);
+                } else if (m.app === 'photolynk') {
+                    await dbRunAsync(`UPDATE user_plans SET expires_at = ?, status = 'expired' WHERE user_id = ? AND payment_type = 'ecosystem'`, [Date.now(), Number(m.identity)]);
+                }
+            }
+            return res.json({ ok: true, subUntil: 0 });
+        }
+        if (action === 'extend') {
+            const days = Math.min(Math.max(Number(req.body?.days) || 0, 1), 365);
+            const subUntil = await ecoGrantSub(accountId, days * 86400000, { sourceApp: 'admin', kind: 'grant', provenance: `+${days}d` });
+            return res.json({ ok: true, subUntil });
+        }
+        if (action === 'set-until') {
+            const until = Number(req.body?.until) || 0;
+            if (until <= Date.now()) return res.status(400).json({ error: 'until must be a future epoch ms' });
+            await ecoApplySub(accountId, until, { sourceApp: 'admin', kind: 'grant', provenance: 'set-until' });
+            return res.json({ ok: true, subUntil: until });
+        }
+        res.status(400).json({ error: 'action = revoke|extend|set-until' });
+    } catch (e) { res.status(500).json({ error: 'Failed' }); }
 });
 
 // ========================== /STEALTHLYNK ECOSYSTEM ===========================
