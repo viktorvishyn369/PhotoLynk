@@ -4110,10 +4110,15 @@ async function ecoEnsureAccount(app, identity, wallet) {
                 `SELECT account_id FROM ecosystem_members WHERE wallet = ? AND NOT (app = ? AND identity = ?) LIMIT 1`,
                 [wallet, app, String(identity)]);
             if (other && other.account_id !== existing.account_id) {
-                await dbRunAsync(`UPDATE ecosystem_members SET account_id = ? WHERE app = ? AND identity = ?`,
-                    [other.account_id, app, String(identity)]);
-                await ecoMergeAccounts(other.account_id, existing.account_id);
-                return other.account_id;
+                const conflict = await dbGetAsync(
+                    `SELECT 1 AS x FROM ecosystem_members WHERE account_id = ? AND app = ? LIMIT 1`,
+                    [other.account_id, app]);
+                if (!conflict) {
+                    await dbRunAsync(`UPDATE ecosystem_members SET account_id = ? WHERE app = ? AND identity = ?`,
+                        [other.account_id, app, String(identity)]);
+                    await ecoMergeAccounts(other.account_id, existing.account_id);
+                    return other.account_id;
+                }
             }
         }
         return existing.account_id;
@@ -4121,7 +4126,13 @@ async function ecoEnsureAccount(app, identity, wallet) {
     let accountId = null;
     if (wallet) {
         const w = await dbGetAsync(`SELECT account_id FROM ecosystem_members WHERE wallet = ? LIMIT 1`, [wallet]);
-        if (w) accountId = w.account_id;
+        if (w) {
+            // One instance per app per account: only join when this app is not
+            // already registered on that account (e.g. a second phone with the
+            // same wallet gets its own unsubscribed account instead).
+            const hasApp = await dbGetAsync(`SELECT 1 AS x FROM ecosystem_members WHERE account_id = ? AND app = ? LIMIT 1`, [w.account_id, app]);
+            if (!hasApp) accountId = w.account_id;
+        }
     }
     if (!accountId) {
         accountId = 'eco_' + crypto.createHash('sha256').update(`${app}|${identity}|${Date.now()}|${crypto.randomBytes(8).toString('hex')}`).digest('hex').slice(0, 24);
@@ -4697,52 +4708,16 @@ app.post('/api/ecosystem/tg-link', ecoMaybeAuth, async (req, res) => {
 });
 
 // Link code: issue (10min TTL) on one app, redeem on the other.
+// Link codes removed — accounts link automatically by wallet (ecoEnsureAccount).
+// Stubs return 410 so older app builds get a clean error instead of a merge.
 app.post('/api/ecosystem/link-code', ecoMaybeAuth, async (req, res) => {
-    try {
-        const who = await ecoCallerAccount(req);
-        if (who.error) return res.status(403).json({ error: who.error });
-        const code = 'LNK-' + crypto.randomBytes(3).toString('hex').toUpperCase();
-        await dbRunAsync(`INSERT INTO ecosystem_link_codes (code, account_id, expires_at) VALUES (?, ?, ?)`,
-            [code, who.accountId, Date.now() + ECO_LINK_CODE_TTL_MS]);
-        res.json({ code, expiresInMs: ECO_LINK_CODE_TTL_MS });
-    } catch (e) { res.status(500).json({ error: 'Link code failed' }); }
+    res.status(410).json({ error: 'Link codes removed — the same wallet links apps automatically.' });
 });
 
 app.post('/api/ecosystem/link', ecoMaybeAuth, async (req, res) => {
-    try {
-        const who = await ecoCallerAccount(req);
-        if (who.error) return res.status(403).json({ error: who.error });
-        const code = String(req.body?.code || '').trim().toUpperCase();
-        if (!/^LNK-[0-9A-F]{6}$/.test(code)) return res.status(400).json({ error: 'Invalid code' });
-        const row = await dbGetAsync(`SELECT * FROM ecosystem_link_codes WHERE code = ?`, [code]);
-        if (!row || row.used || row.expires_at < Date.now()) return res.status(400).json({ error: 'Code expired or invalid' });
-        if (row.account_id === who.accountId) return res.status(400).json({ error: 'Already linked' });
-        const merged = await ecoMergeAccounts(row.account_id, who.accountId);
-        await dbRunAsync(`UPDATE ecosystem_link_codes SET used = 1 WHERE code = ?`, [code]);
-        await ecoSyncMemberEntitlement(merged);
-        const members = await dbAllAsync(`SELECT app FROM ecosystem_members WHERE account_id = ?`, [merged]);
-        res.json({ ok: true, accountId: merged, linkedApps: members.map(m => m.app) });
-    } catch (e) { res.status(500).json({ error: 'Link failed' }); }
+    res.status(410).json({ error: 'Link codes removed — the same wallet links apps automatically.' });
 });
 
-// Weekly ad kit: the unique code + ready-to-paste copies. Deterministic code
-// so re-opening the kit shows the same one all week.
-app.get('/api/ecosystem/ad-kit', ecoMaybeAuth, async (req, res) => {
-    try {
-        const who = await ecoCallerAccount(req);
-        if (who.error) return res.status(403).json({ error: who.error });
-        const wk = ecoWeekKey();
-        const code = ecoAdCode(who.accountId, wk);
-        const claim = await dbGetAsync(`SELECT status FROM ad_claims WHERE account_id = ? AND week_key = ?`, [who.accountId, wk]);
-        const copies = {};
-        for (const [k, v] of Object.entries(ECO_AD_COPIES)) copies[k] = v.replace('{CODE}', code);
-        res.json({ weekKey: wk, code, copies, requiredTag: ECO_REQUIRED_TAG, alreadyClaimed: !!claim, claimStatus: claim?.status || null });
-    } catch (e) { res.status(500).json({ error: 'Ad kit failed' }); }
-});
-
-// Claim a weekly free sub by posting an ad. X posts are verified via the free
-// oEmbed endpoint; anything unverifiable goes to a manual review queue.
-const _adClaimRate = new Map();
 app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
     try {
         const who = await ecoCallerAccount(req);
