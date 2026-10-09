@@ -779,7 +779,7 @@ function renderEcoTable(){
 }
 
 function ecoSubAction(accountId,action){
-  if(action==='revoke'&&!confirm('Revoke this account\'s shared subscription now? Member entitlements written by the ecosystem will be stripped immediately.'))return;
+  if(action==='revoke'&&!confirm('Revoke this account\\'s shared subscription now? Member entitlements written by the ecosystem will be stripped immediately.'))return;
   var body={accountId:accountId,action:action};
   if(action==='extend')body.days=7;
   fetch('/admin/api/eco-account/sub',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
