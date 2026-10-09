@@ -4222,15 +4222,15 @@ function ecoAdCode(accountId, weekKey) {
 // keep X copy under 280 chars. Mention stores (Google Play + Solana dApp Store),
 // Apple on demand, stealthlynk.io, and the core feature set of each app.
 const ECO_AD_COPIES = {
-    // ≤280 chars including code — counted: 251.
-    x: 'StealthLynk — private Solana apps, one sub:\nPaceSeeker: self-custody DCA AI autotrader, 37 indicators\nPhotoLynk: zero-knowledge encrypted photo vault\nGoogle Play + Solana dApp Store\nstealthlynk.io\n#Solana #SolanaMobile #StealthLynk {CODE}',
+    // ≤280 chars including code — counted: ~250.
+    x: 'StealthLynk — private Solana apps, one sub:\nPaceSeeker: self-custody DCA AI autotrader, 37 indicators\nPhotoLynk: zero-knowledge encrypted photo vault\nOn Solana dApp Store (PhotoLynk also on Google Play)\nstealthlynk.io\n#Solana #SolanaMobile #StealthLynk {CODE}',
     telegram: `StealthLynk Ecosystem — private Solana apps, one subscription covers everything.
 
 🤖 PaceSeeker — self-custody AI autotrading on Solana. DCA AI with 3 strategies + 4 substrategies, 37 indicators, pretrained on 4 years of history with live auto-tuning, safety module, bank-level security, 3 wallet connection types. On-chain, 24/7.
 
 📸 PhotoLynk — stealth zero-knowledge cloud photo vault. On-device encryption, exact + burst dedup, bit-for-bit original preservation, cross-platform (desktop builds on GitHub), NFT albums with authenticity proofs for your rights.
 
-📲 Google Play + Solana Mobile dApp Store. Want it on Apple Store? Reply "Apple" — we ship when demand is there.
+📲 Both on the Solana Mobile dApp Store — PhotoLynk also on Google Play (PaceSeeker's Google release is on its way). Want them on Apple Store? Reply "Apple" — we ship at 100+ requests.
 
 https://stealthlynk.io
 #Solana #SolanaMobile #StealthLynk
@@ -4241,7 +4241,7 @@ PaceSeeker: self-custody AI autotrading on-chain, 24/7. DCA AI — 3 strategies 
 
 PhotoLynk: stealth zero-knowledge cloud vault. On-device encryption, exact + burst dedup, bit-for-bit original preservation, cross-platform (desktop apps on GitHub), NFT albums with authenticity proofs.
 
-Get both on Google Play + Solana Mobile dApp Store. Reply "Apple" if you want an Apple Store release.
+Both on the Solana Mobile dApp Store; PhotoLynk also on Google Play (PaceSeeker coming soon). Reply "Apple" if you want an Apple Store release — we ship at 100+ requests.
 
 https://stealthlynk.io
 #Solana #SolanaMobile #StealthLynk #CryptoTrading #PhotoBackup #PrivacyFirst #SelfCustody
@@ -4252,7 +4252,7 @@ PaceSeeker — self-custodial AI autotrading on Solana, on-chain and 24/7: DCA A
 
 PhotoLynk — stealth zero-knowledge cloud photo backup: on-device encryption, exact + burst deduplication, bit-for-bit original preservation, cross-platform (desktop apps on GitHub), Web3 NFT albums with authenticity proofs to protect your rights.
 
-Available on Google Play and the Solana Mobile dApp Store. Interested in an Apple Store release? Comment "Apple" — we'll ship it when demand is there.
+Both apps are on the Solana Mobile dApp Store; PhotoLynk is also on Google Play with PaceSeeker on its way. Interested in an Apple Store release? Comment "Apple" — we ship at 100+ requests.
 
 https://stealthlynk.io
 #Solana #SolanaMobile #StealthLynk
@@ -4263,7 +4263,7 @@ PaceSeeker: self-custody DCA AI autotrader — 3 strategies + 4 substrategies, 3
 
 PhotoLynk: zero-knowledge encrypted photo vault — on-device encryption, exact + burst dedup, bit-for-bit originals, cross-platform, NFT albums with authenticity proofs.
 
-Google Play + Solana Mobile dApp Store. Apple Store on demand — reply "Apple".
+Both on Solana Mobile dApp Store; PhotoLynk also on Google Play. Apple Store at 100+ requests — reply "Apple".
 
 https://stealthlynk.io
 #Solana #SolanaMobile #StealthLynk
