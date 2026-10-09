@@ -4225,11 +4225,11 @@ function ecoAdCode(accountId, weekKey) {
 // keep X copy under 280 chars. Mention stores (Google Play + Solana dApp Store),
 // Apple on demand, stealthlynk.io, and the core feature set of each app.
 const ECO_AD_COPIES = {
-    // ≤280 chars including code — counted: ~250.
-    x: 'StealthLynk — private Solana apps, one sub:\nPaceSeeker: self-custody DCA AI autotrader, 37 indicators\nPhotoLynk: zero-knowledge encrypted photo vault\nOn Solana dApp Store (PhotoLynk also on Google Play)\nstealthlynk.io\n#Solana #SolanaMobile #StealthLynk {CODE}',
+    // ≤280 chars including code — counted: ~262.
+    x: 'StealthLynk — private Solana apps, one sub:\nPaceSeeker: self-custody trading — DEX/CEX + DCA AI, 37 indicators\nPhotoLynk: zero-knowledge encrypted photo vault\nSolana dApp Store (PhotoLynk also on Google Play)\nstealthlynk.io\n#Solana #SolanaMobile #StealthLynk {CODE}',
     telegram: `StealthLynk Ecosystem — private Solana apps, one subscription covers everything.
 
-🤖 PaceSeeker — self-custody AI autotrading on Solana. DCA AI with 3 strategies + 4 substrategies, 37 indicators, pretrained on 4 years of history with live auto-tuning, safety module, bank-level security, 3 wallet connection types. On-chain, 24/7.
+🤖 PaceSeeker — self-custody trading suite on Solana: DEX autotrading (Auto & Atomic modes), CEX live trading via your own API keys, and the DCA AI engine — 3 strategies + 4 substrategies, 37 indicators, pretrained on 4 years of history with live auto-tuning, safety module, bank-level security, 3 wallet connection types. On-chain, 24/7.
 
 📸 PhotoLynk — stealth zero-knowledge cloud photo vault. On-device encryption, exact + burst dedup, bit-for-bit original preservation, cross-platform (desktop builds on GitHub), NFT albums with authenticity proofs for your rights.
 
@@ -4240,7 +4240,7 @@ https://stealthlynk.io
 {CODE}`,
     instagram: `StealthLynk Ecosystem — private Solana apps, one subscription.
 
-PaceSeeker: self-custody AI autotrading on-chain, 24/7. DCA AI — 3 strategies + 4 substrategies, 37 indicators, pretrained on 4 years of market history, live auto-tuning, safety module, bank-level security, 3 wallet types. Self-custody always.
+PaceSeeker: self-custody trading suite, on-chain 24/7. DEX autotrading (Auto & Atomic), CEX live trading via your API keys, DCA AI — 3 strategies + 4 substrategies, 37 indicators, pretrained on 4 years of market history, live auto-tuning, safety module, bank-level security, 3 wallet types. Self-custody always.
 
 PhotoLynk: stealth zero-knowledge cloud vault. On-device encryption, exact + burst dedup, bit-for-bit original preservation, cross-platform (desktop apps on GitHub), NFT albums with authenticity proofs.
 
@@ -4251,7 +4251,7 @@ https://stealthlynk.io
 {CODE}`,
     facebook: `StealthLynk Ecosystem — two private Solana apps, one subscription covers everything.
 
-PaceSeeker — self-custodial AI autotrading on Solana, on-chain and 24/7: DCA AI with 3 strategies and 4 substrategies, 37 indicators, pretrained on 4 years of history, live auto-tuning, safety module, bank-level app security, 3 wallet connection types.
+PaceSeeker — self-custodial trading suite on Solana, on-chain and 24/7: DEX autotrading (Auto & Atomic modes), CEX live trading via your own API keys, and DCA AI with 3 strategies and 4 substrategies, 37 indicators, pretrained on 4 years of history, live auto-tuning, safety module, bank-level app security, 3 wallet connection types.
 
 PhotoLynk — stealth zero-knowledge cloud photo backup: on-device encryption, exact + burst deduplication, bit-for-bit original preservation, cross-platform (desktop apps on GitHub), Web3 NFT albums with authenticity proofs to protect your rights.
 
@@ -4262,7 +4262,7 @@ https://stealthlynk.io
 Code: {CODE}`,
     generic: `StealthLynk Ecosystem — private Solana apps, one subscription.
 
-PaceSeeker: self-custody DCA AI autotrader — 3 strategies + 4 substrategies, 37 indicators, pretrained on 4 years of history, safety module, bank-level security.
+PaceSeeker: self-custody trading suite — DEX autotrading (Auto & Atomic), CEX live via your API keys, DCA AI with 3 strategies + 4 substrategies, 37 indicators, pretrained on 4 years of history, safety module, bank-level security.
 
 PhotoLynk: zero-knowledge encrypted photo vault — on-device encryption, exact + burst dedup, bit-for-bit originals, cross-platform, NFT albums with authenticity proofs.
 
