@@ -4222,6 +4222,10 @@ db.serialize(() => {
     // and on resubmits after a background rejection.
     db.run(`ALTER TABLE ad_claims ADD COLUMN granted_at INTEGER`, () => { });
     db.run(`UPDATE ad_claims SET granted_at = COALESCE(granted_at, created_at) WHERE granted_at IS NULL`, () => { });
+    // Which app claimed the week (grants are app-local) and which PhotoLynk
+    // tier it was claimed for (100/200GB only — free access never binds).
+    db.run(`ALTER TABLE ad_claims ADD COLUMN app TEXT`, () => { });
+    db.run(`ALTER TABLE ad_claims ADD COLUMN tier_gb INTEGER`, () => { });
     // One-time social requirements: X handle (bound from a verified post or
     // declared) + Telegram group membership (verified via bot getChatMember).
     // *_state: 'verified' | 'bound' | 'declared' | 'not_following' | null
@@ -4236,7 +4240,14 @@ db.serialize(() => {
 });
 
 const ECO_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
-const ECO_PL_TIER_GB = 100;            // ecosystem grant -> PhotoLynk 100GB tier
+// Binding tier: a paid PhotoLynk plan at/above ECO_BIND_MIN_TIER_GB (and a
+// PaceSeeker sub at the same $3.99 price point) activates the shared
+// entitlement across every ecosystem app. Lower tiers and weekly ad claims
+// are app-local only — free access never binds.
+const ECO_BIND_MIN_TIER_GB = 400;
+const ECO_PL_TIER_GB = 400;            // ecosystem grant -> PhotoLynk 400GB tier ($3.99 = PaceSeeker price)
+const ECO_AD_MAX_TIER_GB = 200;        // ad-week grants materialize at most 200GB, app-local
+const ECO_AD_TIERS_GB = [100, 200];    // tiers a user may claim a free week on
 const ECO_LINK_CODE_TTL_MS = 10 * 60 * 1000;
 const ecoWeekKey = (now = Date.now()) => Math.floor(now / ECO_WEEK_MS);
 
@@ -4395,10 +4406,13 @@ async function ecoBackfillPhotolynkSub(accountId) {
             `SELECT identity FROM ecosystem_members WHERE account_id = ? AND app = 'photolynk'`, [accountId]);
         for (const m of members) {
             const plan = await dbGetAsync(
-                `SELECT expires_at, payment_type FROM user_plans WHERE user_id = ? AND status = 'active' AND deleted_at IS NULL ORDER BY expires_at DESC LIMIT 1`,
+                `SELECT expires_at, payment_type, plan_gb FROM user_plans WHERE user_id = ? AND status = 'active' AND deleted_at IS NULL ORDER BY expires_at DESC LIMIT 1`,
                 [Number(m.identity)]);
             const expiresAt = Number(plan?.expires_at) || 0;
             if (expiresAt <= Date.now()) continue;
+            // Only binding tiers feed the shared sub: 100/200GB plans and
+            // ad-week grants are app-local by design.
+            if ((Number(plan.plan_gb) || 0) < ECO_BIND_MIN_TIER_GB || plan.payment_type === 'ad_claim') continue;
             const cur = await ecoGetSub(accountId);
             if (expiresAt <= (Number(cur?.sub_until) || 0)) continue;
             const kind = plan.payment_type === 'ecosystem' ? 'link_sync' : 'payment';
@@ -4418,10 +4432,15 @@ async function ecoMergeAccounts(targetId, sourceId) {
     const a = await ecoGetSub(targetId); const b = await ecoGetSub(sourceId);
     const maxUntil = Math.max(Number(a?.sub_until) || 0, Number(b?.sub_until) || 0);
     if (maxUntil > 0) {
+        // Keep the winning sub's provenance — including an ad_claim's
+        // source_app, which decides which app the entitlement stays local to.
+        const winner = (Number(b?.sub_until) || 0) > (Number(a?.sub_until) || 0) ? b : a;
         await dbRunAsync(`INSERT INTO stealthlynk_subs (account_id, sub_until, source_app, source_kind, provenance, updated_at)
             VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(account_id) DO UPDATE SET sub_until = excluded.sub_until, updated_at = excluded.updated_at`,
-            [targetId, maxUntil, 'merge', 'merge', '', Date.now()]);
+            ON CONFLICT(account_id) DO UPDATE SET sub_until = excluded.sub_until,
+                source_app = excluded.source_app, source_kind = excluded.source_kind,
+                provenance = excluded.provenance, updated_at = excluded.updated_at`,
+            [targetId, maxUntil, winner?.source_app || 'merge', winner?.source_kind || 'merge', winner?.provenance || '', Date.now()]);
     }
     await dbRunAsync(`UPDATE OR IGNORE ecosystem_members SET account_id = ? WHERE account_id = ?`, [targetId, sourceId]);
     await dbRunAsync(`DELETE FROM ecosystem_members WHERE account_id = ?`, [sourceId]); // PK collisions left behind
@@ -4437,7 +4456,10 @@ async function ecoMergeAccounts(targetId, sourceId) {
 // Apply a concrete sub_until to the shared record and materialize it into each
 // member app's own entitlement rows. PL: user_plans (never downgrades plan_gb).
 // PS: sub_until (the signed grant reaches the client on its next ping).
-async function ecoApplySub(accountId, subUntil, { sourceApp, kind, provenance } = {}) {
+// onlyApp limits member materialization to one app (ad weeks are app-local —
+// they must never light up the other ecosystem app). plTierGb overrides the
+// PhotoLynk plan size (ad weeks cap at ECO_AD_MAX_TIER_GB, not the bind tier).
+async function ecoApplySub(accountId, subUntil, { sourceApp, kind, provenance, onlyApp, plTierGb } = {}) {
     const now = Date.now();
     // 'link_sync' is a propagation-only rewrite — it must never overwrite the
     // provenance columns, or every heartbeat would erase the real source
@@ -4457,7 +4479,9 @@ async function ecoApplySub(accountId, subUntil, { sourceApp, kind, provenance } 
             [accountId, subUntil, sourceApp || null, kind || null, provenance || null, now]);
     }
     const members = await dbAllAsync(`SELECT app, identity FROM ecosystem_members WHERE account_id = ?`, [accountId]);
+    const planGb = Number(plTierGb) || ECO_PL_TIER_GB;
     for (const m of members) {
+        if (onlyApp && m.app !== onlyApp) continue;
         try {
             if (m.app === 'photolynk') {
                 await dbRunAsync(
@@ -4469,7 +4493,7 @@ async function ecoApplySub(accountId, subUntil, { sourceApp, kind, provenance } 
                         expires_at = MAX(COALESCE(user_plans.expires_at, 0), excluded.expires_at),
                         payment_type = CASE WHEN excluded.expires_at > COALESCE(user_plans.expires_at, 0) THEN 'ecosystem' ELSE user_plans.payment_type END,
                         grace_until = NULL, deleted_at = NULL, updated_at = excluded.updated_at`,
-                    [Number(m.identity), ECO_PL_TIER_GB, subUntil, now]);
+                    [Number(m.identity), planGb, subUntil, now]);
             } else if (m.app === 'paceseeker') {
                 await dbRunAsync(
                     `UPDATE paceseeker_devices SET sub_until = MAX(COALESCE(sub_until, 0), ?) WHERE device_hash = ?`,
@@ -4503,6 +4527,36 @@ async function ecoFloorSub(accountId, untilMs, meta = {}) {
     return ecoApplySub(accountId, next, meta);
 }
 
+// Weekly ad reward — APP-LOCAL by design ("free access never binds").
+// PaceSeeker: the shared row feeds the signed grant but ad_claim propagation
+// is scoped to paceseeker members only. PhotoLynk: write only the user's own
+// user_plans row — the shared sub stays untouched so no other app lights up.
+// Stacks from the current expiry like ecoGrantSub, and never shrinks a
+// bigger paid plan (plan_gb/expiry are MAX()ed).
+async function ecoAdWeekGrant(who, { planGb = 100, provenance = '' } = {}) {
+    const now = Date.now();
+    if (who.app === 'paceseeker') {
+        return ecoGrantSub(who.accountId, ECO_WEEK_MS, {
+            sourceApp: 'paceseeker', kind: 'ad_claim', provenance,
+            onlyApp: 'paceseeker',
+        });
+    }
+    const cur = await dbGetAsync(`SELECT expires_at FROM user_plans WHERE user_id = ?`, [Number(who.identity)]);
+    const until = Math.max(now, Number(cur?.expires_at) || 0) + ECO_WEEK_MS;
+    const gb = Math.min(Math.max(Number(planGb) || 100, 1), ECO_AD_MAX_TIER_GB);
+    await dbRunAsync(
+        `INSERT INTO user_plans (user_id, plan_gb, status, expires_at, payment_type, updated_at)
+         VALUES (?, ?, 'active', ?, 'ad_claim', ?)
+         ON CONFLICT(user_id) DO UPDATE SET
+            plan_gb = MAX(COALESCE(user_plans.plan_gb, 0), excluded.plan_gb),
+            status = 'active',
+            expires_at = excluded.expires_at,
+            payment_type = CASE WHEN COALESCE(user_plans.expires_at, 0) <= ? THEN 'ad_claim' ELSE user_plans.payment_type END,
+            grace_until = NULL, deleted_at = NULL, updated_at = excluded.updated_at`,
+        [Number(who.identity), gb, until, now, now]);
+    return until;
+}
+
 // When a member joins an account that already has a sub, propagate the shared
 // entitlement to its app row immediately (don't wait for a payment/ping).
 async function ecoSyncMemberEntitlement(accountId) {
@@ -4511,17 +4565,25 @@ async function ecoSyncMemberEntitlement(accountId) {
     await ecoBackfillPhotolynkSub(accountId);
     const sub = await ecoGetSub(accountId);
     if (!sub || !(Number(sub.sub_until) > Date.now())) return;
+    // Ad weeks are app-local: they propagate only within the claiming app and
+    // materialize at the ad tier, never the bind tier.
+    const adKind = sub.source_kind === 'ad_claim';
+    const targetApp = adKind ? sub.source_app : null;
     // Skip the write when nothing changed — every heartbeat used to rewrite
     // subs + member rows even though MAX() is a no-op, churning updated_at.
     const stale = await dbAllAsync(
         `SELECT m.app, m.identity FROM ecosystem_members m
-         WHERE m.account_id = ? AND (
+         WHERE m.account_id = ? AND (? IS NULL OR m.app = ?) AND (
             (m.app = 'paceseeker' AND COALESCE((SELECT d.sub_until FROM paceseeker_devices d WHERE d.device_hash = m.identity), 0) < ?)
             OR (m.app = 'photolynk' AND COALESCE((SELECT p.expires_at FROM user_plans p WHERE p.user_id = CAST(m.identity AS INTEGER)), 0) < ?)
          ) LIMIT 1`,
-        [accountId, Number(sub.sub_until), Number(sub.sub_until)]).catch(() => []);
+        [accountId, targetApp, targetApp, Number(sub.sub_until), Number(sub.sub_until)]).catch(() => []);
     if (stale.length === 0) return;
-    await ecoApplySub(accountId, Number(sub.sub_until), { kind: 'link_sync' });
+    await ecoApplySub(accountId, Number(sub.sub_until), {
+        kind: 'link_sync',
+        onlyApp: targetApp || undefined,
+        plTierGb: adKind ? ECO_AD_MAX_TIER_GB : undefined,
+    });
 }
 
 // Weekly ad verification. Code is deterministic per account+week: HMAC over
@@ -4808,7 +4870,7 @@ async function ecoCheckCherryMember(accountId) {
 // Keep the bot only in the target group — codes are accepted from any room the
 // bot can see, so scoping it to one room is what binds them to our community.
 async function ecoCherryHandleCode(code, senderWallet) {
-    const member = await dbGetAsync(`SELECT account_id FROM ecosystem_members WHERE wallet = ?`, [senderWallet]).catch(() => null);
+    const member = await dbGetAsync(`SELECT account_id, app, identity FROM ecosystem_members WHERE wallet = ?`, [senderWallet]).catch(() => null);
     if (!member) return;
     const wk = ecoWeekKey();
     if (ecoAdCode(member.account_id, wk) !== code) return; // not this week's code
@@ -4816,10 +4878,12 @@ async function ecoCherryHandleCode(code, senderWallet) {
     const existing = await dbGetAsync(`SELECT status FROM ad_claims WHERE account_id = ? AND week_key = ?`, [member.account_id, wk]).catch(() => null);
     if (existing) return; // already claimed
     await dbRunAsync(
-        `INSERT INTO ad_claims (account_id, week_key, platform, post_url, code, author_handle, status, created_at, verified_at)
-         VALUES (?, ?, 'cherry', ?, ?, ?, 'verified', ?, ?)`,
-        [member.account_id, wk, CHERRY_GROUP_URL, code, senderWallet, Date.now(), Date.now()]).catch(() => { });
-    await ecoGrantSub(member.account_id, ECO_WEEK_MS, { sourceApp: 'cherry', kind: 'ad_claim', provenance: CHERRY_GROUP_URL }).catch(() => { });
+        `INSERT INTO ad_claims (account_id, week_key, platform, post_url, code, author_handle, status, app, tier_gb, created_at, verified_at)
+         VALUES (?, ?, 'cherry', ?, ?, ?, 'verified', ?, ?, ?, ?)`,
+        [member.account_id, wk, CHERRY_GROUP_URL, code, senderWallet, member.app, member.app === 'photolynk' ? 100 : null, Date.now(), Date.now()]).catch(() => { });
+    // App-local grant like any ad claim (never binds the ecosystem).
+    const who = { accountId: member.account_id, app: member.app || 'paceseeker', identity: member.identity };
+    await ecoAdWeekGrant(who, { planGb: 100, provenance: CHERRY_GROUP_URL }).catch(() => { });
     console.log(`[Eco] Cherry: verified claim for ${member.account_id} (wallet ${senderWallet.slice(0, 8)}…)`);
 }
 
@@ -4964,12 +5028,16 @@ app.get('/api/ecosystem/status', ecoMaybeAuth, async (req, res) => {
         // the user exactly which wallet the room check looks for.
         const walletRow = await dbGetAsync(`SELECT wallet, wallet_verified FROM ecosystem_members WHERE account_id = ? AND wallet IS NOT NULL LIMIT 1`, [who.accountId]).catch(() => null);
         const myMember = await dbGetAsync(`SELECT wallet_verified FROM ecosystem_members WHERE app = ? AND identity = ?`, [who.app, String(who.identity)]).catch(() => null);
+        // Ad weeks are app-local — a claim made in another app does not make
+        // THIS caller subscribed (paid/binding kinds still span the account).
+        const appliesHere = !sub || sub.source_kind !== 'ad_claim' || sub.source_app === who.app;
+        const localUntil = appliesHere ? (Number(sub?.sub_until) || 0) : 0;
         res.json({
             accountId: who.accountId,
             linkedApps: members.map(m => m.app),
             walletVerified: !!(myMember && myMember.wallet_verified),
-            subUntil: sub?.sub_until || 0,
-            subscribed: !!(sub && Number(sub.sub_until) > Date.now()),
+            subUntil: localUntil,
+            subscribed: localUntil > Date.now(),
             weekKey: wk,
             adClaim: claim ? { status: claim.status, platform: claim.platform, postUrl: claim.post_url } : null,
             social: {
@@ -5147,6 +5215,8 @@ app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
 
         const postUrl = String(req.body?.postUrl || '').trim();
         if (!/^https:\/\//.test(postUrl)) return res.status(400).json({ error: 'Paste the full https:// post URL' });
+        // PhotoLynk ad weeks only exist on the local (non-binding) tiers.
+        const tierGb = ECO_AD_TIERS_GB.includes(Number(req.body?.tier)) ? Number(req.body.tier) : 100;
         // Platform is detected server-side from the URL — never trust the client.
         const platform = ecoDetectPlatform(postUrl);
         // Weekly rotation: only the week's platform counts, so posts spread
@@ -5255,14 +5325,15 @@ app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
         // One claim per account+week; duplicate URL rejected by UNIQUE index.
         try {
             await dbRunAsync(
-                `INSERT INTO ad_claims (account_id, week_key, platform, post_url, code, author_handle, status, created_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                `INSERT INTO ad_claims (account_id, week_key, platform, post_url, code, author_handle, status, app, tier_gb, created_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(account_id, week_key) DO UPDATE SET
                     post_url = excluded.post_url, platform = excluded.platform,
                     code = excluded.code, author_handle = excluded.author_handle,
-                    status = excluded.status, created_at = excluded.created_at,
+                    status = excluded.status, app = excluded.app, tier_gb = excluded.tier_gb,
+                    created_at = excluded.created_at,
                     verified_at = NULL, verify_attempts = 0`,
-                [who.accountId, wk, platform, postUrl, code, authorHandle, status, Date.now()]);
+                [who.accountId, wk, platform, postUrl, code, authorHandle, status, who.app, who.app === 'photolynk' ? tierGb : null, Date.now()]);
         } catch (e) {
             if (/UNIQUE.*post_url/i.test(e.message || '')) {
                 return res.status(400).json({ error: 'This post was already used for a claim' });
@@ -5294,9 +5365,14 @@ app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
         const g = await dbRunAsync(
             `UPDATE ad_claims SET granted_at = ? WHERE account_id = ? AND week_key = ? AND granted_at IS NULL`,
             [Date.now(), who.accountId, wk]);
+        // Grant is app-local: PS gets a shared row scoped to paceseeker
+        // members; PL writes only the user's own plan row (ad weeks never
+        // bind the ecosystem).
         const subUntil = g.changes > 0
-            ? await ecoGrantSub(who.accountId, ECO_WEEK_MS, { sourceApp: who.app, kind: 'ad_claim', provenance: postUrl })
-            : Number((await ecoGetSub(who.accountId))?.sub_until) || 0;
+            ? await ecoAdWeekGrant(who, { planGb: tierGb, provenance: postUrl })
+            : who.app === 'paceseeker'
+                ? Number((await ecoGetSub(who.accountId))?.sub_until) || 0
+                : Number((await dbGetAsync(`SELECT expires_at FROM user_plans WHERE user_id = ?`, [Number(who.identity)]))?.expires_at) || 0;
         if (status === 'verified') return res.json({ ok: true, status: 'verified', subUntil });
         return res.json({ ok: true, status: 'pending', subUntil, message: 'Week granted — post is being confirmed in the background' });
     } catch (e) {
@@ -5323,7 +5399,21 @@ app.post('/admin/api/ad-claims/:id/review', adminAuth, async (req, res) => {
         const g = await dbRunAsync(
             `UPDATE ad_claims SET granted_at = ? WHERE id = ? AND granted_at IS NULL`, [Date.now(), id]);
         if (g.changes === 0) return res.json({ ok: true, status: 'verified', alreadyGranted: true });
-        const subUntil = await ecoGrantSub(row.account_id, ECO_WEEK_MS, { sourceApp: 'admin', kind: 'ad_claim', provenance: row.post_url });
+        // Grant to the app the claim came from. Claims that predate the app
+        // column keep the old shared-sub semantics (admin is approving them
+        // knowingly).
+        let subUntil;
+        if (!row.app) {
+            subUntil = await ecoGrantSub(row.account_id, ECO_WEEK_MS, { sourceApp: 'admin', kind: 'ad_claim', provenance: row.post_url });
+        } else {
+            const who = { accountId: row.account_id, app: row.app };
+            if (row.app === 'photolynk') {
+                const mem = await dbGetAsync(`SELECT identity FROM ecosystem_members WHERE account_id = ? AND app = 'photolynk' LIMIT 1`, [row.account_id]);
+                if (!mem?.identity) return res.status(400).json({ error: 'No photolynk member on this account' });
+                who.identity = mem.identity;
+            }
+            subUntil = await ecoAdWeekGrant(who, { planGb: Number(row.tier_gb) || 100, provenance: row.post_url });
+        }
         return res.json({ ok: true, status: 'verified', subUntil });
     }
     if (action === 'reject') {
@@ -5540,12 +5630,12 @@ app.get('/api/paceseeker/trial', (req, res) => {
 // allowed to mint a cross-app entitlement. The memo HMAC pepper lives in the
 // app's native binary so the server can't validate it - instead we require a
 // real tx: PS1| memo + a transfer into the shared treasury worth >=
-// PS_ECO_MIN_PAYMENT_USD (below the cheapest legit $10 promo payment, high
-// enough that faking the heartbeat costs nearly as much as paying).
+// PS_ECO_MIN_PAYMENT_USD (below the $3.99 sub price after quote tolerance,
+// high enough that faking the heartbeat costs nearly as much as paying).
 // Same shared treasury as SOLANA_PAYMENT_WALLET (duplicated literally - that
 // const is declared later in this file and would hit the TDZ).
 const PS_TREASURY_WALLET = 'HttTZkUG8xn5A1uJPjRDJqqufdwvHmNQroEGmST8iimU';
-const PS_ECO_MIN_PAYMENT_USD = 8;
+const PS_ECO_MIN_PAYMENT_USD = 3.5; // below the $3.99 sub price minus quote-drift tolerance
 const PS_ECO_STABLE_MINTS = {
     'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': 6, // USDC
     'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB': 6, // USDT
@@ -5689,7 +5779,9 @@ async function _psTrialRespond(res, row, id, wallet) {
         const accountId = await ecoEnsureAccount('paceseeker', id, wallet || null);
         await ecoSyncMemberEntitlement(accountId);
         const sub = await ecoGetSub(accountId);
-        const subUntil = Number(sub?.sub_until) || 0;
+        // Ad weeks are app-local: a claim made in another app stays there.
+        const appliesToPs = sub && (sub.source_kind !== 'ad_claim' || sub.source_app === 'paceseeker');
+        const subUntil = appliesToPs ? (Number(sub.sub_until) || 0) : 0;
         const g = subUntil > Date.now() ? ecoSignGrant(accountId, subUntil) : null;
         out.eco = { account: accountId, subUntil, grant: g ? g.grant : null, sig: g ? g.sig : null };
     } catch (e) {
@@ -7729,12 +7821,15 @@ app.post('/api/solana/verify-payment', async (req, res) => {
             [user.id, normalizedTier, expiresAt, solanaExpiry.trialCarryoverAppliedAt, now]
         );
 
-        // Ecosystem mirror: a paid PhotoLynk plan activates PaceSeeker (and
-        // future member apps) under the shared StealthLynk account.
+        // Ecosystem mirror: only binding tiers (400GB+) activate PaceSeeker
+        // and future member apps. 100/200GB stay app-local — same as a paid
+        // plan bought in-app on a low tier.
         try {
-            const uw = await dbGetAsync(`SELECT wallet_address FROM users WHERE id = ?`, [user.id]);
-            const acct = await ecoEnsureAccount('photolynk', user.id, uw?.wallet_address || null, { verified: true });
-            await ecoFloorSub(acct, expiresAt, { sourceApp: 'photolynk', kind: 'payment', provenance: txSignature, allowRevoked: true });
+            if (normalizedTier >= ECO_BIND_MIN_TIER_GB) {
+                const uw = await dbGetAsync(`SELECT wallet_address FROM users WHERE id = ?`, [user.id]);
+                const acct = await ecoEnsureAccount('photolynk', user.id, uw?.wallet_address || null, { verified: true });
+                await ecoFloorSub(acct, expiresAt, { sourceApp: 'photolynk', kind: 'payment', provenance: txSignature, allowRevoked: true });
+            }
         } catch (e) { console.warn('[Eco] payment mirror failed:', e.message); }
 
         console.log(`[Solana] Payment verified: ${txSignature} - User ${user.email} - ${normalizedTier}GB ${duration}`);
@@ -7866,11 +7961,13 @@ app.post('/api/solana/verify-skr-payment', async (req, res) => {
             [user.id, normalizedTier, expiresAt, solanaExpiry.trialCarryoverAppliedAt, now]
         );
 
-        // Ecosystem mirror (same as SOL path).
+        // Ecosystem mirror (same as SOL path): binding tiers only.
         try {
-            const uw = await dbGetAsync(`SELECT wallet_address FROM users WHERE id = ?`, [user.id]);
-            const acct = await ecoEnsureAccount('photolynk', user.id, uw?.wallet_address || null, { verified: true });
-            await ecoFloorSub(acct, expiresAt, { sourceApp: 'photolynk', kind: 'payment', provenance: txSignature, allowRevoked: true });
+            if (normalizedTier >= ECO_BIND_MIN_TIER_GB) {
+                const uw = await dbGetAsync(`SELECT wallet_address FROM users WHERE id = ?`, [user.id]);
+                const acct = await ecoEnsureAccount('photolynk', user.id, uw?.wallet_address || null, { verified: true });
+                await ecoFloorSub(acct, expiresAt, { sourceApp: 'photolynk', kind: 'payment', provenance: txSignature, allowRevoked: true });
+            }
         } catch (e) { console.warn('[Eco] SKR payment mirror failed:', e.message); }
 
         console.log(`[Solana SKR] Payment verified: ${txSignature} - User ${user.email} - ${normalizedTier}GB ${duration}`);
