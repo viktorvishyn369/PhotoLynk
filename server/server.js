@@ -4893,7 +4893,7 @@ async function ecoCheckCherryMember(accountId) {
     const wallets = (members || []).map(m => m.wallet).filter(Boolean);
     if (!wallets.length) return null;
     try {
-        const r = await axios.get(`https://chat.cherry.fun/api/v1/apps/groups/${CHERRY_ROOM_ID}/members`, {
+        const r = await axios.get(`https://api.cherry.fun/api/v1/apps/groups/${CHERRY_ROOM_ID}/members`, {
             headers: { Authorization: `Bearer ${CHERRY_APP_KEY}` }, timeout: 8000,
         });
         const list = r.data?.members || r.data?.data || r.data || [];
