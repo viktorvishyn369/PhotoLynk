@@ -4407,6 +4407,7 @@ const ECO_TG_GROUP = process.env.ECO_TG_GROUP || 'StealthLynk_IO';
 const ECO_TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const ECO_X_BEARER = process.env.TWITTER_BEARER_TOKEN || '';
 const CHERRY_APP_KEY = process.env.CHERRY_APP_KEY || '';
+const CHERRY_BOT_KEY = process.env.CHERRY_BOT_KEY || '';
 const CHERRY_ROOM_ID = process.env.CHERRY_ROOM_ID || 'KJz2UvNqFjKzRQqdZGbJ';
 const CHERRY_GROUP_URL = `https://chat.cherry.fun/g/${CHERRY_ROOM_ID}`;
 
@@ -4467,6 +4468,57 @@ async function ecoCheckCherryMember(accountId) {
         return wallets.some(w => roomWallets.has(String(w).toLowerCase()));
     } catch (e) { return null; }
 }
+
+// ── Cherry bot: sees group messages via getUpdates (Telegram-style). When a
+// member posts their weekly SLK- code in the group, the sender's wallet proves
+// membership — we mark cherry_state='member' AND auto-record a verified claim
+// (a Cherry post IS the weekly ad; there is no URL to paste).
+// Keep the bot only in the target group — codes are accepted from any room the
+// bot can see, so scoping it to one room is what binds them to our community.
+async function ecoCherryHandleCode(code, senderWallet) {
+    const member = await dbGetAsync(`SELECT account_id FROM ecosystem_members WHERE wallet = ?`, [senderWallet]).catch(() => null);
+    if (!member) return;
+    const wk = ecoWeekKey();
+    if (ecoAdCode(member.account_id, wk) !== code) return; // not this week's code
+    await dbRunAsync(`UPDATE ecosystem_accounts SET cherry_state = 'member' WHERE account_id = ?`, [member.account_id]).catch(() => { });
+    const existing = await dbGetAsync(`SELECT status FROM ad_claims WHERE account_id = ? AND week_key = ?`, [member.account_id, wk]).catch(() => null);
+    if (existing) return; // already claimed
+    await dbRunAsync(
+        `INSERT INTO ad_claims (account_id, week_key, platform, post_url, code, author_handle, status, created_at, verified_at)
+         VALUES (?, ?, 'cherry', ?, ?, ?, 'verified', ?, ?)`,
+        [member.account_id, wk, CHERRY_GROUP_URL, code, senderWallet, Date.now(), Date.now()]).catch(() => { });
+    await ecoGrantSub(member.account_id, ECO_WEEK_MS, { sourceApp: 'cherry', kind: 'ad_claim', provenance: CHERRY_GROUP_URL }).catch(() => { });
+    console.log(`[Eco] Cherry: verified claim for ${member.account_id} (wallet ${senderWallet.slice(0, 8)}…)`);
+}
+
+async function ecoCherryBotLoop() {
+    if (!CHERRY_BOT_KEY) return;
+    let offset = 0;
+    for (;;) {
+        try {
+            const r = await axios.get(`https://api.cherry.fun/api/v1/bots/getUpdates`, {
+                headers: { Authorization: `Bearer ${CHERRY_BOT_KEY}` },
+                params: { offset, timeout: 25 },
+                timeout: 35000,
+            });
+            const updates = r.data?.updates || r.data?.result || (Array.isArray(r.data) ? r.data : []);
+            for (const u of updates) {
+                if (u.update_id != null) offset = u.update_id + 1;
+                else if (u.updateId != null) offset = u.updateId + 1;
+                const msg = u.message || u.groupMessage || u.newMessage || u;
+                const text = String(msg?.content || msg?.text || '');
+                const sender = String(msg?.senderId || msg?.sender || msg?.wallet || msg?.from?.wallet || '');
+                const m = text.match(/SLK-[0-9A-F]{6}/);
+                if (m && /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(sender)) {
+                    await ecoCherryHandleCode(m[0], sender).catch(() => { });
+                }
+            }
+        } catch (e) {
+            await new Promise(r => setTimeout(r, 5000)); // poll errors - back off
+        }
+    }
+}
+ecoCherryBotLoop().catch(() => { });
 
 // TG deep-link pairing: /api/ecosystem/tg-link issues a code; the user opens
 // t.me/<bot>?start=<code>; the bot long-poll loop below resolves it.
@@ -4593,7 +4645,7 @@ app.get('/api/ecosystem/status', ecoMaybeAuth, async (req, res) => {
                 xHandleRequired: ECO_X_HANDLE,
                 tgGroup: ECO_TG_GROUP,
                 cherryGroup: CHERRY_GROUP_URL,
-                cherryConfigured: !!CHERRY_APP_KEY,
+                cherryConfigured: !!(CHERRY_APP_KEY || CHERRY_BOT_KEY),
                 cherryState: social?.cherry_state || null,
             },
         });
@@ -4743,13 +4795,26 @@ app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
         }
         const needX = !acct?.x_handle && !(platform === 'x' && v.verified);
         const needTg = ECO_TG_BOT_TOKEN ? !acct?.tg_user_id : !acct?.tg_username;
-        // Cherry: membership is wallet-bound. With a key configured we check the
-        // room's member list; the user needs at least one linked wallet, so an
-        // account with no wallet counts as "not joined" (they can't be verified
-        // otherwise). API errors (null) never block.
-        const hasWallet = !!(await dbGetAsync(`SELECT 1 FROM ecosystem_members WHERE account_id = ? AND wallet IS NOT NULL LIMIT 1`, [who.accountId]).catch(() => null));
-        const cherryMember = CHERRY_APP_KEY ? await ecoCheckCherryMember(who.accountId) : null;
-        const needCherry = CHERRY_APP_KEY ? (cherryMember === false || (cherryMember === null && !hasWallet)) : false;
+        // Cherry: two ways to be a verified member — (a) cherry_state='member'
+        // set by the bot witnessing your code in the group, or (b) a live
+        // members.list match via CHERRY_APP_KEY. An account with no linked
+        // wallet can't satisfy either path -> counts as missing. API errors
+        // (null) never block.
+        const cherryConfigured = !!(CHERRY_APP_KEY || CHERRY_BOT_KEY);
+        let cherryOk = acct?.cherry_state === 'member';
+        if (cherryConfigured && !cherryOk && CHERRY_APP_KEY) {
+            const cm = await ecoCheckCherryMember(who.accountId);
+            if (cm === true) {
+                cherryOk = true;
+                dbRunAsync(`UPDATE ecosystem_accounts SET cherry_state = 'member' WHERE account_id = ?`, [who.accountId]).catch(() => { });
+            } else if (cm === null) {
+                // API down/unknown — lenient only if the account at least has a
+                // wallet that COULD have joined.
+                const hasWallet = !!(await dbGetAsync(`SELECT 1 FROM ecosystem_members WHERE account_id = ? AND wallet IS NOT NULL LIMIT 1`, [who.accountId]).catch(() => null));
+                cherryOk = hasWallet;
+            }
+        }
+        const needCherry = cherryConfigured && !cherryOk;
         if (needX || needTg || needCherry) {
             return res.status(428).json({
                 error: 'social_required',
@@ -4762,12 +4827,8 @@ app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
                 tgGroup: ECO_TG_GROUP,
                 cherryGroup: CHERRY_GROUP_URL,
                 tgBotConfigured: !!ECO_TG_BOT_TOKEN,
-                message: 'One-time setup: follow @' + ECO_X_HANDLE + ' on X, join @' + ECO_TG_GROUP + ' on Telegram' + (CHERRY_APP_KEY ? ' and join the Cherry group' : '') + ', then resubmit.',
+                message: 'One-time setup: follow @' + ECO_X_HANDLE + ' on X, join @' + ECO_TG_GROUP + ' on Telegram' + (cherryConfigured ? ' and post your code in the Cherry group' : '') + ', then resubmit.',
             });
-        }
-        if (cherryMember === false) { /* unreachable — needCherry covers it */ }
-        else if (cherryMember === true && acct?.cherry_state !== 'member') {
-            dbRunAsync(`UPDATE ecosystem_accounts SET cherry_state = 'member' WHERE account_id = ?`, [who.accountId]).catch(() => { });
         }
         // Hard re-checks on every claim when credentials exist. A null result
         // (API down) never blocks — we only block on a definitive "not a member".
