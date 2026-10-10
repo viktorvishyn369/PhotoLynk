@@ -4768,7 +4768,13 @@ const ECO_REQUIRED_TAG = '#stealthlynk';
 // instead of always landing on the same one. Deterministic per week, so
 // the ad-kit and the claim verifier always agree.
 const ECO_AD_PLATFORMS = ['x', 'telegram', 'instagram', 'facebook'];
-const ecoWeekPlatform = (wk) => ECO_AD_PLATFORMS[Math.abs(Number(wk) || 0) % ECO_AD_PLATFORMS.length];
+// Anchor the 4-week cycle so week ECO_AD_ANCHOR_WEEK = 'x' (matches the
+// sheet's first button), then telegram -> instagram -> facebook -> x…
+// Launch week was the anchor; keep this constant forever or old claims'
+// week->platform mapping shifts retroactively.
+const ECO_AD_ANCHOR_WEEK = 2962;
+const ecoWeekPlatform = (wk) =>
+    ECO_AD_PLATFORMS[(((Number(wk) || 0) - ECO_AD_ANCHOR_WEEK) % ECO_AD_PLATFORMS.length + ECO_AD_PLATFORMS.length) % ECO_AD_PLATFORMS.length];
 
 // Detect the platform from the post URL — the client's platform hint is ignored
 // (never trust caller-supplied classification).
