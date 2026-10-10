@@ -5225,17 +5225,35 @@ app.post('/api/ecosystem/bind-social', ecoMaybeAuth, async (req, res) => {
         const tgUsername = String(req.body?.tgUsername || '').trim().replace(/^@/, '');
         if (xHandle && !/^[A-Za-z0-9_]{1,15}$/.test(xHandle)) return res.status(400).json({ error: 'Invalid X handle' });
         if (tgUsername && !/^[A-Za-z0-9_]{5,32}$/.test(tgUsername)) return res.status(400).json({ error: 'Invalid Telegram username' });
-        const acct = await dbGetAsync(`SELECT x_handle, tg_username FROM ecosystem_accounts WHERE account_id = ?`, [who.accountId]);
+        const acct = await dbGetAsync(`SELECT x_handle, x_state, tg_user_id, tg_username, tg_state FROM ecosystem_accounts WHERE account_id = ?`, [who.accountId]);
         if (xHandle) {
             if (acct?.x_handle && acct.x_handle !== xHandle) {
-                return res.status(400).json({ error: `X handle is already pinned to @${acct.x_handle}` });
+                // A declared handle stays correctable (typos shouldn't brick the
+                // account) — but a PROVEN binding is locked: server-verified
+                // follow, or a verified X claim already recorded under the
+                // pinned author. Without this, a mistyped handle can never be
+                // fixed and every weekly claim bounces on the author check.
+                const proven = acct.x_state === 'verified' || !!(await dbGetAsync(
+                    `SELECT 1 AS x FROM ad_claims WHERE account_id = ? AND platform = 'x' AND status = 'verified' LIMIT 1`,
+                    [who.accountId]));
+                if (proven) {
+                    return res.status(400).json({ error: `X handle is already pinned to @${acct.x_handle}` });
+                }
             }
             const follows = await ecoCheckXFollow(xHandle); // null when unconfigured
             await dbRunAsync(`UPDATE ecosystem_accounts SET x_handle = ?, x_state = ? WHERE account_id = ?`,
                 [xHandle, follows === false ? 'not_following' : (follows === true ? 'verified' : 'bound'), who.accountId]);
         }
-        if (tgUsername && !acct?.tg_username) {
-            await dbRunAsync(`UPDATE ecosystem_accounts SET tg_username = ?, tg_state = 'declared' WHERE account_id = ?`, [tgUsername, who.accountId]);
+        if (tgUsername && acct?.tg_username !== tgUsername) {
+            // Same rule: a bot-verified membership (tg_user_id) or a verified
+            // Telegram claim locks the identity; a merely-declared username
+            // stays correctable.
+            const proven = acct?.tg_state === 'verified' || !!acct?.tg_user_id || !!(await dbGetAsync(
+                `SELECT 1 AS x FROM ad_claims WHERE account_id = ? AND platform = 'telegram' AND status = 'verified' LIMIT 1`,
+                [who.accountId]));
+            if (!proven) {
+                await dbRunAsync(`UPDATE ecosystem_accounts SET tg_username = ?, tg_state = 'declared' WHERE account_id = ?`, [tgUsername, who.accountId]);
+            }
         }
         res.json({ ok: true });
     } catch (e) { res.status(500).json({ error: 'Bind failed' }); }
@@ -5673,6 +5691,27 @@ app.post('/admin/api/eco-account/sub', adminAuth, async (req, res) => {
             return res.json({ ok: true, subUntil: until });
         }
         res.status(400).json({ error: 'action = revoke|extend|set-until' });
+    } catch (e) { res.status(500).json({ error: 'Failed' }); }
+});
+
+// Admin escape hatch: clear pinned social handles on an ecosystem account.
+// bind-social lets users fix UNPROVEN handles themselves, but a proven one
+// (verified follow / verified claim) is locked by design — clearing it here
+// is the support path for a binding that was proven on the wrong identity.
+app.post('/admin/api/eco-account/clear-social', adminAuth, async (req, res) => {
+    try {
+        const accountId = String(req.body?.accountId || '');
+        if (!accountId) return res.status(400).json({ error: 'accountId required' });
+        const acct = await dbGetAsync(`SELECT account_id FROM ecosystem_accounts WHERE account_id = ?`, [accountId]);
+        if (!acct) return res.status(404).json({ error: 'Account not found' });
+        const fields = Array.isArray(req.body?.fields) ? req.body.fields : ['x', 'tg'];
+        const sets = [];
+        if (fields.includes('x')) sets.push(`x_handle = NULL, x_state = NULL`);
+        if (fields.includes('tg')) sets.push(`tg_username = NULL, tg_state = NULL, tg_user_id = NULL`);
+        if (fields.includes('cherry')) sets.push(`cherry_state = NULL`);
+        if (!sets.length) return res.status(400).json({ error: 'fields = ["x"|"tg"|"cherry"]' });
+        await dbRunAsync(`UPDATE ecosystem_accounts SET ${sets.join(', ')} WHERE account_id = ?`, [accountId]);
+        res.json({ ok: true });
     } catch (e) { res.status(500).json({ error: 'Failed' }); }
 });
 
