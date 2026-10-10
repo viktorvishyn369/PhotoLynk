@@ -3420,10 +3420,22 @@ const purgeExpiredComplimentaryUsers = async () => {
 const purgeStalePaceSeekerDevices = async () => {
     const now = Date.now();
     const cutoff = now - PURGE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+    // The ad_until ALTER can lose the SQLITE_BUSY race during schema init
+    // (empty-callback ALTERs). Re-issue it here; only apply the ad_until
+    // predicate once the column actually exists.
+    let hasAdUntil = true;
+    try {
+        const cols = await dbAllAsync(`PRAGMA table_info(paceseeker_devices)`);
+        hasAdUntil = (cols || []).some(c => c.name === 'ad_until');
+        if (!hasAdUntil) {
+            await dbRunAsync(`ALTER TABLE paceseeker_devices ADD COLUMN ad_until INTEGER`);
+            hasAdUntil = true;
+        }
+    } catch (e) { /* column likely exists now */ }
     const stale = await dbAllAsync(
         `SELECT device_hash, first_seen, trial_started_at, trial_expires_at FROM paceseeker_devices
-         WHERE last_seen < ? AND (sub_until IS NULL OR sub_until < ?) AND (ad_until IS NULL OR ad_until < ?)`,
-        [cutoff, now, now]
+         WHERE last_seen < ? AND (sub_until IS NULL OR sub_until < ?)${hasAdUntil ? ' AND (ad_until IS NULL OR ad_until < ?)' : ''}`,
+        hasAdUntil ? [cutoff, now, now] : [cutoff, now]
     );
     for (const r of stale || []) {
         await dbRunAsync(
@@ -4279,6 +4291,8 @@ if (!ECO_SIGNING_KEY) console.warn('[Eco] WARNING: no RC signing key — ecosyst
 // 'ECO1|<account_id>|<sub_until>' signed with the RC key. The PaceSeeker client
 // verifies it with the same baked public key it uses for remote config.
 const _ecoGrantCache = new Map();
+// Per-account ad-claim rate limiter: 10 claims/hour (in-memory, single node).
+const _adClaimRate = new Map();
 function ecoSignGrant(accountId, subUntil) {
     if (!ECO_SIGNING_KEY) return null;
     const cacheKey = `${accountId}|${subUntil}`;
@@ -4405,6 +4419,10 @@ const ecoGetSub = (accountId) => dbGetAsync(`SELECT * FROM stealthlynk_subs WHER
 // unsubscribed until their next renewal. Idempotent (floor semantics) and
 // only fires when the local plan would RAISE the shared expiry, so it never
 // rewrites provenance of a later ad claim or payment.
+// Payment types that may feed the shared ecosystem entitlement: '' = legacy
+// rows predating the column (the solana verifier was the only writer then);
+// 'ecosystem' = materialized from the shared sub itself.
+const ECO_BINDABLE_PAYMENT_TYPES = new Set(['', 'solana', 'skr', 'ecosystem']);
 async function ecoBackfillPhotolynkSub(accountId) {
     try {
         const members = await dbAllAsync(
@@ -4416,8 +4434,13 @@ async function ecoBackfillPhotolynkSub(accountId) {
             const expiresAt = Number(plan?.expires_at) || 0;
             if (expiresAt <= Date.now()) continue;
             // Only binding tiers feed the shared sub: 100/200GB plans and
-            // ad-week grants are app-local by design.
-            if ((Number(plan.plan_gb) || 0) < ECO_BIND_MIN_TIER_GB || plan.payment_type === 'ad_claim') continue;
+            // ad-week grants are app-local by design. Only PROVEN payment
+            // types may bind — on-chain-verified solana/skr, ecosystem-
+            // materialized rows, and NULL (legacy solana-era rows predating
+            // the column). Store/client-reported types (apple, google, …)
+            // are never bound without receipt verification.
+            if ((Number(plan.plan_gb) || 0) < ECO_BIND_MIN_TIER_GB) continue;
+            if (!ECO_BINDABLE_PAYMENT_TYPES.has(plan.payment_type == null ? '' : String(plan.payment_type))) continue;
             const cur = await ecoGetSub(accountId);
             if (expiresAt <= (Number(cur?.sub_until) || 0)) continue;
             const kind = plan.payment_type === 'ecosystem' ? 'link_sync' : 'payment';
@@ -4532,60 +4555,64 @@ async function ecoFloorSub(accountId, untilMs, meta = {}) {
     return ecoApplySub(accountId, next, meta);
 }
 
-// Weekly ad reward — APP-LOCAL by design ("free access never binds").
-// PaceSeeker: the week lands on the device's own ad_until column (server-only
-// writes) and reaches the client via the signed grant — stealthlynk_subs is
-// never touched, so ad time can't leak into the shared entitlement. PhotoLynk:
-// writes only the user's own user_plans row. Stacks from the current expiry
-// like ecoGrantSub, and never shrinks a bigger paid plan (MAX semantics).
+// Weekly ad reward — one post per account+week earns a free week on EVERY app
+// currently linked to the account ("post once, both apps free"). Still
+// APP-LOCAL storage: each member's own row holds the week (PS ad_until, PL
+// user_plans) and stealthlynk_subs is never touched, so ad time can never
+// be re-tagged as a paid binding or leak into future apps joining later.
+// Stacks from each member's current expiry and never shrinks paid time.
 async function ecoAdWeekGrant(who, { planGb = 100, provenance = '' } = {}) {
     const now = Date.now();
     // Revoked accounts can't re-earn via ads (same gate ecoGrantSub applies
     // on the PS path — admin must lift the revoke or grant explicitly).
     const cur = await ecoGetSub(who.accountId);
     if (cur?.source_kind === 'revoke') return 0;
-    if (who.app === 'paceseeker') {
-        // PS ad weeks live ONLY on the caller's own device row — never in
-        // stealthlynk_subs. The shared row stays binding-only, so a later
-        // payment floor can never re-tag mixed paid+ad time as 'payment'
-        // and leak the ad week into the other app. The signed grant in
-        // _psTrialRespond signs max(shared, device) so the week still
-        // reaches the client. Stacks from max(now, local entitlement) so
-        // paid time is never shortened and ad time piles after it.
-        const sharedApplies = !ecoLocalAdApp(cur) || ecoLocalAdApp(cur) === 'paceseeker';
-        const dev = await dbGetAsync(`SELECT ad_until FROM paceseeker_devices WHERE device_hash = ?`, [String(who.identity)]);
-        const base = Math.max(now, Number(dev?.ad_until) || 0, sharedApplies ? (Number(cur?.sub_until) || 0) : 0);
-        const until = base + ECO_WEEK_MS;
-        // Upsert: the device row could be missing if it was purged for silence
-        // between its last ping and this claim.
+    const members = await dbAllAsync(
+        `SELECT app, identity FROM ecosystem_members WHERE account_id = ?`, [who.accountId]).catch(() => []);
+    const targets = (members && members.length) ? members : [{ app: who.app, identity: who.identity }];
+    let callerUntil = 0;
+    for (const m of targets) {
+        if (m.app === 'paceseeker') {
+            // PS ad weeks live ONLY on the device's own ad_until column — never
+            // in stealthlynk_subs (client-writable sub_until stays untrusted).
+            // The signed grant in _psTrialRespond signs max(shared, device).
+            const sharedApplies = !ecoLocalAdApp(cur) || ecoLocalAdApp(cur) === 'paceseeker';
+            const dev = await dbGetAsync(`SELECT ad_until FROM paceseeker_devices WHERE device_hash = ?`, [String(m.identity)]);
+            const base = Math.max(now, Number(dev?.ad_until) || 0, sharedApplies ? (Number(cur?.sub_until) || 0) : 0);
+            const until = base + ECO_WEEK_MS;
+            // Upsert: the device row could be missing if it was purged for
+            // silence between its last ping and this claim.
+            await dbRunAsync(
+                `INSERT INTO paceseeker_devices (device_hash, ad_until, first_seen, last_seen)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(device_hash) DO UPDATE SET ad_until = MAX(COALESCE(ad_until, 0), excluded.ad_until), last_seen = excluded.last_seen`,
+                [String(m.identity), until, now, now]);
+            if (who.app === 'paceseeker' && String(m.identity) === String(who.identity)) callerUntil = until;
+            continue;
+        }
+        if (m.app !== 'photolynk' || !m.identity) continue;
+        const plan = await dbGetAsync(`SELECT expires_at FROM user_plans WHERE user_id = ?`, [Number(m.identity)]);
+        const until = Math.max(now, Number(plan?.expires_at) || 0) + ECO_WEEK_MS;
+        const gb = Math.min(Math.max(Number(planGb) || 100, 1), ECO_AD_MAX_TIER_GB);
+        // expires_at is MAX()ed (not overwritten) so a payment landing between
+        // the SELECT and the upsert can't be shrunk. payment_type flips to
+        // 'ad_claim' whenever the ad grant is what extends the row — CRITICAL:
+        // that marker is what keeps ecoBackfillPhotolynkSub from re-binding a
+        // stacked ad week (paid 400GB + ad week would otherwise look like a
+        // paid plan and leak the ad time into the shared sub).
         await dbRunAsync(
-            `INSERT INTO paceseeker_devices (device_hash, ad_until, first_seen, last_seen)
-             VALUES (?, ?, ?, ?)
-             ON CONFLICT(device_hash) DO UPDATE SET ad_until = MAX(COALESCE(ad_until, 0), excluded.ad_until), last_seen = excluded.last_seen`,
-            [String(who.identity), until, now, now]);
-        return until;
+            `INSERT INTO user_plans (user_id, plan_gb, status, expires_at, payment_type, updated_at)
+             VALUES (?, ?, 'active', ?, 'ad_claim', ?)
+             ON CONFLICT(user_id) DO UPDATE SET
+                plan_gb = MAX(COALESCE(user_plans.plan_gb, 0), excluded.plan_gb),
+                status = 'active',
+                expires_at = MAX(COALESCE(user_plans.expires_at, 0), excluded.expires_at),
+                payment_type = CASE WHEN excluded.expires_at > COALESCE(user_plans.expires_at, 0) THEN 'ad_claim' ELSE user_plans.payment_type END,
+                grace_until = NULL, deleted_at = NULL, updated_at = excluded.updated_at`,
+            [Number(m.identity), gb, until, now]);
+        if (who.app === 'photolynk' && Number(m.identity) === Number(who.identity)) callerUntil = until;
     }
-    if (!who.identity) return 0;
-    const plan = await dbGetAsync(`SELECT expires_at FROM user_plans WHERE user_id = ?`, [Number(who.identity)]);
-    const until = Math.max(now, Number(plan?.expires_at) || 0) + ECO_WEEK_MS;
-    const gb = Math.min(Math.max(Number(planGb) || 100, 1), ECO_AD_MAX_TIER_GB);
-    // expires_at is MAX()ed (not overwritten) so a payment landing between the
-    // SELECT and the upsert can't be shrunk. payment_type flips to 'ad_claim'
-    // whenever the ad grant is what extends the row — CRITICAL: that marker is
-    // what keeps ecoBackfillPhotolynkSub from re-binding a stacked ad week
-    // (paid 400GB + ad week would otherwise look like a paid plan and leak
-    // the ad time into the shared sub).
-    await dbRunAsync(
-        `INSERT INTO user_plans (user_id, plan_gb, status, expires_at, payment_type, updated_at)
-         VALUES (?, ?, 'active', ?, 'ad_claim', ?)
-         ON CONFLICT(user_id) DO UPDATE SET
-            plan_gb = MAX(COALESCE(user_plans.plan_gb, 0), excluded.plan_gb),
-            status = 'active',
-            expires_at = MAX(COALESCE(user_plans.expires_at, 0), excluded.expires_at),
-            payment_type = CASE WHEN excluded.expires_at > COALESCE(user_plans.expires_at, 0) THEN 'ad_claim' ELSE user_plans.payment_type END,
-            grace_until = NULL, deleted_at = NULL, updated_at = excluded.updated_at`,
-        [Number(who.identity), gb, until, now]);
-    return until;
+    return callerUntil;
 }
 
 // An ad_claim shared row is app-local only when its source_app is a real app.
@@ -5273,12 +5300,24 @@ app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
         rl.push(Date.now()); _adClaimRate.set(who.accountId, rl);
 
         const wk = ecoWeekKey();
+        // Caller's own effective entitlement — included in early "already
+        // claimed" responses so a linked second app sees its granted week too.
+        const callerLocalUntil = async () => {
+            if (who.app === 'paceseeker') {
+                const sub = await ecoGetSub(who.accountId);
+                const la = ecoLocalAdApp(sub);
+                const sharedUntil = (!la || la === 'paceseeker') ? (Number(sub?.sub_until) || 0) : 0;
+                const dev = await dbGetAsync(`SELECT ad_until FROM paceseeker_devices WHERE device_hash = ?`, [String(who.identity)]);
+                return Math.max(sharedUntil, Number(dev?.ad_until) || 0);
+            }
+            return Number((await dbGetAsync(`SELECT expires_at FROM user_plans WHERE user_id = ?`, [Number(who.identity)]))?.expires_at) || 0;
+        };
         const existing = await dbGetAsync(`SELECT * FROM ad_claims WHERE account_id = ? AND week_key = ?`, [who.accountId, wk]);
         if (existing && existing.status === 'verified') {
-            return res.json({ ok: true, status: 'verified', already: true });
+            return res.json({ ok: true, status: 'verified', already: true, subUntil: await callerLocalUntil() });
         }
         if (existing && (existing.status === 'pending' || existing.status === 'review')) {
-            return res.json({ ok: true, status: 'pending', message: 'Claim already submitted — being confirmed in the background' });
+            return res.json({ ok: true, status: 'pending', subUntil: await callerLocalUntil(), message: 'Claim already submitted — being confirmed in the background' });
         }
 
         const postUrl = String(req.body?.postUrl || '').trim();
@@ -5496,7 +5535,7 @@ app.post('/admin/api/ad-claims/:id/review', adminAuth, async (req, res) => {
     res.status(400).json({ error: 'action = approve|reject' });
 });
 app.get('/admin/api/eco-links', adminAuth, async (req, res) => {
-    const members = await dbAllAsync(`SELECT m.account_id, m.app, m.identity, m.wallet, m.linked_at, s.sub_until FROM ecosystem_members m LEFT JOIN stealthlynk_subs s ON s.account_id = m.account_id ORDER BY m.linked_at DESC LIMIT 500`);
+    const members = await dbAllAsync(`SELECT m.account_id, m.app, m.identity, m.wallet, m.wallet_verified, m.linked_at, s.sub_until FROM ecosystem_members m LEFT JOIN stealthlynk_subs s ON s.account_id = m.account_id ORDER BY m.linked_at DESC LIMIT 500`);
     res.json({ members });
 });
 
@@ -7502,6 +7541,13 @@ app.get('/api/subscription/downgrade-check', authenticateToken, async (req, res)
 
 app.post('/api/subscription/sync', authenticateToken, async (req, res) => {
     try {
+        // This endpoint trusts client-supplied entitlement data (productId,
+        // expiresAt, paymentType) with no receipt verification — the current
+        // app has no IAP SDK and nothing calls it. Disabled by default; set
+        // ALLOW_UNVERIFIED_SUB_SYNC=1 only for the legacy integration.
+        if (process.env.ALLOW_UNVERIFIED_SUB_SYNC !== '1') {
+            return res.status(404).json({ error: 'Not found' });
+        }
         const userId = req.user.id;
         const {
             productId,
@@ -7598,11 +7644,14 @@ app.post('/api/subscription/sync', authenticateToken, async (req, res) => {
 
 app.post('/api/revenuecat/webhook', async (req, res) => {
     try {
-        if (REVENUECAT_WEBHOOK_SECRET) {
-            const auth = (req.headers['authorization'] || '').toString();
-            if (auth !== `Bearer ${REVENUECAT_WEBHOOK_SECRET}`) {
-                return res.status(401).json({ error: 'Unauthorized' });
-            }
+        // The webhook is the ONLY thing that can verify store purchases — with
+        // no secret configured it must fail closed, never open.
+        if (!REVENUECAT_WEBHOOK_SECRET) {
+            return res.status(503).json({ error: 'RevenueCat webhook not configured' });
+        }
+        const auth = (req.headers['authorization'] || '').toString();
+        if (auth !== `Bearer ${REVENUECAT_WEBHOOK_SECRET}`) {
+            return res.status(401).json({ error: 'Unauthorized' });
         }
 
         const event = req.body || {};
@@ -7632,6 +7681,16 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
                 if (err) return res.status(500).json({ error: 'Database error' });
                 if (!row || !row.user_id) return res.status(404).json({ error: 'User not found' });
                 const currentPlan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [row.user_id]);
+
+                // Ownership guard: a live crypto-paid / ad / premium plan owns
+                // this row — a stale store event must not rewrite its expiry,
+                // status, or payment provenance.
+                const NON_STORE_TYPES = new Set(['solana', 'skr', 'ad_claim', 'premium_sol', 'premium_skr']);
+                const curPayType = String(currentPlan?.payment_type || '');
+                if (NON_STORE_TYPES.has(curPayType) && Number(currentPlan?.expires_at) > Date.now()) {
+                    console.log(`[RevenueCat Webhook] Ignoring event for user ${row.user_id}: active ${curPayType} plan owns the row`);
+                    return res.json({ ok: true, ignored: 'owned_by_nonstore_plan' });
+                }
 
                 // DOWNGRADE GUARD: Reject if user's storage exceeds target tier
                 if (tierGb) {
@@ -7668,7 +7727,7 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
                     await dbRunAsync(
                         `UPDATE user_plans
                             SET status = ?,
-                                expires_at = ?,
+                                expires_at = MAX(COALESCE(expires_at, 0), ?),
                                 grace_until = NULL,
                                 deleted_at = NULL,
                                 rc_product_id = ?,
@@ -7781,6 +7840,40 @@ const respondVerificationFailure = (res, txVerification, fallbackError) => {
     return res.status(400).json({ error: txVerification.error || fallbackError });
 };
 
+// Enforce the app-built product memo so only real PhotoLynk payment txs can
+// mint entitlements — arbitrary treasury inflows and cross-product reuses fail.
+// New clients append a per-user payment code as a 4th memo segment, binding
+// the tx to the purchasing account so a stranger's on-chain payment cannot be
+// claimed on a different account.
+const paymentCodeFor = (userId) => crypto
+    .createHmac('sha256', JWT_SECRET)
+    .update(`plpay:${userId}`)
+    .digest('hex')
+    .slice(0, 8);
+
+const requirePaymentMemo = (res, memo, expected, userId) => {
+    if (memo === expected) return true;
+    if (userId && memo === `${expected}:${paymentCodeFor(userId)}`) return true;
+    console.warn(`[Solana] Payment memo mismatch: got ${JSON.stringify(memo)}, expected ${JSON.stringify(expected)} for user ${userId}`);
+    respondVerificationFailure(res, { code: 'MEMO_MISMATCH', error: 'Payment memo does not match the claimed purchase' }, 'Transaction verification failed');
+    return false;
+};
+
+// The per-user payment code new clients embed in the payment memo.
+app.get('/api/solana/payment-code', async (req, res) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ error: 'Authorization token required' });
+    }
+    let decoded;
+    try {
+        decoded = jwt.verify(authHeader.substring(7), JWT_SECRET);
+    } catch (e) {
+        return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+    return res.json({ code: paymentCodeFor(decoded.id) });
+});
+
 // Verify Solana payment transaction
 app.post('/api/solana/verify-payment', async (req, res) => {
     const { txSignature, tierGb, duration, solAmount, paymentWallet } = req.body;
@@ -7851,6 +7944,9 @@ app.post('/api/solana/verify-payment', async (req, res) => {
         if (!txVerification.success) {
             return respondVerificationFailure(res, txVerification, 'Transaction verification failed');
         }
+        if (!requirePaymentMemo(res, txVerification.memo, `PhotoLynk:sub:${normalizedTier}:${duration === 'yearly' ? 'yearly' : 'monthly'}`, user.id)) {
+            return;
+        }
 
         // Check if this transaction was already processed
         const existingTx = await dbGetAsync(
@@ -7881,14 +7977,15 @@ app.post('/api/solana/verify-payment', async (req, res) => {
             [user.id, txSignature, txVerification.receivedAmount || 0, normalizedTier, duration || 'monthly', now, now]
         );
 
-        // Activate subscription
+        // Activate subscription — floor the expiry so a concurrent grant that
+        // landed between our plan read and this write is never shortened.
         await dbRunAsync(
             `INSERT INTO user_plans (user_id, plan_gb, status, expires_at, trial_carryover_applied_at, updated_at)
              VALUES (?, ?, 'active', ?, ?, ?)
              ON CONFLICT(user_id) DO UPDATE SET
                 plan_gb = excluded.plan_gb,
                 status = 'active',
-                expires_at = excluded.expires_at,
+                expires_at = MAX(COALESCE(user_plans.expires_at, 0), excluded.expires_at),
                 trial_carryover_applied_at = COALESCE(excluded.trial_carryover_applied_at, user_plans.trial_carryover_applied_at),
                 payment_type = 'solana',
                 payment_at = excluded.updated_at,
@@ -7997,6 +8094,9 @@ app.post('/api/solana/verify-skr-payment', async (req, res) => {
         if (!txVerification.success) {
             return respondVerificationFailure(res, txVerification, 'SKR transaction verification failed');
         }
+        if (!requirePaymentMemo(res, txVerification.memo, `PhotoLynk:sub:${normalizedTier}:${duration === 'yearly' ? 'yearly' : 'monthly'}`, user.id)) {
+            return;
+        }
 
         const existingTx = await dbGetAsync(
             `SELECT * FROM solana_payments WHERE tx_signature = ?`,
@@ -8028,7 +8128,7 @@ app.post('/api/solana/verify-skr-payment', async (req, res) => {
              ON CONFLICT(user_id) DO UPDATE SET
                 plan_gb = excluded.plan_gb,
                 status = 'active',
-                expires_at = excluded.expires_at,
+                expires_at = MAX(COALESCE(user_plans.expires_at, 0), excluded.expires_at),
                 trial_carryover_applied_at = COALESCE(excluded.trial_carryover_applied_at, user_plans.trial_carryover_applied_at),
                 payment_type = 'skr',
                 payment_at = excluded.updated_at,
@@ -8068,6 +8168,28 @@ app.post('/api/solana/verify-skr-payment', async (req, res) => {
 // Second arg is now the SERVER-computed expected USD value — the on-chain
 // amount is enforced against the recent SOL price band. Any client-supplied
 // amount is ignored for enforcement (logged by callers for diagnostics).
+// Solana Memo program v1 — the client tags every PhotoLynk payment with a
+// product memo ("PhotoLynk:sub:<tierGb>:<duration>" / "PhotoLynk:premium:0:premium").
+// Requiring the memo binds a claimed purchase to a real app-built payment and
+// stops arbitrary treasury inflows (deposits, sweeps, other users' transfers)
+// from minting plans.
+const PL_MEMO_PROGRAM_ID = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr';
+const extractPhotoLynkMemo = (tx) => {
+    const ixs = [
+        ...(tx?.transaction?.message?.instructions || []),
+        ...((tx?.meta?.innerInstructions || []).flatMap(ii => ii.instructions || [])),
+    ];
+    for (const ix of ixs) {
+        const pid = ix.programId || (ix.program === 'spl-memo' ? PL_MEMO_PROGRAM_ID : null);
+        if (pid !== PL_MEMO_PROGRAM_ID) continue;
+        let text = '';
+        if (typeof ix.parsed === 'string') text = ix.parsed;
+        else if (ix.data) { try { text = Buffer.from(ix.data, 'base64').toString('utf8'); } catch (e) { text = ''; } }
+        if (text && text.startsWith('PhotoLynk:')) return text;
+    }
+    return null;
+};
+
 async function verifySolanaTransaction(txSignature, expectedUsd) {
     console.log('[Solana] Verifying transaction:', txSignature, 'expected USD:', expectedUsd);
 
@@ -8125,32 +8247,25 @@ async function verifySolanaTransaction(txSignature, expectedUsd) {
         return { success: false, code: 'TX_TOO_OLD', error: 'Transaction is older than 30 days' };
     }
 
-    // Parse transfer instructions to find sender, receiver, and amount
+    // Sum all System Program transfers INTO the payment wallet — batched txs
+    // can carry unrelated transfers first, and split payments are legitimate.
     const instructions = tx.transaction?.message?.instructions || [];
     let sender = null;
-    let receiver = null;
+    const receiver = SOLANA_PAYMENT_WALLET;
     let transferAmount = 0;
 
     for (const ix of instructions) {
         // Look for System Program transfer instruction
-        if (ix.program === 'system' && ix.parsed?.type === 'transfer') {
-            sender = ix.parsed.info.source;
-            receiver = ix.parsed.info.destination;
-            transferAmount = ix.parsed.info.lamports / LAMPORTS_PER_SOL;
-            console.log(`[Solana] Transfer found: ${sender} -> ${receiver}, amount: ${transferAmount} SOL`);
-            break;
+        if (ix.program === 'system' && ix.parsed?.type === 'transfer' && ix.parsed.info.destination === SOLANA_PAYMENT_WALLET) {
+            if (!sender) sender = ix.parsed.info.source;
+            transferAmount += ix.parsed.info.lamports / LAMPORTS_PER_SOL;
+            console.log(`[Solana] Treasury transfer found: ${ix.parsed.info.source} -> ${receiver}, amount: ${ix.parsed.info.lamports / LAMPORTS_PER_SOL} SOL`);
         }
     }
 
-    if (!sender || !receiver || transferAmount <= 0) {
-        console.log('[Solana] No valid transfer instruction found in transaction');
+    if (!sender || transferAmount <= 0) {
+        console.log(`[Solana] No transfer to the payment wallet found. Expected: ${SOLANA_PAYMENT_WALLET}`);
         console.log('[Solana] Instructions:', JSON.stringify(instructions, null, 2));
-        return { success: false, error: 'No valid transfer found in transaction' };
-    }
-
-    // Verify the payment is TO our wallet
-    if (receiver !== SOLANA_PAYMENT_WALLET) {
-        console.log(`[Solana] Payment not to our wallet. Expected: ${SOLANA_PAYMENT_WALLET}, Got: ${receiver}`);
         return { success: false, code: 'WRONG_WALLET', error: 'Payment not sent to correct wallet' };
     }
 
@@ -8184,6 +8299,7 @@ async function verifySolanaTransaction(txSignature, expectedUsd) {
         receiver,
         blockTime: tx.blockTime,
         slot: tx.slot,
+        memo: extractPhotoLynkMemo(tx),
     };
 }
 
@@ -8367,6 +8483,7 @@ async function verifySkrTokenTransaction(txSignature, expectedUsd, expectedToken
         success: true,
         receivedAmount: receivedSkr,
         ...matchedTransfer,
+        memo: extractPhotoLynkMemo(tx),
     };
 }
 
@@ -13732,6 +13849,9 @@ try {
             if (!txVerification.success) {
                 return respondVerificationFailure(res, txVerification, 'Transaction verification failed');
             }
+            if (!requirePaymentMemo(res, txVerification.memo, 'PhotoLynk:premium:0:premium', user.id)) {
+                return;
+            }
 
             // Check if this transaction was already processed
             const existingTx = await dbGetAsync(
@@ -13829,6 +13949,9 @@ try {
             const txVerification = await verifySkrTokenTransaction(txSignature, expectedUsd, SKR_TOKEN_MINT);
             if (!txVerification.success) {
                 return respondVerificationFailure(res, txVerification, 'SKR transaction verification failed');
+            }
+            if (!requirePaymentMemo(res, txVerification.memo, 'PhotoLynk:premium:0:premium', user.id)) {
+                return;
             }
 
             const existingTx = await dbGetAsync(
