@@ -4920,7 +4920,9 @@ async function ecoCheckTgMember(tgUserId) {
 // (no key, API down, or account has no wallet on file).
 async function ecoCheckCherryMember(accountId) {
     if (!CHERRY_APP_KEY) return null;
-    const members = await dbAllAsync(`SELECT wallet FROM ecosystem_members WHERE account_id = ? AND wallet IS NOT NULL`, [accountId]).catch(() => []);
+    // Only verified wallet bindings count — an unverified `w=` report must
+    // not let an account ride on someone else's Cherry membership.
+    const members = await dbAllAsync(`SELECT wallet FROM ecosystem_members WHERE account_id = ? AND wallet IS NOT NULL AND wallet_verified = 1`, [accountId]).catch(() => []);
     const wallets = (members || []).map(m => m.wallet).filter(Boolean);
     if (!wallets.length) return null;
     try {
@@ -4940,7 +4942,9 @@ async function ecoCheckCherryMember(accountId) {
 // Keep the bot only in the target group — codes are accepted from any room the
 // bot can see, so scoping it to one room is what binds them to our community.
 async function ecoCherryHandleCode(code, senderWallet) {
-    const member = await dbGetAsync(`SELECT account_id, app, identity FROM ecosystem_members WHERE wallet = ?`, [senderWallet]).catch(() => null);
+    // Prefer the VERIFIED holder of this wallet — an unverified `w=` report
+    // could otherwise shadow the real owner and eat their legit claim.
+    const member = await dbGetAsync(`SELECT account_id, app, identity FROM ecosystem_members WHERE wallet = ? ORDER BY wallet_verified DESC LIMIT 1`, [senderWallet]).catch(() => null);
     if (!member) return;
     const wk = ecoWeekKey();
     if (ecoAdCode(member.account_id, wk) !== code) return; // not this week's code
@@ -5385,7 +5389,7 @@ app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
             } else if (cm === null) {
                 // API down/unknown — lenient only if the account at least has a
                 // wallet that COULD have joined.
-                const hasWallet = !!(await dbGetAsync(`SELECT 1 FROM ecosystem_members WHERE account_id = ? AND wallet IS NOT NULL LIMIT 1`, [who.accountId]).catch(() => null));
+                const hasWallet = !!(await dbGetAsync(`SELECT 1 FROM ecosystem_members WHERE account_id = ? AND wallet IS NOT NULL AND wallet_verified = 1 LIMIT 1`, [who.accountId]).catch(() => null));
                 cherryOk = hasWallet;
             }
         }
