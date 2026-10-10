@@ -5166,7 +5166,15 @@ app.get('/api/ecosystem/status', ecoMaybeAuth, async (req, res) => {
         const sub = await ecoGetSub(who.accountId);
         const wk = ecoWeekKey();
         const claim = await dbGetAsync(`SELECT status, platform, post_url FROM ad_claims WHERE account_id = ? AND week_key = ?`, [who.accountId, wk]);
-        const social = await dbGetAsync(`SELECT x_handle, x_state, tg_username, tg_state, cherry_state FROM ecosystem_accounts WHERE account_id = ?`, [who.accountId]);
+        const social = await dbGetAsync(`SELECT x_handle, x_state, tg_username, tg_state, tg_user_id, cherry_state FROM ecosystem_accounts WHERE account_id = ?`, [who.accountId]);
+        // Proven bindings are locked — same rule as bind-social: verified state,
+        // bot-verified TG id, or a verified claim under the handle. Clients use
+        // these to render the inputs disabled instead of letting users type
+        // into a field the server will reject.
+        const xProven = !!(social?.x_handle && (social.x_state === 'verified' || (await dbGetAsync(
+            `SELECT 1 AS x FROM ad_claims WHERE account_id = ? AND platform = 'x' AND status = 'verified' LIMIT 1`, [who.accountId]))));
+        const tgProven = !!(social?.tg_username && (social.tg_state === 'verified' || !!social.tg_user_id || (await dbGetAsync(
+            `SELECT 1 AS x FROM ad_claims WHERE account_id = ? AND platform = 'telegram' AND status = 'verified' LIMIT 1`, [who.accountId]))));
         // Cherry identity is the wallet itself — expose it so clients can show
         // the user exactly which wallet the room check looks for.
         const walletRow = await dbGetAsync(`SELECT wallet, wallet_verified FROM ecosystem_members WHERE account_id = ? AND wallet IS NOT NULL LIMIT 1`, [who.accountId]).catch(() => null);
@@ -5198,8 +5206,10 @@ app.get('/api/ecosystem/status', ecoMaybeAuth, async (req, res) => {
             social: {
                 xHandle: social?.x_handle || null,
                 xState: social?.x_state || null,
+                xProven,
                 tgUsername: social?.tg_username || null,
                 tgState: social?.tg_state || null,
+                tgProven,
                 tgBotConfigured: !!ECO_TG_BOT_TOKEN,
                 xFollowChecked: !!ECO_X_BEARER,
                 xHandleRequired: ECO_X_HANDLE,
