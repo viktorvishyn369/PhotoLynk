@@ -3216,6 +3216,17 @@ const purgeUserEverywhere = async (userId, options = {}) => {
     deleted.db.devices = await safeDeleteFromTable('devices', 'user_id = ?', [uid]);
     deleted.db.users = await safeDeleteFromTable('users', 'id = ?', [uid]);
 
+    // Detach the ecosystem member — the shared account, paid sub, ad claims
+    // and social state all belong to the ACCOUNT, not the user, so they must
+    // survive for any still-linked apps (a PaceSeeker device keeps what was
+    // paid for). But the member row itself keys on this identity: leaving it
+    // makes a tombstone that permanently blocks the one-app-per-account slot,
+    // so a re-registered user could never rejoin their own account even via
+    // the same verified wallet, and every sub update would materialize
+    // user_plans rows for a dead user_id. Deleting it frees the slot; if a
+    // surviving member still proves the same wallet, rejoin restores access.
+    deleted.db.ecosystem_members = await safeDeleteFromTable('ecosystem_members', "app = 'photolynk' AND identity = ?", [String(uid)]);
+
     console.log(`[UserPurge] Completed user=${uid} reason=${reason} files=${deleteFiles ? 'yes' : 'no'}`);
     return { ok: true, deleted };
 };
@@ -3325,6 +3336,32 @@ const migrateStalePlanStates = async () => {
     }
     if (staleGrace.length > 0) {
         console.log(`[Migration] Expired ${staleGrace.length} stale grace users`);
+    }
+
+    // 5. Ecosystem members whose PhotoLynk user no longer exists — tombstones
+    //    left by purges done before the member detach was added. They hold the
+    //    one-app-per-account slot forever and would silently block a
+    //    re-registered same-wallet user from rejoining their own account.
+    //    PaceSeeker members are NOT swept here: a purged device is meant to
+    //    restore its trial on return, so its member row survives on purpose.
+    try {
+        const orphans = await dbAllAsync(
+            `SELECT m.identity FROM ecosystem_members m
+             WHERE m.app = 'photolynk'
+               AND NOT EXISTS (SELECT 1 FROM users u WHERE CAST(u.id AS TEXT) = m.identity)`
+        );
+        for (const row of orphans) {
+            await dbRunAsync(
+                `DELETE FROM ecosystem_members WHERE app = 'photolynk' AND identity = ?`,
+                [String(row.identity)]
+            );
+            fixed++;
+        }
+        if (orphans.length > 0) {
+            console.log(`[Migration] Detached ${orphans.length} orphaned ecosystem member(s)`);
+        }
+    } catch (e) {
+        console.warn('[Migration] eco member sweep skipped:', e.message);
     }
 
     if (fixed > 0) {
@@ -4516,6 +4553,11 @@ async function ecoApplySub(accountId, subUntil, { sourceApp, kind, provenance, o
         if (onlyApp && m.app !== onlyApp) continue;
         try {
             if (m.app === 'photolynk') {
+                // Skip members whose user row is gone — a purge detaches the
+                // member, but a sub update can race the delete and would
+                // otherwise resurrect a user_plans row for a dead user.
+                const alive = await dbGetAsync(`SELECT 1 AS x FROM users WHERE CAST(id AS TEXT) = ?`, [String(m.identity)]);
+                if (!alive) continue;
                 await dbRunAsync(
                     `INSERT INTO user_plans (user_id, plan_gb, status, expires_at, payment_type, updated_at)
                      VALUES (?, ?, 'active', ?, 'ecosystem', ?)
@@ -4595,6 +4637,10 @@ async function ecoAdWeekGrant(who, { planGb = 100, provenance = '' } = {}) {
             continue;
         }
         if (m.app !== 'photolynk' || !m.identity) continue;
+        // Skip members whose user row is gone — same purge-race guard as in
+        // ecoApplySub, keeps ad grants from resurrecting dead user_plans rows.
+        const alive = await dbGetAsync(`SELECT 1 AS x FROM users WHERE CAST(id AS TEXT) = ?`, [String(m.identity)]);
+        if (!alive) continue;
         const plan = await dbGetAsync(`SELECT expires_at FROM user_plans WHERE user_id = ?`, [Number(m.identity)]);
         const until = Math.max(now, Number(plan?.expires_at) || 0) + ECO_WEEK_MS;
         const gb = Math.min(Math.max(Number(planGb) || 100, 1), ECO_AD_MAX_TIER_GB);
