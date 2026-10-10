@@ -5251,9 +5251,10 @@ app.post('/api/ecosystem/bind-social', ecoMaybeAuth, async (req, res) => {
             const proven = acct?.tg_state === 'verified' || !!acct?.tg_user_id || !!(await dbGetAsync(
                 `SELECT 1 AS x FROM ad_claims WHERE account_id = ? AND platform = 'telegram' AND status = 'verified' LIMIT 1`,
                 [who.accountId]));
-            if (!proven) {
-                await dbRunAsync(`UPDATE ecosystem_accounts SET tg_username = ?, tg_state = 'declared' WHERE account_id = ?`, [tgUsername, who.accountId]);
+            if (proven) {
+                return res.status(400).json({ error: `Telegram username is already pinned to @${acct.tg_username}` });
             }
+            await dbRunAsync(`UPDATE ecosystem_accounts SET tg_username = ?, tg_state = 'declared' WHERE account_id = ?`, [tgUsername, who.accountId]);
         }
         res.json({ ok: true });
     } catch (e) { res.status(500).json({ error: 'Bind failed' }); }
