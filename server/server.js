@@ -4422,7 +4422,11 @@ const ecoGetSub = (accountId) => dbGetAsync(`SELECT * FROM stealthlynk_subs WHER
 // Payment types that may feed the shared ecosystem entitlement: '' = legacy
 // rows predating the column (the solana verifier was the only writer then);
 // 'ecosystem' = materialized from the shared sub itself.
-const ECO_BINDABLE_PAYMENT_TYPES = new Set(['', 'solana', 'skr', 'ecosystem']);
+// Payment types proven enough to feed the shared sub. 'apple'/'google' are
+// trustworthy ONLY because the unauthenticated /api/subscription/sync is
+// 404'd — the authenticated RevenueCat webhook is the sole writer. If that
+// endpoint is ever re-enabled, remove store types from this set.
+const ECO_BINDABLE_PAYMENT_TYPES = new Set(['', 'solana', 'skr', 'ecosystem', 'apple', 'google']);
 async function ecoBackfillPhotolynkSub(accountId) {
     try {
         const members = await dbAllAsync(
@@ -5855,9 +5859,12 @@ async function verifyPsPaymentTx(signature) {
 // Two bindings stop replay abuse: the tx fee payer must equal the member's
 // VERIFIED wallet (a public sig can't be claimed by a stranger), and the grant
 // duration is fixed server-side — the client-reported plan string is ignored.
-// FLOOR (not additive grant) anchored to the tx blockTime: the heartbeat path
-// floors the same cap, so both paths converge to paidAt + one period and can
-// never stack ~2x a period when the RPC verify lands after a heartbeat floor.
+// Each NEW verified signature STACKS one plan period on the current
+// entitlement (max of shared sub, device ad weeks, tx blockTime) — same
+// renewal semantics PhotoLynk applies, so paying early never burns paid
+// days. The heartbeat re-mirror stays a floor (it re-fires every ping and
+// must stay idempotent); it can only ever reach paidAt + one period, never
+// above the stacked value this writes.
 async function ecoMirrorPsPayment(deviceHash, wallet, sig) {
     if (!sig) return;
     // Ensure the member row exists first — the revenue insert fires before
@@ -5877,7 +5884,14 @@ async function ecoMirrorPsPayment(deviceHash, wallet, sig) {
     db.run(`UPDATE paceseeker_revenue SET eco_verified = 1 WHERE signature = ?`, [sig], () => { });
     // A brand-new verified payment is an affirmative act — it may re-activate
     // an account an admin revoked (they paid again; a ban would be separate).
-    const until = (v.paidAt || Date.now()) + PS_ECO_PLAN_MS + 12 * 60 * 60 * 1000;
+    // Stack on the fullest current entitlement: shared sub, this device's
+    // earned ad weeks, or the tx blockTime — each new sig buys +1 period.
+    const [sub, dev] = await Promise.all([
+        ecoGetSub(member.account_id),
+        dbGetAsync(`SELECT ad_until FROM paceseeker_devices WHERE device_hash = ?`, [String(deviceHash)]),
+    ]);
+    const base = Math.max(v.paidAt || Date.now(), Number(sub?.sub_until) || 0, Number(dev?.ad_until) || 0);
+    const until = base + PS_ECO_PLAN_MS + 12 * 60 * 60 * 1000;
     await ecoFloorSub(member.account_id, until, { sourceApp: 'paceseeker', kind: 'payment', provenance: sig, allowRevoked: true });
 }
 
