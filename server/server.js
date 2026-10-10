@@ -5003,10 +5003,13 @@ async function ecoCherryHandleCode(code, senderWallet) {
     await dbRunAsync(`UPDATE ecosystem_accounts SET cherry_state = 'member' WHERE account_id = ?`, [member.account_id]).catch(() => { });
     const existing = await dbGetAsync(`SELECT status FROM ad_claims WHERE account_id = ? AND week_key = ?`, [member.account_id, wk]).catch(() => null);
     if (existing) return; // already claimed
+    // post_url is globally UNIQUE — a constant room URL would let only ONE
+    // Cherry claim ever exist. Derive a unique-per-claim locator instead.
+    const postUrl = `cherry://${CHERRY_ROOM_ID}/${wk}/${senderWallet}`;
     await dbRunAsync(
         `INSERT INTO ad_claims (account_id, week_key, platform, post_url, code, author_handle, status, app, tier_gb, created_at, verified_at)
          VALUES (?, ?, 'cherry', ?, ?, ?, 'verified', ?, ?, ?, ?)`,
-        [member.account_id, wk, CHERRY_GROUP_URL, code, senderWallet, member.app, member.app === 'photolynk' ? 100 : null, Date.now(), Date.now()]).catch(() => { });
+        [member.account_id, wk, postUrl, code, senderWallet, member.app, member.app === 'photolynk' ? 100 : null, Date.now(), Date.now()]).catch(() => { });
     // Same atomic grant-guard as the claim endpoint: only the writer that
     // flipped granted_at issues the week — a racing manual claim can't
     // stack a second +7d, and admin approve can't grant twice.
