@@ -5072,16 +5072,44 @@ async function ecoTgApi(method, params) {
     return r.data?.result;
 }
 
-// A group message during a Telegram week IS the weekly claim — "Hi" proves
-// membership, no promo spam in the community group needed. Only verified
-// bindings (tg_user_id) map a sender to an account — a merely-declared
-// username could otherwise ride someone else's messages.
+// A group message proves Telegram control: posting anything in the community
+// group confirms the binding. Verified tg_user_id senders refresh their state;
+// a merely-declared username matching the sender auto-verifies (tg_user_id +
+// tg_state='verified' → input locks client-side via tgProven). And during a
+// Telegram week the same message IS the weekly claim — "Hi" proves membership,
+// no promo spam needed.
 async function ecoTgHandleGroupMessage(msg) {
+    const senderId = String(msg?.from?.id || '');
+    const senderHandle = msg?.from?.username ? String(msg.from.username) : null;
+    if (!senderId || msg?.from?.is_bot) return;
+    let acct = await dbGetAsync(
+        `SELECT account_id, tg_username, tg_state FROM ecosystem_accounts WHERE tg_user_id = ?`, [senderId]).catch(() => null);
+    if (!acct && senderHandle) {
+        // Auto-prove a declared handle — only when exactly ONE account declares
+        // it, so an ambiguous duplicate can't bind the wrong account.
+        const declared = await dbAllAsync(
+            `SELECT account_id, tg_username, tg_state FROM ecosystem_accounts
+             WHERE LOWER(tg_username) = ? AND (tg_user_id IS NULL OR tg_user_id = '')`,
+            [senderHandle.toLowerCase()]).catch(() => []);
+        if (declared.length === 1) {
+            acct = declared[0];
+            await dbRunAsync(
+                `UPDATE ecosystem_accounts SET tg_user_id = ?, tg_username = ?, tg_state = 'verified' WHERE account_id = ?`,
+                [senderId, senderHandle, acct.account_id]).catch(() => { });
+            console.log(`[Eco] TG handle @${senderHandle} proven by group post → ${acct.account_id}`);
+            ecoTgApi('sendMessage', { chat_id: msg.chat.id, reply_to_message_id: msg.message_id, text: 'Telegram verified ✓ — your handle is now locked to this account.' }).catch(() => { });
+        }
+    }
+    if (!acct) return;
+    // Bound account: keep the state verified and the username current — the
+    // tg_user_id is the identity, handles can change on the TG side.
+    if (acct.tg_state !== 'verified' || (senderHandle && String(acct.tg_username || '').toLowerCase() !== senderHandle.toLowerCase())) {
+        await dbRunAsync(
+            `UPDATE ecosystem_accounts SET tg_state = 'verified', tg_username = COALESCE(?, tg_username) WHERE account_id = ?`,
+            [senderHandle, acct.account_id]).catch(() => { });
+    }
     const wk = ecoWeekKey();
     if (ecoWeekPlatform(wk) !== 'telegram') return;
-    const senderId = String(msg?.from?.id || '');
-    const acct = await dbGetAsync(`SELECT account_id FROM ecosystem_accounts WHERE tg_user_id = ?`, [senderId]).catch(() => null);
-    if (!acct) return;
     const existing = await dbGetAsync(`SELECT status FROM ad_claims WHERE account_id = ? AND week_key = ?`, [acct.account_id, wk]).catch(() => null);
     if (existing) return;
     const mem = await dbGetAsync(`SELECT app, identity FROM ecosystem_members WHERE account_id = ? LIMIT 1`, [acct.account_id]).catch(() => null);
