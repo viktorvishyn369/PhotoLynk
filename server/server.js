@@ -5072,6 +5072,38 @@ async function ecoTgApi(method, params) {
     return r.data?.result;
 }
 
+// A group message during a Telegram week IS the weekly claim — "Hi" proves
+// membership, no promo spam in the community group needed. Only verified
+// bindings (tg_user_id) map a sender to an account — a merely-declared
+// username could otherwise ride someone else's messages.
+async function ecoTgHandleGroupMessage(msg) {
+    const wk = ecoWeekKey();
+    if (ecoWeekPlatform(wk) !== 'telegram') return;
+    const senderId = String(msg?.from?.id || '');
+    const acct = await dbGetAsync(`SELECT account_id FROM ecosystem_accounts WHERE tg_user_id = ?`, [senderId]).catch(() => null);
+    if (!acct) return;
+    const existing = await dbGetAsync(`SELECT status FROM ad_claims WHERE account_id = ? AND week_key = ?`, [acct.account_id, wk]).catch(() => null);
+    if (existing) return;
+    const mem = await dbGetAsync(`SELECT app, identity FROM ecosystem_members WHERE account_id = ? LIMIT 1`, [acct.account_id]).catch(() => null);
+    if (!mem?.identity) return;
+    const postUrl = `tg://@${ECO_TG_GROUP}/msg/${msg.message_id}`;
+    const code = ecoAdCode(acct.account_id, wk);
+    await dbRunAsync(
+        `INSERT INTO ad_claims (account_id, week_key, platform, post_url, code, author_handle, status, app, tier_gb, created_at, verified_at)
+         VALUES (?, ?, 'telegram', ?, ?, ?, 'verified', ?, ?, ?, ?)`,
+        [acct.account_id, wk, postUrl, code, ECO_TG_GROUP, mem.app, mem.app === 'photolynk' ? 100 : null, Date.now(), Date.now()]).catch(() => { });
+    // Same atomic grant-guard as the claim endpoint: only the writer that
+    // flips granted_at issues the week.
+    const g = await dbRunAsync(
+        `UPDATE ad_claims SET granted_at = ? WHERE account_id = ? AND week_key = ? AND granted_at IS NULL`,
+        [Date.now(), acct.account_id, wk]).catch(() => null);
+    if (!g || g.changes === 0) return;
+    await ecoAdWeekGrant({ accountId: acct.account_id, app: mem.app, identity: mem.identity },
+        { planGb: 100, provenance: postUrl }).catch(() => { });
+    ecoTgApi('sendMessage', { chat_id: msg.chat.id, reply_to_message_id: msg.message_id, text: 'Free week claimed on every linked app ✓' }).catch(() => { });
+    console.log(`[Eco] TG group claim verified for ${acct.account_id}`);
+}
+
 // Long-poll the bot for /start <code>. Resolves the code's ecosystem account,
 // verifies group membership via getChatMember, marks tg_state, replies to the
 // user. Runs only when TELEGRAM_BOT_TOKEN is set; harmless if two servers poll
@@ -5087,6 +5119,10 @@ async function ecoTgBotLoop() {
                 offset = u.update_id + 1;
                 const msg = u.message;
                 const text = String(msg?.text || '');
+                if (msg?.from?.id && msg.chat?.username && String(msg.chat.username).toLowerCase() === ECO_TG_GROUP.toLowerCase() && !text.startsWith('/')) {
+                    ecoTgHandleGroupMessage(msg).catch(() => { });
+                    continue;
+                }
                 if (!msg?.from?.id || !text.startsWith('/start')) continue;
                 const code = text.split(/\s+/)[1] || '';
                 const chatId = msg.chat.id;
