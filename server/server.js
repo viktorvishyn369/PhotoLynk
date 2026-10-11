@@ -15,6 +15,7 @@ const axios = require('axios');
 const nacl = require('tweetnacl');
 const naclUtil = require('tweetnacl-util');
 const updater = require('./updater');
+const paymentRecovery = require('./paymentRecovery');
 let sharp;
 try { sharp = require('sharp'); console.log('[Server] sharp loaded'); } catch (e) { sharp = null; console.log('[Server] sharp failed to load:', e.message); }
 
@@ -438,6 +439,7 @@ const adminAuth = async (req, res, next) => {
 };
 
 // Admin page (Basic Auth + IP allowlist + no cache)
+// === ADMIN_PAGE_ROUTE_BEGIN ===
 app.get('/admin', adminAuth, (req, res) => {
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Pragma', 'no-cache');
@@ -662,6 +664,7 @@ table{min-width:100%;width:auto}
       <div class="form-group"><label>Premium Expires At (epoch ms)</label><input id="e-premiumExpiresAt" placeholder="absolute epoch"/></div>
     </div>
     <div class="modal-actions">
+      <button class="btn btn-ghost" id="e-recover" onclick="recoverPayment()" style="margin-right:auto">Recover payment</button>
       <button class="btn btn-ghost" onclick="closeModal()">Cancel</button>
       <button class="btn btn-primary" onclick="saveEdit()">Save Changes</button>
     </div>
@@ -1173,6 +1176,41 @@ function openEdit(id){
 }
 function closeModal(){document.getElementById('edit-modal').classList.remove('open')}
 
+// On-chain payment recovery: preview the tx against this user, confirm, then
+// let the server validate + credit atomically. All display strings go through
+// prompt/confirm/toast text, never innerHTML.
+async function recoverPayment(){
+  var uid=Number(document.getElementById('e-id').value);if(!uid)return;
+  var sig=prompt('On-chain transaction signature to recover for user #'+uid+':');
+  if(!sig)return;sig=String(sig).trim();if(!sig)return;
+  var btn=document.getElementById('e-recover');btn.disabled=true;
+  try{
+    var r=await fetch('/api/admin/treasury-payment?signature='+encodeURIComponent(sig)+'&userId='+uid);
+    var d=await r.json();if(!r.ok)throw new Error(d.error||'Preview failed');
+    if(d.alreadyProcessed){toast('That payment is already credited','error');return;}
+    if(d.historical){toast('Transaction is older than 30 days - manual review only','error');return;}
+    if(d.price&&d.price.ok===false){toast('On-chain amount is below the required price','error');return;}
+    if(d.price&&d.price.ok!==true){toast('Price unavailable - try again shortly','error');return;}
+    var u=allUsers.find(function(x){return x.id===uid})||{};
+    var label=(u.display_handle||u.email||('#'+uid));
+    var attrib=d.attribution==='admin_required'
+      ?'Wallet is not linked. Confirm this payment belongs to the selected user.'
+      :'Attribution: '+d.attribution;
+    var msg='Credit on-chain payment to '+label+' (ID '+uid+')?\\n\\n'
+      +'Amount: '+d.amount+' '+d.token+'\\n'
+      +'Plan: '+d.tierGb+'GB '+d.duration+'\\n'
+      +'Paid at: '+new Date(d.paymentAt).toISOString()+'\\n'
+      +'Payer: '+(d.payer||'unknown')+'\\n'
+      +attrib+'\\n'
+      +'New expiry: '+(d.expectedExpiresAt?new Date(d.expectedExpiresAt).toISOString():'n/a');
+    if(!window.confirm(msg))return;
+    var r2=await fetch('/api/admin/treasury-recover',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({signature:sig,userId:uid,confirm:true})});
+    var d2=await r2.json();if(!r2.ok)throw new Error(d2.error||'Recovery failed');
+    toast('Payment credited: '+d.tierGb+'GB '+d.duration,'success');closeModal();loadUsers();
+  }catch(e){toast('Recover failed: '+e.message,'error')}
+  finally{btn.disabled=false;}
+}
+
 async function saveEdit(){
   var uid=Number(document.getElementById('e-id').value);
   var payload={userId:uid};
@@ -1222,6 +1260,7 @@ setInterval(function(){if(activeApp==='paceseeker'&&psLoaded)loadPsUsers()},3000
 </html>`;
     res.send(html);
 });
+// === ADMIN_PAGE_ROUTE_END ===
 
 // Admin API: lookup user (email | userUuid | deviceUuid)
 app.get('/admin/api/user', adminAuth, async (req, res) => {
@@ -4123,6 +4162,7 @@ async function psUpdateGeo(id, ip) {
 const psDomainCache = new Map(); // wallet -> full domain 'label.tld' ('' = none)
 const psTldCache = new Map();    // parent name-account key -> tld label
 const SNS_ROOT_ACCOUNT = '58PwtjSDuFHuUkYjH9BYnnQKHfwo9reZhC2zMJv9JPkx';
+// === BASE58_ENCODE_BEGIN ===
 const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
 function base58Encode(buf) {
     let zeros = 0;
@@ -4139,6 +4179,7 @@ function base58Encode(buf) {
     }
     return '1'.repeat(zeros) + digits.reverse().map(d => BASE58_ALPHABET[d]).join('');
 }
+// === BASE58_ENCODE_END ===
 // The name record's first 32 bytes are the parent name-account key. Names
 // directly under the SNS root resolve as .sns (the migrated .sol registry);
 // sub-names sit under their TLD's name account, which reverse-lookups to the
@@ -5420,6 +5461,12 @@ app.post('/api/ecosystem/bind-wallet', ecoMaybeAuth, async (req, res) => {
             return res.status(409).json({ error: `A different wallet is already linked to this ${who.app === 'paceseeker' ? 'device' : 'account'} — connect that wallet in the app first` });
         }
         const accountId = await ecoEnsureAccount(who.app, who.identity, newWallet, { verified: true });
+        // PhotoLynk callers get a durable proof-of-ownership binding row used
+        // for payment attribution (challenge + signature + key/address all
+        // verified above; never from /api/save-wallet).
+        if (who.app === 'photolynk') {
+            await dbRunAsync(paymentRecovery.UPSERT_WALLET_BINDING_SQL, [newWallet, Number(who.identity), Date.now()]);
+        }
         await ecoSyncMemberEntitlement(accountId);
         const members = await dbAllAsync(`SELECT app FROM ecosystem_members WHERE account_id = ?`, [accountId]);
         res.json({ ok: true, accountId, linkedApps: members.map(m => m.app) });
@@ -6932,6 +6979,7 @@ const purgeExpiredWalletChallenges = (now) => {
  * @param {number} [params.now]
  * @returns {{ok: boolean, legacy?: boolean, error?: string}}
  */
+// === WALLET_MSG_VALIDATOR_BEGIN ===
 const validateWalletLoginMessage = ({ messageText, walletAddress, loginVersion, challengeMap, allowLegacy, now = Date.now() }) => {
     if (Number(loginVersion) === 2) {
         const walletNorm = String(walletAddress || '').trim();
@@ -6968,10 +7016,15 @@ const validateWalletLoginMessage = ({ messageText, walletAddress, loginVersion, 
     }
     return { ok: false, error: 'Invalid sign-in message content' };
 };
+// === WALLET_MSG_VALIDATOR_END ===
 
+// === FIND_USER_BY_WALLET_BEGIN ===
 // Look up a user by linked wallet address or any wallet-derived email/name
 // variant produced by previous builds. Shared by /api/wallet-login and the
 // challenge endpoint (which reports only whether an account is linked).
+// Must resolve to EXACTLY ONE user - duplicate wallet-derived emails/aliases
+// across accounts are ambiguous and must never pick a first match (that
+// could graft a proven wallet onto the wrong account).
 const findUserByWalletAddress = async (walletAddressNorm) => {
     const walletAddressLower = String(walletAddressNorm).toLowerCase();
     const walletDerivedEmails = [
@@ -6979,11 +7032,17 @@ const findUserByWalletAddress = async (walletAddressNorm) => {
         `${walletAddressLower}@photolynk.local`,
         `${walletAddressLower}.skr`,
     ];
-    return dbGetAsync(
+    const rows = await dbAllAsync(
         `SELECT * FROM users WHERE wallet_address = ? OR LOWER(email) = ? OR LOWER(email) IN (?, ?, ?) OR LOWER(alias_email) = ? OR LOWER(alias_email) IN (?, ?, ?)`,
         [walletAddressNorm, walletAddressLower, ...walletDerivedEmails, walletAddressLower, ...walletDerivedEmails]
     );
+    if (Array.isArray(rows) && rows.length > 1) {
+        console.warn('[WalletLogin] wallet lookup ambiguous:', walletAddressNorm, '-', rows.length, 'accounts matched');
+        return null;
+    }
+    return rows && rows.length === 1 ? rows[0] : null;
 };
+// === FIND_USER_BY_WALLET_END ===
 
 // GET /api/wallet-login/challenge — issue a single-use nonce for wallet login v2.
 // `linked` tells the client whether an account exists for this wallet, so a
@@ -7011,6 +7070,7 @@ app.get('/api/wallet-login/challenge', authRateLimiter, async (req, res) => {
     res.json({ nonce, expires_in: 300, linked });
 });
 
+// === WALLET_LOGIN_ROUTE_BEGIN ===
 // Wallet Login
 // Allows users with a wallet-linked account to log in by proving ownership of the
 // wallet via a SIWS signature. The client sends the wallet address, the signed
@@ -7033,41 +7093,33 @@ app.post('/api/wallet-login', authRateLimiter, async (req, res) => {
             return res.status(401).json({ error: 'No account linked to this wallet' });
         }
 
-        // Repair corrupted records: ensure wallet_address and a proper wallet-derived email are set.
-        const expectedEmail = `${walletAddressLower}@seeker.photolynk.local`;
-        if (!user.wallet_address || String(user.wallet_address).toLowerCase() !== walletAddressLower) {
-            console.log('[WalletLogin] Repairing wallet_address for user', user.id, '→', wallet_address);
-            await dbRunAsync(
-                `UPDATE users SET wallet_address = COALESCE(wallet_address, ?), email = CASE WHEN email IS NULL OR email = '' OR LOWER(email) = ? OR email NOT LIKE '%@%' THEN ? ELSE email END WHERE id = ?`,
-                [walletAddressNorm, walletAddressLower, expectedEmail, user.id]
-            );
-        }
-
-        // Verify Ed25519 signature. MWA returns signed_message and signature as base64.
-        let publicKeyBytes, signatureBytes, messageBytes;
+        // Verify Ed25519 signature AND that the public key encodes to the
+        // claimed wallet address BEFORE any account repair or binding write —
+        // otherwise anyone could graft their wallet onto a wallet-matched
+        // account without holding the key. MWA returns base64 fields.
+        let messageBytes;
         try {
-            publicKeyBytes = naclUtil.decodeBase64(public_key_b64);
-            signatureBytes = naclUtil.decodeBase64(signature);
             messageBytes = naclUtil.decodeBase64(signed_message);
         } catch (decodeErr) {
             return res.status(400).json({ error: 'Invalid signature encoding' });
         }
-        if (publicKeyBytes.length !== nacl.sign.publicKeyLength) {
-            return res.status(400).json({ error: 'Invalid public key length' });
-        }
-        if (signatureBytes.length !== nacl.sign.signatureLength) {
-            return res.status(400).json({ error: 'Invalid signature length' });
-        }
-        const valid = nacl.sign.detached.verify(messageBytes, signatureBytes, publicKeyBytes);
-        if (!valid) {
-            console.log('[WalletLogin] Invalid signature for wallet:', wallet_address);
-            return res.status(401).json({ error: 'Invalid wallet signature' });
+        const ownership = paymentRecovery.verifyWalletOwnership({
+            nacl, naclUtil, base58Encode,
+            publicKeyB64: public_key_b64,
+            signatureB64: signature,
+            messageBytes,
+            walletAddress: walletAddressNorm,
+        });
+        if (!ownership.ok) {
+            console.log('[WalletLogin] Rejected for wallet:', wallet_address, '-', ownership.error);
+            return res.status(ownership.status || 401).json({ error: ownership.error });
         }
 
         // Message validation: v2 is nonce-bound challenge-response (the
         // master-key signature is never sent); the legacy fixed message is
         // accepted behind WALLET_LOGIN_ALLOW_LEGACY (default on) so older
-        // clients keep working until the flag is flipped.
+        // clients keep working until the flag is flipped. The nonce is only
+        // consumed after the signature + key/address proof above.
         const messageText = naclUtil.encodeUTF8(messageBytes);
         const msgCheck = validateWalletLoginMessage({
             messageText,
@@ -7080,6 +7132,19 @@ app.post('/api/wallet-login', authRateLimiter, async (req, res) => {
             console.log('[WalletLogin] Message rejected for wallet:', wallet_address, '-', msgCheck.error);
             return res.status(401).json({ error: msgCheck.error || 'Invalid sign-in message content' });
         }
+
+        // Repair corrupted records: ensure wallet_address and a proper wallet-derived email are set.
+        const expectedEmail = `${walletAddressLower}@seeker.photolynk.local`;
+        if (!user.wallet_address || String(user.wallet_address).toLowerCase() !== walletAddressLower) {
+            console.log('[WalletLogin] Repairing wallet_address for user', user.id, '→', wallet_address);
+            await dbRunAsync(
+                `UPDATE users SET wallet_address = COALESCE(wallet_address, ?), email = CASE WHEN email IS NULL OR email = '' OR LOWER(email) = ? OR email NOT LIKE '%@%' THEN ? ELSE email END WHERE id = ?`,
+                [walletAddressNorm, walletAddressLower, expectedEmail, user.id]
+            );
+        }
+
+        // Proven wallet ownership -> durable payment-attribution binding.
+        await dbRunAsync(paymentRecovery.UPSERT_WALLET_BINDING_SQL, [walletAddressNorm, user.id, Date.now()]);
 
         // Register/Update device.
         await dbRunAsync(
@@ -7120,6 +7185,7 @@ app.post('/api/wallet-login', authRateLimiter, async (req, res) => {
         res.status(500).json({ error: e.message || 'Wallet login failed' });
     }
 });
+// === WALLET_LOGIN_ROUTE_END ===
 
 // ============================================================================
 // EMAIL VERIFICATION ENDPOINTS (inactive by default, ready to enable)
@@ -7594,6 +7660,7 @@ const inferMobileSubscriptionDurationMs = (productId) => {
     return null;
 };
 
+// === PAID_EXPIRY_BEGIN ===
 const normalizePositiveTimestamp = (value) => {
     const n = Number(value);
     return Number.isFinite(n) && n > 0 ? n : null;
@@ -7627,6 +7694,7 @@ const computePaidSubscriptionExpiry = ({
         trialCarryoverAppliedAt: carryoverMs > 0 ? paymentAt : normalizePositiveTimestamp(currentPlan?.trial_carryover_applied_at),
     };
 };
+// === PAID_EXPIRY_END ===
 
 const resolveStoreSubscriptionUpdate = ({
     currentPlan,
@@ -8007,6 +8075,16 @@ const PLAN_DURATION_MS = {
     yearly: 365 * 24 * 60 * 60 * 1000,
 };
 
+// Atomic subscription creditor: dedicated SQLite connection + BEGIN IMMEDIATE
+// per credit so payment row, plan update and the audit row commit or roll back
+// together (the shared db handle has unrelated traffic and must never BEGIN).
+const creditSolanaSubscription = paymentRecovery.createSubscriptionCreditor({
+    sqlite3,
+    dbPath: DB_PATH,
+    computeExpiry: computePaidSubscriptionExpiry,
+    durations: PLAN_DURATION_MS,
+});
+
 // Map a verification failure to an HTTP response. Terminal codes answer 400
 // with { error, code, expected, received }; missing price band answers 503
 // (client treats it as retryable); everything else keeps the legacy 400
@@ -8094,11 +8172,36 @@ app.post('/api/solana/verify-payment', async (req, res) => {
         return res.status(400).json({ error: 'Invalid tier' });
     }
 
+    const normDuration = duration === 'yearly' ? 'yearly' : 'monthly';
+    const txSig = String(txSignature || '').trim();
+
     try {
         // Find user by ID from JWT token
         const user = await dbGetAsync(`SELECT id, email FROM users WHERE id = ?`, [decoded.id]);
         if (!user) {
             return res.status(404).json({ error: 'User not found' });
+        }
+
+        // Idempotent retry: an identical already-recorded payment returns the
+        // current subscription before any RPC work. A signature claimed for a
+        // DIFFERENT user/payment is a conflict - and the stored row is never
+        // leaked to another account.
+        const existingEarly = await dbGetAsync(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [txSig]);
+        if (existingEarly) {
+            if (paymentRecovery.samePaymentRow(existingEarly, { userId: user.id, token: 'SOL', tierGb: normalizedTier, duration: normDuration })) {
+                const plan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [user.id]);
+                return res.json({
+                    success: true,
+                    alreadyProcessed: true,
+                    message: 'Payment already verified',
+                    subscription: {
+                        tierGb: plan?.plan_gb ?? normalizedTier,
+                        status: plan?.status || 'active',
+                        expiresAt: plan?.expires_at ? new Date(plan.expires_at).toISOString() : null,
+                    },
+                });
+            }
+            return res.status(409).json({ error: 'Transaction already processed', code: 'PAYMENT_CONFLICT' });
         }
 
         // DOWNGRADE GUARD: Reject if user's storage exceeds target tier
@@ -8127,73 +8230,63 @@ app.post('/api/solana/verify-payment', async (req, res) => {
         console.log('[Solana] Client-claimed solAmount (ignored for enforcement):', solAmount);
 
         // Verify transaction on Solana blockchain
-        const txVerification = await verifySolanaTransaction(txSignature, expectedUsd);
+        const txVerification = await verifySolanaTransaction(txSig, expectedUsd);
         if (!txVerification.success) {
             return respondVerificationFailure(res, txVerification, 'Transaction verification failed');
         }
-        if (!requirePaymentMemo(res, txVerification.memo, `PhotoLynk:sub:${normalizedTier}:${duration === 'yearly' ? 'yearly' : 'monthly'}`, user.id)) {
+        if (!requirePaymentMemo(res, txVerification.memo, `PhotoLynk:sub:${normalizedTier}:${normDuration}`, user.id)) {
             return;
         }
 
-        // Check if this transaction was already processed
-        const existingTx = await dbGetAsync(
-            `SELECT * FROM solana_payments WHERE tx_signature = ?`,
-            [txSignature]
-        );
-        if (existingTx) {
-            return res.status(409).json({ error: 'Transaction already processed', existingPayment: existingTx });
+        // Payment + plan + audit commit atomically (dedicated connection).
+        const now = Date.now();
+        const paymentAt = Number(txVerification.blockTime) > 0 ? txVerification.blockTime * 1000 : now;
+        let creditResult;
+        try {
+            creditResult = await creditSolanaSubscription({
+                userId: user.id,
+                signature: txSig,
+                token: 'SOL',
+                amount: txVerification.receivedAmount || 0,
+                tierGb: normalizedTier,
+                duration: normDuration,
+                paymentAt,
+                source: 'client_verify',
+                detail: `sender=${txVerification.sender || 'unknown'}`,
+            });
+        } catch (e) {
+            if (e.code === 'PAYMENT_CONFLICT') {
+                return res.status(409).json({ error: 'Transaction already processed', code: 'PAYMENT_CONFLICT' });
+            }
+            throw e;
+        }
+        const expiresAt = creditResult.expiresAt;
+
+        if (creditResult.alreadyProcessed) {
+            return res.json({
+                success: true,
+                alreadyProcessed: true,
+                message: 'Payment already verified',
+                subscription: {
+                    tierGb: creditResult.planGb ?? normalizedTier,
+                    status: creditResult.status || 'active',
+                    expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null,
+                },
+            });
         }
 
-        // Calculate subscription expiry
-        const now = Date.now();
-        const durationMs = PLAN_DURATION_MS[duration] || PLAN_DURATION_MS.monthly;
-
-        // Get current plan to check existing expiration
-        const currentPlan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [user.id]);
-        const solanaExpiry = computePaidSubscriptionExpiry({
-            currentPlan,
-            purchaseAt: now,
-            durationMs,
-        });
-        const expiresAt = solanaExpiry.expiresAt;
-
-        // Record the payment — store the ON-CHAIN amount, not the client claim
-        await dbRunAsync(
-            `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, tier_gb, duration, created_at, verified_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [user.id, txSignature, txVerification.receivedAmount || 0, normalizedTier, duration || 'monthly', now, now]
-        );
-
-        // Activate subscription — floor the expiry so a concurrent grant that
-        // landed between our plan read and this write is never shortened.
-        await dbRunAsync(
-            `INSERT INTO user_plans (user_id, plan_gb, status, expires_at, trial_carryover_applied_at, updated_at)
-             VALUES (?, ?, 'active', ?, ?, ?)
-             ON CONFLICT(user_id) DO UPDATE SET
-                plan_gb = excluded.plan_gb,
-                status = 'active',
-                expires_at = MAX(COALESCE(user_plans.expires_at, 0), excluded.expires_at),
-                trial_carryover_applied_at = COALESCE(excluded.trial_carryover_applied_at, user_plans.trial_carryover_applied_at),
-                payment_type = 'solana',
-                payment_at = excluded.updated_at,
-                grace_until = NULL,
-                deleted_at = NULL,
-                updated_at = excluded.updated_at`,
-            [user.id, normalizedTier, expiresAt, solanaExpiry.trialCarryoverAppliedAt, now]
-        );
-
-        // Ecosystem mirror: only binding tiers (400GB+) activate PaceSeeker
-        // and future member apps. 100/200GB stay app-local — same as a paid
-        // plan bought in-app on a low tier.
+        // Ecosystem mirror: only PURCHASED binding tiers (400GB+) activate
+        // PaceSeeker and future member apps - a preserved larger plan must
+        // not unlock the ecosystem for a low-tier payment, and the mirror
+        // never asserts users.wallet_address (self-reported) as verified.
         try {
-            if (normalizedTier >= ECO_BIND_MIN_TIER_GB) {
-                const uw = await dbGetAsync(`SELECT wallet_address FROM users WHERE id = ?`, [user.id]);
-                const acct = await ecoEnsureAccount('photolynk', user.id, uw?.wallet_address || null, { verified: true });
-                await ecoFloorSub(acct, expiresAt, { sourceApp: 'photolynk', kind: 'payment', provenance: txSignature, allowRevoked: true });
+            if (normalizedTier >= ECO_BIND_MIN_TIER_GB && expiresAt > Date.now()) {
+                const acct = await ecoEnsureAccount('photolynk', user.id, null);
+                await ecoFloorSub(acct, expiresAt, { sourceApp: 'photolynk', kind: 'payment', provenance: txSig, allowRevoked: true });
             }
         } catch (e) { console.warn('[Eco] payment mirror failed:', e.message); }
 
-        console.log(`[Solana] Payment verified: ${txSignature} - User ${user.email} - ${normalizedTier}GB ${duration}`);
+        console.log(`[Solana] Payment verified: ${txSig} - User ${user.email} - ${normalizedTier}GB ${duration}`);
 
         return res.json({
             success: true,
@@ -8247,10 +8340,32 @@ app.post('/api/solana/verify-skr-payment', async (req, res) => {
         return res.status(400).json({ error: 'Invalid tier' });
     }
 
+    const normDuration = duration === 'yearly' ? 'yearly' : 'monthly';
+    const txSig = String(txSignature || '').trim();
+
     try {
         const user = await dbGetAsync(`SELECT id, email FROM users WHERE id = ?`, [decoded.id]);
         if (!user) {
             return res.status(404).json({ error: 'User not found' });
+        }
+
+        // Idempotent retry / foreign-signature guard (same as the SOL path).
+        const existingEarly = await dbGetAsync(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [txSig]);
+        if (existingEarly) {
+            if (paymentRecovery.samePaymentRow(existingEarly, { userId: user.id, token: 'SKR', tierGb: normalizedTier, duration: normDuration })) {
+                const plan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [user.id]);
+                return res.json({
+                    success: true,
+                    alreadyProcessed: true,
+                    message: 'Payment already verified',
+                    subscription: {
+                        tierGb: plan?.plan_gb ?? normalizedTier,
+                        status: plan?.status || 'active',
+                        expiresAt: plan?.expires_at ? new Date(plan.expires_at).toISOString() : null,
+                    },
+                });
+            }
+            return res.status(409).json({ error: 'Transaction already processed', code: 'PAYMENT_CONFLICT' });
         }
 
         const currentPlanGb = await getUserPlanGb(user.id);
@@ -8277,64 +8392,60 @@ app.post('/api/solana/verify-skr-payment', async (req, res) => {
         }
         console.log('[Solana SKR] Client-claimed skrAmount (ignored for enforcement):', skrAmount);
 
-        const txVerification = await verifySkrTokenTransaction(txSignature, expectedUsd, SKR_TOKEN_MINT);
+        const txVerification = await verifySkrTokenTransaction(txSig, expectedUsd, SKR_TOKEN_MINT);
         if (!txVerification.success) {
             return respondVerificationFailure(res, txVerification, 'SKR transaction verification failed');
         }
-        if (!requirePaymentMemo(res, txVerification.memo, `PhotoLynk:sub:${normalizedTier}:${duration === 'yearly' ? 'yearly' : 'monthly'}`, user.id)) {
+        if (!requirePaymentMemo(res, txVerification.memo, `PhotoLynk:sub:${normalizedTier}:${normDuration}`, user.id)) {
             return;
         }
 
-        const existingTx = await dbGetAsync(
-            `SELECT * FROM solana_payments WHERE tx_signature = ?`,
-            [txSignature]
-        );
-        if (existingTx) {
-            return res.status(409).json({ error: 'Transaction already processed', existingPayment: existingTx });
+        const now = Date.now();
+        const paymentAt = Number(txVerification.blockTime) > 0 ? txVerification.blockTime * 1000 : now;
+        let creditResult;
+        try {
+            creditResult = await creditSolanaSubscription({
+                userId: user.id,
+                signature: txSig,
+                token: 'SKR',
+                amount: txVerification.receivedAmount || 0,
+                tierGb: normalizedTier,
+                duration: normDuration,
+                paymentAt,
+                source: 'client_verify_skr',
+                detail: `mint=${SKR_TOKEN_MINT}`,
+            });
+        } catch (e) {
+            if (e.code === 'PAYMENT_CONFLICT') {
+                return res.status(409).json({ error: 'Transaction already processed', code: 'PAYMENT_CONFLICT' });
+            }
+            throw e;
+        }
+        const expiresAt = creditResult.expiresAt;
+
+        if (creditResult.alreadyProcessed) {
+            return res.json({
+                success: true,
+                alreadyProcessed: true,
+                message: 'Payment already verified',
+                subscription: {
+                    tierGb: creditResult.planGb ?? normalizedTier,
+                    status: creditResult.status || 'active',
+                    expiresAt: expiresAt ? new Date(expiresAt).toISOString() : null,
+                },
+            });
         }
 
-        const now = Date.now();
-        const durationMs = PLAN_DURATION_MS[duration] || PLAN_DURATION_MS.monthly;
-        const currentPlan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [user.id]);
-        const solanaExpiry = computePaidSubscriptionExpiry({
-            currentPlan,
-            purchaseAt: now,
-            durationMs,
-        });
-        const expiresAt = solanaExpiry.expiresAt;
-
-        await dbRunAsync(
-            `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, skr_amount, payment_token, tier_gb, duration, created_at, verified_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-            [user.id, txSignature, 0, txVerification.receivedAmount || 0, 'SKR', normalizedTier, duration || 'monthly', now, now]
-        );
-
-        await dbRunAsync(
-            `INSERT INTO user_plans (user_id, plan_gb, status, expires_at, trial_carryover_applied_at, updated_at)
-             VALUES (?, ?, 'active', ?, ?, ?)
-             ON CONFLICT(user_id) DO UPDATE SET
-                plan_gb = excluded.plan_gb,
-                status = 'active',
-                expires_at = MAX(COALESCE(user_plans.expires_at, 0), excluded.expires_at),
-                trial_carryover_applied_at = COALESCE(excluded.trial_carryover_applied_at, user_plans.trial_carryover_applied_at),
-                payment_type = 'skr',
-                payment_at = excluded.updated_at,
-                grace_until = NULL,
-                deleted_at = NULL,
-                updated_at = excluded.updated_at`,
-            [user.id, normalizedTier, expiresAt, solanaExpiry.trialCarryoverAppliedAt, now]
-        );
-
-        // Ecosystem mirror (same as SOL path): binding tiers only.
+        // Ecosystem mirror (same as SOL path): PURCHASED binding tiers only,
+        // never the self-reported wallet.
         try {
-            if (normalizedTier >= ECO_BIND_MIN_TIER_GB) {
-                const uw = await dbGetAsync(`SELECT wallet_address FROM users WHERE id = ?`, [user.id]);
-                const acct = await ecoEnsureAccount('photolynk', user.id, uw?.wallet_address || null, { verified: true });
-                await ecoFloorSub(acct, expiresAt, { sourceApp: 'photolynk', kind: 'payment', provenance: txSignature, allowRevoked: true });
+            if (normalizedTier >= ECO_BIND_MIN_TIER_GB && expiresAt > Date.now()) {
+                const acct = await ecoEnsureAccount('photolynk', user.id, null);
+                await ecoFloorSub(acct, expiresAt, { sourceApp: 'photolynk', kind: 'payment', provenance: txSig, allowRevoked: true });
             }
         } catch (e) { console.warn('[Eco] SKR payment mirror failed:', e.message); }
 
-        console.log(`[Solana SKR] Payment verified: ${txSignature} - User ${user.email} - ${normalizedTier}GB ${duration}`);
+        console.log(`[Solana SKR] Payment verified: ${txSig} - User ${user.email} - ${normalizedTier}GB ${duration}`);
 
         return res.json({
             success: true,
@@ -8351,328 +8462,141 @@ app.post('/api/solana/verify-skr-payment', async (req, res) => {
     }
 });
 
-// Helper function to verify Solana transaction.
-// Second arg is now the SERVER-computed expected USD value — the on-chain
-// amount is enforced against the recent SOL price band. Any client-supplied
-// amount is ignored for enforcement (logged by callers for diagnostics).
-// Solana Memo program v1 — the client tags every PhotoLynk payment with a
+// Helper function to verify Solana transactions.
+// Solana Memo program — the client tags every PhotoLynk payment with a
 // product memo ("PhotoLynk:sub:<tierGb>:<duration>" / "PhotoLynk:premium:0:premium").
 // Requiring the memo binds a claimed purchase to a real app-built payment and
 // stops arbitrary treasury inflows (deposits, sweeps, other users' transfers)
-// from minting plans.
-const PL_MEMO_PROGRAM_ID = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr';
-const extractPhotoLynkMemo = (tx) => {
-    const ixs = [
-        ...(tx?.transaction?.message?.instructions || []),
-        ...((tx?.meta?.innerInstructions || []).flatMap(ii => ii.instructions || [])),
-    ];
-    for (const ix of ixs) {
-        const pid = ix.programId || (ix.program === 'spl-memo' ? PL_MEMO_PROGRAM_ID : null);
-        if (pid !== PL_MEMO_PROGRAM_ID) continue;
-        let text = '';
-        if (typeof ix.parsed === 'string') text = ix.parsed;
-        else if (ix.data) { try { text = Buffer.from(ix.data, 'base64').toString('utf8'); } catch (e) { text = ''; } }
-        if (text && text.startsWith('PhotoLynk:')) return text;
-    }
-    return null;
-};
+// from minting plans. Extraction lives in paymentRecovery (strict base58 raw
+// data + a single-PhotoLynk-memo rule shared with scanner and admin paths).
+const extractPhotoLynkMemo = (tx) => paymentRecovery.extractPaymentMemo(tx);
 
-async function verifySolanaTransaction(txSignature, expectedUsd) {
-    console.log('[Solana] Verifying transaction:', txSignature, 'expected USD:', expectedUsd);
+// === VERIFY_TREASURY_TX_BEGIN ===
+// Shared on-chain verification used by BOTH client verify endpoints (and the
+// same strict extraction the scanner/admin paths use): finalized
+// getTransaction with endpoint fallback, strict treasury-transfer
+// extraction, product memo and price-band checks. The second arg is the
+// SERVER-computed expected USD value - any client-supplied amount is ignored
+// for enforcement (callers log it for diagnostics only).
+async function verifyTreasuryTransaction(txSignature, expectedUsd, token) {
+    const sig = String(txSignature || '').trim();
+    const isSkr = token === 'SKR';
+    console.log(`[Solana] Verifying ${token} transaction:`, sig, 'expected USD:', expectedUsd);
 
-    // Retry up to 5 times with 2 second intervals to allow tx to propagate
+    // Retry up to 5 times with 2 second intervals to let the tx reach
+    // finalized on the RPC nodes. A null/absent tx or missing meta is a
+    // transport/replication issue - retryable, never a verdict.
     const maxRetries = 5;
     const retryDelay = 2000;
     let tx = null;
-
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-            console.log(`[Solana] Attempt ${attempt}/${maxRetries} to fetch transaction`);
-            const response = await axios.post(SOLANA_RPC_ENDPOINT, {
-                jsonrpc: '2.0',
-                id: 1,
-                method: 'getTransaction',
-                params: [
-                    txSignature,
-                    { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0, commitment: 'confirmed' }
-                ],
-            }, {
-                timeout: 30000,
-                headers: { 'Content-Type': 'application/json' },
-            });
-
-            tx = response.data?.result;
-            if (tx) {
-                console.log('[Solana] Transaction found on attempt', attempt);
-                break;
-            }
-
-            if (attempt < maxRetries) {
-                console.log(`[Solana] Transaction not found yet, waiting ${retryDelay}ms...`);
-                await new Promise(resolve => setTimeout(resolve, retryDelay));
-            }
-        } catch (e) {
-            console.error(`[Solana] RPC error on attempt ${attempt}:`, e.message);
-            if (attempt < maxRetries) {
-                await new Promise(resolve => setTimeout(resolve, retryDelay));
-            }
+        tx = await treasuryFetchTransaction(sig);
+        if (tx && tx.meta) {
+            console.log(`[Solana] Transaction found on attempt ${attempt}`);
+            break;
         }
+        if (attempt < maxRetries) await treasurySleep(retryDelay);
     }
 
     if (!tx) {
-        return { success: false, error: 'Transaction not found after retries - may still be propagating' };
+        return { success: false, code: 'TX_UNAVAILABLE', retryable: true, error: 'Transaction not found after retries - may still be propagating' };
     }
-
-    // Check if transaction explicitly failed (only if meta exists)
-    if (tx.meta && tx.meta.err) {
+    if (!tx.meta || tx.meta.err === undefined) {
+        return { success: false, code: 'TX_UNAVAILABLE', retryable: true, error: 'Transaction metadata unavailable - retry shortly' };
+    }
+    if (tx.meta.err !== null) {
         return { success: false, code: 'TX_FAILED', error: 'Transaction failed on chain' };
     }
-
-    // Reject stale transactions — client pending entries live 14 days and
-    // legacy builds may hold older ones, so allow up to 30 days.
-    if (tx.blockTime && (Date.now() - tx.blockTime * 1000) > 30 * 24 * 60 * 60 * 1000) {
+    const blockTimeSec = Number(tx.blockTime);
+    if (!(blockTimeSec > 0)) {
+        return { success: false, code: 'TX_UNAVAILABLE', retryable: true, error: 'Transaction blockTime unavailable - retry shortly' };
+    }
+    // Client pending entries live 14 days and legacy builds may hold older
+    // ones - allow up to 30 days.
+    if (Date.now() - blockTimeSec * 1000 > 30 * 24 * 60 * 60 * 1000) {
         return { success: false, code: 'TX_TOO_OLD', error: 'Transaction is older than 30 days' };
     }
 
-    // Sum all System Program transfers INTO the payment wallet — batched txs
-    // can carry unrelated transfers first, and split payments are legitimate.
-    const instructions = tx.transaction?.message?.instructions || [];
-    let sender = null;
-    const receiver = SOLANA_PAYMENT_WALLET;
-    let transferAmount = 0;
-
-    for (const ix of instructions) {
-        // Look for System Program transfer instruction
-        if (ix.program === 'system' && ix.parsed?.type === 'transfer' && ix.parsed.info.destination === SOLANA_PAYMENT_WALLET) {
-            if (!sender) sender = ix.parsed.info.source;
-            transferAmount += ix.parsed.info.lamports / LAMPORTS_PER_SOL;
-            console.log(`[Solana] Treasury transfer found: ${ix.parsed.info.source} -> ${receiver}, amount: ${ix.parsed.info.lamports / LAMPORTS_PER_SOL} SOL`);
+    let transfer;
+    try {
+        transfer = paymentRecovery.extractTreasuryTransfer(tx, {
+            wallet: SOLANA_PAYMENT_WALLET, mint: SKR_TOKEN_MINT, decimals: SKR_TOKEN_DECIMALS,
+        });
+    } catch (e) {
+        if (e.code === 'NO_INFLOW') {
+            return { success: false, code: 'WRONG_WALLET', error: 'Payment not sent to correct wallet' };
         }
+        if (e.code === 'TX_NO_META' || e.code === 'TX_MALFORMED') {
+            return { success: false, code: 'TX_UNAVAILABLE', retryable: true, error: e.message };
+        }
+        if (e.code === 'TX_FAILED') {
+            return { success: false, code: 'TX_FAILED', error: 'Transaction failed on chain' };
+        }
+        // AMBIGUOUS_PAYMENT / UNSAFE_AMOUNT: terminal coded failure.
+        return { success: false, code: e.code || 'TX_INVALID', error: e.message };
+    }
+    if (transfer.token !== token) {
+        return { success: false, code: 'WRONG_WALLET', error: `Transaction carries a ${transfer.token} payment, not ${token}` };
     }
 
-    if (!sender || transferAmount <= 0) {
-        console.log(`[Solana] No transfer to the payment wallet found. Expected: ${SOLANA_PAYMENT_WALLET}`);
-        console.log('[Solana] Instructions:', JSON.stringify(instructions, null, 2));
-        return { success: false, code: 'WRONG_WALLET', error: 'Payment not sent to correct wallet' };
+    let memo;
+    try {
+        memo = extractPhotoLynkMemo(tx);
+    } catch (e) {
+        return { success: false, code: e.code || 'MEMO_MISMATCH', error: e.message };
     }
 
     // Enforce the on-chain amount against the server-side USD expectation and
     // the recent price band (protects against underpayment and replayed
     // commission txs that share the payment wallet).
-    const band = await getPriceBand('sol');
+    const band = await getPriceBand(isSkr ? 'skr' : 'sol');
     if (!band) {
         return { success: false, code: 'PRICE_UNAVAILABLE', retryable: true, error: 'Price feed unavailable, retry later' };
     }
-    const evalResult = evaluatePaymentAmount({ receivedUnits: transferAmount, expectedUsd, band });
+    const evalResult = evaluatePaymentAmount({ receivedUnits: transfer.amount, expectedUsd, band });
     if (!evalResult.ok) {
-        console.log(`[Solana] Underpaid: received ${transferAmount} SOL, expected ~${evalResult.expectedAtLatest} SOL (min ${evalResult.minAcceptable}) for $${expectedUsd}`);
+        console.log(`[Solana] Underpaid: received ${transfer.amount} ${token}, expected ~${evalResult.expectedAtLatest} (min ${evalResult.minAcceptable}) for $${expectedUsd}`);
         return {
             success: false,
             code: 'UNDERPAID',
-            error: `Received ${transferAmount} SOL but expected at least ${evalResult.minAcceptable} SOL ($${expectedUsd} USD)`,
-            receivedSol: transferAmount,
-            expectedSol: evalResult.expectedAtLatest,
-            minAcceptableSol: evalResult.minAcceptable,
+            error: `Received ${transfer.amount} ${token} but expected at least ${evalResult.minAcceptable} ${token} ($${expectedUsd} USD)`,
+            ...(isSkr
+                ? { receivedSkr: transfer.amount, expectedSkr: evalResult.expectedAtLatest, minAcceptableSkr: evalResult.minAcceptable }
+                : { receivedSol: transfer.amount, expectedSol: evalResult.expectedAtLatest, minAcceptableSol: evalResult.minAcceptable }),
             expectedUsd,
         };
     }
 
-    console.log(`[Solana] Valid payment: ${transferAmount} SOL from ${sender} to ${receiver}`);
-
+    console.log(`[Solana] Valid ${token} payment: ${transfer.amount} from ${transfer.senderWallet}`);
     return {
         success: true,
-        receivedAmount: transferAmount,
-        sender,
-        receiver,
-        blockTime: tx.blockTime,
+        receivedAmount: transfer.amount,
+        sender: transfer.senderWallet,
+        receiver: SOLANA_PAYMENT_WALLET,
+        blockTime: blockTimeSec,
         slot: tx.slot,
-        memo: extractPhotoLynkMemo(tx),
+        memo,
+        ...(isSkr ? {
+            receivedRawAmount: Number(transfer.rawAmount),
+            owner: SOLANA_PAYMENT_WALLET,
+            mint: SKR_TOKEN_MINT,
+        } : {}),
     };
 }
 
-// Second arg is the SERVER-computed expected USD value (SKR multiplier already
-// applied by the caller). The on-chain SKR amount is enforced against the
-// recent SKR price band; the client-supplied skrAmount is ignored for
-// enforcement.
+async function verifySolanaTransaction(txSignature, expectedUsd) {
+    return verifyTreasuryTransaction(txSignature, expectedUsd, 'SOL');
+}
+
+// Second arg is the SERVER-computed expected USD value (SKR multiplier
+// already applied by the caller). Only the configured SKR mint is accepted.
 async function verifySkrTokenTransaction(txSignature, expectedUsd, expectedTokenMint = SKR_TOKEN_MINT) {
-    console.log('[Solana SKR] Verifying transaction:', txSignature, 'expected USD:', expectedUsd);
-
-    const maxRetries = 7;
-    const retryDelay = 2500;
-    let tx = null;
-    let matchedTransfer = null;
-
-    for (let attempt = 1; attempt <= maxRetries; attempt++) {
-        try {
-            console.log(`[Solana SKR] Attempt ${attempt}/${maxRetries} to fetch/verify transaction`);
-            const response = await axios.post(SOLANA_RPC_ENDPOINT, {
-                jsonrpc: '2.0',
-                id: 1,
-                method: 'getTransaction',
-                params: [
-                    txSignature,
-                    { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0, commitment: 'confirmed' }
-                ],
-            }, {
-                timeout: 30000,
-                headers: { 'Content-Type': 'application/json' },
-            });
-
-            tx = response.data?.result;
-
-            if (!tx) {
-                console.log(`[Solana SKR] Transaction not found yet (attempt ${attempt})`);
-                if (attempt < maxRetries) {
-                    await new Promise(resolve => setTimeout(resolve, retryDelay));
-                }
-                continue;
-            }
-
-            if (tx.meta && tx.meta.err) {
-                return { success: false, code: 'TX_FAILED', error: 'Transaction failed on chain' };
-            }
-
-            // Client pending entries live 14 days and legacy builds may hold
-            // older ones — allow up to 30 days.
-            if (tx.blockTime && (Date.now() - tx.blockTime * 1000) > 30 * 24 * 60 * 60 * 1000) {
-                return { success: false, code: 'TX_TOO_OLD', error: 'Transaction is older than 30 days' };
-            }
-
-            // --- Approach 1: postTokenBalances (preferred) ---
-            const preTokenBalances = Array.isArray(tx.meta?.preTokenBalances) ? tx.meta.preTokenBalances : [];
-            const postTokenBalances = Array.isArray(tx.meta?.postTokenBalances) ? tx.meta.postTokenBalances : [];
-
-            for (const postBalance of postTokenBalances) {
-                if (postBalance?.owner !== SOLANA_PAYMENT_WALLET) continue;
-                if (postBalance?.mint !== expectedTokenMint) continue;
-
-                const preBalance = preTokenBalances.find((entry) => entry.accountIndex === postBalance.accountIndex);
-                const postRaw = Number(postBalance?.uiTokenAmount?.amount || 0);
-                const preRaw = Number(preBalance?.uiTokenAmount?.amount || 0);
-                const deltaRaw = postRaw - preRaw;
-
-                if (deltaRaw > 0) {
-                    matchedTransfer = {
-                        receivedRawAmount: deltaRaw,
-                        owner: postBalance.owner,
-                        mint: postBalance.mint,
-                        blockTime: tx.blockTime,
-                        slot: tx.slot,
-                    };
-                    break;
-                }
-            }
-
-            if (matchedTransfer) break;
-
-            // --- Approach 2: Fallback — parse spl-token transfer instructions ---
-            const accountKeys = (tx.transaction?.message?.accountKeys || []).map(
-                k => (typeof k === 'string' ? k : k?.pubkey || '')
-            );
-            const allInstructions = [
-                ...(tx.transaction?.message?.instructions || []),
-                ...((tx.meta?.innerInstructions || []).flatMap(ii => ii.instructions || [])),
-            ];
-
-            for (const ix of allInstructions) {
-                if (ix.program !== 'spl-token') continue;
-                const pType = ix.parsed?.type;
-                if (pType !== 'transfer' && pType !== 'transferChecked') continue;
-
-                const info = ix.parsed?.info;
-                if (!info) continue;
-
-                const destAccount = info.destination;
-                const rawAmount = Number(pType === 'transferChecked' ? info.tokenAmount?.amount : info.amount) || 0;
-                if (rawAmount <= 0) continue;
-
-                const destIdx = accountKeys.indexOf(destAccount);
-                const destOwnerFromBalances = postTokenBalances.find(
-                    b => b.accountIndex === destIdx && b.mint === expectedTokenMint
-                );
-
-                if (destOwnerFromBalances?.owner === SOLANA_PAYMENT_WALLET) {
-                    matchedTransfer = {
-                        receivedRawAmount: rawAmount,
-                        owner: SOLANA_PAYMENT_WALLET,
-                        mint: expectedTokenMint,
-                        blockTime: tx.blockTime,
-                        slot: tx.slot,
-                    };
-                    break;
-                }
-
-                if (!destOwnerFromBalances) {
-                    const preDestBal = preTokenBalances.find(b => b.accountIndex === destIdx);
-                    if (!preDestBal && destIdx >= 0) {
-                        const paymentWalletIdx = accountKeys.indexOf(SOLANA_PAYMENT_WALLET);
-                        if (paymentWalletIdx >= 0) {
-                            matchedTransfer = {
-                                receivedRawAmount: rawAmount,
-                                owner: SOLANA_PAYMENT_WALLET,
-                                mint: expectedTokenMint,
-                                blockTime: tx.blockTime,
-                                slot: tx.slot,
-                            };
-                            break;
-                        }
-                    }
-                }
-            }
-
-            if (matchedTransfer) break;
-
-            console.log(`[Solana SKR] Tx found but no token match on attempt ${attempt}. postTokenBalances count: ${postTokenBalances.length}, instructions: ${allInstructions.length}`);
-            if (attempt < maxRetries) {
-                await new Promise(resolve => setTimeout(resolve, retryDelay));
-            }
-        } catch (e) {
-            console.error(`[Solana SKR] RPC error on attempt ${attempt}:`, e.message);
-            if (attempt < maxRetries) {
-                await new Promise(resolve => setTimeout(resolve, retryDelay));
-            }
-        }
+    if (expectedTokenMint !== SKR_TOKEN_MINT) {
+        return { success: false, code: 'WRONG_WALLET', error: 'Unsupported token mint' };
     }
-
-    if (!tx) {
-        return { success: false, error: 'Transaction not found after retries - may still be propagating' };
-    }
-
-    if (!matchedTransfer) {
-        console.error('[Solana SKR] No valid transfer found. postTokenBalances:', JSON.stringify(tx.meta?.postTokenBalances || []));
-        // Tx was found but carried no SKR transfer to the payment wallet —
-        // wrong receiver (terminal, not retryable).
-        return { success: false, code: 'WRONG_WALLET', error: 'No valid SKR transfer to the payment wallet was found in transaction' };
-    }
-
-    const receivedSkr = matchedTransfer.receivedRawAmount / Math.pow(10, SKR_TOKEN_DECIMALS);
-
-    const band = await getPriceBand('skr');
-    if (!band) {
-        return { success: false, code: 'PRICE_UNAVAILABLE', retryable: true, error: 'Price feed unavailable, retry later' };
-    }
-    const evalResult = evaluatePaymentAmount({ receivedUnits: receivedSkr, expectedUsd, band });
-    if (!evalResult.ok) {
-        console.log(`[Solana SKR] Underpaid: received ${receivedSkr} ${SKR_TOKEN_SYMBOL}, expected ~${evalResult.expectedAtLatest} (min ${evalResult.minAcceptable}) for $${expectedUsd}`);
-        return {
-            success: false,
-            code: 'UNDERPAID',
-            error: `Received ${receivedSkr} ${SKR_TOKEN_SYMBOL} but expected at least ${evalResult.minAcceptable} ($${expectedUsd} USD)`,
-            receivedSkr,
-            expectedSkr: evalResult.expectedAtLatest,
-            minAcceptableSkr: evalResult.minAcceptable,
-            expectedUsd,
-        };
-    }
-
-    console.log(`[Solana SKR] Verified: ${matchedTransfer.receivedRawAmount} raw ${SKR_TOKEN_SYMBOL} to ${SOLANA_PAYMENT_WALLET}`);
-    return {
-        success: true,
-        receivedAmount: receivedSkr,
-        ...matchedTransfer,
-        memo: extractPhotoLynkMemo(tx),
-    };
+    return verifyTreasuryTransaction(txSignature, expectedUsd, 'SKR');
 }
+// === VERIFY_TREASURY_TX_END ===
 
 // ---------------------------------------------------------------------------
 // Treasury watchdog: periodically scans recent inflows to SOLANA_PAYMENT_WALLET
@@ -8682,24 +8606,29 @@ async function verifySkrTokenTransaction(txSignature, expectedUsd, expectedToken
 // Precision rules - a payment is only credited when attribution is certain:
 //   1. Signature must not already be in solana_payments (idempotent - client
 //      verify wins, scanner never double-credits).
-//   2. Memo must parse as PhotoLynk:sub:<tier>:<duration>[:<code>] or
-//      PhotoLynk:premium:0:premium[:<code>]. A memo-less inflow is credited
-//      ONLY when the sender wallet resolves to exactly one user AND the
-//      amount fits exactly one tier/duration price window
-//      ('credited_sub_inferred'); anything else is logged 'no_memo' or
-//      'no_memo_ambiguous' and never credited.
-//   3. User binding: a memo with a 4th-segment code binds via
-//      paymentCodeFor(userId). Without a code the sender wallet must match
-//      exactly one users.wallet_address row. Code present but resolving to a
-//      different user than the sender wallet -> 'conflict', never credited.
+//   2. Memo must parse as PhotoLynk:sub:<tier>:<duration>[:<8-hex code>].
+//      Missing/unparseable memo -> 'no_memo' manual review; premium memos ->
+//      'premium_manual'. There is NO amount-based inference.
+//   3. User binding: a memo with a payment code binds via paymentCodeFor -
+//      ALL users are scanned and exactly one must match (HMAC collision ->
+//      no match). Without a code the sender wallet must resolve via
+//      solana_wallet_bindings (written only by ed25519-verified logins /
+//      eco bind-wallet) to exactly one user. users.wallet_address is
+//      user-editable and never consulted. Code vs bound-wallet mismatch ->
+//      'conflict', never credited.
 //   4. The received amount still has to pass the same price-band check the
-//      verify endpoints use (guards against underpayment + price drift).
-//   5. Downgrade guard identical to the client path (storage > target tier ->
-//      'downgrade_blocked', never credited).
+//      verify endpoints use (guards against underpayment + price drift), and
+//      the tx must be inside the 30d window - older -> 'historical_review'.
+//   5. Downgrade guard identical to the client path, plus preserveTier in
+//      the atomic credit so recovery never lowers an existing plan.
 //
-// treasury_scan_seen records one terminal outcome per signature so skipped txs
-// are not re-evaluated every cycle; transient RPC errors stay unmarked and are
-// retried on the next run.
+// Signature collection is a rolling sweep: every run takes the newest head
+// page per endpoint+address plus up to 4 backward pages from a persisted
+// cursor, NEVER stopping at a known signature. Retryable outcomes
+// ('no_user','code_no_match','conflict','rpc_error','underpaid') are
+// re-queued each run independently of sweep position; every other outcome is
+// terminal/sticky. Payment + plan + audit write atomically via
+// creditSolanaSubscription.
 // ---------------------------------------------------------------------------
 
 const TREASURY_SCAN_INTERVAL_MS = 6 * 60 * 60 * 1000; // every 6h
@@ -8707,6 +8636,7 @@ const TREASURY_SCAN_FIRST_DELAY_MS = 3 * 60 * 1000;   // 3min after boot
 const TREASURY_SCAN_PAGE_LIMIT = 100;                  // signatures per getSignaturesForAddress page
 const TREASURY_SCAN_MAX_SIGS = 500;                    // hard cap on signatures processed per run
 const TREASURY_SCAN_TX_DELAY_MS = 400;                 // spacing between getTransaction RPC calls
+const TREASURY_TX_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // same 30d window as the client verify path
 // The configured endpoint first, mainnet-beta as fallback: public RPCs reject
 // indexed calls (getTokenAccountsByOwner) and serve shallow signature history.
 const TREASURY_RPC_ENDPOINTS = [SOLANA_RPC_ENDPOINT, 'https://api.mainnet-beta.solana.com'].filter((v, i, a) => a.indexOf(v) === i);
@@ -8754,80 +8684,46 @@ const treasuryMarkSeen = async (signature, outcome, userId = null, detail = null
 
 // Resolve a memo's optional 4th-segment payment code to a user id.
 // paymentCodeFor is an HMAC, so this is a per-user compare - fine at this
-// cadence (a few dozen txs every 6h).
+// cadence (a few dozen txs every 6h). ALL matches are gathered: exactly one
+// wins, a collision is ambiguous and treated as no match. DB errors propagate
+// so the caller retries the signature instead of recording a terminal miss.
 const treasuryUserByPaymentCode = async (code) => {
     if (!code) return null;
-    try {
-        const users = await dbAllAsync(`SELECT id, email FROM users`, []);
-        for (const u of users || []) {
-            if (u && u.id && paymentCodeFor(u.id) === code) return u;
-        }
-    } catch (e) {
-        console.warn('[TreasuryScan] code lookup failed:', e.message);
+    const users = await dbAllAsync(`SELECT id, email FROM users`, []);
+    const matches = (users || []).filter((u) => u && u.id && paymentCodeFor(u.id) === code);
+    if (matches.length === 1) return matches[0];
+    if (matches.length > 1) {
+        console.warn(`[TreasuryScan] payment code ${code} matched ${matches.length} users - ambiguous, skipping attribution`);
     }
     return null;
 };
 
-// Exact single-wallet match - zero or multiple matches are both 'no user'.
-const treasuryUserByWallet = async (walletAddress) => {
-    if (!walletAddress) return null;
-    try {
-        const rows = await dbAllAsync(
-            `SELECT id, email FROM users WHERE wallet_address = ?`, [walletAddress]
-        );
-        if (rows && rows.length === 1) return rows[0];
-        if (rows && rows.length > 1) {
-            console.warn(`[TreasuryScan] wallet ${walletAddress} maps to ${rows.length} users - ambiguous, skipping attribution`);
-        }
-    } catch (e) {
-        console.warn('[TreasuryScan] wallet lookup failed:', e.message);
-    }
-    return null;
-};
-
-// Parse the treasury-bound deltas + sender out of a jsonParsed transaction.
-const treasuryExtractInflow = (tx) => {
-    const accountKeys = (tx?.transaction?.message?.accountKeys || []).map(
-        (k) => (typeof k === 'string' ? k : k?.pubkey || '')
+// Verified sender binding rows: ONLY solana_wallet_bindings counts (rows are
+// written exclusively after an ed25519-verified wallet login or eco
+// bind-wallet). users.wallet_address is user-editable and proves nothing.
+// Returns ALL bound rows - ambiguity must be decided by the caller (multi
+// owner -> 'conflict'), never hidden as a null "no match". DB errors
+// propagate (retryable).
+const treasuryBoundUsers = async (walletAddress) => {
+    if (!walletAddress) return [];
+    return dbAllAsync(
+        `SELECT DISTINCT u.id, u.email FROM users u JOIN solana_wallet_bindings b ON b.user_id = u.id WHERE b.wallet = ?`,
+        [walletAddress]
     );
-    const feePayer = accountKeys[0] || null;
+};
 
-    // SOL delta on the payment wallet (lamports)
-    let solLamports = 0;
-    const walletIdx = accountKeys.indexOf(SOLANA_PAYMENT_WALLET);
-    if (walletIdx >= 0) {
-        const pre = Number(tx?.meta?.preBalances?.[walletIdx] || 0);
-        const post = Number(tx?.meta?.postBalances?.[walletIdx] || 0);
-        if (post > pre) solLamports = post - pre;
-    }
-
-    // SKR delta on the payment wallet's token accounts (raw units)
-    let skrRaw = 0;
-    let skrAuthority = null;
-    const preTokenBalances = Array.isArray(tx?.meta?.preTokenBalances) ? tx.meta.preTokenBalances : [];
-    const postTokenBalances = Array.isArray(tx?.meta?.postTokenBalances) ? tx.meta.postTokenBalances : [];
-    for (const postBalance of postTokenBalances) {
-        if (postBalance?.owner !== SOLANA_PAYMENT_WALLET) continue;
-        if (postBalance?.mint !== SKR_TOKEN_MINT) continue;
-        const preBalance = preTokenBalances.find((e) => e.accountIndex === postBalance.accountIndex);
-        const delta = Number(postBalance?.uiTokenAmount?.amount || 0) - Number(preBalance?.uiTokenAmount?.amount || 0);
-        if (delta > 0) skrRaw += delta;
-    }
-
-    // SPL transfer instruction also reveals the sending authority (owner wallet)
-    const allInstructions = [
-        ...(tx?.transaction?.message?.instructions || []),
-        ...((tx?.meta?.innerInstructions || []).flatMap((ii) => ii.instructions || [])),
-    ];
-    for (const ix of allInstructions) {
-        if (ix.program !== 'spl-token') continue;
-        const pType = ix.parsed?.type;
-        if (pType !== 'transfer' && pType !== 'transferChecked') continue;
-        const info = ix.parsed?.info;
-        if (info && info.authority) { skrAuthority = info.authority; break; }
-    }
-
-    return { solLamports, skrRaw, senderWallet: skrAuthority || feePayer };
+// Legacy attribution candidates for the admin preview ONLY: wallet_address and
+// wallet-derived legacy email/alias forms. Never proof of ownership.
+const treasuryLegacyWalletCandidates = async (walletAddress) => {
+    if (!walletAddress) return [];
+    const wallet = String(walletAddress);
+    const lower = wallet.toLowerCase();
+    const variants = [lower, `${lower}@seeker.photolynk.local`, `${lower}@photolynk.local`, `${lower}.skr`];
+    return dbAllAsync(
+        `SELECT id,email,alias_email,wallet_address FROM users
+         WHERE wallet_address=? OR LOWER(email) IN (?,?,?,?) OR LOWER(alias_email) IN (?,?,?,?)`,
+        [wallet, ...variants, ...variants]
+    );
 };
 
 // Discover the treasury's SKR token accounts. CRITICAL: SPL transfers arrive
@@ -8870,66 +8766,61 @@ const treasuryGetTokenAccounts = async () => {
     return [];
 };
 
-// Page newest->oldest on ONE address until a signature we already know about
-// (treasury_scan_seen or solana_payments) or the per-run cap. Backlogged runs
-// reach every payment; steady-state runs stop after the first page.
-// Every endpoint is walked - public RPCs serve shallow history, so the merge
-// picks up older payments a single endpoint would miss. Outcomes 'no_memo'/
-// 'no_user' are NOT treated as known: they stay eligible for re-evaluation
-// (memo-less attribution may resolve them later).
-const treasuryCollectSignatures = async (address) => {
-    const collected = [];
-    const collectedSet = new Set();
-    for (const endpoint of TREASURY_RPC_ENDPOINTS) {
-        const walkSeen = new Set();
-        let beforeCursor = undefined;
-        let keepPaging = true;
-        while (keepPaging && collected.length < TREASURY_SCAN_MAX_SIGS) {
-            const params = { limit: TREASURY_SCAN_PAGE_LIMIT, commitment: 'confirmed' };
-            if (beforeCursor) params.before = beforeCursor;
-            let page = [];
-            try {
-                const result = await treasuryRpcOn(endpoint, 'getSignaturesForAddress', [address, params]);
-                page = Array.isArray(result) ? result : [];
-            } catch (e) {
-                console.warn(`[TreasuryScan] getSignaturesForAddress(${address}) failed on ${endpoint}:`, e.message);
-                break;
-            }
-            if (page.length === 0) break;
-            for (const entry of page) {
-                const sig = entry?.signature;
-                if (!sig) continue;
-                if (walkSeen.has(sig)) { keepPaging = false; break; } // dup at page boundary
-                walkSeen.add(sig);
-                if (collectedSet.has(sig)) continue; // already queued via another endpoint
-                const alreadyKnown = await dbGetAsync(
-                    `SELECT 1 FROM treasury_scan_seen WHERE signature = ? AND outcome NOT IN ('no_memo','no_user')
-                     UNION SELECT 1 FROM solana_payments WHERE tx_signature = ? LIMIT 1`,
-                    [sig, sig]
-                );
-                if (alreadyKnown) { keepPaging = false; break; } // reached processed history
-                collectedSet.add(sig);
-                collected.push(entry);
-                if (collected.length >= TREASURY_SCAN_MAX_SIGS) break;
-            }
-            if (page.length < TREASURY_SCAN_PAGE_LIMIT) break; // exhausted history
-            beforeCursor = page[page.length - 1]?.signature;
-            if (!beforeCursor) break;
-            await treasurySleep(300);
-        }
-    }
-    return collected;
+// treasury_scan_state cursor helpers - the rolling sweep position survives
+// restarts, so a multi-page backlog drains over consecutive runs.
+const treasuryStateGet = async (key) => {
+    const row = await dbGetAsync(`SELECT value FROM treasury_scan_state WHERE key = ?`, [key]);
+    try { return row?.value ? JSON.parse(row.value) : null; } catch (_) { return null; }
+};
+const treasuryStateSet = async (key, value) => {
+    await dbRunAsync(
+        `INSERT OR REPLACE INTO treasury_scan_state (key, value, updated_at) VALUES (?, ?, ?)`,
+        [key, JSON.stringify(value), Date.now()]
+    );
+};
+const treasuryStateClear = async (key) => {
+    await dbRunAsync(`DELETE FROM treasury_scan_state WHERE key = ?`, [key]);
 };
 
-// Parse a PhotoLynk product memo -> {kind:'sub'|'premium', tierGb, duration, code} | null
-const treasuryParseMemo = (memo) => {
-    if (typeof memo !== 'string') return null;
-    const sub = memo.match(/^PhotoLynk:sub:(\d+):(monthly|yearly)(?::([0-9a-fA-F]{4,64}))?$/);
-    if (sub) return { kind: 'sub', tierGb: Number(sub[1]), duration: sub[2], code: sub[3] || null };
-    const prem = memo.match(/^PhotoLynk:premium:0:premium(?::([0-9a-fA-F]{4,64}))?$/);
-    if (prem) return { kind: 'premium', tierGb: 0, duration: 'premium', code: prem[1] || null };
+// Rolling full-history sweep per endpoint+address: always the newest head
+// page plus up to 4 backward pages from the persisted cursor each run (max
+// 500/endpoint/address). NEVER stops at a known signature - processed rows
+// are filtered later, so pagination cannot strand a backlog behind one.
+const treasuryCollectSignatures = (address) => paymentRecovery.collectTreasurySignatures({
+    endpoints: TREASURY_RPC_ENDPOINTS,
+    address,
+    rpcOn: treasuryRpcOn,
+    getState: treasuryStateGet,
+    setState: treasuryStateSet,
+    clearState: treasuryStateClear,
+    sleep: treasurySleep,
+    pageLimit: TREASURY_SCAN_PAGE_LIMIT,
+    maxSigs: TREASURY_SCAN_MAX_SIGS,
+    maxSweepPages: 4,
+    commitment: 'finalized',
+});
+
+// === TREASURY_FETCH_TX_BEGIN ===
+// getTransaction across endpoints: a null/empty result falls through to the
+// next endpoint just like an error (shallow nodes silently miss history).
+// A malformed payload (no message, no meta, missing blockTime) is also a
+// fall-through - only a well-formed finalized tx short-circuits. A failed
+// on-chain tx (meta.err non-null) still counts: the caller must see and
+// reject it, not loop on the next endpoint.
+const treasuryFetchTransaction = async (signature) => {
+    for (const endpoint of TREASURY_RPC_ENDPOINTS) {
+        try {
+            const tx = await treasuryRpcOn(endpoint, 'getTransaction',
+                [signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0, commitment: 'finalized' }]);
+            if (tx && tx.transaction?.message && tx.meta && tx.meta.err !== undefined
+                && Number.isFinite(Number(tx.blockTime)) && Number(tx.blockTime) > 0) return tx;
+        } catch (e) {
+            console.warn(`[TreasuryScan] getTransaction(${signature}) failed on ${endpoint}:`, e.message);
+        }
+    }
     return null;
 };
+// === TREASURY_FETCH_TX_END ===
 
 const treasuryScanOnce = async () => {
     if (treasuryScanInFlight) return { ok: false, reason: 'already_running' };
@@ -8942,133 +8833,167 @@ const treasuryScanOnce = async () => {
         // order matches on-chain order.
         const scanAddresses = [SOLANA_PAYMENT_WALLET, ...(await treasuryGetTokenAccounts())];
         console.log(`[TreasuryScan] scanning ${scanAddresses.length} address(es): ${scanAddresses.join(', ')}`);
-        const seenSigs = new Set();
-        const sigInfos = [];
+        const collected = [];
         for (const addr of scanAddresses) {
-            const entries = await treasuryCollectSignatures(addr);
-            for (const e of entries) {
-                if (!seenSigs.has(e.signature)) { seenSigs.add(e.signature); sigInfos.push(e); }
+            try {
+                collected.push(...await treasuryCollectSignatures(addr));
+            } catch (e) {
+                console.warn(`[TreasuryScan] signature collection failed for ${addr}:`, e.message);
+                summary.errors++;
             }
         }
+        // Old retryable outcomes are re-evaluated independently of the sweep
+        // position - a user may have bound a wallet since the first pass.
+        let retrySigs = [];
+        try {
+            const rows = await dbAllAsync(
+                `SELECT signature FROM treasury_scan_seen WHERE outcome IN ('no_user','code_no_match','conflict','rpc_error','underpaid') ORDER BY seen_at ASC LIMIT 100`, []);
+            retrySigs = (rows || []).map((r) => r.signature);
+        } catch (e) { console.warn('[TreasuryScan] retry queue read failed:', e.message); }
+        const { queue: sigInfos, retrySet } = paymentRecovery.buildScanQueue(collected, retrySigs);
         sigInfos.sort((a, b) => (Number(a.slot) || 0) - (Number(b.slot) || 0));
 
         for (const info of sigInfos) {
             const signature = info?.signature;
             if (!signature) continue;
-            if (info?.err) { await treasuryMarkSeen(signature, 'tx_failed_onchain', null, JSON.stringify(info.err).slice(0, 300)); continue; }
-
-            // Idempotency: client verify already credited this signature
-            const existing = await dbGetAsync(`SELECT 1 FROM solana_payments WHERE tx_signature = ?`, [signature]);
-            if (existing) { await treasuryMarkSeen(signature, 'already_credited'); summary.already++; continue; }
-            // 'no_memo'/'no_user' are non-terminal: re-evaluate them so
-            // memo-less attribution gets another chance each run.
-            const seen = await dbGetAsync(
-                `SELECT 1 FROM treasury_scan_seen WHERE signature = ? AND outcome NOT IN ('no_memo','no_user')`,
-                [signature]
-            );
-            if (seen) continue;
-
-            summary.scanned++;
-            let tx = null;
             try {
-                tx = await treasuryRpc('getTransaction',
-                    [signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0, commitment: 'confirmed' }]) || null;
-            } catch (e) {
-                console.warn(`[TreasuryScan] getTransaction RPC error for ${signature}:`, e.message);
-            }
-            if (!tx) { summary.errors++; continue; } // unmarked -> retried next run
-            await treasurySleep(TREASURY_SCAN_TX_DELAY_MS);
+                if (info?.err) { await treasuryMarkSeen(signature, 'tx_failed_onchain', null, JSON.stringify(info.err).slice(0, 300)); continue; }
 
-            if (tx.meta && tx.meta.err) { await treasuryMarkSeen(signature, 'tx_failed_onchain'); continue; }
+                // Terminal outcomes are sticky; retry-queue sigs re-evaluate.
+                const seenRow = await dbGetAsync(`SELECT outcome FROM treasury_scan_seen WHERE signature = ?`, [signature]);
+                if (seenRow && !retrySet.has(signature)) continue;
 
-            const { solLamports, skrRaw, senderWallet } = treasuryExtractInflow(tx);
-            if (solLamports <= 0 && skrRaw <= 0) { await treasuryMarkSeen(signature, 'no_inflow'); summary.skipped++; continue; }
-
-            const isSkr = skrRaw > 0;
-            const receivedUnits = isSkr
-                ? skrRaw / Math.pow(10, SKR_TOKEN_DECIMALS)
-                : solLamports / LAMPORTS_PER_SOL;
-
-            const memo = extractPhotoLynkMemo(tx);
-            let parsed = treasuryParseMemo(memo);
-            if (!parsed) {
-                // Memo-less attribution: the sender wallet must resolve to
-                // exactly one user (wallet_address is only set by an
-                // ed25519-signed login, so this is cryptographic proof of the
-                // payer) AND the amount must land in exactly ONE tier/duration
-                // price window. Zero or multiple candidates -> ambiguous,
-                // never credited. Premium is never inferred.
-                const senderUser = senderWallet ? await treasuryUserByWallet(senderWallet) : null;
-                if (!senderUser) {
-                    await treasuryMarkSeen(signature, 'no_memo', null,
-                        `sender=${senderWallet || 'unknown'} solLamports=${solLamports} skrRaw=${skrRaw} memo=${memo ? 'unparseable' : 'none'}`);
-                    console.warn(`[TreasuryScan] ${signature}: inflow without valid PhotoLynk memo - sender=${senderWallet} sol=${solLamports} skrRaw=${skrRaw} - NOT credited`);
-                    summary.skipped++;
-                    continue;
-                }
-                const band = await getPriceBand(isSkr ? 'skr' : 'sol');
-                if (!band) { summary.errors++; continue; } // no price -> retryable next run
-                const candidates = [];
-                for (const tierKey of Object.keys(PLAN_PRICES_USD)) {
-                    const tierGb = normalizeTierGb(tierKey);
-                    if (!tierGb) continue;
-                    for (const duration of ['monthly', 'yearly']) {
-                        const expectedUsd = (PLAN_PRICES_USD[tierGb] || 0) * (duration === 'yearly' ? 12 : 1) * (isSkr ? SKR_SUBSCRIPTION_MULTIPLIER : 1);
-                        const evalResult = evaluatePaymentAmount({ receivedUnits, expectedUsd, band });
-                        const maxAcceptable = Number.isFinite(evalResult.expectedAtLatest) ? evalResult.expectedAtLatest * 1.25 : Infinity;
-                        if (evalResult.ok && receivedUnits <= maxAcceptable) {
-                            candidates.push({ tierGb, duration, expectedUsd });
-                        }
+                // Idempotency: client verify already credited this signature.
+                // Never overwrite credited_* provenance with already_credited.
+                const existing = await dbGetAsync(`SELECT 1 FROM solana_payments WHERE tx_signature = ?`, [signature]);
+                if (existing) {
+                    if (!seenRow || !/^credited/.test(seenRow.outcome || '')) {
+                        await treasuryMarkSeen(signature, 'already_credited');
                     }
-                }
-                if (candidates.length !== 1) {
-                    await treasuryMarkSeen(signature, 'no_memo_ambiguous', null,
-                        `sender=${senderWallet} amount=${receivedUnits} ${isSkr ? 'SKR' : 'SOL'} candidates=${JSON.stringify(candidates)}`);
-                    console.warn(`[TreasuryScan] ${signature}: memo-less inflow from ${senderWallet} matched ${candidates.length} tier/duration windows - NOT credited`);
-                    summary.skipped++;
+                    summary.already++;
                     continue;
                 }
-                parsed = { kind: 'sub', tierGb: candidates[0].tierGb, duration: candidates[0].duration, code: null, inferred: true };
-            }
 
-            // User binding: memo code is authoritative; fall back to sender
-            // wallet only when the memo carries no code.
-            let user = null;
-            if (parsed.code) {
-                user = await treasuryUserByPaymentCode(parsed.code);
-                if (!user) {
-                    await treasuryMarkSeen(signature, 'code_no_match', null, `code=${parsed.code} sender=${senderWallet}`);
-                    console.warn(`[TreasuryScan] ${signature}: payment code matched no user - NOT credited`);
-                    summary.skipped++;
+                summary.scanned++;
+                const tx = await treasuryFetchTransaction(signature);
+                if (!tx) {
+                    await treasuryMarkSeen(signature, 'rpc_error', null, 'getTransaction returned null on all endpoints');
+                    summary.errors++;
                     continue;
                 }
-                // If a sender wallet is known AND maps to a different user,
-                // the signals conflict - never guess.
-                const walletUser = await treasuryUserByWallet(senderWallet);
-                if (walletUser && walletUser.id !== user.id) {
-                    await treasuryMarkSeen(signature, 'conflict', null,
-                        `codeUser=${user.id} walletUser=${walletUser.id}`);
-                    console.warn(`[TreasuryScan] ${signature}: memo code vs sender wallet conflict (code->${user.id}, wallet->${walletUser.id}) - NOT credited`);
-                    summary.skipped++;
-                    continue;
-                }
-            } else {
-                user = await treasuryUserByWallet(senderWallet);
-                if (!user) {
-                    await treasuryMarkSeen(signature, 'no_user', null, `sender=${senderWallet} memo=${memo}`);
-                    console.warn(`[TreasuryScan] ${signature}: no memo code and sender ${senderWallet} matches no registered wallet - NOT credited`);
-                    summary.skipped++;
-                    continue;
-                }
-            }
+                await treasurySleep(TREASURY_SCAN_TX_DELAY_MS);
 
-            if (parsed.kind === 'sub') {
-                const normalizedTier = normalizeTierGb(parsed.tierGb);
-                if (!normalizedTier) {
-                    await treasuryMarkSeen(signature, 'bad_tier', user.id, `tier=${parsed.tierGb}`);
+                const paymentAt = Number(tx.blockTime) > 0 ? tx.blockTime * 1000 : null;
+                if (!paymentAt) {
+                    await treasuryMarkSeen(signature, 'rpc_error', null, 'missing blockTime');
+                    summary.errors++;
+                    continue;
+                }
+
+                let transfer;
+                try {
+                    transfer = paymentRecovery.extractTreasuryTransfer(tx, {
+                        wallet: SOLANA_PAYMENT_WALLET, mint: SKR_TOKEN_MINT, decimals: SKR_TOKEN_DECIMALS,
+                    });
+                } catch (e) {
+                    if (e.code === 'TX_FAILED') {
+                        await treasuryMarkSeen(signature, 'tx_failed_onchain');
+                    } else if (e.code === 'TX_NO_META' || e.code === 'TX_MALFORMED') {
+                        // Missing/malformed meta is an RPC payload problem,
+                        // not a verdict on the tx - retryable.
+                        await treasuryMarkSeen(signature, 'rpc_error', null, e.message);
+                        summary.errors++;
+                    } else if (e.code === 'NO_INFLOW') {
+                        await treasuryMarkSeen(signature, 'no_inflow');
+                        summary.skipped++;
+                    } else if (e.code === 'AMBIGUOUS_PAYMENT' || e.code === 'UNSAFE_AMOUNT') {
+                        await treasuryMarkSeen(signature, 'ambiguous_payment', null, e.message);
+                        summary.skipped++;
+                    } else {
+                        await treasuryMarkSeen(signature, 'rpc_error', null, e.message);
+                        summary.errors++;
+                    }
+                    continue;
+                }
+                const isSkr = transfer.token === 'SKR';
+                const receivedUnits = transfer.amount;
+                const senderWallet = transfer.senderWallet;
+
+                // Older than the 30d verify window: never auto-priced at
+                // today's rate - logged for manual admin review.
+                if (Date.now() - paymentAt > TREASURY_TX_MAX_AGE_MS) {
+                    await treasuryMarkSeen(signature, 'historical_review', null,
+                        `sender=${senderWallet} amount=${receivedUnits} ${transfer.token} paid=${new Date(paymentAt).toISOString()}`);
                     summary.skipped++;
                     continue;
                 }
+
+                let memo;
+                try {
+                    memo = extractPhotoLynkMemo(tx);
+                } catch (e) {
+                    // Conflicting PhotoLynk memos on one tx - manual review.
+                    await treasuryMarkSeen(signature, 'no_memo', null, `${e.message} - manual review`);
+                    console.warn(`[TreasuryScan] ${signature}: ${e.message} - NOT credited`);
+                    summary.skipped++;
+                    continue;
+                }
+                const parsed = paymentRecovery.parseSubscriptionMemo(memo);
+                if (!parsed) {
+                    if (typeof memo === 'string' && memo.startsWith('PhotoLynk:premium')) {
+                        await treasuryMarkSeen(signature, 'premium_manual', null,
+                            `premium inflow sender=${senderWallet} amount=${receivedUnits} ${transfer.token} - needs manual admin credit`);
+                        console.warn(`[TreasuryScan] ${signature}: premium inflow from ${senderWallet} - logged for manual credit`);
+                    } else {
+                        await treasuryMarkSeen(signature, 'no_memo', null,
+                            `sender=${senderWallet || 'unknown'} amount=${receivedUnits} ${transfer.token} memo=${memo ? 'unparseable' : 'none'} - manual review`);
+                        console.warn(`[TreasuryScan] ${signature}: inflow without valid PhotoLynk sub memo - sender=${senderWallet} amount=${receivedUnits} ${transfer.token} - NOT credited`);
+                    }
+                    summary.skipped++;
+                    continue;
+                }
+                const normalizedTier = parsed.tierGb; // memo regex whitelists tiers
+
+                // User binding: a payment code is authoritative; a codeless
+                // memo binds ONLY via solana_wallet_bindings (ed25519-proven).
+                let user = null;
+                if (parsed.code) {
+                    user = await treasuryUserByPaymentCode(parsed.code);
+                    if (!user) {
+                        await treasuryMarkSeen(signature, 'code_no_match', null, `code=${parsed.code} sender=${senderWallet}`);
+                        console.warn(`[TreasuryScan] ${signature}: payment code matched no user - NOT credited`);
+                        summary.skipped++;
+                        continue;
+                    }
+                    // A verified binding to a different user - or a wallet
+                    // bound to MULTIPLE users - conflicts with the code.
+                    const boundIds = paymentRecovery.boundUserIds(await treasuryBoundUsers(senderWallet));
+                    if (boundIds.length > 1 || (boundIds.length === 1 && boundIds[0] !== Number(user.id))) {
+                        await treasuryMarkSeen(signature, 'conflict', null,
+                            `codeUser=${user.id} boundIds=${boundIds.join('|') || 'none'}`);
+                        console.warn(`[TreasuryScan] ${signature}: memo code vs bound wallet conflict (code->${user.id}, bound->${boundIds.join(',') || 'none'}) - NOT credited`);
+                        summary.skipped++;
+                        continue;
+                    }
+                } else {
+                    const boundRows = await treasuryBoundUsers(senderWallet);
+                    const boundIds = paymentRecovery.boundUserIds(boundRows);
+                    if (boundIds.length > 1) {
+                        await treasuryMarkSeen(signature, 'conflict', null,
+                            `sender=${senderWallet} boundIds=${boundIds.join('|')}`);
+                        console.warn(`[TreasuryScan] ${signature}: sender ${senderWallet} bound to multiple users - ambiguous, NOT credited`);
+                        summary.skipped++;
+                        continue;
+                    }
+                    if (boundIds.length !== 1) {
+                        await treasuryMarkSeen(signature, 'no_user', null, `sender=${senderWallet} memo=${memo}`);
+                        console.warn(`[TreasuryScan] ${signature}: no memo code and sender ${senderWallet} has no verified binding - NOT credited`);
+                        summary.skipped++;
+                        continue;
+                    }
+                    user = boundRows.find((r) => Number(r.id) === boundIds[0]);
+                }
+
                 // Downgrade guard - identical to the client verify path.
                 const currentPlanGb = await getUserPlanGb(user.id);
                 if (currentPlanGb && normalizedTier < currentPlanGb) {
@@ -9092,70 +9017,53 @@ const treasuryScanOnce = async () => {
                     continue;
                 }
 
-                const now = Date.now();
-                const durationMs = PLAN_DURATION_MS[parsed.duration] || PLAN_DURATION_MS.monthly;
-                const currentPlan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [user.id]);
-                const solanaExpiry = computePaidSubscriptionExpiry({ currentPlan, purchaseAt: now, durationMs });
-                const expiresAt = solanaExpiry.expiresAt;
-
-                // tx_signature is UNIQUE: if the client's /verify-* landed
-                // between our idempotency check and here, this INSERT throws
-                // and the plan is never touched - the client credit stands.
+                // Payment + plan + audit commit atomically; preserveTier keeps
+                // recovery from downgrading an unrelated higher plan.
+                let creditResult;
                 try {
-                    await dbRunAsync(
-                        `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, skr_amount, payment_token, tier_gb, duration, created_at, verified_at)
-                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                        [user.id, signature, isSkr ? 0 : receivedUnits, isSkr ? receivedUnits : 0, isSkr ? 'SKR' : 'SOL', normalizedTier, parsed.duration, now, now]
-                    );
+                    creditResult = await creditSolanaSubscription({
+                        userId: user.id,
+                        signature,
+                        token: transfer.token,
+                        amount: receivedUnits,
+                        tierGb: normalizedTier,
+                        duration: parsed.duration,
+                        paymentAt,
+                        source: 'treasury_scan',
+                        detail: `sender=${senderWallet} memo=${memo}`,
+                        preserveTier: true,
+                    });
                 } catch (e) {
-                    if (/UNIQUE|constraint/i.test(e.message || '')) {
-                        await treasuryMarkSeen(signature, 'already_credited', user.id, 'lost race to client verify');
-                        summary.already++;
+                    if (e.code === 'PAYMENT_CONFLICT') {
+                        await treasuryMarkSeen(signature, 'conflict', null, e.message);
+                        summary.skipped++;
                         continue;
                     }
                     throw e;
                 }
-                await dbRunAsync(
-                    `INSERT INTO user_plans (user_id, plan_gb, status, expires_at, trial_carryover_applied_at, updated_at)
-                     VALUES (?, ?, 'active', ?, ?, ?)
-                     ON CONFLICT(user_id) DO UPDATE SET
-                        plan_gb = excluded.plan_gb,
-                        status = 'active',
-                        expires_at = MAX(COALESCE(user_plans.expires_at, 0), excluded.expires_at),
-                        trial_carryover_applied_at = COALESCE(excluded.trial_carryover_applied_at, user_plans.trial_carryover_applied_at),
-                        payment_type = ?,
-                        payment_at = excluded.updated_at,
-                        grace_until = NULL,
-                        deleted_at = NULL,
-                        updated_at = excluded.updated_at`,
-                    [user.id, normalizedTier, expiresAt, solanaExpiry.trialCarryoverAppliedAt, now, isSkr ? 'skr' : 'solana']
-                );
+                if (creditResult.alreadyProcessed) {
+                    if (!seenRow || !/^credited/.test(seenRow.outcome || '')) {
+                        await treasuryMarkSeen(signature, 'already_credited');
+                    }
+                    summary.already++;
+                    continue;
+                }
+
                 try {
-                    if (normalizedTier >= ECO_BIND_MIN_TIER_GB) {
-                        const uw = await dbGetAsync(`SELECT wallet_address FROM users WHERE id = ?`, [user.id]);
-                        const acct = await ecoEnsureAccount('photolynk', user.id, uw?.wallet_address || null, { verified: true });
-                        await ecoFloorSub(acct, expiresAt, { sourceApp: 'photolynk', kind: 'payment', provenance: signature, allowRevoked: true });
+                    if (normalizedTier >= ECO_BIND_MIN_TIER_GB && creditResult.expiresAt > Date.now()) {
+                        const acct = await ecoEnsureAccount('photolynk', user.id, null);
+                        await ecoFloorSub(acct, creditResult.expiresAt, { sourceApp: 'photolynk', kind: 'payment', provenance: signature, allowRevoked: true });
                     }
                 } catch (e) { console.warn('[TreasuryScan] Eco mirror failed:', e.message); }
 
-                await treasuryMarkSeen(signature, parsed.inferred ? 'credited_sub_inferred' : 'credited_sub', user.id,
-                    `tier=${normalizedTier}GB ${parsed.duration} ${isSkr ? 'SKR' : 'SOL'} expires=${new Date(expiresAt).toISOString()}${parsed.inferred ? ` inferred sender=${senderWallet} amount=${receivedUnits}` : ''}`);
-                console.log(`[TreasuryScan] CREDITED user ${user.id} (${user.email}): ${normalizedTier}GB ${parsed.duration} via ${signature}`);
+                await treasuryMarkSeen(signature, 'credited_sub', user.id,
+                    `tier=${creditResult.planGb}GB ${parsed.duration} ${transfer.token} expires=${new Date(creditResult.expiresAt).toISOString()} sender=${senderWallet} amount=${receivedUnits}`);
+                console.log(`[TreasuryScan] CREDITED user ${user.id} (${user.email}): ${creditResult.planGb}GB ${parsed.duration} via ${signature}`);
                 summary.credited++;
-            } else {
-                // Premium payment detected + attributed, but premium activation
-                // (nftService + capacity-gated storage allocation) lives in the
-                // NFT block scope. A half-done auto-credit is worse than a
-                // manual one - log it for the admin instead of crediting.
-                const expectedUsd = PREMIUM_PRICE_USD * (isSkr ? SKR_PREMIUM_MULTIPLIER : 1);
-                const band = await getPriceBand(isSkr ? 'skr' : 'sol');
-                if (!band) { summary.errors++; continue; }
-                const evalResult = evaluatePaymentAmount({ receivedUnits, expectedUsd, band });
-                await treasuryMarkSeen(signature, 'premium_manual', user.id,
-                    `attributed premium payment ${isSkr ? 'SKR' : 'SOL'} amount=${receivedUnits} bandOk=${evalResult.ok} - needs manual admin credit`);
-                console.warn(`[TreasuryScan] ${signature}: attributed PREMIUM payment for user ${user.id} (${user.email}), amount ${receivedUnits} ${isSkr ? 'SKR' : 'SOL'} - logged for manual credit, not auto-applied`);
-                summary.skipped++;
-                continue;
+            } catch (e) {
+                console.warn(`[TreasuryScan] ${signature}: processing error -`, e.message);
+                await treasuryMarkSeen(signature, 'rpc_error', null, String(e.message || e).slice(0, 300));
+                summary.errors++;
             }
         }
         summary.finishedAt = new Date().toISOString();
@@ -9198,6 +9106,103 @@ app.get('/api/admin/treasury-scan-log', adminAuth, async (req, res) => {
     }
 });
 
+// Read-only inspection shared by the preview (GET) and recover (POST) routes.
+// Revalidates everything server-side: on-chain transfer, strict sub memo,
+// price band, and attribution - never trusts client-supplied tier/amount.
+const inspectTreasuryPayment = paymentRecovery.createTreasuryInspector({
+    fetchTx: treasuryFetchTransaction,
+    getUserById: async (id) => dbGetAsync(`SELECT id, email, alias_email, wallet_address FROM users WHERE id = ?`, [id]),
+    getPaymentBySignature: async (sig) => dbGetAsync(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [sig]),
+    getPlanByUser: async (id) => dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [id]),
+    resolvePaymentCode: treasuryUserByPaymentCode,
+    getBoundUsersByWallet: async (w) => dbAllAsync(
+        `SELECT DISTINCT u.id, u.email FROM users u JOIN solana_wallet_bindings b ON b.user_id = u.id WHERE b.wallet = ?`, [w]),
+    getLegacyWalletCandidates: treasuryLegacyWalletCandidates,
+    getPriceBand,
+    evaluatePayment: evaluatePaymentAmount,
+    computeExpiry: computePaidSubscriptionExpiry,
+    durations: PLAN_DURATION_MS,
+    extractMemo: extractPhotoLynkMemo,
+    treasury: { wallet: SOLANA_PAYMENT_WALLET, mint: SKR_TOKEN_MINT, decimals: SKR_TOKEN_DECIMALS },
+    planPricesUsd: PLAN_PRICES_USD,
+    skrSubscriptionMultiplier: SKR_SUBSCRIPTION_MULTIPLIER,
+});
+
+// Preview an on-chain payment against a selected user - writes nothing.
+app.get('/api/admin/treasury-payment', adminAuth, async (req, res) => {
+    try {
+        const r = await inspectTreasuryPayment(req.query.signature, req.query.userId);
+        if (!r.ok) return res.status(r.status || 400).json({ error: r.error, code: r.code });
+        res.json(r.inspection);
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
+// === TREASURY_RECOVER_ROUTE_BEGIN ===
+// Explicit admin recovery: credits a payment the scanner could not attribute
+// (e.g. codeless memo + no verified wallet binding yet). The admin sees the
+// full preview first and confirms - payment, plan and audit land atomically.
+app.post('/api/admin/treasury-recover', adminAuth, async (req, res) => {
+    try {
+        const { signature, userId } = req.body || {};
+        if (!paymentRecovery.recoveryConfirmed(req.body)) {
+            return res.status(400).json({ error: 'confirm:true required', code: 'CONFIRM_REQUIRED' });
+        }
+        const r = await inspectTreasuryPayment(signature, userId);
+        if (!r.ok) return res.status(r.status || 400).json({ error: r.error, code: r.code });
+        const insp = r.inspection;
+        if (insp.alreadyProcessed) {
+            return res.json({ ok: true, alreadyProcessed: true, expiresAt: insp.expectedExpiresAt, planGb: insp.planGb ?? insp.tierGb, status: insp.planStatus });
+        }
+        if (insp.historical) {
+            return res.status(400).json({ error: 'Transaction is older than 30 days - historical pricing unavailable', code: 'HISTORICAL_REVIEW' });
+        }
+        if (!insp.price || insp.price.ok === null) {
+            return res.status(503).json({ error: 'Price feed unavailable, retry later', code: 'PRICE_UNAVAILABLE' });
+        }
+        if (insp.price.ok === false) {
+            return res.status(400).json({ error: 'On-chain amount is below the required price', code: 'UNDERPAID' });
+        }
+        let creditResult;
+        try {
+            creditResult = await creditSolanaSubscription({
+                userId: Number(userId),
+                signature: insp.signature,
+                token: insp.token,
+                amount: insp.amount,
+                tierGb: insp.tierGb,
+                duration: insp.duration,
+                paymentAt: insp.paymentAt,
+                source: 'admin_recovery',
+                detail: JSON.stringify({ payer: insp.payer, memo: insp.memo, admin: ADMIN_USER || 'admin' }),
+                preserveTier: true,
+            });
+        } catch (e) {
+            if (e.code === 'PAYMENT_CONFLICT') {
+                return res.status(409).json({ error: e.message, code: 'PAYMENT_CONFLICT' });
+            }
+            throw e;
+        }
+        if (creditResult.alreadyProcessed) {
+            return res.json({ ok: true, alreadyProcessed: true, expiresAt: creditResult.expiresAt, planGb: creditResult.planGb, status: creditResult.status });
+        }
+        await treasuryMarkSeen(insp.signature, 'credited_sub_admin', Number(userId),
+            `tier=${creditResult.planGb}GB ${insp.duration} ${insp.token} expires=${new Date(creditResult.expiresAt).toISOString()} payer=${insp.payer} via=${insp.attribution}`);
+        try {
+            if (insp.tierGb >= ECO_BIND_MIN_TIER_GB && creditResult.expiresAt > Date.now()) {
+                const acct = await ecoEnsureAccount('photolynk', Number(userId), null);
+                await ecoFloorSub(acct, creditResult.expiresAt, { sourceApp: 'photolynk', kind: 'payment', provenance: insp.signature, allowRevoked: true });
+            }
+        } catch (e) { console.warn('[TreasuryRecover] Eco mirror failed:', e.message); }
+        console.log(`[TreasuryRecover] admin credited user ${userId}: ${creditResult.planGb}GB ${insp.duration} via ${signature}`);
+        res.json({ ok: true, expiresAt: creditResult.expiresAt, planGb: creditResult.planGb, attribution: insp.attribution });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+// === TREASURY_RECOVER_ROUTE_END ===
+
 // PaceSeeker device-bound trial registry. First-write-wins on trial start so a
 // reinstall keeps the original expiry instead of resetting the clock.
 // Serialized: unsynchronized ALTERs race each other for the schema lock and a
@@ -9217,6 +9222,12 @@ db.serialize(() => {
         value TEXT,
         updated_at INTEGER
     )`);
+    // Audit trail for every subscription credit (payment + plan written
+    // atomically by paymentRecovery.createSubscriptionCreditor).
+    db.run(`CREATE TABLE IF NOT EXISTS solana_subscription_credits (tx_signature TEXT PRIMARY KEY,user_id INTEGER NOT NULL,source TEXT NOT NULL,payment_at INTEGER NOT NULL,expires_before INTEGER,expires_after INTEGER NOT NULL,detail TEXT,created_at INTEGER NOT NULL)`);
+    // Cryptographically proven wallet<->user bindings (ed25519-verified logins
+    // and eco bind-wallet only - never /api/save-wallet).
+    db.run(`CREATE TABLE IF NOT EXISTS solana_wallet_bindings (wallet TEXT NOT NULL,user_id INTEGER NOT NULL,verified_at INTEGER NOT NULL,PRIMARY KEY(wallet,user_id))`);
     db.run(`CREATE TABLE IF NOT EXISTS paceseeker_devices (
         device_hash TEXT PRIMARY KEY,
         first_seen INTEGER,
