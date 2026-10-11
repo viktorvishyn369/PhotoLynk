@@ -8139,6 +8139,7 @@ app.get('/api/solana/payment-code', async (req, res) => {
     return res.json({ code: paymentCodeFor(decoded.id) });
 });
 
+// === CLIENT_SUB_VERIFY_ROUTES_BEGIN ===
 // Verify Solana payment transaction
 app.post('/api/solana/verify-payment', async (req, res) => {
     const { txSignature, tierGb, duration, solAmount, paymentWallet } = req.body;
@@ -8201,7 +8202,7 @@ app.post('/api/solana/verify-payment', async (req, res) => {
                     },
                 });
             }
-            return res.status(409).json({ error: 'Transaction already processed', code: 'PAYMENT_CONFLICT' });
+            return res.status(400).json({ error: 'Transaction belongs to a different account or purchase', code: 'PAYMENT_CONFLICT', retryable: false });
         }
 
         // DOWNGRADE GUARD: Reject if user's storage exceeds target tier
@@ -8256,7 +8257,7 @@ app.post('/api/solana/verify-payment', async (req, res) => {
             });
         } catch (e) {
             if (e.code === 'PAYMENT_CONFLICT') {
-                return res.status(409).json({ error: 'Transaction already processed', code: 'PAYMENT_CONFLICT' });
+                return res.status(400).json({ error: 'Transaction belongs to a different account or purchase', code: 'PAYMENT_CONFLICT', retryable: false });
             }
             throw e;
         }
@@ -8365,7 +8366,7 @@ app.post('/api/solana/verify-skr-payment', async (req, res) => {
                     },
                 });
             }
-            return res.status(409).json({ error: 'Transaction already processed', code: 'PAYMENT_CONFLICT' });
+            return res.status(400).json({ error: 'Transaction belongs to a different account or purchase', code: 'PAYMENT_CONFLICT', retryable: false });
         }
 
         const currentPlanGb = await getUserPlanGb(user.id);
@@ -8417,7 +8418,7 @@ app.post('/api/solana/verify-skr-payment', async (req, res) => {
             });
         } catch (e) {
             if (e.code === 'PAYMENT_CONFLICT') {
-                return res.status(409).json({ error: 'Transaction already processed', code: 'PAYMENT_CONFLICT' });
+                return res.status(400).json({ error: 'Transaction belongs to a different account or purchase', code: 'PAYMENT_CONFLICT', retryable: false });
             }
             throw e;
         }
@@ -8461,6 +8462,7 @@ app.post('/api/solana/verify-skr-payment', async (req, res) => {
         return res.status(500).json({ error: 'SKR payment verification failed' });
     }
 });
+// === CLIENT_SUB_VERIFY_ROUTES_END ===
 
 // Helper function to verify Solana transactions.
 // Solana Memo program — the client tags every PhotoLynk payment with a
@@ -8822,6 +8824,7 @@ const treasuryFetchTransaction = async (signature) => {
 };
 // === TREASURY_FETCH_TX_END ===
 
+// === TREASURY_SCAN_RUN_BEGIN ===
 const treasuryScanOnce = async () => {
     if (treasuryScanInFlight) return { ok: false, reason: 'already_running' };
     treasuryScanInFlight = true;
@@ -9007,7 +9010,11 @@ const treasuryScanOnce = async () => {
                 }
                 const expectedUsd = (PLAN_PRICES_USD[normalizedTier] || 0) * (parsed.duration === 'yearly' ? 12 : 1) * (isSkr ? SKR_SUBSCRIPTION_MULTIPLIER : 1);
                 const band = await getPriceBand(isSkr ? 'skr' : 'sol');
-                if (!band) { summary.errors++; continue; } // retryable next run
+                if (!band) {
+                    await treasuryMarkSeen(signature, 'rpc_error', user.id, 'Price feed unavailable; retry verification');
+                    summary.errors++;
+                    continue;
+                }
                 const evalResult = evaluatePaymentAmount({ receivedUnits, expectedUsd, band });
                 if (!evalResult.ok) {
                     await treasuryMarkSeen(signature, 'underpaid', user.id,
@@ -9077,6 +9084,7 @@ const treasuryScanOnce = async () => {
         treasuryScanInFlight = false;
     }
 };
+// === TREASURY_SCAN_RUN_END ===
 
 // 6h cadence + one early run after boot. .unref so the interval never holds
 // the process open on its own.

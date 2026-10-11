@@ -1442,3 +1442,154 @@ test('treasuryFetchTransaction (real code): both bad -> null; failed on-chain st
     assert.deepEqual(tx.meta.err, { InstructionError: [0, 'Custom'] });
     assert.equal(calls.length, 1); // no fall-through on a real verdict
 });
+
+// ===========================================================================
+// Client subscription verify routes - REAL handlers via VM: a signature
+// claimed by a DIFFERENT purchase is 400 PAYMENT_CONFLICT (never a 409 that
+// old clients count as success); an identical same-user claim stays 200.
+// ===========================================================================
+const mkRes = () => {
+    const out = { statusCode: 200, body: null };
+    out.status = (c) => { out.statusCode = c; return out; };
+    out.json = (b) => { out.body = b; return out; };
+    return out;
+};
+const mkReq = (body) => ({ body, headers: { authorization: 'Bearer t' } });
+const loadSubVerifyRoutes = (over = {}) => {
+    const routes = {};
+    evalServer('CLIENT_SUB_VERIFY_ROUTES', 'null', {
+        app: { post: (p, h) => { routes[p] = h; } },
+        jwt: { verify: () => ({ id: 1 }) },
+        JWT_SECRET: 'test-secret',
+        SOLANA_PAYMENT_WALLET: TREASURY,
+        SKR_TOKEN_MINT: SKR_MINT,
+        SKR_TOKEN_SYMBOL: 'SKR',
+        SKR_SUBSCRIPTION_MULTIPLIER: 1,
+        normalizeTierGb: (t) => ([100, 200, 400, 1000].includes(Number(t)) ? Number(t) : null),
+        dbGetAsync: async () => null,
+        paymentRecovery,
+        getUserPlanGb: async () => 0,
+        canDowngradeToTier: async () => true,
+        getUserUsedBytes: async () => 0,
+        getMinRequiredTier: async () => 0,
+        PLAN_PRICES_USD: { 100: 10, 200: 20, 400: 40, 1000: 100 },
+        verifySolanaTransaction: async () => ({ success: true, receivedAmount: 0.5, blockTime: Math.floor(Date.now() / 1000) - 60, memo: 'PhotoLynk:sub:100:monthly', sender: PAYER }),
+        verifySkrTokenTransaction: async () => ({ success: true, receivedAmount: 100, blockTime: Math.floor(Date.now() / 1000) - 60, memo: 'PhotoLynk:sub:100:monthly', sender: PAYER }),
+        respondVerificationFailure: (res, _r, msg) => res.status(400).json({ error: msg }),
+        requirePaymentMemo: () => true,
+        creditSolanaSubscription: async () => ({ expiresAt: Date.now() + 1e6, alreadyProcessed: false, planGb: 100, status: 'active' }),
+        ecoEnsureAccount: async () => ({}),
+        ecoFloorSub: async () => {},
+        ECO_BIND_MIN_TIER_GB: 400,
+        ...over,
+    });
+    return routes;
+};
+const SUB_ROUTES = [['/api/solana/verify-payment', 'SOL'], ['/api/solana/verify-skr-payment', 'SKR']];
+
+test('client verify routes (real code): foreign-claimed signature -> 400 PAYMENT_CONFLICT, no credit call', async () => {
+    let creditCalls = 0;
+    const routes = loadSubVerifyRoutes({
+        dbGetAsync: async (sql) => {
+            if (sql.includes('FROM users')) return { id: 1, email: 'a@b' };
+            if (sql.includes('FROM solana_payments')) {
+                return { tx_signature: 'sig', user_id: 2, tier_gb: 100, duration: 'monthly', payment_token: 'SOL' };
+            }
+            return null;
+        },
+        creditSolanaSubscription: async () => { creditCalls++; },
+    });
+    for (const [p] of SUB_ROUTES) {
+        const res = mkRes();
+        await routes[p](mkReq({ txSignature: 'sig', tierGb: 100, duration: 'monthly' }), res);
+        assert.equal(res.statusCode, 400, `${p} must be 400 (old clients treat any 409 as success)`);
+        assert.equal(res.body.code, 'PAYMENT_CONFLICT');
+        assert.equal(res.body.retryable, false);
+        assert.notEqual(res.body.success, true);
+    }
+    assert.equal(creditCalls, 0);
+});
+
+test('client verify routes (real code): identical same-user claim -> 200 alreadyProcessed', async () => {
+    for (const [p, token] of SUB_ROUTES) {
+        const routes = loadSubVerifyRoutes({
+            dbGetAsync: async (sql) => {
+                if (sql.includes('FROM users')) return { id: 1, email: 'a@b' };
+                if (sql.includes('FROM solana_payments')) {
+                    return { tx_signature: 'sig', user_id: 1, tier_gb: 100, duration: 'monthly', payment_token: token };
+                }
+                if (sql.includes('FROM user_plans')) return { plan_gb: 100, status: 'active', expires_at: Date.now() + 1e6 };
+                return null;
+            },
+        });
+        const res = mkRes();
+        await routes[p](mkReq({ txSignature: 'sig', tierGb: 100, duration: 'monthly' }), res);
+        assert.equal(res.statusCode, 200);
+        assert.equal(res.body.success, true);
+        assert.equal(res.body.alreadyProcessed, true);
+    }
+});
+
+test('client verify routes (real code): raced creditor PAYMENT_CONFLICT -> 400, never 200/409', async () => {
+    for (const [p] of SUB_ROUTES) {
+        const routes = loadSubVerifyRoutes({
+            dbGetAsync: async (sql) => (sql.includes('FROM users') ? { id: 1, email: 'a@b' } : null),
+            creditSolanaSubscription: async () => {
+                const e = new Error('transaction belongs to a different purchase');
+                e.code = 'PAYMENT_CONFLICT';
+                throw e;
+            },
+        });
+        const res = mkRes();
+        await routes[p](mkReq({ txSignature: 'sig', tierGb: 100, duration: 'monthly' }), res);
+        assert.equal(res.statusCode, 400);
+        assert.equal(res.body.code, 'PAYMENT_CONFLICT');
+        assert.equal(res.body.retryable, false);
+    }
+});
+
+// ===========================================================================
+// treasuryScanOnce - REAL scanner: a missing price band records a retryable
+// 'rpc_error' seen row instead of dying silently (previously the sig was
+// dropped for the run with no durable record).
+// ===========================================================================
+test('treasuryScanOnce (real code): null price band -> rpc_error marked, retryable', async () => {
+    const marked = [];
+    const scan = evalServer('TREASURY_SCAN_RUN', 'treasuryScanOnce', {
+        treasuryScanInFlight: false,
+        SOLANA_PAYMENT_WALLET: TREASURY,
+        SKR_TOKEN_MINT: SKR_MINT,
+        SKR_TOKEN_DECIMALS: SKR_DECIMALS,
+        SKR_SUBSCRIPTION_MULTIPLIER: 1,
+        TREASURY_TX_MAX_AGE_MS: 30 * 24 * 60 * 60 * 1000,
+        TREASURY_SCAN_TX_DELAY_MS: 0,
+        PLAN_PRICES_USD: { 100: 10 },
+        ECO_BIND_MIN_TIER_GB: 400,
+        paymentRecovery,
+        treasuryGetTokenAccounts: async () => [],
+        treasuryCollectSignatures: async () => [{ signature: 'sig', slot: 1 }],
+        dbAllAsync: async () => [],
+        dbGetAsync: async () => null,
+        treasuryMarkSeen: async (...a) => { marked.push(a); },
+        treasuryFetchTransaction: async () => solTx({}),
+        treasurySleep: async () => {},
+        extractPhotoLynkMemo: () => 'PhotoLynk:sub:100:monthly:abcd1234',
+        treasuryUserByPaymentCode: async () => ({ id: 7, email: 'u@x' }),
+        treasuryBoundUsers: async () => [],
+        getUserPlanGb: async () => 0,
+        canDowngradeToTier: async () => true,
+        getPriceBand: async () => null,
+        evaluatePaymentAmount: () => { throw new Error('unreachable: band null'); },
+        creditSolanaSubscription: async () => { throw new Error('unreachable: band null'); },
+        ecoEnsureAccount: async () => ({}),
+        ecoFloorSub: async () => {},
+    });
+    const summary = await scan();
+    assert.equal(summary.errors, 1);
+    assert.equal(summary.credited, 0);
+    const m = marked.find((a) => a[0] === 'sig');
+    assert.ok(m, 'signature must get a durable seen row');
+    assert.equal(m[1], 'rpc_error');
+    assert.equal(m[2], 7);
+    assert.match(m[3], /Price feed unavailable/);
+});
