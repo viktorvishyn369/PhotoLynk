@@ -114,17 +114,34 @@ function base58Decode(str) {
     return Uint8Array.from([...new Array(zeros).fill(0), ...digits.reverse()]);
 }
 
-// The single PhotoLynk product memo on a transaction (parsed string or raw
-// base58 memo data). Exactly one PhotoLynk: memo is allowed - two different
-// product memos on one tx is a MEMO_MISMATCH, not a first-match win, so a
-// crafted tx cannot satisfy a sub verification while also claiming premium.
-function extractPaymentMemo(tx) {
+// PaceSeeker sub memo: PS1|monthly|<milliseconds>|<8-hex checksum>[|promo:<14-char PS code>].
+// The checksum field is ALWAYS present (native SecurityModule) and is NOT a
+// promo marker - a discount exists only with an explicit promo: suffix. The
+// timestamp is client-reported telemetry; on-chain blockTime stays
+// authoritative for paidAt.
+const PS_MEMO_RE = /^PS1\|monthly\|(\d+)\|([0-9a-fA-F]{8})(?:\|promo:(PS[A-Z0-9]{12}))?$/;
+// ECO2 quote-reference memo: SLQ1|<32-lower-hex quote id>. Optional, carries
+// no product intent of its own - it only accompanies a primary product memo.
+const QUOTE_MEMO_RE = /^SLQ1\|([0-9a-f]{32})$/;
+
+function parsePaceSeekerMemo(memo) {
+    if (typeof memo !== 'string') return null;
+    const m = memo.match(PS_MEMO_RE);
+    if (!m) return null;
+    const timestamp = Number(m[1]);
+    if (!Number.isSafeInteger(timestamp) || timestamp <= 0) return null;
+    return { duration: 'monthly', reportedPaidAt: timestamp, checksum: m[2].toLowerCase(), promo: m[3] || null };
+}
+
+// All memo-instruction texts on a transaction (parsed string payloads and raw
+// base58 instruction data, top-level and inner), from either memo program.
+function _memoTexts(tx) {
     const message = tx?.transaction?.message || {};
     const ixs = [
         ...(Array.isArray(message.instructions) ? message.instructions : []),
         ...((Array.isArray(tx?.meta?.innerInstructions) ? tx.meta.innerInstructions : []).flatMap((ii) => ii?.instructions || [])),
     ];
-    const found = [];
+    const texts = [];
     for (const ix of ixs) {
         if (!ix) continue;
         const pid = ix.programId
@@ -139,12 +156,82 @@ function extractPaymentMemo(tx) {
                 try { text = Buffer.from(raw).toString('utf8'); } catch (_) { text = ''; }
             }
         }
-        if (text && text.startsWith('PhotoLynk:')) found.push(text);
+        if (text) texts.push(text);
     }
-    if (found.length > 1) {
-        throw codedError('MEMO_MISMATCH', `conflicting PhotoLynk memos (${found.length})`);
+    return texts;
+}
+
+// The single PhotoLynk product memo on a transaction (parsed string or raw
+// base58 memo data). Exactly one product memo is allowed - two product memos
+// on one tx (two PhotoLynk memos, or a PhotoLynk memo plus a PS1| memo) is a
+// MEMO_MISMATCH, not a first-match win, so a crafted tx cannot satisfy a sub
+// verification while also claiming premium or a PaceSeeker sub.
+function extractPaymentMemo(tx) {
+    const eco = _classifyMemos(tx);
+    return eco.pl[0] || null;
+}
+
+// Cross-app memo inspection for the ECO2 protocol. Exactly ONE primary
+// product memo (PhotoLynk:* or PS1|*) and at most one SLQ1| quote reference;
+// unrelated memo text is ignored. Returns null when no primary memo exists,
+// {app, memo, tierGb, duration, code, promo, reportedPaidAt, productId,
+// quoteId} otherwise.
+function extractEcosystemMemo(tx) {
+    const cls = _classifyMemos(tx);
+    const quoteIds = [];
+    for (const t of cls.other) {
+        if (t.startsWith('SLQ1|') && !QUOTE_MEMO_RE.test(t)) {
+            throw codedError('MEMO_MISMATCH', 'invalid quote memo');
+        }
+        const q = t.match(QUOTE_MEMO_RE);
+        if (q) quoteIds.push(q[1]);
     }
-    return found[0] || null;
+    if (quoteIds.length > 1) {
+        throw codedError('MEMO_MISMATCH', `conflicting quote memos (${quoteIds.length})`);
+    }
+    const quoteId = quoteIds[0] || null;
+    if (cls.pl.length) {
+        const memo = cls.pl[0];
+        const parsed = parseSubscriptionMemo(memo) || parsePremiumMemo(memo);
+        if (!parsed) throw codedError('MEMO_MISMATCH', 'invalid product memo');
+        return {
+            app: 'photolynk', memo,
+            tierGb: parsed.tierGb,
+            duration: parsed.duration,
+            productId: parsed.duration === 'premium' ? 'photolynk.premium' : `photolynk.storage_${parsed.tierGb}`,
+            code: parsed.code,
+            promo: null, reportedPaidAt: null, quoteId,
+        };
+    }
+    if (cls.ps.length) {
+        const memo = cls.ps[0];
+        const parsed = parsePaceSeekerMemo(memo);
+        if (!parsed) throw codedError('MEMO_MISMATCH', 'invalid product memo');
+        return {
+            app: 'paceseeker', memo,
+            tierGb: null, duration: 'monthly',
+            productId: 'paceseeker.monthly',
+            code: null,
+            promo: parsed.promo,
+            reportedPaidAt: parsed.reportedPaidAt,
+            quoteId,
+        };
+    }
+    return null;
+}
+
+function _classifyMemos(tx) {
+    const pl = [], ps = [], other = [];
+    for (const t of _memoTexts(tx)) {
+        if (t.startsWith('PhotoLynk:')) pl.push(t);
+        else if (t.startsWith('PS1|')) ps.push(t);
+        else other.push(t);
+    }
+    const total = pl.length + ps.length;
+    if (total > 1) {
+        throw codedError('MEMO_MISMATCH', `conflicting product memos (${total})`);
+    }
+    return { pl, ps, other };
 }
 
 // ---------------------------------------------------------------------------
@@ -346,7 +433,7 @@ function samePaymentRow(row, { userId, token, tierGb, duration }) {
 // (the shared server handle has unrelated traffic and must never BEGIN), runs
 // BEGIN IMMEDIATE and writes payment + plan + audit in one transaction.
 // ---------------------------------------------------------------------------
-function createSubscriptionCreditor({ sqlite3, dbPath, computeExpiry, durations }) {
+function createSubscriptionCreditor({ sqlite3, dbPath, computeExpiry, durations, ecosystem = null }) {
     if (!sqlite3 || !dbPath || typeof computeExpiry !== 'function' || !durations) {
         throw codedError('BAD_CREDITOR_CONFIG', 'createSubscriptionCreditor requires {sqlite3, dbPath, computeExpiry, durations}');
     }
@@ -356,6 +443,7 @@ function createSubscriptionCreditor({ sqlite3, dbPath, computeExpiry, durations 
     const creditUnlocked = async ({
         userId, signature, token, amount, tierGb, duration,
         paymentAt, source, detail, preserveTier = false,
+        amountAtomic = null, payerWallet = null, mint = null, quoteId = null, evidence = null,
     }) => {
         const uid = Number(userId);
         if (!Number.isInteger(uid) || uid <= 0) throw codedError('INVALID_INPUT', 'invalid userId');
@@ -385,6 +473,9 @@ function createSubscriptionCreditor({ sqlite3, dbPath, computeExpiry, durations 
         });
         const get = (sql, params = []) => new Promise((resolve, reject) => {
             conn.get(sql, params, (e, row) => { e ? reject(e) : resolve(row); });
+        });
+        const all = (sql, params = []) => new Promise((resolve, reject) => {
+            conn.all(sql, params, (e, rows) => { e ? reject(e) : resolve(rows || []); });
         });
 
         try {
@@ -417,10 +508,36 @@ function createSubscriptionCreditor({ sqlite3, dbPath, computeExpiry, durations 
             }
 
             const expiry = computeExpiry({ currentPlan, purchaseAt: payAt, durationMs });
-            const expiresAt = Math.max(Number(expiry?.expiresAt) || 0, Number(currentPlan?.expires_at) || 0);
-            const planGb = preserveTier ? Math.max(Number(currentPlan?.plan_gb) || 0, tier) : tier;
-            const status = expiresAt > now ? 'active' : (currentPlan?.status || 'expired');
             const paymentType = token === 'SKR' ? 'skr' : 'solana';
+            let eco = null;
+            if (ecosystem) {
+                eco = await ecosystem.applyPhotolynkInTransaction({ run, get, all }, {
+                    signature: sig, userId: uid, token,
+                    amountAtomic: amountAtomic == null ? null : String(amountAtomic),
+                    payerWallet: payerWallet || null,
+                    paidAt: payAt, verifiedAt: now, tierGb: tier, duration, source,
+                    quoteId: quoteId || null, mint: mint || null,
+                    evidence: evidence || null,
+                }, currentPlan);
+                if (eco && eco.ok === false) {
+                    // The core already committed nothing; persist a conflict
+                    // audit row under this tx, commit it, then fail closed.
+                    await run(
+                        `INSERT INTO solana_subscription_credits (tx_signature,user_id,source,payment_at,expires_before,expires_after,detail,created_at)
+                         VALUES (?,?,?,?,?,?,?,?)`,
+                        [sig, uid, 'eco_conflict', payAt, currentPlan?.expires_at ?? null, currentPlan?.expires_at ?? null,
+                         String(`${eco.code || 'conflict'}:${JSON.stringify(eco.conflicting || {}).slice(0, 400)}`).slice(0, 500), now]);
+                    await run('COMMIT');
+                    begun = false;
+                    throw codedError('PAYMENT_CONFLICT', eco.code || 'payment conflict');
+                }
+            }
+            const expiresAt = eco ? (Number(eco.expiresAt) || 0)
+                : Math.max(Number(expiry?.expiresAt) || 0, Number(currentPlan?.expires_at) || 0);
+            const planGb = eco ? (Number(eco.planGb) || 0)
+                : (preserveTier ? Math.max(Number(currentPlan?.plan_gb) || 0, tier) : tier);
+            const status = eco ? (eco.status || (expiresAt > now ? 'active' : 'expired'))
+                : (expiresAt > now ? 'active' : (currentPlan?.status || 'expired'));
 
             try {
                 await run(
@@ -451,18 +568,31 @@ function createSubscriptionCreditor({ sqlite3, dbPath, computeExpiry, durations 
                 throw e;
             }
 
-            await run(
-                `INSERT INTO user_plans (user_id,plan_gb,status,expires_at,trial_carryover_applied_at,payment_type,payment_at,grace_until,deleted_at,updated_at)
-                 VALUES (?,?,?,?,?,?,?,NULL,NULL,?)
-                 ON CONFLICT(user_id) DO UPDATE SET
-                    plan_gb=excluded.plan_gb,status=excluded.status,expires_at=excluded.expires_at,
-                    trial_carryover_applied_at=COALESCE(excluded.trial_carryover_applied_at,user_plans.trial_carryover_applied_at),
-                    payment_type=CASE WHEN COALESCE(user_plans.payment_at,0)<=excluded.payment_at THEN excluded.payment_type ELSE user_plans.payment_type END,
-                    payment_at=MAX(COALESCE(user_plans.payment_at,0),excluded.payment_at),
-                    grace_until=CASE WHEN excluded.expires_at>? THEN NULL ELSE user_plans.grace_until END,
-                    deleted_at=CASE WHEN excluded.expires_at>? THEN NULL ELSE user_plans.deleted_at END, updated_at=excluded.updated_at`,
-                [uid, planGb, status, expiresAt, expiry?.trialCarryoverAppliedAt ?? null, paymentType, payAt, now, now, now]
-            );
+            if (eco) {
+                // The core already projected plan_gb/status/expires_at and the
+                // real payment_type - only the purchase timestamp and the
+                // one-time trial carryover marker move here.
+                await run(
+                    `UPDATE user_plans SET
+                        payment_at = MAX(COALESCE(user_plans.payment_at, 0), ?),
+                        trial_carryover_applied_at = COALESCE(?, user_plans.trial_carryover_applied_at),
+                        updated_at = ?
+                     WHERE user_id = ?`,
+                    [payAt, expiry?.trialCarryoverAppliedAt ?? null, now, uid]);
+            } else {
+                await run(
+                    `INSERT INTO user_plans (user_id,plan_gb,status,expires_at,trial_carryover_applied_at,payment_type,payment_at,grace_until,deleted_at,updated_at)
+                     VALUES (?,?,?,?,?,?,?,NULL,NULL,?)
+                     ON CONFLICT(user_id) DO UPDATE SET
+                        plan_gb=excluded.plan_gb,status=excluded.status,expires_at=excluded.expires_at,
+                        trial_carryover_applied_at=COALESCE(excluded.trial_carryover_applied_at,user_plans.trial_carryover_applied_at),
+                        payment_type=CASE WHEN COALESCE(user_plans.payment_at,0)<=excluded.payment_at THEN excluded.payment_type ELSE user_plans.payment_type END,
+                        payment_at=MAX(COALESCE(user_plans.payment_at,0),excluded.payment_at),
+                        grace_until=CASE WHEN excluded.expires_at>? THEN NULL ELSE user_plans.grace_until END,
+                        deleted_at=CASE WHEN excluded.expires_at>? THEN NULL ELSE user_plans.deleted_at END, updated_at=excluded.updated_at`,
+                    [uid, planGb, status, expiresAt, expiry?.trialCarryoverAppliedAt ?? null, paymentType, payAt, now, now, now]
+                );
+            }
 
             await run(
                 `INSERT INTO solana_subscription_credits (tx_signature,user_id,source,payment_at,expires_before,expires_after,detail,created_at)
@@ -756,6 +886,16 @@ function createTreasuryInspector({
             };
         }
 
+        // An SLQ1 quote reference changes who may redeem this payment - the
+        // caller must route it through the protocol, not the legacy credit.
+        let quoteId = null;
+        try {
+            const eco = extractEcosystemMemo(tx);
+            if (eco && eco.quoteId) quoteId = eco.quoteId;
+        } catch (e) {
+            return { ok: false, status: 400, code: e.code || 'MEMO_MISMATCH', error: e.message };
+        }
+
         const isSkr = transfer.token === 'SKR';
         const expectedUsd = (planPricesUsd[parsed.tierGb] || 0)
             * (parsed.duration === 'yearly' ? 12 : 1)
@@ -838,6 +978,7 @@ function createTreasuryInspector({
                 paymentAt,
                 historical,
                 alreadyProcessed,
+                quoteId,
                 attribution,
                 candidates: candidates.map((c) => ({
                     id: c.id, email: c.email, alias_email: c.alias_email, wallet_address: c.wallet_address,
@@ -863,7 +1004,11 @@ module.exports = {
     base58Decode,
     parseSubscriptionMemo,
     parsePremiumMemo,
+    parsePaceSeekerMemo,
+    PS_MEMO_RE,
+    QUOTE_MEMO_RE,
     extractPaymentMemo,
+    extractEcosystemMemo,
     extractTreasuryTransfer,
     boundUserIds,
     approvedRecoveryUsers,

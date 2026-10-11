@@ -21,6 +21,7 @@ const PS_DEVICE_COLUMNS = {
     wallet_address: 'TEXT',
     wallet_domain: 'TEXT',
     ad_until: 'INTEGER',
+    reported_sub_until: 'INTEGER',
 };
 
 const PS_REVENUE_COLUMNS = {

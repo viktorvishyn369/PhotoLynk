@@ -17,6 +17,9 @@ const naclUtil = require('tweetnacl-util');
 const updater = require('./updater');
 const paymentRecovery = require('./paymentRecovery');
 const { ensurePaceSeekerSchema, createSubscriptionReadiness } = require('./subscriptionSchema');
+const { createEcosystemService, DEFAULT_REGISTRY } = require('./ecosystemEntitlements');
+const { createEcosystemPaymentService, USDC_MINT, USDT_MINT } = require('./ecosystemPayments');
+const { mountEcosystemRoutes } = require('./ecosystemRoutes');
 let sharp;
 try { sharp = require('sharp'); console.log('[Server] sharp loaded'); } catch (e) { sharp = null; console.log('[Server] sharp failed to load:', e.message); }
 
@@ -629,6 +632,7 @@ table{min-width:100%;width:auto}
       <tbody id="claims-tbody"></tbody>
     </table>
   </div>
+  <div id="eco-core-banner" style="display:none;margin:10px 0;padding:10px 14px;border-radius:8px;font-size:13px"></div>
   <table id="eco-table" style="display:none">
     <thead><tr>
       <th>Account</th>
@@ -636,12 +640,26 @@ table{min-width:100%;width:auto}
       <th>Wallets</th>
       <th>Socials</th>
       <th>Sub Source</th>
-      <th>Sub Until</th>
+      <th>Shared until</th>
+      <th>Entitlements</th>
       <th>Claims</th>
       <th>Actions</th>
     </tr></thead>
     <tbody id="eco-tbody"></tbody>
   </table>
+  <div id="eco-pager" style="display:none;margin:10px 0;font-size:13px;color:var(--muted)">
+    <button class="btn btn-ghost" style="padding:4px 12px;font-size:12px" onclick="ecoPage(-1)" id="eco-pager-prev">Prev</button>
+    <span id="eco-pager-label" style="margin:0 10px"></span>
+    <button class="btn btn-ghost" style="padding:4px 12px;font-size:12px" onclick="ecoPage(1)" id="eco-pager-next">Next</button>
+  </div>
+  <details id="eco-jobs-wrap" style="display:none;margin-top:18px">
+    <summary style="cursor:pointer;font-size:14px;color:var(--text)">Payment queue <span class="date-cell" id="eco-jobs-note"></span></summary>
+    <div id="eco-jobs-counts" style="margin:8px 0;font-size:12px"></div>
+    <table id="eco-jobs-table">
+      <thead><tr><th>Signature</th><th>State</th><th>Attempts</th><th>Last error</th><th>Next attempt</th><th>Subjects</th></tr></thead>
+      <tbody id="eco-jobs-tbody"></tbody>
+    </table>
+  </details>
   <div id="empty" class="empty-state" style="display:none">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M15.75 6a3.75 3.75 0 1 1-7.5 0 3.75 3.75 0 0 1 7.5 0ZM4.501 20.118a7.5 7.5 0 0 1 14.998 0"/></svg>
     <p>No users match your search</p>
@@ -702,7 +720,7 @@ table{min-width:100%;width:auto}
 <script>
 var allUsers=[];var filteredUsers=[];var sortCol='id';var sortDir='desc';var activeFilter='all';var serverTime='';var adminStats={photolynk_nfts_minted:0,photolynk_paid_nfts_minted:0,photolynk_free_premium_nfts_minted:0,photolynk_premium_users:0};
 var activeApp='photolynk';var psUsers=[];var psFiltered=[];var psLoaded=false;var psSortCol='last_seen';var psSortDir='desc';var psRevenue={count:0,usd:0};
-var ecoAccounts=[];var ecoFiltered=[];var ecoLoaded=false;
+var ecoAccounts=[];var ecoFiltered=[];var ecoLoaded=false;var ecoOffset=0;var ecoLimit=200;var ecoTotal=0;var ecoCore=null;
 
 function switchApp(app){
   activeApp=app;activeFilter='all';
@@ -712,11 +730,14 @@ function switchApp(app){
   document.getElementById('ps-table').style.display='none';
   document.getElementById('eco-table').style.display='none';
   document.getElementById('eco-claims').style.display='none';
+  document.getElementById('eco-core-banner').style.display='none';
+  document.getElementById('eco-pager').style.display='none';
+  document.getElementById('eco-jobs-wrap').style.display='none';
   document.getElementById('empty').style.display='none';
   document.getElementById('ps-presence-filter').style.display=ps?'':'none';
   document.getElementById('search').placeholder=ps?'Search device hash, IP, wallet or SNS name...':eco?'Search account id, wallet, handle or identity...':'Search by user, .skr, email, ID, status, plan...';
   if(eco){
-    if(ecoLoaded){document.getElementById('eco-table').style.display='';updateStats();buildFilters();applyFilters()}
+    if(ecoLoaded){document.getElementById('eco-table').style.display='';document.getElementById('eco-core-banner').style.display='';document.getElementById('eco-pager').style.display='';document.getElementById('eco-jobs-wrap').style.display='';updateStats();buildFilters();applyFilters()}
     else{document.getElementById('loading').style.display='';loadEcoAccounts()}
     loadAdClaims();
     return;
@@ -734,16 +755,51 @@ function switchApp(app){
 
 // Ecosystem accounts view - one row per shared account showing its member
 // apps, wallets, sub provenance (payment vs ad_claim) and admin controls.
+// Paged server-side; per-account entitlements come from the core read model
+// when it is ready (omitted entirely in legacy compatibility mode).
 async function loadEcoAccounts(){
   try{
-    var r=await fetch('/admin/api/eco-accounts');var d=await r.json();
+    var r=await fetch('/admin/api/eco-accounts?offset='+ecoOffset+'&limit='+ecoLimit);var d=await r.json();
     if(!r.ok)throw new Error(d.error||'Failed');
     serverTime=d.server_time||'';
-    ecoAccounts=d.accounts||[];ecoLoaded=true;
+    ecoAccounts=d.accounts||[];ecoTotal=Number(d.total)||0;ecoCore=d.ecosystem||null;ecoLoaded=true;
     document.getElementById('loading').style.display='none';
     document.getElementById('eco-table').style.display='';
+    document.getElementById('eco-pager').style.display='';
+    renderEcoBanner();
+    renderEcoPager();
+    loadEcoJobs();
+    document.getElementById('eco-jobs-wrap').style.display='';
     updateStats();buildFilters();applyFilters();
   }catch(e){document.getElementById('loading').textContent='Error: '+e.message}
+}
+
+function renderEcoBanner(){
+  var el=document.getElementById('eco-core-banner');
+  el.style.display='';
+  var init=(ecoCore&&ecoCore.init)||{};
+  if(ecoCore&&ecoCore.legacyMode){
+    var since=init.at?new Date(Number(init.at)).toLocaleString('en-GB'):'startup';
+    el.style.background='rgba(234,179,8,.12)';el.style.border='1px solid var(--warn)';el.style.color='var(--warn)';
+    el.innerHTML='<b>Ecosystem core: LEGACY MODE</b> since '+since+' &mdash; '+String(init.code||'INIT_FAILED')+': '+String(init.message||'')+' (attempts '+(init.attempts||1)+'). Payments still credit per app; cross-app benefits resume automatically when the core recovers.';
+  }else{
+    el.style.background='rgba(34,197,94,.10)';el.style.border='1px solid var(--success)';el.style.color='var(--success)';
+    el.innerHTML='<b>Ecosystem core: ready</b>'+(init.attempts>1?' (recovered after '+init.attempts+' attempts)':'');
+  }
+}
+
+function renderEcoPager(){
+  var lo=ecoTotal===0?0:ecoOffset+1;
+  var hi=Math.min(ecoOffset+ecoAccounts.length,ecoTotal);
+  document.getElementById('eco-pager-label').textContent='showing '+lo+'\u2013'+hi+' of '+ecoTotal;
+  document.getElementById('eco-pager-prev').disabled=ecoOffset<=0;
+  document.getElementById('eco-pager-next').disabled=ecoOffset+ecoLimit>=ecoTotal;
+}
+
+function ecoPage(dir){
+  var next=ecoOffset+dir*ecoLimit;
+  if(next<0||(dir>0&&ecoOffset+ecoLimit>=ecoTotal))return;
+  ecoOffset=next;ecoLoaded=false;loadEcoAccounts();
 }
 
 function ecoSourceBadge(a){
@@ -783,6 +839,7 @@ function renderEcoTable(){
     html+='<td>'+(soc.join(' ')||'<span class="date-cell">-</span>')+' '+strict+'</td>';
     html+='<td>'+ecoSourceBadge(a)+'</td>';
     html+='<td>'+(a.sub_until?fmtDate(new Date(Number(a.sub_until)).toISOString()):'<span class="date-cell">-</span>')+'</td>';
+    html+='<td style="font-size:11px;min-width:220px">'+ecoEntitlementLines(a)+'</td>';
     html+='<td><span class="date-cell">'+claimsTxt+'</span></td>';
     html+='<td><button class="btn btn-primary" style="padding:3px 8px;font-size:11px" onclick="ecoSubAction(&apos;'+a.account_id+'&apos;,&apos;extend&apos;)" title="Add 7 days to the shared sub">+7d</button> '
       +(a.subscribed?'<button class="btn btn-red" style="padding:3px 8px;font-size:11px" onclick="ecoSubAction(&apos;'+a.account_id+'&apos;,&apos;revoke&apos;)" title="Revoke the shared sub now">Revoke</button>':'<span class="date-cell">-</span>')
@@ -790,6 +847,78 @@ function renderEcoTable(){
     html+='</tr>';
   });
   tbody.innerHTML=html;
+}
+
+// One line per member/source of the core snapshot: 'PL #123 · direct 1000GB
+// · until D · payment', 'shared · 399¢ · until D · from PS payment',
+// 'PS a1b2c3… · ad week · until D', 'premium storage 500GB · until D'.
+// Legacy mode has no read model - the column shows the mode, never a guess.
+var ECO_KIND_LABEL={payment:'payment',ad_claim:'ad week',legacy:'legacy',admin:'admin',store:'store',timeline:'shared fold',localplan:'local plan',premium:'premium',grant:'grant'};
+function ecoKindLabel(k){return ECO_KIND_LABEL[k]||k||'?';}
+function ecoUntil(e){return e==null?'<span title="unbounded">unbounded</span>':(e?fmtDate(new Date(Number(e)).toISOString()):'<span class="date-cell">expired</span>');}
+function ecoEntitlementLines(a){
+  if(!('entitlements' in a)){
+    return '<span class="date-cell" title="Ecosystem core in legacy compatibility mode">legacy mode</span>';
+  }
+  if(a.entitlementsError||a.entitlements==null){
+    return '<span style="color:var(--warn)" title="core snapshot failed">err: '+String(a.entitlementsError||'?')+'</span>';
+  }
+  var ent=a.entitlements;var out=[];
+  (ent.members||[]).forEach(function(m){
+    var lab=m.app==='paceseeker'?'PS':'PL';
+    var idt=m.app==='photolynk'?('#'+m.identity):String(m.identity||'').substring(0,8)+'&hellip;';
+    var bits=[];
+    if(m.planGb)bits.push(m.planGb+'GB');
+    if(m.expiresAt!=null)bits.push('until '+ecoUntil(m.expiresAt));
+    if(m.sourceKind)bits.push(ecoKindLabel(m.sourceKind));
+    out.push('<div title="'+m.app+' '+m.identity+' &middot; '+(m.sourceKind||'')+'/'+(m.sourceScope||'')+'"><span class="mini-tag" style="color:'+(m.app==='paceseeker'?'var(--accent)':'var(--success)')+'">'+lab+'</span> '+idt+(m.active?'':' <s>expired</s>')+' &middot; '+(bits.join(' &middot; ')||'no grant')+'</div>');
+  });
+  (ent.sources||[]).forEach(function(s){
+    if(s.scope!=='shared')return;
+    var kind=s.kind||'shared';
+    var label='shared &middot; '+(Number(s.monthlyValueCents)||0)+'&cent; &middot; '+(s.expiresAt!=null?'until '+ecoUntil(s.expiresAt):'open');
+    var from=s.app&&s.app!=='*'?('from '+s.app+' '):'';
+    var rev=s.revoked;
+    out.push('<div title="'+(s.eventId||'')+'" style="'+(rev?'text-decoration:line-through;opacity:.6':'')+'"><span class="mini-tag" style="color:var(--muted)">'+from+ecoKindLabel(kind)+'</span> '+label+(rev?' <span style="color:var(--danger)">revoked</span>':'')+'</div>');
+  });
+  return out.join('')||'<span class="date-cell">-</span>';
+}
+
+// Durable verification queue - ECO2 payments waiting for on-chain
+// confirmation. conflict/UNVERIFIED rows are highlighted for the admin.
+async function loadEcoJobs(){
+  try{
+    var r=await fetch('/admin/api/eco-jobs?limit=100');var d=await r.json();
+    if(!r.ok)return;
+    var note=document.getElementById('eco-jobs-note');
+    var cdiv=document.getElementById('eco-jobs-counts');
+    if(d.legacyMode){note.textContent='(core in legacy mode - no queue)';cdiv.innerHTML='';document.getElementById('eco-jobs-tbody').innerHTML='';return;}
+    var c=d.counts||{};var pend=Number(c.pending)||0;
+    note.textContent='('+pend+' pending'+((Number(c.leased)||0)?', '+c.leased+' leased':'')+')';
+    var chips=Object.keys(c).filter(function(k){return k!=='leased'}).map(function(k){
+      return'<span class="mini-tag" style="margin-right:6px;color:'+(k==='pending'?'var(--warn)':(k==='rejected'||k==='failed'||k==='conflict')?'var(--danger)':'var(--muted)')+'">'+k+': '+c[k]+'</span>';
+    }).join('');
+    cdiv.innerHTML=chips||'<span class="date-cell">empty</span>';
+    var tb=document.getElementById('eco-jobs-tbody');var html='';
+    (d.jobs||[]).forEach(function(j){
+      var bad=j.state==='rejected'||j.state==='failed'||j.state==='conflict'||j.last_error_code==='PAYMENT_ACCOUNT_UNVERIFIED';
+      var subs=(j.subjects||[]).map(function(s){
+        var w=s.wallet?(' <span class="uuid-cell" title="'+s.wallet+'">'+s.wallet+'</span>'):'';
+        return (s.app||'?')+':'+String(s.identity||'').substring(0,8)+w;
+      }).join('<br>');
+      var sig=String(j.signature||'');
+      html+='<tr'+(bad?' style="background:rgba(239,68,68,.08)"':'')+'>';
+      html+='<td class="uuid-cell" title="'+sig+' - click to copy" onclick="copyUuid(this,&apos;'+sig+'&apos;)">'+sig.substring(0,12)+'&hellip;</td>';
+      html+='<td><span class="mini-tag" style="color:'+(bad?'var(--danger)':j.state==='done'?'var(--success)':'var(--warn)')+'">'+j.state+'</span></td>';
+      html+='<td>'+(Number(j.attempts)||0)+'</td>';
+      html+='<td><span class="mini-tag" style="color:'+(j.last_error_code?'var(--danger)':'var(--muted)')+'">'+(j.last_error_code||'-')+'</span></td>';
+      html+='<td><span class="date-cell">'+(j.next_attempt_at?fmtDate(new Date(Number(j.next_attempt_at)).toISOString()):'-')+'</span></td>';
+      html+='<td style="font-size:11px">'+subs+'</td>';
+      html+='</tr>';
+    });
+    if(!html)html='<tr><td colspan="6" style="text-align:center;padding:14px;color:var(--muted)">No queued payments</td></tr>';
+    tb.innerHTML=html;
+  }catch(e){}
 }
 
 function ecoSubAction(accountId,action){
@@ -994,13 +1123,13 @@ async function loadUsers(){
 
 function updateStats(){
   if(activeApp==='ecosystem'){
-    var etotal=ecoAccounts.length;
+    var etotal=ecoTotal||ecoAccounts.length;
     var esubs=ecoAccounts.filter(function(a){return a.subscribed}).length;
     var epaid=ecoAccounts.filter(function(a){return a.subscribed&&a.source_kind==='payment'}).length;
     var eads=ecoAccounts.filter(function(a){return a.subscribed&&a.source_kind==='ad_claim'}).length;
     var epend=ecoAccounts.filter(function(a){return a.claims_total&&!a.claims_verified}).length;
     var est=serverTime?'<span>Server: <b>'+new Date(serverTime).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+'</b></span>':'';
-    document.getElementById('header-stats').innerHTML=est+'<span>Accounts: <b>'+etotal+'</b></span><span>Active subs: <b>'+esubs+'</b></span><span>Paid: <b>'+epaid+'</b></span><span>Ad-based: <b>'+eads+'</b></span><span>Claims w/o verified: <b>'+epend+'</b></span>';
+    document.getElementById('header-stats').innerHTML=est+'<span>Accounts: <b>'+etotal+'</b></span><span>Active subs (this page): <b>'+esubs+'</b></span><span>Paid (this page): <b>'+epaid+'</b></span><span>Ad-based (this page): <b>'+eads+'</b></span><span>Claims w/o verified (this page): <b>'+epend+'</b></span>';
     return;
   }
   if(activeApp==='paceseeker'){
@@ -1466,7 +1595,35 @@ app.post('/admin/api/user/plan', adminAuth, async (req, res) => {
         params.push(now, uid);
 
         const sql = `UPDATE user_plans SET ${updates.join(', ')} WHERE user_id = ?`;
-        await dbRunAsync(sql, params);
+        if (ecosystemReady) {
+            // The write and the source-model event commit in one core
+            // transaction. Any change to plan_gb/expires_at/status is a
+            // direct-plan correction: it revokes the member's prior local
+            // sources and records a deterministic event - the id derives
+            // from the NORMALIZED resulting plan, never generated 'now',
+            // so a retried identical edit is a no-op while an extension
+            // (which changes expires_at) still records a new event.
+            // Premium-only edits do not create a subscription event.
+            const touchedSub = updates.some((u) => u.startsWith('plan_gb') || u.startsWith('expires_at') || u.startsWith('status'));
+            await ecosystem.transaction(async (tx) => {
+                await tx.run(sql, params);
+                if (touchedSub) {
+                    const next = await tx.get(`SELECT plan_gb, expires_at, status FROM user_plans WHERE user_id = ?`, [uid]);
+                    const nextGb = Number(next?.plan_gb) || 0;
+                    const nextExp = next && next.expires_at != null ? Number(next.expires_at) : null;
+                    const nextStatus = String(next?.status || '');
+                    const eventId = 'admin-plan:' + crypto.createHash('sha256')
+                        .update(JSON.stringify([uid, nextGb, nextExp, nextStatus])).digest('hex').slice(0, 16);
+                    await ecosystem.recordLocalPlanInTransaction(tx, {
+                        userId: uid, eventId, kind: 'admin', actor: ADMIN_USER || 'admin',
+                        plan: { planGb: nextGb, status: nextStatus, startsAt: now, expiresAt: nextExp },
+                        sharedEligible: false,
+                    });
+                }
+            });
+        } else {
+            await dbRunAsync(sql, params);
+        }
 
         const plan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [uid]);
         return res.json({ ok: true, plan });
@@ -2184,6 +2341,14 @@ const resolveClassicFileForUser = async (user, filename) => {
 };
 
 const ensurePlanRow = async (userId) => {
+    // Post-ready the core owns the entitlement state: projecting the member
+    // first heals a stale/absent row into the resolved state before it is
+    // read (deduped per user via _ecoProject — concurrent reads share one
+    // projection write, and a new receipt revision can never be masked by
+    // an obsolete cache).
+    if (ecosystemReady) {
+        await _ecoProject('photolynk', userId);
+    }
     const existing = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [userId]);
     if (existing) return existing;
     const now = Date.now();
@@ -3384,36 +3549,13 @@ const purgeUserEverywhereUnlocked = async (userId, options = {}) => {
     };
 
     // Retention purges run under the account gate, but the gate only orders
-    // THIS process - re-read the live plan under the gate right before any
-    // filesystem deletion so a credit that committed between the autopurge
-    // candidate SELECT and now can never lose its files. Any live or renewed
-    // entitlement, or a tombstone that no longer satisfies the cutoff, makes
-    // this a skip - never a failure.
-    if (deleteFiles && reason === 'autopurge_retention') {
-        const plan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [uid]);
-        const now = Date.now();
-        const retentionCutoff = now - (PURGE_RETENTION_DAYS * 24 * 60 * 60 * 1000);
-        const pStatus = plan ? String(plan.status || '') : '';
-        const pExpires = Number(plan?.expires_at) || 0;
-        const pGrace = Number(plan?.grace_until) || 0;
-        const pTrial = Number(plan?.trial_until) || 0;
-        const pComplimentary = pTrial > 0 ? pTrial + Math.max(0, TRIAL_COMPLIMENTARY_DAYS) * 24 * 60 * 60 * 1000 : 0;
-        const pPremiumGb = Number(plan?.premium_gb) || 0;
-        const pPremiumExp = Number(plan?.premium_expires_at) || 0;
-        const pDeleted = Number(plan?.deleted_at) || 0;
-        const stillEntitled = !plan
-            || pStatus === 'active' || pStatus === 'trial' || pStatus === 'grace'
-            || pExpires > now
-            || pGrace > now
-            || pComplimentary > now
-            || (pPremiumGb > 0 && (!pPremiumExp || pPremiumExp > now))
-            || !(pDeleted > 0 && pDeleted < retentionCutoff);
-        if (stillEntitled) {
-            return { ok: true, userId: uid, skipped: true, reason: 'entitlement_changed' };
-        }
-    }
-
-    if (deleteFiles) {
+    // THIS process - the FINAL entitlement re-check and the filesystem
+    // deletion serialize under the database-writer gate (same gate the
+    // payment creditor holds) so no credit can commit between the check and
+    // the rm. Any live or renewed entitlement, or a tombstone that no longer
+    // satisfies the cutoff, makes this a skip - never a failure. The check
+    // itself is reads only - no nested writer acquisition inside.
+    const doFilesystemDelete = async () => {
         const dirsToDelete = new Set();
 
         for (const key of possibleKeys) {
@@ -3461,53 +3603,109 @@ const purgeUserEverywhereUnlocked = async (userId, options = {}) => {
         }
 
         deleted.filesDeleted = deleted.directories.length > 0;
-    }
+    };
 
-    if (!preserveNftData) {
-        try {
-            const nftService = require('../nft-service');
-            if (nftService?.balance?.deleteUserData) {
-                deleted.nftDb = nftService.balance.deleteUserData(uid);
+    // NFT cleanup + metadata deletes in one block so the retention path can
+    // hold the database-writer gate across the ENTIRE purge: a core payment
+    // credit must not commit between the entitlement re-check and the
+    // user_plan/users deletion. Manual deletion keeps the same ungated
+    // behavior as before.
+    const doMetadataDelete = async () => {
+        if (!preserveNftData) {
+            try {
+                const nftService = require('../nft-service');
+                if (nftService?.balance?.deleteUserData) {
+                    deleted.nftDb = nftService.balance.deleteUserData(uid);
+                }
+            } catch (e) {
+                console.warn('[UserPurge] NFT DB cleanup skipped:', e.message);
             }
-        } catch (e) {
-            console.warn('[UserPurge] NFT DB cleanup skipped:', e.message);
         }
+
+        deleted.db.cloud_chunks = await safeDeleteFromTable('cloud_chunks', 'user_id = ?', [uid]);
+        deleted.db.cloud_device_state = await safeDeleteFromTable('cloud_device_state', 'user_id = ?', [uid]);
+        deleted.db.files = await safeDeleteFromTable('files', 'user_id = ?', [uid]);
+        deleted.db.platform_hashes = await safeDeleteFromTable('platform_hashes', 'user_id = ?', [uid]);
+        deleted.db.solana_payments = await safeDeleteFromTable('solana_payments', 'user_id = ?', [uid]);
+
+        const deviceUuids = devices.map(d => d && d.device_uuid ? String(d.device_uuid) : '').filter(Boolean);
+        let linkedDeleted = 0;
+        for (const deviceUuid of deviceUuids) {
+            linkedDeleted += await safeDeleteFromTable(
+                'linked_devices',
+                'device_uuid_a = ? OR device_uuid_b = ?',
+                [deviceUuid, deviceUuid]
+            );
+        }
+        deleted.db.linked_devices = linkedDeleted;
+
+        deleted.db.user_plans = await safeDeleteFromTable('user_plans', 'user_id = ?', [uid]);
+        deleted.db.devices = await safeDeleteFromTable('devices', 'user_id = ?', [uid]);
+        deleted.db.users = await safeDeleteFromTable('users', 'id = ?', [uid]);
+
+        // Detach the ecosystem member — the shared account, paid sub, ad claims
+        // and social state all belong to the ACCOUNT, not the user, so they must
+        // survive for any still-linked apps (a PaceSeeker device keeps what was
+        // paid for). But the member row itself keys on this identity: leaving it
+        // makes a tombstone that permanently blocks the one-app-per-account slot,
+        // so a re-registered user could never rejoin their own account even via
+        // the same verified wallet, and every sub update would materialize
+        // user_plans rows for a dead user_id. Deleting it frees the slot; if a
+        // surviving member still proves the same wallet, rejoin restores access.
+        deleted.db.ecosystem_members = await safeDeleteFromTable('ecosystem_members', "app = 'photolynk' AND identity = ?", [String(uid)]);
+
+        console.log(`[UserPurge] Completed user=${uid} reason=${reason} files=${deleteFiles ? 'yes' : 'no'}`);
+        return { ok: true, deleted };
+    };
+
+    if (reason === 'autopurge_retention') {
+        return await paymentRecovery.withDatabaseWriter(DB_PATH, async () => {
+            // Core effective entitlement (read-only, no projection writes):
+            // an active resolved member or shared timeline blocks deletion.
+            let coreActive = false;
+            const now = Date.now();
+            if (ecosystemReady) {
+                // Fail CLOSED: a resolution error means entitlement state is
+                // unknown, so this pass must skip rather than delete files
+                // on a null snapshot.
+                let snap;
+                try {
+                    snap = await ecosystem.resolveIdentity('photolynk', String(uid), { project: false });
+                } catch (e) {
+                    console.error(`[UserPurge] Entitlement resolution failed for user ${uid} - skipping purge:`, e.message);
+                    return { ok: true, userId: uid, skipped: true, reason: 'entitlement_unavailable' };
+                }
+                const ent = snap && snap.entitlement;
+                if (ent && (ent.active || (ent.expiresAt != null && Number(ent.expiresAt) > now))) coreActive = true;
+                if (snap && Number(snap.sharedUntil) > now) coreActive = true;
+            }
+            const plan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [uid]);
+            const retentionCutoff = now - (PURGE_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+            const pStatus = plan ? String(plan.status || '') : '';
+            const pExpires = Number(plan?.expires_at) || 0;
+            const pGrace = Number(plan?.grace_until) || 0;
+            const pTrial = Number(plan?.trial_until) || 0;
+            const pComplimentary = pTrial > 0 ? pTrial + Math.max(0, TRIAL_COMPLIMENTARY_DAYS) * 24 * 60 * 60 * 1000 : 0;
+            const pPremiumGb = Number(plan?.premium_gb) || 0;
+            const pPremiumExp = Number(plan?.premium_expires_at) || 0;
+            const pDeleted = Number(plan?.deleted_at) || 0;
+            const stillEntitled = coreActive || !plan
+                || pStatus === 'active' || pStatus === 'trial' || pStatus === 'grace'
+                || pExpires > now
+                || pGrace > now
+                || pComplimentary > now
+                || (pPremiumGb > 0 && (!pPremiumExp || pPremiumExp > now))
+                || !(pDeleted > 0 && pDeleted < retentionCutoff);
+            if (stillEntitled) {
+                return { ok: true, userId: uid, skipped: true, reason: 'entitlement_changed' };
+            }
+            if (deleteFiles) await doFilesystemDelete();
+            return await doMetadataDelete();
+        });
     }
 
-    deleted.db.cloud_chunks = await safeDeleteFromTable('cloud_chunks', 'user_id = ?', [uid]);
-    deleted.db.cloud_device_state = await safeDeleteFromTable('cloud_device_state', 'user_id = ?', [uid]);
-    deleted.db.files = await safeDeleteFromTable('files', 'user_id = ?', [uid]);
-    deleted.db.platform_hashes = await safeDeleteFromTable('platform_hashes', 'user_id = ?', [uid]);
-    deleted.db.solana_payments = await safeDeleteFromTable('solana_payments', 'user_id = ?', [uid]);
-
-    const deviceUuids = devices.map(d => d && d.device_uuid ? String(d.device_uuid) : '').filter(Boolean);
-    let linkedDeleted = 0;
-    for (const deviceUuid of deviceUuids) {
-        linkedDeleted += await safeDeleteFromTable(
-            'linked_devices',
-            'device_uuid_a = ? OR device_uuid_b = ?',
-            [deviceUuid, deviceUuid]
-        );
-    }
-    deleted.db.linked_devices = linkedDeleted;
-
-    deleted.db.user_plans = await safeDeleteFromTable('user_plans', 'user_id = ?', [uid]);
-    deleted.db.devices = await safeDeleteFromTable('devices', 'user_id = ?', [uid]);
-    deleted.db.users = await safeDeleteFromTable('users', 'id = ?', [uid]);
-
-    // Detach the ecosystem member — the shared account, paid sub, ad claims
-    // and social state all belong to the ACCOUNT, not the user, so they must
-    // survive for any still-linked apps (a PaceSeeker device keeps what was
-    // paid for). But the member row itself keys on this identity: leaving it
-    // makes a tombstone that permanently blocks the one-app-per-account slot,
-    // so a re-registered user could never rejoin their own account even via
-    // the same verified wallet, and every sub update would materialize
-    // user_plans rows for a dead user_id. Deleting it frees the slot; if a
-    // surviving member still proves the same wallet, rejoin restores access.
-    deleted.db.ecosystem_members = await safeDeleteFromTable('ecosystem_members', "app = 'photolynk' AND identity = ?", [String(uid)]);
-
-    console.log(`[UserPurge] Completed user=${uid} reason=${reason} files=${deleteFiles ? 'yes' : 'no'}`);
-    return { ok: true, deleted };
+    if (deleteFiles) await doFilesystemDelete();
+    return await doMetadataDelete();
 };
 // === USER_PURGE_END ===
 
@@ -4386,9 +4584,31 @@ app.get('/ai-federation/dashboard', async (req, res) => {
 // ============================================================================
 
 const PS_TRIAL_DAYS = Number.parseInt(process.env.PS_TRIAL_DAYS || '7', 10);
-const psTrialBuckets = new Map();
+const psTrialBuckets = new Map(); // ip -> {count,reset}
+const psDeviceBuckets = new Map(); // device_hash -> {count,reset}
 // Minute-level presence pings (~60/hr) + trial syncs + NAT headroom.
-const PS_TRIAL_RATE_LIMIT = 300; // requests per IP per hour
+// Per-device ceiling: 120/hr; per-IP ceiling: 12000/hr (a shared NAT with
+// ~10 devices still fits with wide headroom).
+const PS_TRIAL_RATE_LIMIT = 12000; // requests per IP per hour
+const PS_DEVICE_RATE_LIMIT = 120;  // requests per device per hour
+const PS_RATE_MAP_MAX = 20000;
+const psRateCheck = (map, key, limit) => {
+    const now = Date.now();
+    let b = map.get(key);
+    if (!b) {
+        if (map.size >= PS_RATE_MAP_MAX) {
+            // Shed oldest entries first; a still-full map refuses to track a
+            // new key - fail closed as unavailable rather than unbounded.
+            let dropped = 0;
+            for (const [k, v] of map) { if (v.reset <= now || dropped < 1000) { map.delete(k); dropped++; } }
+            if (map.size >= PS_RATE_MAP_MAX) return 'overflow';
+        }
+        b = { count: 0, reset: now + 3600000 };
+        map.set(key, b);
+    }
+    if (now > b.reset) { b.count = 0; b.reset = now + 3600000; }
+    return ++b.count > limit ? 'limited' : 'ok';
+};
 
 // Resolve country for a device lazily: only when the IP is new/changed, cached
 // in-memory (pings run ~60s - a lookup per ping would exhaust ip-api limits).
@@ -4543,14 +4763,15 @@ db.serialize(() => {
     // wallet_verified=1 means the wallet was proven by an Ed25519 signature
     // (PhotoLynk: wallet-login; PaceSeeker: /api/ecosystem/bind-wallet). Only
     // verified wallets drive account matching — an unverified claim could
-    // otherwise join a stranger's account by reporting their address.
+    // otherwise join a stranger's account by reporting their address. The
+    // core's legacy baseline reconciles pre-existing rows via member proofs;
+    // no blanket verified=1 write runs here anymore.
     db.run(`ALTER TABLE ecosystem_members ADD COLUMN wallet_verified INTEGER DEFAULT 0`, () => { });
     // When an unverified wallet claim last changed — a verified bind requires
     // the claimed wallet to have been stable for a while, so a stolen device
     // hash can't be used to overwrite-and-bind in one shot: the real device's
     // next heartbeat reverts the unverified wallet long before the window ends.
     db.run(`ALTER TABLE ecosystem_members ADD COLUMN wallet_changed_at INTEGER`, () => { });
-    db.run(`UPDATE ecosystem_members SET wallet_verified = 1 WHERE app = 'photolynk' AND wallet IS NOT NULL`, () => { });
     db.run(`CREATE INDEX IF NOT EXISTS idx_eco_members_wallet ON ecosystem_members(wallet)`, (e) => { if (e) console.error('[Eco] idx wallet:', e.message); });
     db.run(`CREATE INDEX IF NOT EXISTS idx_eco_members_acct ON ecosystem_members(account_id)`, (e) => { if (e) console.error('[Eco] idx acct:', e.message); });
     db.run(`CREATE INDEX IF NOT EXISTS idx_ad_claims_status ON ad_claims(status)`, (e) => { if (e) console.error('[Eco] idx claims:', e.message); });
@@ -4559,10 +4780,10 @@ db.serialize(() => {
     db.run(`ALTER TABLE ecosystem_accounts ADD COLUMN ad_strict INTEGER DEFAULT 0`, () => { });
     db.run(`ALTER TABLE ad_claims ADD COLUMN verify_attempts INTEGER DEFAULT 0`, () => { });
     // granted_at marks that this week's entitlement was already issued — the
-    // atomic UPDATE-guard below prevents double-grants on concurrent claims
-    // and on resubmits after a background rejection.
+    // atomic grant path prevents double-grants on concurrent claims and on
+    // resubmits after a background rejection. The core baseline reconciles
+    // pre-existing rows; the blanket COALESCE backfill no longer runs.
     db.run(`ALTER TABLE ad_claims ADD COLUMN granted_at INTEGER`, () => { });
-    db.run(`UPDATE ad_claims SET granted_at = COALESCE(granted_at, created_at) WHERE granted_at IS NULL`, () => { });
     // Which app claimed the week (grants are app-local) and which PhotoLynk
     // tier it was claimed for (100/200GB only — free access never binds).
     db.run(`ALTER TABLE ad_claims ADD COLUMN app TEXT`, () => { });
@@ -4617,6 +4838,101 @@ function _loadEcoSigningKey() {
 const ECO_SIGNING_KEY = _loadEcoSigningKey();
 if (!ECO_SIGNING_KEY) console.warn('[Eco] WARNING: no RC signing key — ecosystem grants cannot be issued to PaceSeeker clients');
 
+// Ecosystem entitlement core: single writer model for accounts/members/
+// receipts/benefits. Created against the same sqlite3 module + DB_PATH as the
+// rest of the server; initialized in the readiness chain at the bottom of the
+// file. `ecosystemReady` flips true only after schema + baseline migration
+// committed, so no route/worker touches core state before it is durable.
+const ecosystem = createEcosystemService({ sqlite3, dbPath: DB_PATH, registry: DEFAULT_REGISTRY });
+let ecosystemReady = false;
+let paymentProtocol = null; // created once treasury helpers exist
+// Admin-visible ecosystem-core startup state: { ok, code, message, at,
+// attempts }. ok=false means the server is running in legacy compatibility
+// mode — legacy routes keep working; a retry timer keeps probing the core.
+let _ecoInitState = null;
+let _ecoInitAttempts = 0;
+let _ecoInitTimer = null;
+
+// Durable proof evidence for a PL wallet: the ed25519-verified
+// solana_wallet_bindings row is the legacy proof of ownership. Returns a
+// proofKind/proofRef pair derived from that durable evidence, or nulls when
+// no binding exists - verified:true alone never invents a proof.
+const ecoPlBindingProof = async (userId, wallet) => {
+    if (!userId || !wallet) return { proofKind: null, proofRef: null };
+    try {
+        const row = await dbGetAsync(
+            `SELECT wallet, verified_at FROM solana_wallet_bindings WHERE user_id = ? AND wallet = ?`,
+            [Number(userId), String(wallet)]);
+        if (!row) return { proofKind: null, proofRef: null };
+        return {
+            proofKind: 'siws',
+            proofRef: crypto.createHash('sha256').update(`binding:${userId}:${wallet}`).digest('hex'),
+        };
+    } catch (e) { return { proofKind: null, proofRef: null }; }
+};
+
+// Existing member proof for a PS device wallet - the only acceptable proof
+// source for verified:true callers on the PaceSeeker path.
+const ecoPsMemberProof = async (deviceHash, wallet) => {
+    if (!deviceHash || !wallet || !ecosystemReady) return { proofKind: null, proofRef: null };
+    try {
+        const row = await ecosystem.readTransaction((tx) => tx.get(
+            `SELECT kind, reference FROM ecosystem_member_proofs WHERE app = 'paceseeker' AND identity = ? AND wallet = ?`,
+            [String(deviceHash), String(wallet)]));
+        if (!row) return { proofKind: null, proofRef: null };
+        return { proofKind: row.kind || 'bind', proofRef: row.reference || `proof:${deviceHash}` };
+    } catch (e) { return { proofKind: null, proofRef: null }; }
+};
+
+// Repair + read the current projection for a user/device after a duplicate or
+// mirror path. Deduped per key so concurrent reads share one projection write.
+const _ecoProjectInFlight = new Map();
+const _ecoProject = (app, identity) => {
+    if (!ecosystemReady) return Promise.resolve(null);
+    const key = `${app}:${identity}`;
+    const held = _ecoProjectInFlight.get(key);
+    if (held) return held;
+    const p = (async () => {
+        try {
+            return await ecosystem.resolveIdentity(app, String(identity), { project: true });
+        } catch (e) {
+            console.warn('[Eco] projection failed for', key, e.message);
+            return null;
+        } finally {
+            _ecoProjectInFlight.delete(key);
+        }
+    })();
+    _ecoProjectInFlight.set(key, p);
+    return p;
+};
+const syncEcoUser = (userId) => _ecoProject('photolynk', userId);
+const syncEcoDevice = (deviceHash) => _ecoProject('paceseeker', deviceHash);
+
+// Signed ECO2 entitlement envelope for a PhotoLynk user: core-derived
+// sources plus server-only extras (trial/grace/premium-storage) so the
+// client's signed cache keeps those privileges distinct - they never
+// become shared benefits and never cross apps. Returns null unsigned when
+// the core/protocol is not ready or the member is absent; additive field
+// only - public response values never derive from it.
+const ecoEntitlementEnvelopeForUser = async (userId, planRow) => {
+    if (!ecosystemReady || !paymentProtocol) return null;
+    try {
+        const snap = await ecosystem.resolveIdentity('photolynk', String(userId), { project: false });
+        if (!snap || !snap.entitlement) return null;
+        const extras = [];
+        const now = Date.now();
+        const t = Number(planRow?.trial_until) || 0;
+        if (t > now) extras.push({ eventId: `trial:${userId}`, kind: 'trial', startsAt: null, expiresAt: t, planGb: Number(planRow?.plan_gb) || 0 });
+        const g = Number(planRow?.grace_until) || 0;
+        if (g > now) extras.push({ eventId: `grace:${userId}`, kind: 'grace', startsAt: null, expiresAt: g, planGb: Number(planRow?.plan_gb) || 0 });
+        const pg = Number(planRow?.premium_gb) || 0;
+        const pe = Number(planRow?.premium_expires_at) || 0;
+        if (pg > 0 && (!pe || pe > now)) extras.push({ eventId: `premium:${userId}`, kind: 'premium_storage', startsAt: null, expiresAt: pe || null, planGb: pg });
+        const signed = paymentProtocol.signEntitlement(snap, { app: 'photolynk', identity: String(userId), extraBenefits: extras });
+        return { keyId: signed.keyId, payload: signed.payload, signature: signed.signature };
+    } catch (e) { return null; }
+};
+
 // 'ECO1|<account_id>|<sub_until>' signed with the RC key. The PaceSeeker client
 // verifies it with the same baked public key it uses for remote config.
 const _ecoGrantCache = new Map();
@@ -4653,101 +4969,69 @@ const ECO_MERGE_STABILITY_MS = 60 * 60 * 1000;
 // Move this member into the account another verified member already anchors
 // with the same wallet, absorbing the emptied source account. Returns the
 // merged account id, or null when no merge applies (no other holder, or the
-// target already has this app).
-async function _ecoTryWalletMerge(app, identity, accountId, wallet) {
-    const other = await dbGetAsync(
-        `SELECT account_id FROM ecosystem_members WHERE wallet = ? AND wallet_verified = 1 AND NOT (app = ? AND identity = ?) LIMIT 1`,
-        [wallet, app, String(identity)]);
-    if (!other || other.account_id === accountId) return null;
-    const conflict = await dbGetAsync(
-        `SELECT 1 AS x FROM ecosystem_members WHERE account_id = ? AND app = ? LIMIT 1`,
-        [other.account_id, app]);
-    if (conflict) return null;
-    await dbRunAsync(`UPDATE ecosystem_members SET account_id = ? WHERE app = ? AND identity = ?`,
-        [other.account_id, app, String(identity)]);
-    await ecoMergeAccounts(other.account_id, accountId);
-    return other.account_id;
-}
-
-async function ecoEnsureAccount(app, identity, wallet, { verified = false } = {}) {
-    const existing = await dbGetAsync(
-        `SELECT account_id, wallet, wallet_verified, wallet_changed_at FROM ecosystem_members WHERE app = ? AND identity = ?`, [app, String(identity)]);
-    if (existing) {
-        if (wallet && (existing.wallet !== wallet || (verified && !existing.wallet_verified))) {
-            // Unverified reports never overwrite a verified wallet binding.
-            // A conflicting report still bumps wallet_changed_at — proof of
-            // life that resets the merge-stability window, so a stolen device
-            // hash can't quietly wait out the delay while the real device
-            // keeps reporting its actual wallet.
-            if (!verified && existing.wallet_verified) {
-                await dbRunAsync(`UPDATE ecosystem_members SET wallet_changed_at = ? WHERE app = ? AND identity = ?`, [Date.now(), app, String(identity)]);
-                return existing.account_id;
-            }
-            // Going from no wallet to a first wallet is not a "change" — the
-            // stability window must not delay the dominant connect→bind flow.
-            const walletChangedAt = (existing.wallet && existing.wallet !== wallet) ? Date.now() : existing.wallet_changed_at;
-            await dbRunAsync(`UPDATE ecosystem_members SET wallet = ?, wallet_verified = ?, wallet_changed_at = ? WHERE app = ? AND identity = ?`,
-                [wallet, verified ? 1 : 0, walletChangedAt, app, String(identity)]);
-            if (verified && (!walletChangedAt || Date.now() - walletChangedAt >= ECO_MERGE_STABILITY_MS)) {
-                const merged = await _ecoTryWalletMerge(app, String(identity), existing.account_id, wallet);
-                if (merged) return merged;
-            }
-            return existing.account_id;
-        }
-        // Matching report on an already-verified wallet: retry a deferred
-        // merge once the reported wallet has been stable for the window.
-        if (wallet && existing.wallet_verified && existing.wallet === wallet) {
-            const stable = !existing.wallet_changed_at || (Date.now() - existing.wallet_changed_at) >= ECO_MERGE_STABILITY_MS;
-            if (stable) {
-                const merged = await _ecoTryWalletMerge(app, String(identity), existing.account_id, wallet);
-                if (merged) return merged;
-            }
-        }
-        return existing.account_id;
+// target already has this app). The core performs this inside ensureAccount —
+// proven-wallet holders are resolved from member proofs, merges go through
+// mergeAccountsTx, and collisions land as identity_conflict events rather
+// than a LIMIT 1 authority query.
+async function ecoEnsureAccount(app, identity, wallet, { verified = false, proofKind = null, proofRef = null, allowRotation = false } = {}) {
+    if (!proofKind && verified) {
+        // A legacy verified:true flag must never invent a proof. PhotoLynk may
+        // upgrade via durable solana_wallet_bindings evidence; PaceSeeker only
+        // via an existing member proof row.
+        const p = app === 'photolynk' ? await ecoPlBindingProof(identity, wallet)
+            : app === 'paceseeker' ? await ecoPsMemberProof(identity, wallet)
+                : { proofKind: null, proofRef: null };
+        proofKind = p.proofKind;
+        proofRef = p.proofRef;
     }
-    let accountId = null;
-    if (wallet && verified) {
-        const w = await dbGetAsync(`SELECT account_id FROM ecosystem_members WHERE wallet = ? AND wallet_verified = 1 LIMIT 1`, [wallet]);
-        if (w) {
-            // One instance per app per account: only join when this app is not
-            // already registered on that account (e.g. a second phone with the
-            // same wallet gets its own unsubscribed account instead).
-            const hasApp = await dbGetAsync(`SELECT 1 AS x FROM ecosystem_members WHERE account_id = ? AND app = ? LIMIT 1`, [w.account_id, app]);
-            if (!hasApp) accountId = w.account_id;
-        }
-    }
-    if (!accountId) {
-        accountId = 'eco_' + crypto.createHash('sha256').update(`${app}|${identity}|${Date.now()}|${crypto.randomBytes(8).toString('hex')}`).digest('hex').slice(0, 24);
+    if (!ecosystemReady) {
+        // Pre-readiness fallback: minimal member upsert only. The readiness
+        // middleware keeps routes from reaching here; pollers may land a
+        // first-contact row that the core will adopt on initialize.
+        const existing = await dbGetAsync(
+            `SELECT account_id FROM ecosystem_members WHERE app = ? AND identity = ?`, [app, String(identity)]);
+        if (existing) return existing.account_id;
+        const accountId = 'eco_' + crypto.createHash('sha256').update(`${app}|${identity}|${Date.now()}|${crypto.randomBytes(8).toString('hex')}`).digest('hex').slice(0, 24);
         await dbRunAsync(`INSERT INTO ecosystem_accounts (account_id, primary_wallet, created_at) VALUES (?, ?, ?)`,
             [accountId, wallet || null, Date.now()]);
+        await dbRunAsync(`INSERT OR IGNORE INTO ecosystem_members (account_id, app, identity, wallet, wallet_verified, wallet_changed_at, linked_at) VALUES (?, ?, ?, ?, 0, NULL, ?)`,
+            [accountId, app, String(identity), wallet || null, Date.now()]);
+        const final = await dbGetAsync(
+            `SELECT account_id FROM ecosystem_members WHERE app = ? AND identity = ?`, [app, String(identity)]);
+        if (final && final.account_id !== accountId) {
+            db.run(`DELETE FROM ecosystem_accounts WHERE account_id = ? AND NOT EXISTS (SELECT 1 FROM ecosystem_members WHERE account_id = ?)`,
+                [accountId, accountId], () => { });
+            return final.account_id;
+        }
+        return accountId;
     }
-    // wallet_changed_at stays NULL on first contact — a first wallet is not a
-    // change, and instant cross-app linking must not hit the stability window.
-    await dbRunAsync(`INSERT OR IGNORE INTO ecosystem_members (account_id, app, identity, wallet, wallet_verified, wallet_changed_at, linked_at) VALUES (?, ?, ?, ?, ?, NULL, ?)`,
-        [accountId, app, String(identity), wallet || null, verified ? 1 : 0, Date.now()]);
-    // Concurrent first-contact for the same (app, identity) can lose the
-    // INSERT race — the member row already points at the other winner's
-    // account. Always return the account the member row actually lives in,
-    // and reap the memberless account row we created for nothing.
-    const final = await dbGetAsync(
-        `SELECT account_id FROM ecosystem_members WHERE app = ? AND identity = ?`, [app, String(identity)]);
-    if (final && final.account_id !== accountId) {
-        db.run(`DELETE FROM ecosystem_accounts WHERE account_id = ? AND NOT EXISTS (SELECT 1 FROM ecosystem_members WHERE account_id = ?)`,
-            [accountId, accountId], () => { });
-        return final.account_id;
-    }
-    if (wallet && verified) db.run(`UPDATE ecosystem_accounts SET primary_wallet = COALESCE(primary_wallet, ?) WHERE account_id = ?`, [wallet, accountId], () => { });
-    return accountId;
+    return await ecosystem.ensureAccount(app, String(identity), {
+        wallet: wallet || null, proofKind, proofRef, allowRotation,
+    });
 }
 
-const ecoGetSub = (accountId) => dbGetAsync(`SELECT * FROM stealthlynk_subs WHERE account_id = ?`, [accountId]);
+// Canonical resolved shared expiry + provenance for an account. The core
+// compat writer keeps stealthlynk_subs in sync, so callers still receive the
+// legacy row shape — resolved through the canonical account, never raw alias
+// rows.
+const ecoGetSub = async (accountId) => {
+    if (ecosystemReady) {
+        const snap = await ecosystem.resolveAccount(accountId, { project: true }).catch(() => null);
+        if (snap) {
+            const row = await dbGetAsync(`SELECT * FROM stealthlynk_subs WHERE account_id = ?`, [snap.accountId]).catch(() => null);
+            if (row) return row;
+            return { account_id: snap.accountId, sub_until: snap.sharedUntil == null ? null : snap.sharedUntil, source_app: null, source_kind: null, provenance: null, updated_at: null };
+        }
+    }
+    return dbGetAsync(`SELECT * FROM stealthlynk_subs WHERE account_id = ?`, [accountId]);
+};
 
 // Legacy paid users who bought a PhotoLynk plan before the ecosystem layer
 // existed have a live user_plans.expires_at but no stealthlynk_subs row —
 // without this backfill installing PaceSeeker later would show them as
-// unsubscribed until their next renewal. Idempotent (floor semantics) and
-// only fires when the local plan would RAISE the shared expiry, so it never
-// rewrites provenance of a later ad claim or payment.
+// unsubscribed until their next renewal. The core seeds that baseline once
+// from the legacy snapshot at initialize/attach time; runtime calls just
+// repair the projection — a live user_plans row never mints new shared time.
 // Payment types that may feed the shared ecosystem entitlement: '' = legacy
 // rows predating the column (the solana verifier was the only writer then);
 // 'ecosystem' = materialized from the shared sub itself.
@@ -4758,27 +5042,8 @@ const ecoGetSub = (accountId) => dbGetAsync(`SELECT * FROM stealthlynk_subs WHER
 const ECO_BINDABLE_PAYMENT_TYPES = new Set(['', 'solana', 'skr', 'ecosystem', 'apple', 'google']);
 async function ecoBackfillPhotolynkSub(accountId) {
     try {
-        const members = await dbAllAsync(
-            `SELECT identity FROM ecosystem_members WHERE account_id = ? AND app = 'photolynk'`, [accountId]);
-        for (const m of members) {
-            const plan = await dbGetAsync(
-                `SELECT expires_at, payment_type, plan_gb FROM user_plans WHERE user_id = ? AND status = 'active' AND deleted_at IS NULL ORDER BY expires_at DESC LIMIT 1`,
-                [Number(m.identity)]);
-            const expiresAt = Number(plan?.expires_at) || 0;
-            if (expiresAt <= Date.now()) continue;
-            // Only binding tiers feed the shared sub: 100/200GB plans and
-            // ad-week grants are app-local by design. Only PROVEN payment
-            // types may bind — on-chain-verified solana/skr, ecosystem-
-            // materialized rows, and NULL (legacy solana-era rows predating
-            // the column). Store/client-reported types (apple, google, …)
-            // are never bound without receipt verification.
-            if ((Number(plan.plan_gb) || 0) < ECO_BIND_MIN_TIER_GB) continue;
-            if (!ECO_BINDABLE_PAYMENT_TYPES.has(plan.payment_type == null ? '' : String(plan.payment_type))) continue;
-            const cur = await ecoGetSub(accountId);
-            if (expiresAt <= (Number(cur?.sub_until) || 0)) continue;
-            const kind = plan.payment_type === 'ecosystem' ? 'link_sync' : 'payment';
-            await ecoFloorSub(accountId, expiresAt, { sourceApp: 'photolynk', kind, provenance: `plan:${plan.payment_type || 'legacy'}` });
-        }
+        if (!ecosystemReady) return;
+        await ecosystem.resolveAccount(accountId, { project: true });
     } catch (e) { console.warn('[Eco] PL sub backfill failed:', e.message); }
 }
 
@@ -4790,28 +5055,30 @@ async function ecoBackfillPhotolynkSub(accountId) {
 // source account intact enough for the next login/bind to merge again.
 async function ecoMergeAccounts(targetId, sourceId) {
     if (!targetId || !sourceId || targetId === sourceId) return targetId;
-    const a = await ecoGetSub(targetId); const b = await ecoGetSub(sourceId);
-    const maxUntil = Math.max(Number(a?.sub_until) || 0, Number(b?.sub_until) || 0);
-    if (maxUntil > 0) {
-        // Keep the winning sub's provenance — including an ad_claim's
-        // source_app, which decides which app the entitlement stays local to.
-        const winner = (Number(b?.sub_until) || 0) > (Number(a?.sub_until) || 0) ? b : a;
-        await dbRunAsync(`INSERT INTO stealthlynk_subs (account_id, sub_until, source_app, source_kind, provenance, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(account_id) DO UPDATE SET sub_until = excluded.sub_until,
-                source_app = excluded.source_app, source_kind = excluded.source_kind,
-                provenance = excluded.provenance, updated_at = excluded.updated_at`,
-            [targetId, maxUntil, winner?.source_app || 'merge', winner?.source_kind || 'merge', winner?.provenance || '', Date.now()]);
+    if (!ecosystemReady) {
+        const a = await dbGetAsync(`SELECT * FROM stealthlynk_subs WHERE account_id = ?`, [targetId]);
+        const b = await dbGetAsync(`SELECT * FROM stealthlynk_subs WHERE account_id = ?`, [sourceId]);
+        const maxUntil = Math.max(Number(a?.sub_until) || 0, Number(b?.sub_until) || 0);
+        if (maxUntil > 0) {
+            const winner = (Number(b?.sub_until) || 0) > (Number(a?.sub_until) || 0) ? b : a;
+            await dbRunAsync(`INSERT INTO stealthlynk_subs (account_id, sub_until, source_app, source_kind, provenance, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id) DO UPDATE SET sub_until = excluded.sub_until,
+                    source_app = excluded.source_app, source_kind = excluded.source_kind,
+                    provenance = excluded.provenance, updated_at = excluded.updated_at`,
+                [targetId, maxUntil, winner?.source_app || 'merge', winner?.source_kind || 'merge', winner?.provenance || '', Date.now()]);
+        }
+        await dbRunAsync(`UPDATE OR IGNORE ecosystem_members SET account_id = ? WHERE account_id = ?`, [targetId, sourceId]);
+        await dbRunAsync(`DELETE FROM ecosystem_members WHERE account_id = ?`, [sourceId]); // PK collisions left behind
+        // ad_claims is UNIQUE(account_id, week_key) — both accounts may hold a
+        // claim for the same week (e.g. each posted before linking). OR IGNORE
+        // keeps the target's own row for that week; leftovers die with the source.
+        await dbRunAsync(`UPDATE OR IGNORE ad_claims SET account_id = ? WHERE account_id = ?`, [targetId, sourceId]);
+        await dbRunAsync(`DELETE FROM ad_claims WHERE account_id = ?`, [sourceId]);
+        await dbRunAsync(`DELETE FROM ecosystem_accounts WHERE account_id = ?`, [sourceId]);
+        return targetId;
     }
-    await dbRunAsync(`UPDATE OR IGNORE ecosystem_members SET account_id = ? WHERE account_id = ?`, [targetId, sourceId]);
-    await dbRunAsync(`DELETE FROM ecosystem_members WHERE account_id = ?`, [sourceId]); // PK collisions left behind
-    // ad_claims is UNIQUE(account_id, week_key) — both accounts may hold a
-    // claim for the same week (e.g. each posted before linking). OR IGNORE
-    // keeps the target's own row for that week; leftovers die with the source.
-    await dbRunAsync(`UPDATE OR IGNORE ad_claims SET account_id = ? WHERE account_id = ?`, [targetId, sourceId]);
-    await dbRunAsync(`DELETE FROM ad_claims WHERE account_id = ?`, [sourceId]);
-    await dbRunAsync(`DELETE FROM ecosystem_accounts WHERE account_id = ?`, [sourceId]);
-    return targetId;
+    return await ecosystem.mergeAccounts(targetId, sourceId);
 }
 
 // Apply a concrete sub_until to the shared record and materialize it into each
@@ -4820,8 +5087,16 @@ async function ecoMergeAccounts(targetId, sourceId) {
 // onlyApp limits member materialization to one app (ad weeks are app-local —
 // they must never light up the other ecosystem app). plTierGb overrides the
 // PhotoLynk plan size (ad weeks cap at ECO_AD_MAX_TIER_GB, not the bind tier).
+// Payments already commit through the creditor/core receipt path, so post-ready
+// mirror calls only resolve + project the current read model — they can never
+// append a second extension.
 // === ECO_APPLY_SUB_BEGIN ===
 async function ecoApplySub(accountId, subUntil, { sourceApp, kind, provenance, onlyApp, plTierGb } = {}) {
+    if (ecosystemReady) {
+        const snap = await ecosystem.resolveAccount(accountId, { project: true }).catch(() => null);
+        if (!snap) return Number(subUntil) || 0;
+        return snap.sharedUntil == null ? (Number(subUntil) || 0) : (Number(snap.sharedUntil) || 0);
+    }
     const now = Date.now();
     // The shared expiry is a FLOOR for automatic writes: an out-of-order
     // renewal mirror can never shorten what a newer payment already set, and
@@ -4897,6 +5172,15 @@ async function ecoApplySub(accountId, subUntil, { sourceApp, kind, provenance, o
 // otherwise one ad claim would silently lift an admin revoke. Admin actions
 // pass allowRevoked to override.
 async function ecoGrantSub(accountId, durationMs, meta = {}) {
+    if (ecosystemReady) {
+        const days = Math.min(365, Math.max(1, Math.round(Number(durationMs) / 86400000)));
+        const r = await ecosystem.adjustShared(accountId, {
+            action: 'extend', days,
+            eventId: `admin:extend:${accountId}:${crypto.randomBytes(8).toString('hex')}`,
+            actor: meta.sourceApp === 'admin' ? 'admin' : (meta.sourceApp || 'system'),
+        }).catch((e) => { console.warn('[Eco] adjustShared extend failed:', e.message); return null; });
+        return r ? (Number(r.sharedUntil) || 0) : (Number((await ecoGetSub(accountId))?.sub_until) || 0);
+    }
     const cur = await ecoGetSub(accountId);
     if (cur?.source_kind === 'revoke' && !meta.allowRevoked) return Number(cur.sub_until) || 0;
     const base = Math.max(Date.now(), Number(cur?.sub_until) || 0);
@@ -4907,8 +5191,14 @@ async function ecoGrantSub(accountId, durationMs, meta = {}) {
 // `untilMs`, never shrinks, never extends. A 'revoke' row is sticky — automatic
 // re-mirrors (heartbeats, backfill, link sync) must not silently undo an admin
 // revoke; only a brand-new verified payment (allowRevoked) or an admin action
-// lifts it.
+// lifts it. Post-ready this is a read+project: the receipt already recorded
+// the grant, so the floor just returns the resolved expiry.
 async function ecoFloorSub(accountId, untilMs, meta = {}) {
+    if (ecosystemReady) {
+        const snap = await ecosystem.resolveAccount(accountId, { project: true }).catch(() => null);
+        if (!snap) return Number(untilMs) || 0;
+        return snap.sharedUntil == null ? (Number(untilMs) || 0) : (Number(snap.sharedUntil) || 0);
+    }
     const cur = await ecoGetSub(accountId);
     if (cur?.source_kind === 'revoke' && !meta.allowRevoked) return Number(cur.sub_until) || 0;
     const next = Math.max(Number(cur?.sub_until) || 0, Number(untilMs) || 0);
@@ -4921,7 +5211,27 @@ async function ecoFloorSub(accountId, untilMs, meta = {}) {
 // user_plans) and stealthlynk_subs is never touched, so ad time can never
 // be re-tagged as a paid binding or leak into future apps joining later.
 // Stacks from each member's current expiry and never shrinks paid time.
+// Post-ready the core owns the grant: service.grantAdClaim commits the
+// granted_at marker and every member effect in one transaction.
 async function ecoAdWeekGrant(who, { planGb = 100, provenance = '' } = {}) {
+    if (ecosystemReady) {
+        const wk = ecoWeekKey();
+        const claim = await dbGetAsync(
+            `SELECT id FROM ad_claims WHERE account_id = ? AND week_key = ?`, [who.accountId, wk]).catch(() => null);
+        if (!claim) return 0;
+        const r = await ecosystem.grantAdClaim(claim.id, { tierGb: planGb }).catch((e) => {
+            console.warn('[Eco] grantAdClaim failed:', e.message);
+            return null;
+        });
+        if (!r) return 0;
+        if (!r.granted && !r.alreadyGranted) return 0;
+        const g = (r.grants || []).find((x) => x.app === who.app && String(x.identity) === String(who.identity));
+        if (g) return Number(g.until) || 0;
+        // alreadyGranted or caller not in grants: report the caller's own
+        // effective expiry rather than fabricating a week.
+        const snap = await ecosystem.resolveIdentity(who.app, String(who.identity), { project: true }).catch(() => null);
+        return snap && snap.entitlement ? (Number(snap.entitlement.expiresAt) || 0) : 0;
+    }
     const now = Date.now();
     // Revoked accounts can't re-earn via ads (same gate ecoGrantSub applies
     // on the PS path — admin must lift the revoke or grant explicitly).
@@ -4989,7 +5299,14 @@ const ecoLocalAdApp = (sub) =>
 
 // When a member joins an account that already has a sub, propagate the shared
 // entitlement to its app row immediately (don't wait for a payment/ping).
+// Post-ready this is projection repair only — the core read model already
+// resolves what each member gets.
 async function ecoSyncMemberEntitlement(accountId) {
+    if (ecosystemReady) {
+        await ecoBackfillPhotolynkSub(accountId);
+        await ecosystem.resolveAccount(accountId, { project: true }).catch(() => null);
+        return;
+    }
     // Pull first: a PhotoLynk member's live plan is authoritative and can lift
     // the shared sub (legacy paid users, missed mirrors, manual admin edits).
     await ecoBackfillPhotolynkSub(accountId);
@@ -5015,6 +5332,84 @@ async function ecoSyncMemberEntitlement(accountId) {
         plTierGb: adKind ? ECO_AD_MAX_TIER_GB : undefined,
     });
 }
+
+// Premium claim + solana_payments insert in ONE core transaction: the
+// ecosystem receipt (with optional quote consumption) and the durable
+// ledger row commit together or not at all. Callers then run
+// resumePremiumPayment for the entitlement effects; markPremiumApplied is
+// stamped only after that succeeds. Returns {alreadyRecorded, applied} so
+// callers can route duplicates through their existing resume paths.
+const recordVerifiedPremiumPayment = async (args) => {
+    const uid = Number(args && args.userId);
+    const signature = String(args && args.signature || '').trim();
+    const token = String(args && args.token || 'SOL').toUpperCase();
+    if (!Number.isFinite(uid) || uid <= 0 || !signature || (token !== 'SOL' && token !== 'SKR')) {
+        throw new Error('invalid premium payment args');
+    }
+    const paymentAt = Number(args.paymentAt) > 0 ? Number(args.paymentAt) : Date.now();
+    const nowMs = Date.now();
+    return paymentRecovery.withAccountMutation(DB_PATH, uid, async () => {
+        if (!ecosystemReady) {
+            await dbRunAsync(
+                `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, skr_amount, payment_token, tier_gb, duration, created_at, verified_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [uid, signature, token === 'SKR' ? 0 : (Number(args.amount) || 0),
+                 token === 'SKR' ? (Number(args.amount) || 0) : 0, token, 0,
+                 token === 'SKR' ? 'premium_skr' : 'premium', paymentAt, nowMs]
+            );
+            return { alreadyRecorded: false };
+        }
+        return ecosystem.transaction(async (tx) => {
+            const claim = await ecosystem.claimPremiumInTransaction(tx, {
+                signature,
+                userId: uid,
+                token,
+                amountAtomic: args.amountAtomic != null ? String(args.amountAtomic) : null,
+                payerWallet: args.payerWallet || null,
+                mint: args.mint || null,
+                paidAt: paymentAt,
+                verifiedAt: nowMs,
+                quoteId: args.quoteId || null,
+                evidence: args.evidence || null,
+            });
+            if (!claim || claim.ok !== true) {
+                const err = new Error((claim && claim.code) || 'PAYMENT_CONFLICT');
+                err.code = (claim && claim.code) || 'PAYMENT_CONFLICT';
+                err.conflicting = claim && claim.conflicting;
+                throw err;
+            }
+            if (claim.alreadyClaimed) {
+                return { alreadyRecorded: true, applied: !!claim.applied };
+            }
+            // The core claim has already verified no conflicting receipt; a
+            // legacy ledger row the core did not flag must still match this
+            // user/product/token before we treat the payment as recorded -
+            // an unexplained UNIQUE conflict never commits a wrong-owner row.
+            const ledgerRow = await tx.get(
+                `SELECT user_id, payment_token, duration FROM solana_payments WHERE tx_signature = ?`, [signature]);
+            if (ledgerRow) {
+                const wantDuration = token === 'SKR' ? 'premium_skr' : 'premium';
+                const same = Number(ledgerRow.user_id) === uid
+                    && String(ledgerRow.payment_token || 'SOL').toUpperCase() === token
+                    && String(ledgerRow.duration) === wantDuration;
+                if (!same) {
+                    const err = new Error('premium payment ledger row belongs to a different purchase');
+                    err.code = 'PAYMENT_CONFLICT';
+                    throw err;
+                }
+                return { alreadyRecorded: true, applied: !!claim.applied };
+            }
+            await tx.run(
+                `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, skr_amount, payment_token, tier_gb, duration, created_at, verified_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                [uid, signature, token === 'SKR' ? 0 : (Number(args.amount) || 0),
+                 token === 'SKR' ? (Number(args.amount) || 0) : 0, token, 0,
+                 token === 'SKR' ? 'premium_skr' : 'premium', paymentAt, nowMs]
+            );
+            return { alreadyRecorded: false };
+        });
+    });
+};
 
 // Weekly ad verification. Code is deterministic per account+week: HMAC over
 // 'account|week' so the kit always shows the same code and it can't be forged
@@ -5332,6 +5727,14 @@ async function ecoCherryHandleCode(code, senderWallet) {
     // Same atomic grant-guard as the claim endpoint: only the writer that
     // flipped granted_at issues the week — a racing manual claim can't
     // stack a second +7d, and admin approve can't grant twice.
+    if (ecosystemReady) {
+        const claim = await dbGetAsync(`SELECT id FROM ad_claims WHERE account_id = ? AND week_key = ?`, [member.account_id, wk]).catch(() => null);
+        if (claim) {
+            const r = await ecosystem.grantAdClaim(claim.id, { tierGb: 100 }).catch(() => null);
+            if (r && (r.granted || r.alreadyGranted)) console.log(`[Eco] Cherry: verified claim for ${member.account_id} (wallet ${senderWallet.slice(0, 8)}…)`);
+        }
+        return;
+    }
     const g = await dbRunAsync(
         `UPDATE ad_claims SET granted_at = ? WHERE account_id = ? AND week_key = ? AND granted_at IS NULL`,
         [Date.now(), member.account_id, wk]).catch(() => null);
@@ -5441,6 +5844,11 @@ async function ecoTgHandleGroupMessage(msg) {
         [acct.account_id, wk, postUrl, code, ECO_TG_GROUP, mem.app, mem.app === 'photolynk' ? 100 : null, Date.now(), Date.now()]).catch(() => { });
     // Same atomic grant-guard as the claim endpoint: only the writer that
     // flips granted_at issues the week.
+    if (ecosystemReady) {
+        const claim = await dbGetAsync(`SELECT id FROM ad_claims WHERE account_id = ? AND week_key = ?`, [acct.account_id, wk]).catch(() => null);
+        if (claim) await ecosystem.grantAdClaim(claim.id, { tierGb: mem.app === 'photolynk' ? 100 : 0 }).catch(() => { });
+        return;
+    }
     const g = await dbRunAsync(
         `UPDATE ad_claims SET granted_at = ? WHERE account_id = ? AND week_key = ? AND granted_at IS NULL`,
         [Date.now(), acct.account_id, wk]).catch(() => null);
@@ -5507,6 +5915,22 @@ ecoTgBotLoop().catch(() => { });
 // Extract the caller's ecosystem account id from either app identity:
 //   app=ps&id=<device_hash>  (same trust model as the trial endpoint)
 //   app=pl + Bearer JWT      (authenticated PhotoLynk user)
+// The member's CURRENT wallet, but only when a durable proof row backs that
+// exact wallet. Historical proofs for rotated-away wallets are retained for
+// payer attribution - they never establish current ownership, and the
+// wallet_verified flag alone (legacy rows can carry it without proof) is
+// never authority either.
+const ecoMemberProvenWallet = async (app, identity) => {
+    if (!ecosystemReady) return null;
+    const row = await ecosystem.readTransaction((tx) => tx.get(
+        `SELECT m.wallet FROM ecosystem_members m
+         JOIN ecosystem_member_proofs p
+           ON p.app = m.app AND p.identity = m.identity AND p.wallet = m.wallet
+         WHERE m.app = ? AND m.identity = ?`,
+        [String(app), String(identity)])).catch(() => null);
+    return row && row.wallet ? row.wallet : null;
+};
+
 async function ecoCallerAccount(req) {
     const app = String(req.query.app || req.body?.app || '').toLowerCase();
     if (app === 'ps' || app === 'paceseeker') {
@@ -5514,18 +5938,24 @@ async function ecoCallerAccount(req) {
         if (!/^[A-Za-z0-9_-]{16,128}$/.test(id)) return { error: 'Invalid device id' };
         const row = await dbGetAsync(`SELECT account_id, wallet, wallet_verified FROM ecosystem_members WHERE app = 'paceseeker' AND identity = ?`, [id]);
         if (!row) return { error: 'Device not registered yet — open PaceSeeker once first' };
-        return { accountId: row.account_id, app: 'paceseeker', identity: id, wallet: row.wallet, walletVerified: !!row.wallet_verified };
+        const provenWallet = await ecoMemberProvenWallet('paceseeker', id);
+        return { accountId: row.account_id, app: 'paceseeker', identity: id, wallet: row.wallet, walletVerified: !!row.wallet_verified, provenWallet };
     }
     if (app === 'pl' || app === 'photolynk') {
         // authenticateToken already ran: req.user.id is the PhotoLynk user.
         if (!req.user?.id) return { error: 'Auth required' };
-        const row = await dbGetAsync(`SELECT account_id, wallet FROM ecosystem_members WHERE app = 'photolynk' AND identity = ?`, [String(req.user.id)]);
+        const row = await dbGetAsync(`SELECT account_id, wallet, wallet_verified FROM ecosystem_members WHERE app = 'photolynk' AND identity = ?`, [String(req.user.id)]);
         if (!row) {
             const u = await dbGetAsync(`SELECT wallet_address FROM users WHERE id = ?`, [req.user.id]);
-            const acct = await ecoEnsureAccount('photolynk', req.user.id, u?.wallet_address || null, { verified: true });
+            // users.wallet_address is user-editable and proves nothing — the
+            // member starts unverified; durable proof arrives only via a
+            // signature-verified bind/login or a solana_wallet_bindings row
+            // the core adopts on ensure.
+            const acct = await ecoEnsureAccount('photolynk', req.user.id, u?.wallet_address || null);
             return { accountId: acct, app: 'photolynk', identity: String(req.user.id), wallet: u?.wallet_address || null };
         }
-        return { accountId: row.account_id, app: 'photolynk', identity: String(req.user.id), wallet: row.wallet };
+        const provenWallet = await ecoMemberProvenWallet('photolynk', req.user.id);
+        return { accountId: row.account_id, app: 'photolynk', identity: String(req.user.id), wallet: row.wallet, walletVerified: !!row.wallet_verified, provenWallet };
     }
     return { error: 'Unknown app (ps|pl)' };
 }
@@ -5682,20 +6112,70 @@ app.post('/api/ecosystem/link', ecoMaybeAuth, async (req, res) => {
 // Ed25519 key proves ownership. This is what lets a PaceSeeker member on an
 // imported/session wallet bind the REAL wallet (returned by MWA authorize) so
 // it auto-links with PhotoLynk — the only safe "same user" proof for
-// different-address wallets.
-const ecoBindChallenges = new Map(); // nonce -> { accountId, expiresAt }
+// different-address wallets. Post-ready the challenge is a persistent row
+// consumed atomically inside the core transaction (nonce + member proof +
+// PL wallet-binding row commit together); the v2 message binds
+// app/identity/target wallet/action, while legacy v1 payloads still work for
+// a first bind or same-wallet rebind but can never rotate a proven wallet.
+const ecoBindChallenges = new Map(); // nonce -> { accountId, expiresAt } (pre-ready fallback only)
 const ECO_BIND_CHALLENGE_TTL_MS = 5 * 60 * 1000;
+
+// Verify an Ed25519 detached signature over `message` and that the public
+// key's address equals expectedAddr. Returns null on success, else a reason.
+const _ecoVerifyWalletSig = (message, sigB64, pubB64, expectedAddr) => {
+    let publicKeyBytes, signatureBytes;
+    try {
+        publicKeyBytes = naclUtil.decodeBase64(pubB64);
+        signatureBytes = naclUtil.decodeBase64(sigB64);
+    } catch (e) { return 'Invalid encoding'; }
+    if (publicKeyBytes.length !== nacl.sign.publicKeyLength || signatureBytes.length !== nacl.sign.signatureLength) {
+        return 'Invalid key or signature length';
+    }
+    if (base58Encode(publicKeyBytes) !== String(expectedAddr || '').trim()) {
+        return 'Public key does not match wallet address';
+    }
+    if (!nacl.sign.detached.verify(naclUtil.decodeUTF8(message), signatureBytes, publicKeyBytes)) {
+        return 'Invalid wallet signature';
+    }
+    return null;
+};
 
 app.get('/api/ecosystem/bind-challenge', ecoMaybeAuth, async (req, res) => {
     try {
         const who = await ecoCallerAccount(req);
         if (who.error) return res.status(403).json({ error: who.error });
         const now = Date.now();
-        for (const [n, e] of ecoBindChallenges) if (!e || e.expiresAt <= now) ecoBindChallenges.delete(n);
-        if (ecoBindChallenges.size >= 10000) return res.status(429).json({ error: 'Too many challenges' });
         const nonce = crypto.randomBytes(32).toString('hex');
-        ecoBindChallenges.set(nonce, { accountId: who.accountId, expiresAt: now + ECO_BIND_CHALLENGE_TTL_MS });
-        res.json({ nonce, message: `StealthLynk-EcoBind-v1\nnonce:${nonce}`, expires_in: 300 });
+        const expiresAt = now + ECO_BIND_CHALLENGE_TTL_MS;
+        // v2 challenge: bound to this app/identity, a target wallet and an
+        // explicit action (bind|rotate). Absent params issue a legacy v1
+        // challenge old clients still understand.
+        const target = String(req.query.wallet || '').trim();
+        const action = String(req.query.action || '').trim().toLowerCase();
+        let message;
+        if (target || action) {
+            if (!/^(bind|rotate)$/.test(action)) return res.status(400).json({ error: 'action must be bind or rotate' });
+            if (!target) return res.status(400).json({ error: 'wallet required for a v2 challenge' });
+            if (action === 'rotate' && !(who.provenWallet || who.wallet)) {
+                return res.status(400).json({ error: 'no proven wallet to rotate' });
+            }
+            message = `StealthLynk-EcoBind-v2\napp:${who.app}\nidentity:${who.identity}\nwallet:${target}\naction:${action}\nnonce:${nonce}`;
+        } else {
+            message = `StealthLynk-EcoBind-v1\nnonce:${nonce}`;
+        }
+        if (ecosystemReady) {
+            await dbRunAsync(
+                `INSERT INTO ecosystem_bind_challenges (nonce,app,identity,account_id,wallet,old_wallet,action,expires_at,used_at)
+                 VALUES (?,?,?,?,?,?,?,?,NULL)`,
+                [nonce, who.app, String(who.identity), who.accountId,
+                 target || null, action === 'rotate' ? (who.provenWallet || who.wallet || null) : null,
+                 action || null, expiresAt]);
+        } else {
+            for (const [n, e] of ecoBindChallenges) if (!e || e.expiresAt <= now) ecoBindChallenges.delete(n);
+            if (ecoBindChallenges.size >= 10000) return res.status(429).json({ error: 'Too many challenges' });
+            ecoBindChallenges.set(nonce, { accountId: who.accountId, expiresAt });
+        }
+        res.json({ nonce, message, expires_in: 300 });
     } catch (e) { res.status(500).json({ error: 'Challenge failed' }); }
 });
 
@@ -5703,51 +6183,144 @@ app.post('/api/ecosystem/bind-wallet', ecoMaybeAuth, async (req, res) => {
     try {
         const who = await ecoCallerAccount(req);
         if (who.error) return res.status(403).json({ error: who.error });
-        const { wallet_address, signature, public_key_b64, nonce } = req.body || {};
+        const { wallet_address, signature, public_key_b64, nonce, old_signature, old_public_key_b64 } = req.body || {};
         if (!wallet_address || !signature || !public_key_b64 || !nonce) {
             return res.status(400).json({ error: 'Missing bind parameters' });
         }
-        const chal = ecoBindChallenges.get(String(nonce));
-        ecoBindChallenges.delete(String(nonce)); // single use
-        if (!chal || chal.expiresAt <= Date.now()) return res.status(400).json({ error: 'Challenge expired — retry' });
-        if (chal.accountId !== who.accountId) return res.status(403).json({ error: 'Challenge not issued to this account' });
-
-        let publicKeyBytes, signatureBytes;
-        try {
-            publicKeyBytes = naclUtil.decodeBase64(public_key_b64);
-            signatureBytes = naclUtil.decodeBase64(signature);
-        } catch (e) { return res.status(400).json({ error: 'Invalid encoding' }); }
-        if (publicKeyBytes.length !== nacl.sign.publicKeyLength || signatureBytes.length !== nacl.sign.signatureLength) {
-            return res.status(400).json({ error: 'Invalid key or signature length' });
-        }
-        // The signed message is the challenge message; verify signature and
-        // that the public key matches the claimed wallet address.
-        const messageBytes = naclUtil.decodeUTF8(`StealthLynk-EcoBind-v1\nnonce:${nonce}`);
-        if (!nacl.sign.detached.verify(messageBytes, signatureBytes, publicKeyBytes)) {
-            return res.status(401).json({ error: 'Invalid wallet signature' });
-        }
-        if (base58Encode(publicKeyBytes) !== String(wallet_address).trim()) {
-            return res.status(400).json({ error: 'Public key does not match wallet address' });
-        }
-
-        // The device hash is a bearer credential — a stolen hash must not be
-        // enough to graft an attacker's wallet onto the member row. If a
-        // wallet is already recorded, the bound wallet must match it; wallet
-        // rotation goes through connect (which re-reports w=) first.
         const newWallet = String(wallet_address).trim();
-        if (who.wallet && who.wallet !== newWallet) {
-            return res.status(409).json({ error: `A different wallet is already linked to this ${who.app === 'paceseeker' ? 'device' : 'account'} — connect that wallet in the app first` });
+
+        if (!ecosystemReady) {
+            // Pre-readiness fallback: the legacy in-memory challenge +
+            // v1-only message. The readiness middleware normally keeps this
+            // branch unreachable; it exists for the short init window.
+            const chal = ecoBindChallenges.get(String(nonce));
+            ecoBindChallenges.delete(String(nonce)); // single use
+            if (!chal || chal.expiresAt <= Date.now()) return res.status(400).json({ error: 'Challenge expired — retry' });
+            if (chal.accountId !== who.accountId) return res.status(403).json({ error: 'Challenge not issued to this account' });
+            const bad = _ecoVerifyWalletSig(`StealthLynk-EcoBind-v1\nnonce:${nonce}`, signature, public_key_b64, newWallet);
+            if (bad) return res.status(bad === 'Invalid wallet signature' ? 401 : 400).json({ error: bad });
+            if (who.wallet && who.wallet !== newWallet) {
+                return res.status(409).json({ error: `A different wallet is already linked to this ${who.app === 'paceseeker' ? 'device' : 'account'} — connect that wallet in the app first` });
+            }
+            const accountId = await ecoEnsureAccount(who.app, who.identity, newWallet, { verified: true });
+            if (who.app === 'photolynk') {
+                await dbRunAsync(paymentRecovery.UPSERT_WALLET_BINDING_SQL, [newWallet, Number(who.identity), Date.now()]);
+            }
+            await ecoSyncMemberEntitlement(accountId);
+            const members = await dbAllAsync(`SELECT app FROM ecosystem_members WHERE account_id = ?`, [accountId]);
+            return res.json({ ok: true, accountId, linkedApps: members.map(m => m.app) });
         }
-        const accountId = await ecoEnsureAccount(who.app, who.identity, newWallet, { verified: true });
-        // PhotoLynk callers get a durable proof-of-ownership binding row used
-        // for payment attribution (challenge + signature + key/address all
-        // verified above; never from /api/save-wallet).
-        if (who.app === 'photolynk') {
-            await dbRunAsync(paymentRecovery.UPSERT_WALLET_BINDING_SQL, [newWallet, Number(who.identity), Date.now()]);
+
+        // Durable path: challenge consume + proof record + PL binding row in
+        // ONE core transaction — no half-applied binds, no nonce replay.
+        const httpErr = (status, error, code) => Object.assign(new Error(error), { http: status, code });
+        let boundAccountId;
+        try {
+            boundAccountId = await ecosystem.transaction(async (tx) => {
+                const consumed = await tx.run(
+                    `UPDATE ecosystem_bind_challenges SET used_at = ? WHERE nonce = ? AND used_at IS NULL`,
+                    [Date.now(), String(nonce)]);
+                const chal = await tx.get(`SELECT * FROM ecosystem_bind_challenges WHERE nonce = ?`, [String(nonce)]);
+                if (!chal || !(consumed && consumed.changes === 1)) {
+                    throw httpErr(400, 'Challenge expired or already used', 'CHALLENGE_USED');
+                }
+                if (Number(chal.expires_at) <= Date.now()) {
+                    throw httpErr(400, 'Challenge expired — retry', 'CHALLENGE_EXPIRED');
+                }
+                // The challenge was issued to THIS app+identity+account —
+                // an account-scoped nonce can never be replayed by another
+                // subject on the same account. Accounts compare canonically:
+                // a legitimate merge between issue and bind must not strand
+                // the challenge on a stale pre-merge id.
+                const canonicalOf = async (id) => {
+                    const a = await tx.get(`SELECT account_id FROM ecosystem_aliases WHERE alias_id = ?`, [String(id)]);
+                    return a ? String(a.account_id) : String(id);
+                };
+                if (chal.app !== who.app || String(chal.identity) !== String(who.identity)
+                    || (await canonicalOf(chal.account_id)) !== (await canonicalOf(who.accountId))) {
+                    throw httpErr(403, 'Challenge not issued to this subject', 'CHALLENGE_SUBJECT');
+                }
+                // Current ownership is the member's wallet backed by a
+                // matching proof. Historical proofs (rotated away) are kept
+                // for payer attribution - they cannot satisfy a new bind or
+                // a rotation that moved on to a newer wallet.
+                const curRow = await tx.get(
+                    `SELECT m.wallet FROM ecosystem_members m
+                     JOIN ecosystem_member_proofs p
+                       ON p.app = m.app AND p.identity = m.identity AND p.wallet = m.wallet
+                     WHERE m.app = ? AND m.identity = ?`,
+                    [who.app, String(who.identity)]);
+                const currentProven = curRow && curRow.wallet ? String(curRow.wallet) : null;
+                let message, proofKind, allowRotation = false;
+                if (chal.action) {
+                    // v2: wallet + action were bound at issue time.
+                    if (chal.wallet && chal.wallet !== newWallet) {
+                        throw httpErr(400, 'wallet does not match the challenge', 'WALLET_MISMATCH');
+                    }
+                    message = `StealthLynk-EcoBind-v2\napp:${chal.app}\nidentity:${chal.identity}\nwallet:${chal.wallet || newWallet}\naction:${chal.action}\nnonce:${nonce}`;
+                    if (chal.action === 'rotate') {
+                        // Rotation requires the CURRENT proven wallet's key to
+                        // sign the exact same domain-separated message. A
+                        // challenge issued before a completed rotation is
+                        // stale - old_wallet no longer matches.
+                        const oldWallet = String(chal.old_wallet || '');
+                        if (!oldWallet || oldWallet !== currentProven) {
+                            throw httpErr(403, 'old wallet is not the proven wallet for this member', 'ROTATE_UNPROVEN');
+                        }
+                        if (!old_signature || !old_public_key_b64) {
+                            throw httpErr(400, 'rotation requires the old wallet signature', 'ROTATE_PROOF_REQUIRED');
+                        }
+                        const badOld = _ecoVerifyWalletSig(message, old_signature, old_public_key_b64, oldWallet);
+                        if (badOld) throw httpErr(badOld === 'Invalid wallet signature' ? 401 : 400, badOld, 'ROTATE_SIG_INVALID');
+                        if (oldWallet === newWallet) {
+                            throw httpErr(400, 'rotation wallet unchanged', 'WALLET_UNCHANGED');
+                        }
+                        proofKind = 'rotation';
+                        allowRotation = true;
+                    } else {
+                        // 'bind': the CURRENT proven wallet differing means
+                        // this is a rotation in disguise — it needs
+                        // action=rotate. Older proofs do not force this.
+                        if (currentProven && currentProven !== newWallet) {
+                            throw httpErr(409, 'a proven wallet is already bound — use action=rotate', 'ROTATION_REQUIRED');
+                        }
+                        proofKind = 'bind';
+                    }
+                } else {
+                    // Legacy v1 payload: only a first bind or a same-wallet
+                    // rebind — it can never rotate a proven wallet.
+                    message = `StealthLynk-EcoBind-v1\nnonce:${nonce}`;
+                    if (currentProven && currentProven !== newWallet) {
+                        throw httpErr(409, 'a proven wallet is already bound — rotation requires a v2 challenge', 'ROTATION_REQUIRED');
+                    }
+                    if (who.wallet && who.wallet !== newWallet) {
+                        throw httpErr(409, `A different wallet is already linked to this ${who.app === 'paceseeker' ? 'device' : 'account'} — connect that wallet in the app first`, 'WALLET_MISMATCH');
+                    }
+                    proofKind = 'bind';
+                }
+                const bad = _ecoVerifyWalletSig(message, signature, public_key_b64, newWallet);
+                if (bad) throw httpErr(bad === 'Invalid wallet signature' ? 401 : 400, bad, 'SIG_INVALID');
+                // Real cryptographic proof only: the verified signature hash
+                // is the durable reference — no profile flag ever satisfies it.
+                const proofRef = crypto.createHash('sha256').update(String(signature)).digest('hex');
+                const accountId = await ecosystem.ensureAccountInTransaction(tx, who.app, String(who.identity), {
+                    wallet: newWallet, proofKind, proofRef, allowRotation,
+                });
+                // PhotoLynk callers get a durable proof-of-ownership binding
+                // row used for payment attribution (never /api/save-wallet).
+                if (who.app === 'photolynk') {
+                    await tx.run(paymentRecovery.UPSERT_WALLET_BINDING_SQL, [newWallet, Number(who.identity), Date.now()]);
+                }
+                return accountId;
+            });
+        } catch (e) {
+            if (e && e.http) return res.status(e.http).json({ error: e.message, code: e.code });
+            throw e;
         }
-        await ecoSyncMemberEntitlement(accountId);
-        const members = await dbAllAsync(`SELECT app FROM ecosystem_members WHERE account_id = ?`, [accountId]);
-        res.json({ ok: true, accountId, linkedApps: members.map(m => m.app) });
+        await ecoSyncMemberEntitlement(boundAccountId);
+        try { wakeEcoWorker(); } catch (_) { }
+        const members = await dbAllAsync(`SELECT app FROM ecosystem_members WHERE account_id = ?`, [boundAccountId]);
+        res.json({ ok: true, accountId: boundAccountId, linkedApps: members.map(m => m.app) });
     } catch (e) { res.status(500).json({ error: 'Bind failed' }); }
 });
 
@@ -5794,6 +6367,16 @@ app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
             return Number((await dbGetAsync(`SELECT expires_at FROM user_plans WHERE user_id = ?`, [Number(who.identity)]))?.expires_at) || 0;
         };
         const existing = await dbGetAsync(`SELECT * FROM ad_claims WHERE account_id = ? AND week_key = ?`, [who.accountId, wk]);
+        if (existing && (existing.status === 'verified' || existing.status === 'pending') && ecosystemReady) {
+            // Idempotent repair: a crash between verification and grant leaves
+            // granted_at NULL — grantAdClaim re-applies the missing effect and
+            // reports whether this attempt actually granted.
+            const r = await ecosystem.grantAdClaim(existing.id, { tierGb: Number(existing.tier_gb) || 100 }).catch(() => null);
+            if (existing.status === 'verified') {
+                return res.json({ ok: true, status: 'verified', already: !(r && r.granted), unapplied: !!(r && !r.granted && !r.alreadyGranted), subUntil: await callerLocalUntil() });
+            }
+            return res.json({ ok: true, status: 'pending', subUntil: await callerLocalUntil(), message: 'Claim already submitted — being confirmed in the background' });
+        }
         if (existing && existing.status === 'verified') {
             return res.json({ ok: true, status: 'verified', already: true, subUntil: await callerLocalUntil() });
         }
@@ -5950,23 +6533,40 @@ app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
         // Atomic grant-guard: only the request that flips granted_at actually
         // grants — concurrent claims and resubmits of the same week can't
         // stack a second +7d on top.
-        const g = await dbRunAsync(
-            `UPDATE ad_claims SET granted_at = ? WHERE account_id = ? AND week_key = ? AND granted_at IS NULL`,
-            [Date.now(), who.accountId, wk]);
-        // Grant is app-local: PS gets a shared row scoped to paceseeker
-        // members; PL writes only the user's own plan row (ad weeks never
-        // bind the ecosystem).
         let subUntil = 0;
-        if (g.changes > 0) {
-            subUntil = await ecoAdWeekGrant(who, { planGb: tierGb, provenance: postUrl });
-        } else if (who.app === 'paceseeker') {
-            const sub = await ecoGetSub(who.accountId);
-            const la = ecoLocalAdApp(sub);
-            const sharedUntil = (!la || la === 'paceseeker') ? (Number(sub?.sub_until) || 0) : 0;
-            const dev = await dbGetAsync(`SELECT ad_until FROM paceseeker_devices WHERE device_hash = ?`, [String(who.identity)]);
-            subUntil = Math.max(sharedUntil, Number(dev?.ad_until) || 0);
+        if (ecosystemReady) {
+            const claim = await dbGetAsync(`SELECT id FROM ad_claims WHERE account_id = ? AND week_key = ?`, [who.accountId, wk]);
+            if (claim) {
+                const r = await ecosystem.grantAdClaim(claim.id, { tierGb }).catch((e) => {
+                    console.warn('[Eco] grantAdClaim failed:', e.message);
+                    return null;
+                });
+                if (r && (r.granted || r.alreadyGranted)) {
+                    subUntil = Number((r.grants || []).find((x) => x.app === who.app && String(x.identity) === String(who.identity))?.until) || 0;
+                    if (!subUntil) {
+                        const snap = await ecosystem.resolveIdentity(who.app, String(who.identity), { project: true }).catch(() => null);
+                        subUntil = Number(snap?.entitlement?.expiresAt) || 0;
+                    }
+                }
+            }
         } else {
-            subUntil = Number((await dbGetAsync(`SELECT expires_at FROM user_plans WHERE user_id = ?`, [Number(who.identity)]))?.expires_at) || 0;
+            const g = await dbRunAsync(
+                `UPDATE ad_claims SET granted_at = ? WHERE account_id = ? AND week_key = ? AND granted_at IS NULL`,
+                [Date.now(), who.accountId, wk]);
+            // Grant is app-local: PS gets a shared row scoped to paceseeker
+            // members; PL writes only the user's own plan row (ad weeks never
+            // bind the ecosystem).
+            if (g.changes > 0) {
+                subUntil = await ecoAdWeekGrant(who, { planGb: tierGb, provenance: postUrl });
+            } else if (who.app === 'paceseeker') {
+                const sub = await ecoGetSub(who.accountId);
+                const la = ecoLocalAdApp(sub);
+                const sharedUntil = (!la || la === 'paceseeker') ? (Number(sub?.sub_until) || 0) : 0;
+                const dev = await dbGetAsync(`SELECT ad_until FROM paceseeker_devices WHERE device_hash = ?`, [String(who.identity)]);
+                subUntil = Math.max(sharedUntil, Number(dev?.ad_until) || 0);
+            } else {
+                subUntil = Number((await dbGetAsync(`SELECT expires_at FROM user_plans WHERE user_id = ?`, [Number(who.identity)]))?.expires_at) || 0;
+            }
         }
         if (status === 'verified') return res.json({ ok: true, status: 'verified', subUntil });
         return res.json({ ok: true, status: 'pending', subUntil, message: 'Week granted — post is being confirmed in the background' });
@@ -5986,9 +6586,36 @@ app.post('/admin/api/ad-claims/:id/review', adminAuth, async (req, res) => {
     const action = String(req.body?.action || '');
     const row = await dbGetAsync(`SELECT * FROM ad_claims WHERE id = ?`, [id]);
     if (!row) return res.status(404).json({ error: 'Not found' });
-    if (row.status === 'verified') return res.json({ ok: true, status: 'verified', already: true });
+    if (row.status === 'verified') {
+        // A crash between the status write and the grant apply leaves the
+        // claim verified but its effect missing - re-run the atomic grant
+        // (it is idempotent: an existing event returns alreadyGranted).
+        if (ecosystemReady && row.granted_at == null) {
+            const r = await ecosystem.grantAdClaim(id, { tierGb: Number(row.tier_gb) || 100 }).catch((e) => {
+                console.warn('[Eco] grantAdClaim repair failed:', e.message);
+                return null;
+            });
+            if (!r) return res.status(500).json({ error: 'Grant failed', retryable: true });
+            if (!r.granted && !r.alreadyGranted) {
+                return res.json({ ok: true, status: 'verified', subUntil: 0, reason: r.reason || 'not_granted' });
+            }
+            return res.json({ ok: true, status: 'verified', already: true, repaired: !r.alreadyGranted });
+        }
+        return res.json({ ok: true, status: 'verified', already: true });
+    }
     if (action === 'approve') {
         await dbRunAsync(`UPDATE ad_claims SET status = 'verified', verified_at = ? WHERE id = ?`, [Date.now(), id]);
+        if (ecosystemReady) {
+            const r = await ecosystem.grantAdClaim(id, { tierGb: Number(row.tier_gb) || 100 }).catch((e) => {
+                console.warn('[Eco] grantAdClaim failed:', e.message);
+                return null;
+            });
+            if (!r) return res.status(500).json({ error: 'Grant failed', retryable: true });
+            if (r.alreadyGranted) return res.json({ ok: true, status: 'verified', alreadyGranted: true });
+            if (!r.granted) return res.json({ ok: true, status: 'verified', subUntil: 0, reason: r.reason || 'not_granted' });
+            const snap = await ecosystem.resolveAccount(r.accountId, { project: true }).catch(() => null);
+            return res.json({ ok: true, status: 'verified', subUntil: snap ? (Number(snap.sharedUntil) || 0) : 0 });
+        }
         // Grant-guard: if this week's entitlement was already issued (optimistic
         // grant at claim time), approving just confirms — no second +7d.
         const g = await dbRunAsync(
@@ -6023,21 +6650,78 @@ app.get('/admin/api/eco-links', adminAuth, async (req, res) => {
 // Full ecosystem account view for admin control: each account with its member
 // apps (identity, wallet, verified flag), shared sub state + provenance, ad
 // claim history, and social bindings. The Ecosystem admin tab renders this.
+// === ADMIN_ECO_ACCOUNTS_BEGIN ===
 app.get('/admin/api/eco-accounts', adminAuth, async (req, res) => {
     try {
-        const accounts = await dbAllAsync(`SELECT account_id, primary_wallet, created_at, x_handle, tg_username, cherry_state, ad_strict FROM ecosystem_accounts ORDER BY created_at DESC LIMIT 1000`);
-        const members = await dbAllAsync(`SELECT account_id, app, identity, wallet, wallet_verified, linked_at FROM ecosystem_members`);
-        const subs = await dbAllAsync(`SELECT account_id, sub_until, source_app, source_kind, provenance, updated_at FROM stealthlynk_subs`);
-        const claims = await dbAllAsync(`SELECT account_id, COUNT(*) AS n, MAX(CASE WHEN status='verified' THEN 1 ELSE 0 END) AS has_verified FROM ad_claims GROUP BY account_id`);
+        const q = req.query || {};
+        const limit = Math.min(Math.max(parseInt(q.limit, 10) || 200, 1), 500);
+        const offset = Math.max(parseInt(q.offset, 10) || 0, 0);
+        const total = Number((await dbGetAsync(`SELECT COUNT(*) AS n FROM ecosystem_accounts`))?.n) || 0;
+        const accounts = await dbAllAsync(
+            `SELECT account_id, primary_wallet, created_at, x_handle, tg_username, cherry_state, ad_strict
+             FROM ecosystem_accounts ORDER BY created_at DESC, account_id LIMIT ? OFFSET ?`, [limit, offset]);
+        const pageIds = accounts.map(a => a.account_id);
+        const ph = pageIds.map(() => '?').join(',');
+        const members = pageIds.length ? await dbAllAsync(
+            `SELECT account_id, app, identity, wallet, wallet_verified, linked_at FROM ecosystem_members WHERE account_id IN (${ph})`, pageIds) : [];
+        const subs = pageIds.length ? await dbAllAsync(
+            `SELECT account_id, sub_until, source_app, source_kind, provenance, updated_at FROM stealthlynk_subs WHERE account_id IN (${ph})`, pageIds) : [];
+        const claims = pageIds.length ? await dbAllAsync(
+            `SELECT account_id, COUNT(*) AS n, MAX(CASE WHEN status='verified' THEN 1 ELSE 0 END) AS has_verified FROM ad_claims WHERE account_id IN (${ph}) GROUP BY account_id`, pageIds) : [];
         const memBy = {}, subBy = {}, claimBy = {};
         for (const m of members) (memBy[m.account_id] = memBy[m.account_id] || []).push(m);
         for (const s of subs) subBy[s.account_id] = s;
         for (const c of claims) claimBy[c.account_id] = c;
+        // Per-account core snapshots: READ-ONLY resolves (project:false), run
+        // sequentially so a page of 500 can never stampede the DB. A single
+        // bad account degrades to entitlementsError — never fails the page.
+        const entBy = {};
+        if (ecosystemReady && ecosystem) {
+            for (const a of accounts) {
+                try {
+                    const snap = await ecosystem.resolveAccount(a.account_id, { project: false });
+                    entBy[a.account_id] = snap ? {
+                        revision: snap.revision == null ? null : Number(snap.revision),
+                        sharedUntil: snap.sharedUntil == null ? null : Number(snap.sharedUntil),
+                        members: (snap.members || []).map(m => ({
+                            app: m.app, identity: m.identity, active: !!m.active,
+                            expiresAt: m.expiresAt == null ? null : Number(m.expiresAt),
+                            planGb: Number(m.planGb) || 0,
+                            sourceKind: m.sourceKind || null, sourceScope: m.sourceScope || null,
+                        })),
+                        sources: (snap.sources || []).map(s => ({
+                            scope: s.scope, app: s.app,
+                            identity: s.identity == null ? null : String(s.identity),
+                            kind: s.kind || null, benefit: s.benefit || null,
+                            tierGb: Number(s.tierGb) || 0,
+                            monthlyValueCents: Number(s.monthlyValueCents) || 0,
+                            startsAt: s.startsAt == null ? null : Number(s.startsAt),
+                            expiresAt: s.expiresAt == null ? null : Number(s.expiresAt),
+                            eventId: s.eventId || null,
+                        })),
+                    } : { error: 'RESOLVE_EMPTY' };
+                } catch (e) {
+                    entBy[a.account_id] = { error: (e && e.code) || 'RESOLVE_FAILED' };
+                }
+            }
+        }
         const now = Date.now();
         res.json({
             server_time: new Date().toISOString(),
+            // Core startup state for the admin page: ready=false + init.ok=false
+            // means the server is in legacy compatibility mode — init carries
+            // the failure code/message/timestamp/attempts.
+            ecosystem: {
+                ready: !!ecosystemReady,
+                legacyMode: !ecosystemReady,
+                init: _ecoInitState,
+            },
+            total,
+            offset,
+            limit,
             accounts: accounts.map(a => {
                 const s = subBy[a.account_id];
+                const ent = entBy[a.account_id];
                 return {
                     ...a,
                     members: memBy[a.account_id] || [],
@@ -6049,11 +6733,60 @@ app.get('/admin/api/eco-accounts', adminAuth, async (req, res) => {
                     source_kind: s?.source_kind || null, // 'payment' | 'ad_claim' | 'merge' | 'link_sync' | 'admin'
                     provenance: s?.provenance || null,
                     sub_updated_at: s?.updated_at || null,
+                    // Legacy compatibility mode: the field is omitted entirely —
+                    // entitlements would be a lie without the core's read model.
+                    ...(ecosystemReady
+                        ? (ent && !ent.error
+                            ? { entitlements: ent }
+                            : { entitlements: null, entitlementsError: ent ? ent.error : 'RESOLVE_FAILED' })
+                        : {}),
                 };
             }),
         });
     } catch (e) { res.status(500).json({ error: 'Failed' }); }
 });
+// === ADMIN_ECO_ACCOUNTS_END ===
+
+// Durable payment-verification queue (ECO2): which signatures are still
+// waiting for on-chain confirmation, and why. Legacy mode has no queue —
+// the client-reported rows live in paceseeker_revenue / solana_payments.
+// === ADMIN_ECO_JOBS_BEGIN ===
+app.get('/admin/api/eco-jobs', adminAuth, async (req, res) => {
+    try {
+        if (!ecosystemReady) return res.json({ legacyMode: true, counts: {}, jobs: [] });
+        const limit = Math.min(Math.max(parseInt((req.query || {}).limit, 10) || 100, 1), 500);
+        const counts = {};
+        for (const r of await dbAllAsync(`SELECT state, COUNT(*) AS n FROM ecosystem_jobs GROUP BY state`)) {
+            counts[r.state] = Number(r.n) || 0;
+        }
+        const leased = await dbGetAsync(
+            `SELECT COUNT(*) AS n FROM ecosystem_jobs WHERE state = 'pending' AND lease_until IS NOT NULL AND lease_until > ?`, [Date.now()]);
+        counts.leased = Number(leased?.n) || 0;
+        const rows = await dbAllAsync(
+            `SELECT job_key, kind, reference_id, payload_json, state, attempts, next_attempt_at, last_error_code, created_at, updated_at
+             FROM ecosystem_jobs ORDER BY updated_at DESC LIMIT ?`, [limit]);
+        const jobs = rows.map(j => {
+            let subjects = [];
+            try { subjects = JSON.parse(j.payload_json || '{}').subjects || []; } catch (_) { subjects = []; }
+            return {
+                signature: j.reference_id,
+                kind: j.kind || null,
+                state: j.state,
+                attempts: Number(j.attempts) || 0,
+                last_error_code: j.last_error_code || null,
+                next_attempt_at: j.next_attempt_at == null ? null : Number(j.next_attempt_at),
+                updated_at: Number(j.updated_at) || 0,
+                subjects: (Array.isArray(subjects) ? subjects : []).map(s => ({
+                    app: s && s.app != null ? s.app : null,
+                    identity: s && s.identity != null ? s.identity : null,
+                    wallet: s && s.wallet ? `${String(s.wallet).slice(0, 8)}…${String(s.wallet).slice(-4)}` : null,
+                })),
+            };
+        });
+        res.json({ counts, jobs });
+    } catch (e) { res.status(500).json({ error: 'Failed' }); }
+});
+// === ADMIN_ECO_JOBS_END ===
 
 // Admin control over a shared sub: revoke strips it now (member rows fall to
 // their own local entitlements), extend adds days, floor sets an absolute
@@ -6066,6 +6799,14 @@ app.post('/admin/api/eco-account/sub', adminAuth, async (req, res) => {
         const acct = await dbGetAsync(`SELECT account_id FROM ecosystem_accounts WHERE account_id = ?`, [accountId]);
         if (!acct) return res.status(404).json({ error: 'Account not found' });
         if (action === 'revoke') {
+            if (ecosystemReady) {
+                const r = await ecosystem.adjustShared(accountId, {
+                    action: 'revoke',
+                    eventId: `admin:revoke:${accountId}:${crypto.randomBytes(8).toString('hex')}`,
+                    actor: 'admin',
+                });
+                return res.json({ ok: true, subUntil: Number(r.sharedUntil) || 0 });
+            }
             await dbRunAsync(`INSERT INTO stealthlynk_subs (account_id, sub_until, source_app, source_kind, provenance, updated_at)
                 VALUES (?, 0, 'admin', 'revoke', ?, ?)
                 ON CONFLICT(account_id) DO UPDATE SET sub_until = 0, source_kind = 'revoke', updated_at = excluded.updated_at`,
@@ -6084,12 +6825,28 @@ app.post('/admin/api/eco-account/sub', adminAuth, async (req, res) => {
         }
         if (action === 'extend') {
             const days = Math.min(Math.max(Number(req.body?.days) || 0, 1), 365);
+            if (ecosystemReady) {
+                const r = await ecosystem.adjustShared(accountId, {
+                    action: 'extend', days,
+                    eventId: `admin:extend:${accountId}:${crypto.randomBytes(8).toString('hex')}`,
+                    actor: 'admin',
+                });
+                return res.json({ ok: true, subUntil: Number(r.sharedUntil) || 0 });
+            }
             const subUntil = await ecoGrantSub(accountId, days * 86400000, { sourceApp: 'admin', kind: 'grant', provenance: `+${days}d`, allowRevoked: true });
             return res.json({ ok: true, subUntil });
         }
         if (action === 'set-until') {
             const until = Number(req.body?.until) || 0;
             if (until <= Date.now()) return res.status(400).json({ error: 'until must be a future epoch ms' });
+            if (ecosystemReady) {
+                const r = await ecosystem.adjustShared(accountId, {
+                    action: 'set-until', until,
+                    eventId: `admin:set-until:${accountId}:${crypto.randomBytes(8).toString('hex')}`,
+                    actor: 'admin',
+                });
+                return res.json({ ok: true, subUntil: Number(r.sharedUntil) || until });
+            }
             await ecoApplySub(accountId, until, { sourceApp: 'admin', kind: 'grant', provenance: 'set-until' });
             return res.json({ ok: true, subUntil: until });
         }
@@ -6126,12 +6883,12 @@ app.get('/api/paceseeker/trial', (req, res) => {
         return res.status(400).json({ error: 'Invalid device id' });
     }
     const ip = String((req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '').replace(/[^0-9a-zA-Z:.\-]/g, '').slice(0, 45);
-    const bucket = psTrialBuckets.get(ip) || { count: 0, reset: Date.now() + 3600000 };
-    if (Date.now() > bucket.reset) { bucket.count = 0; bucket.reset = Date.now() + 3600000; }
-    if (++bucket.count > PS_TRIAL_RATE_LIMIT) {
-        return res.status(429).json({ error: 'Rate limited' });
-    }
-    psTrialBuckets.set(ip, bucket);
+    const ipCheck = psRateCheck(psTrialBuckets, ip || 'unknown', PS_TRIAL_RATE_LIMIT);
+    if (ipCheck === 'limited') return res.status(429).json({ error: 'Rate limited' });
+    if (ipCheck === 'overflow') return res.status(503).json({ error: 'Rate limiter unavailable', code: 'RATE_LIMIT_UNAVAILABLE' });
+    const devCheck = psRateCheck(psDeviceBuckets, id, PS_DEVICE_RATE_LIMIT);
+    if (devCheck === 'limited') return res.status(429).json({ error: 'Rate limited' });
+    if (devCheck === 'overflow') return res.status(503).json({ error: 'Rate limiter unavailable', code: 'RATE_LIMIT_UNAVAILABLE' });
 
     const now = Date.now();
     const vcRaw = String(req.query.vc || '');
@@ -6173,7 +6930,7 @@ app.get('/api/paceseeker/trial', (req, res) => {
                 // on-chain, then mirror a real subscription onto the ecosystem
                 // account. Fire-and-forget: response must not wait on it.
                 try {
-                    if (this.changes > 0) {
+                    if (this.changes > 0 || ecosystemReady) {
                         ecoMirrorPsPayment(id, wallet, paySig).catch(() => { });
                     }
                 } catch (e) { }
@@ -6195,7 +6952,7 @@ app.get('/api/paceseeker/trial', (req, res) => {
                 const started = arch ? arch.trial_started_at : (sa !== null ? sa : now); // sa<=now: an already-expired local start yields an expired record, not a fresh trial
                 const expires = arch ? arch.trial_expires_at : started + trialMs;
                 db.run(
-                    'INSERT OR IGNORE INTO paceseeker_devices (device_hash, first_seen, last_seen, trial_started_at, trial_expires_at, version_code, last_ip, sub_status, sub_until, sub_signature, sub_paid_at, sub_paid_with, sub_plan, sub_usd, sub_amount_atomic, wallet_address) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    'INSERT OR IGNORE INTO paceseeker_devices (device_hash, first_seen, last_seen, trial_started_at, trial_expires_at, version_code, last_ip, sub_status, reported_sub_until, sub_signature, sub_paid_at, sub_paid_with, sub_plan, sub_usd, sub_amount_atomic, wallet_address) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                     [id, arch ? (arch.first_seen || started) : started, now, started, expires, vc, ip, st || 'none', se, paySig, payAt, payWith, payPlan, payUsd, payAmt, wallet],
                     () => {
                         db.get('SELECT * FROM paceseeker_devices WHERE device_hash = ?', [id], (e2, r2) => {
@@ -6209,27 +6966,35 @@ app.get('/api/paceseeker/trial', (req, res) => {
             });
             return;
         }
+        // Client-reported expiry is telemetry only: it lands on
+        // reported_sub_until and never touches the authoritative sub_until
+        // column, which only the core projection writes.
         db.run(
-            'UPDATE paceseeker_devices SET last_seen = ?, version_code = COALESCE(?, version_code), last_ip = ?, sub_status = COALESCE(?, sub_status), sub_until = COALESCE(?, sub_until), sub_signature = COALESCE(?, sub_signature), sub_paid_at = COALESCE(?, sub_paid_at), sub_paid_with = COALESCE(?, sub_paid_with), sub_plan = COALESCE(?, sub_plan), sub_usd = COALESCE(?, sub_usd), sub_amount_atomic = COALESCE(?, sub_amount_atomic), wallet_address = COALESCE(?, wallet_address) WHERE device_hash = ?',
+            'UPDATE paceseeker_devices SET last_seen = ?, version_code = COALESCE(?, version_code), last_ip = ?, sub_status = COALESCE(?, sub_status), reported_sub_until = COALESCE(?, reported_sub_until), sub_signature = COALESCE(?, sub_signature), sub_paid_at = COALESCE(?, sub_paid_at), sub_paid_with = COALESCE(?, sub_paid_with), sub_plan = COALESCE(?, sub_plan), sub_usd = COALESCE(?, sub_usd), sub_amount_atomic = COALESCE(?, sub_amount_atomic), wallet_address = COALESCE(?, wallet_address) WHERE device_hash = ?',
             [now, vc, ip, st, se, paySig, payAt, payWith, payPlan, payUsd, payAmt, wallet, id]
         );
         // Paid device carrying a reported payment signature that predates the
-        // ecosystem layer (or a re-link): verify the signature on-chain, then
-        // floor the shared sub so the other app lights up too. Two client-
-        // reported fields are untrusted: `se` is clamped to paidAt (tx
-        // blockTime) + one plan period, and the mirror only applies when the
-        // tx fee payer equals the member's verified wallet.
+        // ecosystem layer (or a re-link): enqueue chain verification so the
+        // worker's real tx evidence — not the reported `se` — sets the
+        // entitlement. Two client-reported fields are untrusted: `se` is
+        // clamped to paidAt (tx blockTime) + one plan period, and the mirror
+        // only applies when the tx fee payer equals the member's verified
+        // wallet.
         if (st === 'paid' && se && se > now && row.sub_signature) {
-            (async () => {
-                const v = await verifyPsPaymentTx(row.sub_signature);
-                if (!v.ok) return;
-                const member = await dbGetAsync(
-                    `SELECT account_id, wallet, wallet_verified FROM ecosystem_members WHERE app = 'paceseeker' AND identity = ?`, [String(id)]);
-                if (!member?.wallet_verified || !member.wallet || member.wallet !== v.payer) return;
-                const capBase = v.paidAt || Date.now();
-                const cappedUntil = Math.min(Number(se) || 0, capBase + PS_ECO_PLAN_MS + 12 * 60 * 60 * 1000);
-                await ecoFloorSub(member.account_id, cappedUntil, { sourceApp: 'paceseeker', kind: 'payment', provenance: row.sub_signature });
-            })().catch(() => { });
+            if (ecosystemReady) {
+                enqueuePsVerification(id, row.sub_signature);
+            } else {
+                (async () => {
+                    const v = await verifyPsPaymentTx(row.sub_signature);
+                    if (!v.ok) return;
+                    const member = await dbGetAsync(
+                        `SELECT account_id, wallet, wallet_verified FROM ecosystem_members WHERE app = 'paceseeker' AND identity = ?`, [String(id)]);
+                    if (!member?.wallet_verified || !member.wallet || member.wallet !== v.payer) return;
+                    const capBase = v.paidAt || Date.now();
+                    const cappedUntil = Math.min(Number(se) || 0, capBase + PS_ECO_PLAN_MS + 12 * 60 * 60 * 1000);
+                    await ecoFloorSub(member.account_id, cappedUntil, { sourceApp: 'paceseeker', kind: 'payment', provenance: row.sub_signature });
+                })().catch(() => { });
+            }
         }
         if (ip && (row.last_ip !== ip || !row.last_country_code)) psUpdateGeo(id, ip); // IP moved or unresolved
         // Wallet switched, domain never checked, or stored value predates TLD
@@ -6373,6 +7138,12 @@ async function ecoMirrorPsPayment(deviceHash, wallet, sig) {
     // Ensure the member row exists first — the revenue insert fires before
     // _psTrialRespond creates it on a brand-new device's first ping.
     await ecoEnsureAccount('paceseeker', deviceHash, wallet || null);
+    if (ecosystemReady) {
+        // The report carries no authority — enqueue durable on-chain
+        // verification and let the worker mint the entitlement.
+        enqueuePsVerification(deviceHash, sig);
+        return;
+    }
     const v = await verifyPsPaymentTx(sig);
     if (!v.ok) {
         console.warn(`[Eco] unverified payment sig ${sig.slice(0, 16)}… from ${deviceHash.slice(0, 10)} - NOT mirrored`);
@@ -6398,6 +7169,16 @@ async function ecoMirrorPsPayment(deviceHash, wallet, sig) {
     await ecoFloorSub(member.account_id, until, { sourceApp: 'paceseeker', kind: 'payment', provenance: sig, allowRevoked: true });
 }
 
+// Every client-reported signature becomes a durable verification job — the
+// worker verifies on-chain before any entitlement is minted; the report
+// itself carries no authority.
+function enqueuePsVerification(deviceHash, sig) {
+    if (!ecosystemReady || !sig) return;
+    ecosystem.enqueueVerification({ signature: sig, app: 'paceseeker', identity: String(deviceHash) })
+        .then(() => { try { wakeEcoWorker(); } catch (e) { } })
+        .catch(() => { });
+}
+
 // Respond to a PaceSeeker heartbeat: trial fields plus, when the device's
 // ecosystem account holds an active shared sub, an Ed25519-signed grant the
 // client verifies with the same public key it uses for remote config.
@@ -6405,16 +7186,37 @@ async function _psTrialRespond(res, row, id, wallet) {
     const out = { trial: true, startedAt: row.trial_started_at, expiresAt: row.trial_expires_at };
     try {
         const accountId = await ecoEnsureAccount('paceseeker', id, wallet || null);
-        await ecoSyncMemberEntitlement(accountId);
-        const sub = await ecoGetSub(accountId);
-        // Ad weeks are app-local: a claim made in another app stays there.
-        // PS ad weeks live on ad_until (server-written only — sub_until is
-        // client-reported `se` and must never feed a signed grant).
-        const localApp = ecoLocalAdApp(sub);
-        const sharedUntil = (!localApp || localApp === 'paceseeker') ? (Number(sub?.sub_until) || 0) : 0;
-        const subUntil = Math.max(sharedUntil, Number(row.ad_until) || 0);
+        let snap = null;
+        let subUntil = 0;
+        if (ecosystemReady) {
+            // Core snapshot: the resolved member entitlement IS the full
+            // effective grant for this device (local ads, direct payment,
+            // shared timeline). The pre-projection device row's ad_until is
+            // stale - it must never re-inflate a revoked/current core result.
+            snap = await ecosystem.resolveIdentity('paceseeker', String(id), { project: true }).catch(() => null);
+            if (snap && snap.entitlement && snap.entitlement.expiresAt != null) {
+                subUntil = Number(snap.entitlement.expiresAt) || 0;
+            }
+        } else {
+            await ecoSyncMemberEntitlement(accountId);
+            const sub = await ecoGetSub(accountId);
+            // Ad weeks are app-local: a claim made in another app stays there.
+            // PS ad weeks live on ad_until (server-written only — reported
+            // `se` never feeds a signed grant).
+            const localApp = ecoLocalAdApp(sub);
+            const sharedUntil = (!localApp || localApp === 'paceseeker') ? (Number(sub?.sub_until) || 0) : 0;
+            subUntil = Math.max(sharedUntil, Number(row.ad_until) || 0);
+        }
+        // No snapshot, no grant: a failed resolve must never mint a signed
+        // entitlement from empty state.
         const g = subUntil > Date.now() ? ecoSignGrant(accountId, subUntil) : null;
         out.eco = { account: accountId, subUntil, grant: g ? g.grant : null, sig: g ? g.sig : null };
+        if (paymentProtocol && ecosystemReady && snap) {
+            try {
+                const env = paymentProtocol.signEntitlement(snap, { app: 'paceseeker', identity: String(id) });
+                if (env) out.eco.v2 = env;
+            } catch (e) { /* unsigned snapshot — ECO1 above still applies */ }
+        }
     } catch (e) {
         // Eco layer failure must never break the core trial response.
     }
@@ -6995,6 +7797,7 @@ app.get('/api/cloud/usage', authenticateToken, async (req, res) => {
             marginBytes: USER_QUOTA_MARGIN_BYTES,
             subscription,
             serverFreeBytes,
+            entitlementEnvelope: await ecoEntitlementEnvelopeForUser(req.user.id, row),
         });
     } catch (e) {
         return res.status(500).json({ error: 'Usage unavailable' });
@@ -7468,9 +8271,13 @@ app.post('/api/wallet-login', authRateLimiter, async (req, res) => {
         console.log('[WalletLogin] Successful login for user', user.id, 'wallet:', wallet_address);
 
         // Ecosystem membership: the wallet is cryptographically proven here
-        // (SIWS), so wallet-matched auto-linking uses it as the identity root.
+        // (SIWS) — pass the actual proof kind + reference so the member proof
+        // row records the verified signature, not a bare flag.
         try {
-            const acct = await ecoEnsureAccount('photolynk', user.id, walletAddressNorm, { verified: true });
+            const acct = await ecoEnsureAccount('photolynk', user.id, walletAddressNorm, {
+                proofKind: 'siws',
+                proofRef: crypto.createHash('sha256').update(String(signature)).digest('hex'),
+            });
             await ecoSyncMemberEntitlement(acct);
         } catch (e) { console.warn('[Eco] wallet-login membership failed:', e.message); }
 
@@ -7914,6 +8721,13 @@ app.get('/api/subscription/status', authenticateToken, async (req, res) => {
                 };
             }
         } catch (e) { /* eco layer is additive */ }
+        // Signed ECO2 entitlement envelope (additive; existing status fields
+        // unchanged) with core-derived sources + PL trial/grace/premium
+        // extras signed as their own kinds.
+        try {
+            const planRow = await dbGetAsync(`SELECT plan_gb, trial_until, grace_until, premium_gb, premium_expires_at FROM user_plans WHERE user_id = ?`, [userId]);
+            st.entitlementEnvelope = await ecoEntitlementEnvelopeForUser(userId, planRow);
+        } catch (e) { /* unsigned - legacy fields still apply */ }
         return res.json(st);
     } catch (e) {
         return res.status(500).json({ error: 'Failed to resolve subscription status' });
@@ -8201,7 +9015,8 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
             return res.status(401).json({ error: 'Unauthorized' });
         }
 
-        const event = req.body || {};
+        // Provider payload may nest the event body - accept either shape.
+        const event = (req.body && req.body.event) || req.body || {};
         const appUserId = event && (event.app_user_id || event.appUserId) ? String(event.app_user_id || event.appUserId) : '';
         if (!appUserId) return res.status(400).json({ error: 'Missing app_user_id' });
 
@@ -8225,16 +9040,72 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
               LIMIT 1`,
             [appUserId],
             async (err, row) => {
-                if (err) return res.status(500).json({ error: 'Database error' });
+              try {
+                if (err) return res.status(503).json({ error: 'Database error', retryable: true });
                 if (!row || !row.user_id) return res.status(404).json({ error: 'User not found' });
                 const currentPlan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [row.user_id]);
 
+                const now = Date.now();
+                const storeUpdate = resolveStoreSubscriptionUpdate({
+                    currentPlan,
+                    productId,
+                    latestPurchaseAt: latestPurchaseAtMs,
+                    rawExpiresAt: expiresAtMs,
+                    now,
+                });
+                const expiresMs = storeUpdate?.expiresAt;
+                const isActive = expiresMs && expiresMs > now;
+
+                // Stable replay id: prefer the provider event id, else a
+                // per-transaction id. original_transaction_id is NEVER used
+                // alone - renewals share it - so it only feeds the composite
+                // fallback key together with purchased/expiry/product.
+                const stableId = event.id || event.transaction_id
+                    || crypto.createHash('sha256').update(JSON.stringify([
+                        appUserId, store, productId,
+                        event.original_transaction_id || event.transaction_id || null,
+                        latestPurchaseAtMs || null, expiresMs || null])).digest('hex').slice(0, 24);
+
+                const isStaleStore = (lastStoreAt) => Number(lastStoreAt) > 0
+                    && Number(latestPurchaseAtMs) > 0
+                    && latestPurchaseAtMs <= Number(lastStoreAt);
+
+                // Stale provider event: a purchase timestamp at or before the
+                // persisted one replays old state - it must not rewrite the
+                // row (duplicates land as no-ops, never as a second grant).
+                if (isStaleStore(currentPlan?.last_store_purchase_at)) {
+                    return res.json({ ok: true, ignored: 'stale_event' });
+                }
+
                 // Ownership guard: a live crypto-paid / ad / premium plan owns
                 // this row — a stale store event must not rewrite its expiry,
-                // status, or payment provenance.
+                // status, or payment provenance. Post-core the verified store
+                // interval is still a REAL purchase: record it as an
+                // independent store source so projection carries BOTH paid
+                // intervals instead of dropping the store entitlement.
                 const NON_STORE_TYPES = new Set(['solana', 'skr', 'ad_claim', 'premium_sol', 'premium_skr']);
                 const curPayType = String(currentPlan?.payment_type || '');
-                if (NON_STORE_TYPES.has(curPayType) && Number(currentPlan?.expires_at) > Date.now()) {
+                if (NON_STORE_TYPES.has(curPayType) && Number(currentPlan?.expires_at) > now) {
+                    const eventGb = tierGb || Number(currentPlan?.plan_gb) || 0;
+                    if (ecosystemReady && isActive && eventGb > 0) {
+                        const r = await ecosystem.transaction(async (tx) => {
+                            // Staleness re-checked inside the mutation tx - a
+                            // renewal committed between the outer SELECT and
+                            // this write still wins.
+                            const fresh = await tx.get(`SELECT last_store_purchase_at FROM user_plans WHERE user_id = ?`, [row.user_id]);
+                            if (isStaleStore(fresh?.last_store_purchase_at)) return { stale: true };
+                            return await ecosystem.recordLocalPlanInTransaction(tx, {
+                                userId: row.user_id,
+                                eventId: `rc:${stableId}`,
+                                kind: 'store',
+                                actor: 'revenuecat',
+                                plan: { planGb: eventGb, startsAt: storeUpdate?.paymentAt || now, expiresAt: expiresMs },
+                                sharedEligible: !!paymentType && eventGb >= 400,
+                            });
+                        });
+                        if (r && r.stale) return res.json({ ok: true, ignored: 'stale_event' });
+                        return res.json({ ok: true, applied: 'store_source_only' });
+                    }
                     console.log(`[RevenueCat Webhook] Ignoring event for user ${row.user_id}: active ${curPayType} plan owns the row`);
                     return res.json({ ok: true, ignored: 'owned_by_nonstore_plan' });
                 }
@@ -8259,20 +9130,8 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
                     }
                 }
 
-                const now = Date.now();
-                const storeUpdate = resolveStoreSubscriptionUpdate({
-                    currentPlan,
-                    productId,
-                    latestPurchaseAt: latestPurchaseAtMs,
-                    rawExpiresAt: expiresAtMs,
-                    now,
-                });
-                const expiresMs = storeUpdate?.expiresAt;
-                const isActive = expiresMs && expiresMs > now;
-
                 if (isActive) {
-                    await dbRunAsync(
-                        `UPDATE user_plans
+                    const updateSql = `UPDATE user_plans
                             SET status = ?,
                                 expires_at = MAX(COALESCE(expires_at, 0), ?),
                                 grace_until = NULL,
@@ -8285,21 +9144,51 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
                                 last_store_purchase_at = CASE WHEN ? IS NOT NULL AND ? > 0 THEN ? ELSE last_store_purchase_at END,
                                 plan_gb = COALESCE(?, plan_gb),
                                 updated_at = ?
-                          WHERE user_id = ?`,
-                        [
-                            'active',
-                            expiresMs,
-                            productId,
-                            entitlementId,
-                            paymentType,
-                            storeUpdate?.paymentAt || now,
-                            storeUpdate?.trialCarryoverAppliedAt, storeUpdate?.trialCarryoverAppliedAt, storeUpdate?.trialCarryoverAppliedAt,
-                            storeUpdate?.lastStorePurchaseAt, storeUpdate?.lastStorePurchaseAt, storeUpdate?.lastStorePurchaseAt,
-                            tierGb,
-                            now,
-                            row.user_id,
-                        ]
-                    );
+                          WHERE user_id = ?`;
+                    const updateParams = [
+                        'active',
+                        expiresMs,
+                        productId,
+                        entitlementId,
+                        paymentType,
+                        storeUpdate?.paymentAt || now,
+                        storeUpdate?.trialCarryoverAppliedAt, storeUpdate?.trialCarryoverAppliedAt, storeUpdate?.trialCarryoverAppliedAt,
+                        storeUpdate?.lastStorePurchaseAt, storeUpdate?.lastStorePurchaseAt, storeUpdate?.lastStorePurchaseAt,
+                        tierGb,
+                        now,
+                        row.user_id,
+                    ];
+                    if (ecosystemReady) {
+                        // The row write and the store source event commit in
+                        // one tx: a stable event id makes replays a no-op,
+                        // and the raw provider expiry is the grant's own
+                        // interval - it never revokes coexisting crypto or
+                        // shared rights.
+                        const r = await ecosystem.transaction(async (tx) => {
+                            // Staleness is re-checked INSIDE the mutation tx,
+                            // not just on the outer SELECT.
+                            const fresh = await tx.get(`SELECT last_store_purchase_at FROM user_plans WHERE user_id = ?`, [row.user_id]);
+                            if (isStaleStore(fresh?.last_store_purchase_at)) return { stale: true };
+                            await tx.run(updateSql, updateParams);
+                            const eventGb = tierGb || Number(currentPlan?.plan_gb) || 0;
+                            if (eventGb > 0) {
+                                await ecosystem.recordLocalPlanInTransaction(tx, {
+                                    userId: row.user_id,
+                                    eventId: `rc:${stableId}`,
+                                    kind: 'store',
+                                    actor: 'revenuecat',
+                                    plan: { planGb: eventGb, startsAt: storeUpdate?.paymentAt || now, expiresAt: expiresMs },
+                                    // Only a verified store purchase at the
+                                    // shared tier feeds the shared sub.
+                                    sharedEligible: !!paymentType && eventGb >= 400,
+                                });
+                            }
+                            return { stale: false };
+                        });
+                        if (r && r.stale) return res.json({ ok: true, ignored: 'stale_event' });
+                    } else {
+                        await dbRunAsync(updateSql, updateParams);
+                    }
                     return res.json({ ok: true });
                 }
 
@@ -8333,6 +9222,15 @@ app.post('/api/revenuecat/webhook', async (req, res) => {
                     ]
                 );
                 return res.json({ ok: true });
+              } catch (e) {
+                // The async db.get callback must never die as an unhandled
+                // rejection - provider retries need an explicit retryable
+                // failure, not a hung request.
+                console.error('[RevenueCat Webhook] failed:', e.message);
+                if (!res.headersSent) {
+                    return res.status(503).json({ error: 'Webhook processing failed', retryable: true });
+                }
+              }
             }
         );
     } catch (e) {
@@ -8375,6 +9273,13 @@ const creditSolanaSubscription = paymentRecovery.createSubscriptionCreditor({
     dbPath: DB_PATH,
     computeExpiry: computePaidSubscriptionExpiry,
     durations: PLAN_DURATION_MS,
+    // The core hook is live only after initialize committed schema +
+    // baseline; before that the creditor writes the legacy projection so an
+    // early payment never hits uninitialized core tables.
+    ecosystem: {
+        applyPhotolynkInTransaction: (txh, receipt, currentPlan) =>
+            ecosystemReady ? ecosystem.applyPhotolynkInTransaction(txh, receipt, currentPlan) : null,
+    },
 });
 
 // Map a verification failure to an HTTP response. Terminal codes answer 400
@@ -8438,6 +9343,22 @@ app.get('/api/solana/payment-code', async (req, res) => {
     }
     try {
         const code = paymentCodeFor(decoded.id);
+        // Keep the indexed map current for this caller, then read owners
+        // through it - a collision resolves to ambiguous exactly like the
+        // legacy scan, never a first-match guess.
+        if (ecosystemReady && paymentProtocol) {
+            await ecosystem.transaction(async (tx) => {
+                await tx.run(
+                    `INSERT INTO solana_payment_codes (user_id, code) VALUES (?, ?)
+                     ON CONFLICT(user_id) DO UPDATE SET code = excluded.code`,
+                    [Number(decoded.id), code]);
+            });
+            const owners = await paymentProtocol.usersByPaymentCode(code);
+            if (!(owners.length === 1 && Number(owners[0]) === Number(decoded.id))) {
+                return res.status(503).json({ error: 'Payment account verification unavailable', code: 'PAYMENT_ACCOUNT_UNAVAILABLE' });
+            }
+            return res.json({ code });
+        }
         const owner = await treasuryUserByPaymentCode(code);
         if (!owner || Number(owner.id) !== Number(decoded.id)) {
             return res.status(503).json({ error: 'Payment account verification unavailable', code: 'PAYMENT_ACCOUNT_UNAVAILABLE' });
@@ -8501,6 +9422,7 @@ app.post('/api/solana/verify-payment', async (req, res) => {
         const existingEarly = await dbGetAsync(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [txSig]);
         if (existingEarly) {
             if (paymentRecovery.samePaymentRow(existingEarly, { userId: user.id, token: 'SOL', tierGb: normalizedTier, duration: normDuration })) {
+                await syncEcoUser(user.id); // repair/read current projection before returning
                 const plan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [user.id]);
                 return res.json({
                     success: true,
@@ -8549,6 +9471,11 @@ app.post('/api/solana/verify-payment', async (req, res) => {
         if (!requirePaymentMemo(res, txVerification.memo, `PhotoLynk:sub:${normalizedTier}:${normDuration}`, user.id)) {
             return;
         }
+        // A quoted payment is bound to the subject the quote was issued to -
+        // this account cannot redeem another user's signed payment intent.
+        if (txVerification.quoteSubjectId != null && String(txVerification.quoteSubjectId) !== String(user.id)) {
+            return res.status(400).json({ code: 'PAYMENT_CONFLICT', error: 'Payment quote belongs to a different account', retryable: false, success: false });
+        }
 
         // Legacy-queue replay: an upgraded client retrying an OLD unowned
         // pending entry marks pendingReplay + sends the codeless memo. That
@@ -8577,11 +9504,16 @@ app.post('/api/solana/verify-payment', async (req, res) => {
                 signature: txSig,
                 token: 'SOL',
                 amount: txVerification.receivedAmount || 0,
+                amountAtomic: txVerification.receivedRawAmount != null ? String(txVerification.receivedRawAmount) : null,
+                payerWallet: txVerification.sender || null,
+                mint: null,
+                quoteId: txVerification.quoteId || null,
                 tierGb: normalizedTier,
                 duration: normDuration,
                 paymentAt,
                 source: 'client_verify',
                 detail: `sender=${txVerification.sender || 'unknown'}`,
+                evidence: { slot: txVerification.slot || null, memo: txVerification.memo || null },
             });
         } catch (e) {
             if (e.code === 'PAYMENT_CONFLICT') {
@@ -8604,15 +9536,10 @@ app.post('/api/solana/verify-payment', async (req, res) => {
             });
         }
 
-        // Ecosystem mirror: only PURCHASED binding tiers (400GB+) activate
-        // PaceSeeker and future member apps - a preserved larger plan must
-        // not unlock the ecosystem for a low-tier payment, and the mirror
-        // never asserts users.wallet_address (self-reported) as verified.
+        // The core already applied the receipt inside the credit transaction —
+        // refresh the projection so reads see the canonical state.
         try {
-            if (normalizedTier >= ECO_BIND_MIN_TIER_GB && expiresAt > Date.now()) {
-                const acct = await ecoEnsureAccount('photolynk', user.id, null);
-                await ecoFloorSub(acct, expiresAt, { sourceApp: 'photolynk', kind: 'payment', provenance: txSig, allowRevoked: true });
-            }
+            await syncEcoUser(user.id);
         } catch (e) { console.warn('[Eco] payment mirror failed:', e.message); }
 
         console.log(`[Solana] Payment verified: ${txSig} - User ${user.email} - ${normalizedTier}GB ${duration}`);
@@ -8682,6 +9609,7 @@ app.post('/api/solana/verify-skr-payment', async (req, res) => {
         const existingEarly = await dbGetAsync(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [txSig]);
         if (existingEarly) {
             if (paymentRecovery.samePaymentRow(existingEarly, { userId: user.id, token: 'SKR', tierGb: normalizedTier, duration: normDuration })) {
+                await syncEcoUser(user.id);
                 const plan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [user.id]);
                 return res.json({
                     success: true,
@@ -8728,6 +9656,11 @@ app.post('/api/solana/verify-skr-payment', async (req, res) => {
         if (!requirePaymentMemo(res, txVerification.memo, `PhotoLynk:sub:${normalizedTier}:${normDuration}`, user.id)) {
             return;
         }
+        // A quoted payment is bound to the subject the quote was issued to -
+        // this account cannot redeem another user's signed payment intent.
+        if (txVerification.quoteSubjectId != null && String(txVerification.quoteSubjectId) !== String(user.id)) {
+            return res.status(400).json({ code: 'PAYMENT_CONFLICT', error: 'Payment quote belongs to a different account', retryable: false, success: false });
+        }
 
         // Legacy-queue replay (same rule as the SOL route): a codeless memo
         // replayed for a different account only credits when trusted payer
@@ -8752,11 +9685,16 @@ app.post('/api/solana/verify-skr-payment', async (req, res) => {
                 signature: txSig,
                 token: 'SKR',
                 amount: txVerification.receivedAmount || 0,
+                amountAtomic: txVerification.receivedRawAmount != null ? String(txVerification.receivedRawAmount) : null,
+                payerWallet: txVerification.sender || null,
+                mint: SKR_TOKEN_MINT,
+                quoteId: txVerification.quoteId || null,
                 tierGb: normalizedTier,
                 duration: normDuration,
                 paymentAt,
                 source: 'client_verify_skr',
                 detail: `mint=${SKR_TOKEN_MINT}`,
+                evidence: { slot: txVerification.slot || null, memo: txVerification.memo || null },
             });
         } catch (e) {
             if (e.code === 'PAYMENT_CONFLICT') {
@@ -8779,13 +9717,10 @@ app.post('/api/solana/verify-skr-payment', async (req, res) => {
             });
         }
 
-        // Ecosystem mirror (same as SOL path): PURCHASED binding tiers only,
-        // never the self-reported wallet.
+        // The core already applied the receipt inside the credit transaction —
+        // refresh the projection so reads see the canonical state.
         try {
-            if (normalizedTier >= ECO_BIND_MIN_TIER_GB && expiresAt > Date.now()) {
-                const acct = await ecoEnsureAccount('photolynk', user.id, null);
-                await ecoFloorSub(acct, expiresAt, { sourceApp: 'photolynk', kind: 'payment', provenance: txSig, allowRevoked: true });
-            }
+            await syncEcoUser(user.id);
         } catch (e) { console.warn('[Eco] SKR payment mirror failed:', e.message); }
 
         console.log(`[Solana SKR] Payment verified: ${txSig} - User ${user.email} - ${normalizedTier}GB ${duration}`);
@@ -8890,14 +9825,47 @@ async function verifyTreasuryTransaction(txSignature, expectedUsd, token) {
         return { success: false, code: e.code || 'MEMO_MISMATCH', error: e.message };
     }
 
+    // A transaction carrying an SLQ1 quote reference must satisfy the quote,
+    // not just the legacy memo/price path: full quote validation happens
+    // here, and the creditor consumes it atomically with the core receipt.
+    // A malformed quote memo rejects the whole payment - it can never be
+    // silently dropped and paid as a full-price legacy purchase.
+    let quoteId = null;
+    let quoteSubjectId = null;
+    try {
+        const eco = paymentRecovery.extractEcosystemMemo(tx);
+        if (eco && eco.quoteId) {
+            if (eco.app !== 'photolynk') {
+                return { success: false, code: 'MEMO_MISMATCH', error: 'Quote memo on a non-PhotoLynk payment' };
+            }
+            if (!paymentProtocol || !ecosystemReady) {
+                return { success: false, code: 'PROTOCOL_UNAVAILABLE', retryable: true, error: 'Payment protocol not ready - retry shortly' };
+            }
+            const qc = await paymentProtocol.quoteCheck(eco.quoteId, {
+                app: eco.app, productId: eco.productId, duration: eco.duration,
+                token, payer: transfer.senderWallet, rawAmount: transfer.rawAmount,
+                paidAt: blockTimeSec * 1000,
+            });
+            if (!qc.ok) {
+                return { success: false, code: qc.code, retryable: !!qc.retryable, error: `payment quote ${eco.quoteId}: ${qc.code}` };
+            }
+            quoteId = eco.quoteId;
+            quoteSubjectId = qc.payload && qc.payload.subjectId != null ? String(qc.payload.subjectId) : null;
+        }
+    } catch (e) {
+        return { success: false, code: e.code || 'MEMO_MISMATCH', error: e.message };
+    }
+
     // Enforce the on-chain amount against the server-side USD expectation and
     // the recent price band (protects against underpayment and replayed
-    // commission txs that share the payment wallet).
-    const band = await getPriceBand(isSkr ? 'skr' : 'sol');
+    // commission txs that share the payment wallet). A validated quote fixes
+    // the atomic amount at issue time - it is never re-priced by a live band
+    // that may have moved or vanished since the quote was issued.
+    const band = quoteId ? { latest: 0 } : await getPriceBand(isSkr ? 'skr' : 'sol');
     if (!band) {
         return { success: false, code: 'PRICE_UNAVAILABLE', retryable: true, error: 'Price feed unavailable, retry later' };
     }
-    const evalResult = evaluatePaymentAmount({ receivedUnits: transfer.amount, expectedUsd, band });
+    const evalResult = quoteId ? { ok: true } : evaluatePaymentAmount({ receivedUnits: transfer.amount, expectedUsd, band });
     if (!evalResult.ok) {
         console.log(`[Solana] Underpaid: received ${transfer.amount} ${token}, expected ~${evalResult.expectedAtLatest} (min ${evalResult.minAcceptable}) for $${expectedUsd}`);
         return {
@@ -8915,13 +9883,15 @@ async function verifyTreasuryTransaction(txSignature, expectedUsd, token) {
     return {
         success: true,
         receivedAmount: transfer.amount,
+        receivedRawAmount: Number(transfer.rawAmount),
         sender: transfer.senderWallet,
         receiver: SOLANA_PAYMENT_WALLET,
         blockTime: blockTimeSec,
         slot: tx.slot,
         memo,
+        quoteId,
+        quoteSubjectId,
         ...(isSkr ? {
-            receivedRawAmount: Number(transfer.rawAmount),
             owner: SOLANA_PAYMENT_WALLET,
             mint: SKR_TOKEN_MINT,
         } : {}),
@@ -9032,13 +10002,25 @@ const treasuryMarkSeen = async (signature, outcome, userId = null, detail = null
 };
 
 // Resolve a memo's optional 4th-segment payment code to a user id.
-// paymentCodeFor is an HMAC, so this is a per-user compare - fine at this
+// Post-ready the indexed solana_payment_codes map answers in O(1);
+// pre-ready it falls back to the per-user HMAC compare - fine at this
 // cadence (a few dozen txs every 6h). ALL matches are gathered: exactly one
-// wins, a collision is ambiguous and treated as no match. DB errors propagate
-// so the caller retries the signature instead of recording a terminal miss.
+// wins, a collision is ambiguous and treated as no match. DB errors
+// propagate so the caller retries the signature instead of recording a
+// terminal miss.
 // === PAYMENT_CODE_RESOLVER_BEGIN ===
 const treasuryUserByPaymentCode = async (code) => {
     if (!code) return null;
+    if (ecosystemReady && paymentProtocol) {
+        const ids = await paymentProtocol.usersByPaymentCode(code);
+        if (ids.length === 1) {
+            return await dbGetAsync(`SELECT id, email FROM users WHERE id = ?`, [Number(ids[0])]);
+        }
+        if (ids.length > 1) {
+            console.warn(`[TreasuryScan] payment code ${code} matched ${ids.length} users - ambiguous, skipping attribution`);
+        }
+        return null;
+    }
     const users = await dbAllAsync(`SELECT id, email FROM users`, []);
     const matches = (users || []).filter((u) => u && u.id && paymentCodeFor(u.id) === code);
     if (matches.length === 1) return matches[0];
@@ -9101,9 +10083,11 @@ const treasuryLegacyWalletCandidates = async (walletAddress) => {
 // Discover the treasury's SKR token accounts. CRITICAL: SPL transfers arrive
 // at the ATA, whose address - not the wallet's - sits in the tx accountKeys,
 // so getSignaturesForAddress(paymentWallet) never sees SKR payments at all.
-// Scanning these token accounts is what makes the SKR path work.
+// Scanning these token accounts is what makes the SKR (and now USDC/USDT
+// protocol) paths work. `cacheKey` namespaces the persisted discovery per
+// mint; the default keeps the legacy SKR fixture.
 // === TOKEN_ACCOUNT_DISCOVERY_BEGIN ===
-const treasuryGetTokenAccounts = async () => {
+const treasuryGetTokenAccounts = async (mint = SKR_TOKEN_MINT, cacheKey = 'skr_token_accounts') => {
     // UNION semantics: every endpoint that answers contributes its pubkeys,
     // merged with the persisted discovery. A token account that was once
     // discovered may be temporarily invisible (or closed while still holding
@@ -9116,7 +10100,7 @@ const treasuryGetTokenAccounts = async () => {
         let result;
         try {
             result = await treasuryRpcOn(endpoint, 'getTokenAccountsByOwner',
-                [SOLANA_PAYMENT_WALLET, { mint: SKR_TOKEN_MINT }, { encoding: 'jsonParsed' }]);
+                [SOLANA_PAYMENT_WALLET, { mint }, { encoding: 'jsonParsed' }]);
         } catch (e) {
             console.warn(`[TreasuryScan] token account discovery failed on ${endpoint}:`, e.message);
             continue;
@@ -9132,7 +10116,7 @@ const treasuryGetTokenAccounts = async () => {
     }
     let stored = [];
     try {
-        const row = await dbGetAsync(`SELECT value FROM treasury_scan_state WHERE key = 'skr_token_accounts'`, []);
+        const row = await dbGetAsync(`SELECT value FROM treasury_scan_state WHERE key = ?`, [cacheKey]);
         const parsed = row?.value ? JSON.parse(row.value) : null;
         if (Array.isArray(parsed)) stored = parsed.filter((a) => typeof a === 'string' && a);
     } catch (e) {
@@ -9147,8 +10131,8 @@ const treasuryGetTokenAccounts = async () => {
     // addresses are retained even when no endpoint currently lists them.
     try {
         await dbRunAsync(
-            `INSERT OR REPLACE INTO treasury_scan_state (key, value, updated_at) VALUES ('skr_token_accounts', ?, ?)`,
-            [JSON.stringify(union), Date.now()]
+            `INSERT OR REPLACE INTO treasury_scan_state (key, value, updated_at) VALUES (?, ?, ?)`,
+            [cacheKey, JSON.stringify(union), Date.now()]
         );
     } catch (e) {
         console.warn('[TreasuryScan] token account persist failed:', e.message);
@@ -9273,10 +10257,14 @@ const treasuryScanOnce = async () => {
             }
         }
 
-        // SKR arrives at the treasury ATA, SOL at the wallet itself - scan
-        // both, merge by signature, then process oldest->newest so crediting
-        // order matches on-chain order.
-        const scanAddresses = [SOLANA_PAYMENT_WALLET, ...(await treasuryGetTokenAccounts())];
+        // SKR arrives at the treasury ATA, SOL at the wallet itself, and
+        // PS/quote payments may arrive in USDC/USDT at their own ATAs -
+        // scan all of them, merge by signature, then process
+        // oldest->newest so crediting order matches on-chain order.
+        const scanAddresses = [SOLANA_PAYMENT_WALLET,
+            ...(await treasuryGetTokenAccounts(SKR_TOKEN_MINT, 'skr_token_accounts')),
+            ...(await treasuryGetTokenAccounts(USDC_MINT, 'usdc_token_accounts')),
+            ...(await treasuryGetTokenAccounts(USDT_MINT, 'usdt_token_accounts'))];
         console.log(`[TreasuryScan] scanning ${scanAddresses.length} address(es): ${scanAddresses.join(', ')}`);
         const collected = [];
         for (const addr of scanAddresses) {
@@ -9356,6 +10344,40 @@ const treasuryScanOnce = async () => {
                 if (!paymentAt) {
                     await treasuryMarkSeen(signature, 'rpc_error', null, 'missing blockTime');
                     summary.errors++;
+                    continue;
+                }
+
+                // ECO2 dispatch runs BEFORE the legacy SOL/SKR inflow
+                // extraction: a PaceSeeker product memo or an SLQ1 quote
+                // reference belongs to the payment protocol - a PS payment
+                // may arrive in USDC/USDT (which the extractor below would
+                // discard as 'no_inflow'), and a quoted payment must have
+                // its quote validated and consumed atomically.
+                let ecoMemo = null;
+                try {
+                    ecoMemo = paymentRecovery.extractEcosystemMemo(tx);
+                } catch (e) {
+                    await treasuryMarkSeen(signature, 'no_memo', null, `${e.message} - manual review`);
+                    summary.skipped++;
+                    continue;
+                }
+                if (ecoMemo && (ecoMemo.app === 'paceseeker' || ecoMemo.quoteId)) {
+                    if (!paymentProtocol || !ecosystemReady) {
+                        await treasuryMarkSeen(signature, 'rpc_error', null, 'payment protocol not ready');
+                        summary.errors++;
+                        continue;
+                    }
+                    const r = await paymentProtocol.processSignature(signature, { subjects: [] });
+                    if (r.status === 'applied') {
+                        await treasuryMarkSeen(signature, 'credited_protocol', null, `app=${r.app} identity=${r.identity || ''}`);
+                        summary.credited++;
+                    } else if (r.status === 'pending') {
+                        await treasuryMarkSeen(signature, 'rpc_error', null, r.code || 'pending');
+                        summary.errors++;
+                    } else {
+                        await treasuryMarkSeen(signature, 'conflict', null, r.code || 'conflict');
+                        summary.skipped++;
+                    }
                     continue;
                 }
 
@@ -9494,15 +10516,20 @@ const treasuryScanOnce = async () => {
                         continue;
                     }
                     const premiumDuration = isSkr ? 'premium_skr' : 'premium';
-                    const now = Date.now();
                     try {
-                        await dbRunAsync(
-                            `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, skr_amount, payment_token, tier_gb, duration, created_at, verified_at)
-                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                            [user.id, signature, isSkr ? 0 : receivedUnits, isSkr ? receivedUnits : 0, isSkr ? 'SKR' : 'SOL', 0, premiumDuration, paymentAt, now]
-                        );
+                        await recordVerifiedPremiumPayment({
+                            userId: user.id,
+                            signature,
+                            token: isSkr ? 'SKR' : 'SOL',
+                            amount: receivedUnits,
+                            amountAtomic: transfer.rawAmount,
+                            payerWallet: senderWallet,
+                            mint: isSkr ? SKR_TOKEN_MINT : null,
+                            paymentAt,
+                            evidence: { slot: transfer.slot, memo },
+                        });
                     } catch (e) {
-                        if (!/UNIQUE/i.test(e.message || '')) throw e;
+                        if (!/UNIQUE/i.test(e.message || '') && e.code !== 'PAYMENT_CONFLICT') throw e;
                         const raced = await dbGetAsync(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [signature]);
                         if (!raced || Number(raced.user_id) !== Number(user.id) || Number(raced.tier_gb) !== 0 || String(raced.duration || '') !== premiumDuration) {
                             await treasuryMarkSeen(signature, 'conflict', null, 'premium ledger row mismatch');
@@ -9562,6 +10589,10 @@ const treasuryScanOnce = async () => {
                         signature,
                         token: transfer.token,
                         amount: receivedUnits,
+                        amountAtomic: transfer.rawAmount,
+                        payerWallet: senderWallet,
+                        mint: isSkr ? SKR_TOKEN_MINT : null,
+                        evidence: { slot: transfer.slot, memo },
                         tierGb: normalizedTier,
                         duration: parsed.duration,
                         paymentAt,
@@ -9585,12 +10616,10 @@ const treasuryScanOnce = async () => {
                     continue;
                 }
 
-                try {
-                    if (normalizedTier >= ECO_BIND_MIN_TIER_GB && creditResult.expiresAt > Date.now()) {
-                        const acct = await ecoEnsureAccount('photolynk', user.id, null);
-                        await ecoFloorSub(acct, creditResult.expiresAt, { sourceApp: 'photolynk', kind: 'payment', provenance: signature, allowRevoked: true });
-                    }
-                } catch (e) { console.warn('[TreasuryScan] Eco mirror failed:', e.message); }
+                // The core receipt (applied inside the creditor's tx) is the
+                // entitlement; this just repairs/reads the projection so the
+                // shared timeline reaches linked members. No second grant.
+                await syncEcoUser(user.id);
 
                 await treasuryMarkSeen(signature, 'credited_sub', user.id,
                     `tier=${creditResult.planGb}GB ${parsed.duration} ${transfer.token} expires=${new Date(creditResult.expiresAt).toISOString()} sender=${senderWallet} amount=${receivedUnits}`);
@@ -9689,7 +10718,33 @@ app.post('/api/admin/treasury-recover', adminAuth, async (req, res) => {
         if (!r.ok) return res.status(r.status || 400).json({ error: r.error, code: r.code });
         const insp = r.inspection;
         if (insp.alreadyProcessed) {
+            await syncEcoUser(Number(userId));
             return res.json({ ok: true, alreadyProcessed: true, expiresAt: insp.expectedExpiresAt, planGb: insp.planGb ?? insp.tierGb, status: insp.planStatus });
+        }
+        // A tx carrying an SLQ1 quote reference is the quote subject's signed
+        // payment intent - only the protocol may apply it, and only to the
+        // quote's authoritative identity. The requested userId must be that
+        // subject or the recovery conflicts rather than stealing the quote.
+        if (insp.quoteId) {
+            if (!ecosystemReady || !paymentProtocol) {
+                return res.status(503).json({ error: 'Payment protocol unavailable', code: 'PROTOCOL_UNAVAILABLE', retryable: true });
+            }
+            await ecosystem.enqueueVerification({ signature: insp.signature, app: 'photolynk', identity: String(userId) });
+            const pr = await paymentProtocol.processSignature(insp.signature, {
+                subjects: [{ app: 'photolynk', identity: String(userId) }],
+            });
+            if (pr.status === 'applied') {
+                if (String(pr.identity) !== String(userId)) {
+                    return res.status(409).json({ error: 'Payment quote belongs to a different account', code: 'PAYMENT_CONFLICT' });
+                }
+                await treasuryMarkSeen(insp.signature, 'credited_sub_admin', Number(userId),
+                    `quote=${insp.quoteId} tier=${insp.tierGb}GB ${insp.duration} ${insp.token} via=protocol`);
+                return res.json({ ok: true, status: 'applied', attribution: 'quote' });
+            }
+            if (pr.status === 'pending') {
+                return res.status(202).json({ ok: false, status: 'pending', pending: true, code: pr.code || 'PENDING', retryable: true });
+            }
+            return res.status(409).json({ ok: false, status: 'conflict', code: pr.code || 'PAYMENT_CONFLICT' });
         }
         if (insp.historical) {
             return res.status(400).json({ error: 'Transaction is older than 30 days - historical pricing unavailable', code: 'HISTORICAL_REVIEW' });
@@ -9707,6 +10762,10 @@ app.post('/api/admin/treasury-recover', adminAuth, async (req, res) => {
                 signature: insp.signature,
                 token: insp.token,
                 amount: insp.amount,
+                amountAtomic: insp.rawAmount,
+                payerWallet: insp.payer,
+                mint: insp.token === 'SKR' ? SKR_TOKEN_MINT : null,
+                evidence: { memo: insp.memo },
                 tierGb: insp.tierGb,
                 duration: insp.duration,
                 paymentAt: insp.paymentAt,
@@ -9725,12 +10784,9 @@ app.post('/api/admin/treasury-recover', adminAuth, async (req, res) => {
         }
         await treasuryMarkSeen(insp.signature, 'credited_sub_admin', Number(userId),
             `tier=${creditResult.planGb}GB ${insp.duration} ${insp.token} expires=${new Date(creditResult.expiresAt).toISOString()} payer=${insp.payer} via=${insp.attribution}`);
-        try {
-            if (insp.tierGb >= ECO_BIND_MIN_TIER_GB && creditResult.expiresAt > Date.now()) {
-                const acct = await ecoEnsureAccount('photolynk', Number(userId), null);
-                await ecoFloorSub(acct, creditResult.expiresAt, { sourceApp: 'photolynk', kind: 'payment', provenance: insp.signature, allowRevoked: true });
-            }
-        } catch (e) { console.warn('[TreasuryRecover] Eco mirror failed:', e.message); }
+        // Core receipt already committed inside the creditor - projection
+        // repair only, never a second grant.
+        await syncEcoUser(Number(userId));
         console.log(`[TreasuryRecover] admin credited user ${userId}: ${creditResult.planGb}GB ${insp.duration} via ${signature}`);
         res.json({ ok: true, expiresAt: creditResult.expiresAt, planGb: creditResult.planGb, attribution: insp.attribution });
     } catch (e) {
@@ -9765,6 +10821,20 @@ db.serialize(() => {
     // Cryptographically proven wallet<->user bindings (ed25519-verified logins
     // and eco bind-wallet only - never /api/save-wallet).
     db.run(`CREATE TABLE IF NOT EXISTS solana_wallet_bindings (wallet TEXT NOT NULL,user_id INTEGER NOT NULL,verified_at INTEGER NOT NULL,PRIMARY KEY(wallet,user_id))`);
+    // Durable one-use wallet-bind challenges (ECO2 bind/rotation): the nonce
+    // outlives the in-memory map across restarts, binds app+identity+target
+    // wallet+action, and is consumed atomically inside the core transaction.
+    db.run(`CREATE TABLE IF NOT EXISTS ecosystem_bind_challenges (
+        nonce TEXT PRIMARY KEY,
+        app TEXT NOT NULL,
+        identity TEXT NOT NULL,
+        account_id TEXT NOT NULL,
+        wallet TEXT,
+        old_wallet TEXT,
+        action TEXT,
+        expires_at INTEGER NOT NULL,
+        used_at INTEGER
+    )`);
     db.run(`CREATE TABLE IF NOT EXISTS paceseeker_devices (
         device_hash TEXT PRIMARY KEY,
         first_seen INTEGER,
@@ -9788,6 +10858,9 @@ db.serialize(() => {
     // Connected owner wallet + reverse-resolved SNS primary domain.
     db.run(`ALTER TABLE paceseeker_devices ADD COLUMN wallet_address TEXT`, () => { });
     db.run(`ALTER TABLE paceseeker_devices ADD COLUMN wallet_domain TEXT`, () => { });
+    // Client-reported expiry lives apart from authoritative sub_until (which
+    // only the core projection writes).
+    db.run(`ALTER TABLE paceseeker_devices ADD COLUMN reported_sub_until INTEGER`, () => { });
 });
 
 // Append-only revenue ledger keyed on the tx signature. Dedupes re-reports,
@@ -14974,6 +16047,18 @@ try {
             );
             applied = true;
         }
+        // The core premium claim completes only after the real NFT/storage
+        // work succeeded. This runs on every pass - an earlier attempt may
+        // have committed the ledger marker while the core marking crashed,
+        // and a marking failure must stay retryable, not be swallowed.
+        // RECEIPT_UNKNOWN is the pre-core ledger case (no claim to finish).
+        if (ecosystemReady) {
+            try {
+                await ecosystem.markPremiumApplied(row.tx_signature);
+            } catch (e) {
+                if (!e || e.code !== 'RECEIPT_UNKNOWN') throw e;
+            }
+        }
         const premiumStatus = nftService.balance.getPremiumStatus(row.user_id);
         const bal = nftService.balance.getBalance(row.user_id);
         const plan = await dbGetAsync(`SELECT premium_gb FROM user_plans WHERE user_id = ?`, [row.user_id]);
@@ -15199,6 +16284,11 @@ try {
             if (!requirePaymentMemo(res, txVerification.memo, 'PhotoLynk:premium:0:premium', user.id)) {
                 return;
             }
+            // A quoted payment is bound to the subject the quote was issued
+            // to - this account cannot redeem another user's signed intent.
+            if (txVerification.quoteSubjectId != null && String(txVerification.quoteSubjectId) !== String(user.id)) {
+                return res.status(400).json({ code: 'PAYMENT_CONFLICT', error: 'Payment quote belongs to a different account', retryable: false, success: false });
+            }
             // Legacy-queue replay (same rule as the subscription routes): a
             // codeless premium memo only credits THIS account when trusted
             // payer evidence binds the sender to exactly this user.
@@ -15213,24 +16303,32 @@ try {
                 }
             }
 
-            // Ledger first, entitlement second: the INSERT is the durable
-            // record of the verified payment; resumePremiumPayment applies
-            // NFT premium + tax record + plan effects exactly once.
+            // Ledger first, entitlement second: the premium claim + INSERT
+            // commit atomically (core receipt consumes any SLQ quote); then
+            // resumePremiumPayment applies NFT premium + tax record + plan
+            // effects exactly once.
             const now = Date.now();
             const paymentAt = Number(txVerification.blockTime) > 0 ? txVerification.blockTime * 1000 : now;
             try {
-                await dbRunAsync(
-                    `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, tier_gb, duration, created_at, verified_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                    [user.id, txSig, txVerification.receivedAmount || 0, 0, 'premium', paymentAt, now]
-                );
+                await recordVerifiedPremiumPayment({
+                    userId: user.id,
+                    signature: txSig,
+                    token: 'SOL',
+                    amount: txVerification.receivedAmount || 0,
+                    amountAtomic: txVerification.receivedRawAmount != null ? String(txVerification.receivedRawAmount) : null,
+                    payerWallet: txVerification.sender || null,
+                    mint: null,
+                    paymentAt,
+                    quoteId: txVerification.quoteId || null,
+                    evidence: { blockTime: txVerification.blockTime || null, memo: txVerification.memo || null },
+                });
             } catch (e) {
-                if (!/UNIQUE/i.test(e.message || '')) throw e;
-                // Lost the insert race: re-read and apply the same rules -
-                // same user+product resumes, anything else conflicts.
+                if (!/UNIQUE/i.test(e.message || '') && e.code !== 'PAYMENT_CONFLICT') throw e;
+                // Lost the insert race / core conflict: re-read and apply
+                // the same rules - same user+product resumes, anything else
+                // conflicts.
                 const raced = await dbGetAsync(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [txSig]);
-                if (!raced) throw e;
-                if (Number(raced.user_id) === Number(user.id) && matchesPremiumSolRow(raced)) {
+                if (raced && Number(raced.user_id) === Number(user.id) && matchesPremiumSolRow(raced)) {
                     return await respondResumed(raced);
                 }
                 return res.status(400).json({ error: 'Transaction belongs to a different account or purchase', code: 'PAYMENT_CONFLICT', retryable: false });
@@ -15326,6 +16424,11 @@ try {
             if (!requirePaymentMemo(res, txVerification.memo, 'PhotoLynk:premium:0:premium', user.id)) {
                 return;
             }
+            // A quoted payment is bound to the subject the quote was issued
+            // to - this account cannot redeem another user's signed intent.
+            if (txVerification.quoteSubjectId != null && String(txVerification.quoteSubjectId) !== String(user.id)) {
+                return res.status(400).json({ code: 'PAYMENT_CONFLICT', error: 'Payment quote belongs to a different account', retryable: false, success: false });
+            }
             // Legacy-queue replay guard (codeless premium memo only).
             if (req.body.pendingReplay === true && txVerification.memo === 'PhotoLynk:premium:0:premium') {
                 const replayPaymentAt = Number(txVerification.blockTime) > 0 ? txVerification.blockTime * 1000 : Date.now();
@@ -15341,16 +16444,22 @@ try {
             const now = Date.now();
             const paymentAt = Number(txVerification.blockTime) > 0 ? txVerification.blockTime * 1000 : now;
             try {
-                await dbRunAsync(
-                    `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, skr_amount, payment_token, tier_gb, duration, created_at, verified_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                    [user.id, txSig, 0, txVerification.receivedAmount || 0, 'SKR', 0, 'premium_skr', paymentAt, now]
-                );
+                await recordVerifiedPremiumPayment({
+                    userId: user.id,
+                    signature: txSig,
+                    token: 'SKR',
+                    amount: txVerification.receivedAmount || 0,
+                    amountAtomic: txVerification.receivedRawAmount != null ? String(txVerification.receivedRawAmount) : null,
+                    payerWallet: txVerification.sender || null,
+                    mint: SKR_TOKEN_MINT,
+                    paymentAt,
+                    quoteId: txVerification.quoteId || null,
+                    evidence: { blockTime: txVerification.blockTime || null, memo: txVerification.memo || null },
+                });
             } catch (e) {
-                if (!/UNIQUE/i.test(e.message || '')) throw e;
+                if (!/UNIQUE/i.test(e.message || '') && e.code !== 'PAYMENT_CONFLICT') throw e;
                 const raced = await dbGetAsync(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [txSig]);
-                if (!raced) throw e;
-                if (Number(raced.user_id) === Number(user.id) && matchesPremiumSkrRow(raced)) {
+                if (raced && Number(raced.user_id) === Number(user.id) && matchesPremiumSkrRow(raced)) {
                     return await respondResumed(raced);
                 }
                 return res.status(400).json({ error: 'Transaction belongs to a different account or purchase', code: 'PAYMENT_CONFLICT', retryable: false });
@@ -17571,12 +18680,200 @@ const startHttps = () => {
     }
 };
 
-userPlansMigrationDone.then(() => ensurePaceSeekerSchema(db)).then(
-    () => subscriptionReadiness.finish(null),
-    (err) => {
-        console.error('[Schema] subscription schema unavailable:', err && err.message);
-        subscriptionReadiness.finish(err);
-    });
+// Promo policy for PS quotes: only the signed remote-config payload's
+// subPromo fields - never client-supplied config.
+const ecoGetPromoPolicy = async () => {
+    try {
+        const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, 'remote-config.json'), 'utf8'));
+        const payload = cfg && cfg.payload ? JSON.parse(cfg.payload) : {};
+        return {
+            enabled: !!payload.subPromoEnabled,
+            discountPct: Number(payload.subPromoDiscountPct) || 0,
+            mode: String(payload.subPromoMode || 'code'),
+        };
+    } catch (e) {
+        return { enabled: false, discountPct: 0, mode: 'code' };
+    }
+};
+
+// Repair for pending ad claims stranded by a crash between the status
+// write and the grant apply. Processes one bounded page per worker pass,
+// advancing a monotonically increasing id cursor so a transient failure on
+// one row never wedges the sweep; after a full empty pass the cursor
+// resets to scan new rows from the top. grantAdClaim is atomic +
+// idempotent, so re-visiting a claim is always safe.
+let _ecoAdRepairCursor = 0;
+const ECO_AD_REPAIR_PAGE = 50;
+const ecoRepairPendingAdClaims = async () => {
+    if (!ecosystemReady) return;
+    const rows = await dbAllAsync(
+        `SELECT id, tier_gb FROM ad_claims
+          WHERE status IN ('verified','pending') AND granted_at IS NULL AND id > ?
+          ORDER BY id LIMIT ?`, [_ecoAdRepairCursor, ECO_AD_REPAIR_PAGE]).catch(() => []);
+    if (!rows || !rows.length) {
+        _ecoAdRepairCursor = 0;
+        return;
+    }
+    for (const row of rows) {
+        try {
+            await ecosystem.grantAdClaim(row.id, { tierGb: Number(row.tier_gb) || 100 });
+        } catch (e) {
+            console.warn('[Eco] ad-claim repair failed for', row.id, e.message);
+        }
+        // Cursor advances past every fetched id - a row that keeps failing
+        // is retried on the next sweep instead of blocking the rest.
+        _ecoAdRepairCursor = row.id;
+    }
+};
+
+// Durable job worker: bounded reconcile over ecosystem_jobs + one ad-claim
+// repair page, under a single in-flight guard so repair passes can never
+// overlap. A wake call triggers an immediate pass after receipts and binds
+// are recorded.
+let _ecoWorkerInFlight = false;
+let _ecoWorkerTimer = null;
+function wakeEcoWorker() {
+    if (!paymentProtocol || !ecosystemReady || _ecoWorkerInFlight) return;
+    _ecoWorkerInFlight = true;
+    // Absorb any legacy-ledger credits written while the core was down
+    // before reconciling — absorbed receipts may enqueue verify jobs.
+    ecosystem.absorbLegacyLedgerPage({ limit: 50 })
+        .catch((e) => console.warn('[Eco] legacy absorption pass failed:', e.message))
+        .then(() => paymentProtocol.reconcile({ limit: 100 }))
+        .catch((e) => console.warn('[Eco] reconcile failed:', e.message))
+        .then(() => ecoRepairPendingAdClaims())
+        .catch((e) => console.warn('[Eco] ad-claim repair pass failed:', e.message))
+        .finally(() => { _ecoWorkerInFlight = false; });
+}
+function startEcoWorker() {
+    if (_ecoWorkerTimer) return;
+    _ecoWorkerTimer = setInterval(() => { try { wakeEcoWorker(); } catch (_) { } }, 5000);
+    if (_ecoWorkerTimer.unref) _ecoWorkerTimer.unref();
+    wakeEcoWorker();
+}
+
+// Quote-status recovery trigger: polling clients ask for a treasury scan
+// when their quote has no recorded signature yet. Throttled to at most one
+// scan per 30s with a single trailing wakeup; the scan's own in-flight
+// guard and durable cursors stay authoritative.
+let _ecoScanLastAt = 0;
+let _ecoScanPending = false;
+const ECO_SCAN_THROTTLE_MS = 30000;
+const _ecoRunScan = () => {
+    _ecoScanLastAt = Date.now();
+    treasuryScanOnce().catch((e) => console.warn('[Eco] requested scan failed:', e.message));
+};
+const ecoRequestScan = () => {
+    const t = Date.now();
+    if (t - _ecoScanLastAt >= ECO_SCAN_THROTTLE_MS) { _ecoRunScan(); return; }
+    if (_ecoScanPending) return;
+    _ecoScanPending = true;
+    const timer = setTimeout(() => { _ecoScanPending = false; _ecoRunScan(); }, ECO_SCAN_THROTTLE_MS - (t - _ecoScanLastAt));
+    if (timer.unref) timer.unref();
+};
+
+// ECO2 protocol routes - mounted once after the auth/caller deps above.
+mountEcosystemRoutes(app, {
+    auth: ecoMaybeAuth,
+    caller: ecoCallerAccount,
+    ready: () => ecosystemReady && !!paymentProtocol,
+    protocol: () => paymentProtocol,
+    ecosystem,
+    signKey: ECO_SIGNING_KEY,
+    registry: DEFAULT_REGISTRY,
+    requestScan: ecoRequestScan,
+    wakeWorker: wakeEcoWorker,
+});
+
+// === ECO_INIT_BEGIN ===
+// Ecosystem-core startup. The core must DEGRADE, never take legacy routes
+// down: any initialize() failure (schema surprise, SCHEMA_VERSION_UNSUPPORTED,
+// a migration bug on historical rows, a transient lock) leaves
+// ecosystemReady=false — every ecosystemReady branch falls back to its
+// pre-core legacy path — records the failure for admin visibility, and
+// schedules a capped-backoff retry on an unref'd timer. Retries are safe:
+// ecosystem.initialize() is transactional and idempotent via the baseline_v2
+// marker, and paymentProtocol.initialize() is a single idempotent
+// CREATE-IF-NOT-EXISTS/upsert transaction.
+const ECO_INIT_RETRY_BASE_MS = 60 * 1000;
+const ECO_INIT_RETRY_MAX_MS = 10 * 60 * 1000;
+const ecoTryInitialize = async () => {
+    _ecoInitAttempts += 1;
+    try {
+        const init = await ecosystem.initialize();
+        paymentProtocol = createEcosystemPaymentService({
+            ecosystem,
+            signingKey: ECO_SIGNING_KEY,
+            treasury: SOLANA_PAYMENT_WALLET,
+            tokens: {
+                SOL: { decimals: 9, mint: null },
+                SKR: { decimals: SKR_TOKEN_DECIMALS, mint: SKR_TOKEN_MINT },
+                USDC: { decimals: 6, mint: USDC_MINT },
+                USDT: { decimals: 6, mint: USDT_MINT },
+            },
+            fetchTransaction: (sig) => treasuryFetchTransaction(sig),
+            getPriceBand,
+            evaluatePaymentAmount,
+            resolvePaymentCode: (code) => treasuryUserByPaymentCode(code),
+            paymentCodeFor,
+            treasuryBoundUsers,
+            creditSubscription: (args) => creditSolanaSubscription(args),
+            creditPremium: (args) => recordVerifiedPremiumPayment(args),
+            resumePremiumPayment: (row) => resumePremiumPayment(row),
+            getPremiumPayment: async (signature) =>
+                dbGetAsync(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [String(signature)]),
+            getPromoPolicy: ecoGetPromoPolicy,
+            registry: DEFAULT_REGISTRY,
+            now: () => Date.now(),
+        });
+        await paymentProtocol.initialize();
+        ecosystemReady = true;
+        _ecoInitState = { ok: true, code: null, message: null, at: Date.now(), attempts: _ecoInitAttempts };
+        startEcoWorker();
+        // baseline_v2 already stamped means a previous boot migrated — this
+        // boot may have run (or be recovering from) legacy mode, so absorb
+        // any credits written to the legacy ledger while the core was down.
+        if (init && init.migrated === false) {
+            await ecosystem.absorbLegacyLedgerPage({ limit: 200 })
+                .catch((e) => console.warn('[Eco] legacy absorption pass failed:', e.message));
+        }
+        await ecoRepairPendingAdClaims().catch(() => { });
+    } catch (err) {
+        ecosystemReady = false;
+        paymentProtocol = null;
+        _ecoInitState = {
+            ok: false,
+            code: (err && err.code) || 'INIT_FAILED',
+            message: String((err && err.message) || err),
+            at: Date.now(),
+            attempts: _ecoInitAttempts,
+        };
+        console.error('[Eco] core unavailable - legacy compatibility mode:', _ecoInitState.code, _ecoInitState.message);
+        if (!_ecoInitTimer) {
+            const delay = Math.min(
+                ECO_INIT_RETRY_BASE_MS * Math.pow(2, Math.max(0, _ecoInitAttempts - 1)),
+                ECO_INIT_RETRY_MAX_MS);
+            _ecoInitTimer = setTimeout(() => {
+                _ecoInitTimer = null;
+                ecoTryInitialize().catch(() => { });
+            }, delay);
+            if (_ecoInitTimer.unref) _ecoInitTimer.unref();
+        }
+    }
+};
+// === ECO_INIT_END ===
+
+userPlansMigrationDone
+    .then(() => ensurePaceSeekerSchema(db))
+    // Ecosystem init must never reject readiness: it catches its own
+    // failures and drops into legacy compatibility mode with retries.
+    .then(() => ecoTryInitialize().catch(() => { }))
+    .then(
+        () => subscriptionReadiness.finish(null),
+        (err) => {
+            console.error('[Schema] subscription schema unavailable:', err && err.message);
+            subscriptionReadiness.finish(err);
+        });
 
 // Only start listeners when run directly (node server.js) — requiring this
 // module (e.g. unit tests) must not bind ports.

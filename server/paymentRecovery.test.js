@@ -15,6 +15,7 @@ const nacl = require('tweetnacl');
 const naclUtil = require('tweetnacl-util');
 
 const paymentRecovery = require('./paymentRecovery');
+const { createEcosystemService } = require('./ecosystemEntitlements');
 const {
     parseSubscriptionMemo,
     extractTreasuryTransfer,
@@ -34,6 +35,26 @@ const {
 
 const TREASURY = 'TREASURYwallet1111111111111111111111111111';
 const SKR_MINT = 'SKRbvo6Gf7GondiT3BbTfuRDPqLWei4j2Qy2NPGZhW3';
+const USDC_MINT = 'USDCoctVLVnvTXBEuP9s8hntucdJokbo17RwHuNXemT';
+const USDT_MINT = 'USDTuqcZ2d7QpXkM2xJ3b6r9v1n4m8w5y7z0A1B2C3D';
+// The scanned/routed regions now consult the ECO2 payment protocol. These
+// unit fixtures exercise the legacy PhotoLynk path, so the protocol stays
+// disabled unless a test stubs it explicitly.
+const ECO_OFF = { ecosystemReady: false, paymentProtocol: null, ecosystem: null };
+// The scanner's premium claim goes through recordVerifiedPremiumPayment;
+// replicate its legacy (!ecosystemReady) solana_payments INSERT so the fixture
+// DB sees exactly the row production would write.
+const stubRecordVerifiedPremium = (h) => async ({ userId, signature, token, amount, paymentAt }) => {
+    const uid = Number(userId);
+    const t = String(token || 'SOL').toUpperCase();
+    const at = Number(paymentAt) > 0 ? Number(paymentAt) : Date.now();
+    await h.run(
+        `INSERT OR IGNORE INTO solana_payments (user_id, tx_signature, sol_amount, skr_amount, payment_token, tier_gb, duration, created_at, verified_at)
+         VALUES (?,?,?,?,?,?,?,?,?)`,
+        [uid, signature, t === 'SKR' ? 0 : (Number(amount) || 0), t === 'SKR' ? (Number(amount) || 0) : 0,
+         t, 0, t === 'SKR' ? 'premium_skr' : 'premium', at, Date.now()]);
+    return { alreadyRecorded: false };
+};
 const SKR_DECIMALS = 6;
 const MEMO_PROGRAM_ID = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr';
 const PAYER = 'PayerWallet111111111111111111111111111111';
@@ -1206,8 +1227,9 @@ const mkRecoverRoute = ({ inspection, creditImpl } = {}) => {
             return creditImpl ? creditImpl(args) : { alreadyProcessed: false, expiresAt: Date.now() + 86400000, planGb: args.tierGb, status: 'active' };
         },
         treasuryMarkSeen: async (...a) => { calls.markSeen.push(a); },
-        ecoEnsureAccount: async (...a) => { calls.eco.push(a); return 'acct'; },
-        ecoFloorSub: async () => { },
+        // The route now unconditionally projects the credited user into the
+        // ecosystem mirror after a successful credit.
+        syncEcoUser: async (...a) => { calls.eco.push(a); },
         ECO_BIND_MIN_TIER_GB: 400,
         ADMIN_USER: 'admin',
         console, Date,
@@ -1271,15 +1293,17 @@ test('admin recover route (real handler): confirm gate + conflict + canonical si
     assert.equal(calls.credit.length, 0);
 });
 
-test('admin recover route (real handler): eco mirror uses purchased tier, never wallet', async () => {
-    // purchased 400 -> mirror fires with a NULL wallet (not users.wallet_address)
+test('admin recover route (real handler): eco mirror projects the credited user, never a wallet', async () => {
+    // A successful credit unconditionally re-projects the user; the resolver
+    // owns tier/premium semantics, and the route never passes a wallet.
     let { handler, calls } = mkRecoverRoute({ inspection: okInspection({ tierGb: 400, amount: 2 }) });
     let res = resStub();
     await handler({ body: { signature: 'sig', userId: 1, confirm: true } }, res);
     assert.equal(res.statusCode, 200, JSON.stringify(res.body));
     assert.equal(calls.eco.length, 1);
-    assert.equal(calls.eco[0][2], null);
-    // purchased 100 but plan_gb preserved at 400 -> NO ecosystem unlock
+    assert.equal(calls.eco[0][0], 1, 'projected identity is the numeric userId');
+    assert.equal(calls.eco[0].length, 1, 'no wallet is ever projected from the recovery route');
+    // plan_gb preserved at a higher tier still re-projects (resolver decides)
     ({ handler, calls } = mkRecoverRoute({
         inspection: okInspection({ tierGb: 100 }),
         creditImpl: () => ({ alreadyProcessed: false, expiresAt: Date.now() + 86400000, planGb: 400, status: 'active' }),
@@ -1287,7 +1311,8 @@ test('admin recover route (real handler): eco mirror uses purchased tier, never 
     res = resStub();
     await handler({ body: { signature: 'sig', userId: 1, confirm: true } }, res);
     assert.equal(res.statusCode, 200, JSON.stringify(res.body));
-    assert.equal(calls.eco.length, 0);
+    assert.equal(calls.eco.length, 1);
+    assert.equal(calls.eco[0][0], 1);
 });
 
 // ===========================================================================
@@ -1309,6 +1334,7 @@ const runWalletLogin = async (h, body) => {
         JWT_SECRET: 'test-secret',
         ecoEnsureAccount: async () => 'acct',
         ecoSyncMemberEntitlement: async () => { },
+        crypto: require('crypto'),
         console, Date,
     };
     // REAL implementations evaluated in the same sandbox (temp-db dbAllAsync).
@@ -1493,8 +1519,7 @@ const loadSubVerifyRoutes = (over = {}) => {
         treasuryBoundUsers: async () => [],
         treasuryMarkSeen: async () => {},
         creditSolanaSubscription: async () => ({ expiresAt: Date.now() + 1e6, alreadyProcessed: false, planGb: 100, status: 'active' }),
-        ecoEnsureAccount: async () => ({}),
-        ecoFloorSub: async () => {},
+        syncEcoUser: async () => {},
         ECO_BIND_MIN_TIER_GB: 400,
         ...over,
     });
@@ -1597,8 +1622,11 @@ test('treasuryScanOnce (real code): null price band -> rpc_error marked, retryab
         getPriceBand: async () => null,
         evaluatePaymentAmount: () => { throw new Error('unreachable: band null'); },
         creditSolanaSubscription: async () => { throw new Error('unreachable: band null'); },
-        ecoEnsureAccount: async () => ({}),
-        ecoFloorSub: async () => {},
+        USDC_MINT, USDT_MINT,
+        syncEcoUser: async () => {},
+        recordVerifiedPremiumPayment: async () => { throw new Error('not a premium'); },
+        resumePremiumPayment: async () => { throw new Error('no premium resume'); },
+        ...ECO_OFF,
     });
     const summary = await scan();
     assert.equal(summary.errors, 1);
@@ -1624,6 +1652,7 @@ const mkCodeRoute = (over = {}) => {
         treasuryUserByPaymentCode: async () => null,
         respondVerificationFailure: (res, r) => res.status(400).json({ error: r.error, code: r.code }),
         console,
+        ...ECO_OFF,
         ...over,
     });
     return { route: routes['/api/solana/payment-code'], ...fns };
@@ -1688,12 +1717,14 @@ test('payment-code resolver (real code): exactly-one match wins, zero/collision 
     const resolve = evalServer('PAYMENT_CODE_RESOLVER', 'treasuryUserByPaymentCode', {
         paymentCodeFor: code4,
         dbAllAsync: async () => [{ id: 7, email: 'a' }, { id: 8, email: 'b' }],
+        ...ECO_OFF,
     });
     assert.deepEqual(await resolve('code7'), { id: 7, email: 'a' });
     assert.equal(await resolve('nope'), null);
     const collide = evalServer('PAYMENT_CODE_RESOLVER', 'treasuryUserByPaymentCode', {
         paymentCodeFor: () => 'same',
         dbAllAsync: async () => [{ id: 7, email: 'a' }, { id: 8, email: 'b' }],
+        ...ECO_OFF,
     });
     assert.equal(await collide('same'), null, 'collision must not pick a first match');
 });
@@ -1876,8 +1907,11 @@ test('treasuryScanOnce (real code): codeless SOL+SKR auto-credit to admin-approv
         getPriceBand: async () => ({ min: 1, max: 100, latest: 10 }),
         evaluatePaymentAmount: () => ({ ok: true, minAcceptable: 0.1 }),
         creditSolanaSubscription: createSubscriptionCreditor(creditDefaults(dbPath)),
-        ecoEnsureAccount: async () => ({}),
-        ecoFloorSub: async () => {},
+        USDC_MINT, USDT_MINT,
+        syncEcoUser: async () => {},
+        recordVerifiedPremiumPayment: async () => { throw new Error('not a premium'); },
+        resumePremiumPayment: async () => { throw new Error('no premium resume'); },
+        ...ECO_OFF,
     });
     const summary = await scan();
     assert.equal(summary.credited, 2, JSON.stringify(marked));
@@ -1969,6 +2003,7 @@ const loadPremiumPlan = (h, dbPath, over = {}) => vm.runInNewContext(
         PREMIUM_STORAGE_DURATION_MS: 365 * 24 * 60 * 60 * 1000,
         PREMIUM_PRICE_USD: 49.99,
         nftService: { balance: { setPremium: () => {}, recordPayment: () => {}, getPremiumStatus: () => ({ isPremium: true }), getBalance: () => ({ balanceUsd: 0 }) } },
+        ...ECO_OFF,
         ...over,
     });
 
@@ -2085,6 +2120,7 @@ const loadPurge = (h, dbPath, fakeFs) => vm.runInNewContext(
         getWalletTransferInboxDir: () => null,
         clearStealthCloudDedupCachesForKeys: () => {},
         safeDeleteFromTable: async (t, w, p) => (await h.run(`DELETE FROM ${t} WHERE ${w}`, p)).changes || 0,
+        ...ECO_OFF,
     });
 
 test('purge gate (real code): a concurrent credit wins the account gate - zero fs deletes', async () => {
@@ -2679,8 +2715,11 @@ const loadScanner = (over = {}) => evalServer('TREASURY_SCAN_RUN', 'treasuryScan
     getPriceBand: async () => ({ min: 1, max: 100, latest: 10 }),
     evaluatePaymentAmount: () => ({ ok: true, minAcceptable: 0.1 }),
     creditSolanaSubscription: async () => { throw new Error('not a subscription'); },
-    ecoEnsureAccount: async () => ({}),
-    ecoFloorSub: async () => {},
+    USDC_MINT, USDT_MINT,
+    syncEcoUser: async () => {},
+    recordVerifiedPremiumPayment: async () => { throw new Error('not a premium'); },
+    resumePremiumPayment: async () => { throw new Error('no premium resume'); },
+    ...ECO_OFF,
     ...over,
 });
 
@@ -2696,6 +2735,7 @@ test('treasuryScanOnce (real code): SOL+SKR premium memos auto-recover end-to-en
     const premiumFns = loadPremiumPlan(h, dbPath, { nftService: { balance: bal } });
     const scan = loadScanner({
         resumePremiumPayment: premiumFns.resumePremiumPayment,
+        recordVerifiedPremiumPayment: stubRecordVerifiedPremium(h),
         dbAllAsync: h.all, dbGetAsync: h.get, dbRunAsync: h.run,
         treasuryCollectSignatures: async (addr) =>
             addr === TREASURY ? [{ signature: 'premSol', slot: 1 }] : [{ signature: 'premSkr', slot: 2 }],
@@ -2913,6 +2953,7 @@ test('ecoApplySub (real code): stale renewal floor cannot shorten; admin set-unt
         console,
         dbGetAsync: h.get, dbRunAsync: h.run, dbAllAsync: h.all,
         ECO_PL_TIER_GB: 100,
+        ...ECO_OFF,
     });
     // Stale floor (earlier expiry) must NOT shrink the shared record.
     const near = now + 10 * 864e5;
@@ -3436,5 +3477,342 @@ test('subscriptionReadiness: verifier waits behind pending callback-style user_p
     await gated;
     const cols = new Set((await h.all(`PRAGMA table_info(user_plans)`)).map((c) => c.name));
     assert.ok(cols.has('premium_gb') && cols.has('premium_expires_at'));
+    await h.close();
+});
+
+// --- PS memo + promo fixtures conform to the native client format ------------
+test('parsePaceSeekerMemo (real code): native PS1 ms+checksum format incl. promo suffix', async () => {
+    const { parsePaceSeekerMemo } = paymentRecovery;
+    assert.deepEqual(
+        parsePaceSeekerMemo('PS1|monthly|1730000000123|ab12cd34'),
+        { duration: 'monthly', reportedPaidAt: 1730000000123, checksum: 'ab12cd34', promo: null });
+    const withPromo = parsePaceSeekerMemo('PS1|monthly|1730000000123|AB12CD34|promo:PSABCDEFGH1234');
+    assert.equal(withPromo.promo, 'PSABCDEFGH1234', 'real promo suffix parses');
+    assert.equal(withPromo.checksum, 'ab12cd34', 'checksum segment is normalized, never treated as promo');
+    // Rejections: the timestamp is client-reported telemetry only.
+    assert.equal(parsePaceSeekerMemo('PS1|monthly|1700000000'), null, 'missing checksum segment');
+    assert.equal(parsePaceSeekerMemo('PS1|monthly|1730000000123|ab12cd34|promo:XXBAD'), null, 'malformed promo');
+    assert.equal(parsePaceSeekerMemo('PS1|daily|1730000000123|ab12cd34'), null, 'unknown duration');
+    assert.equal(parsePaceSeekerMemo('PS1|monthly|0|ab12cd34'), null, 'non-positive timestamp');
+    assert.equal(parsePaceSeekerMemo('PhotoLynk:sub:100:monthly'), null, 'foreign product memo');
+    assert.equal(parsePaceSeekerMemo('SLQ1|' + 'a'.repeat(32)), null, 'quote memo is not a product memo');
+    assert.equal(parsePaceSeekerMemo(42), null);
+});
+
+test('promoCodeValid (real code): fnv1a-peppered 14-char checksum only', async () => {
+    const { promoCodeValid } = require('./ecosystemPayments');
+    const sum = (init) => (s) => {
+        let h = init;
+        for (const c of s) { h ^= c.charCodeAt(0); h += (h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24); h |= 0; }
+        return (h >>> 0).toString(16).padStart(8, '0');
+    };
+    const base = 'PSTESTCD12'; // 10-char code body
+    const peppered = base + 'PS_PROMO_V1_PEPPER';
+    const good = base + sum(0x811c9dc5)(peppered).slice(0, 4).toUpperCase();
+    assert.equal(good.length, 14);
+    assert.equal(promoCodeValid(good), true, 'fnv1a checksum accepted');
+    assert.equal(promoCodeValid(good.toLowerCase()), true, 'case-normalized before check');
+    const oldAlgo = base + sum(0)(peppered).slice(0, 4).toUpperCase();
+    assert.equal(promoCodeValid(oldAlgo), false, 'old init-0 checksum is invalid');
+    assert.equal(promoCodeValid(base + 'XXXX'), false, 'bad checksum');
+    assert.equal(promoCodeValid('XSTESTCD12' + good.slice(10)), false, 'must carry the PS prefix');
+    assert.equal(promoCodeValid(good.slice(0, 13)), false, 'length enforced');
+    assert.equal(promoCodeValid(''), false);
+});
+
+// ---- Ecosystem-core startup degradation (ECO_INIT region, VM-extracted) ----
+
+test('ecoTryInitialize: init failure keeps legacy mode, records state, unref backoff retry recovers', async () => {
+    const timers = [];
+    const fakeSetTimeout = (fn, ms) => {
+        const t = { fn, ms, unrefd: false, unref: () => { t.unrefd = true; return t; } };
+        timers.push(t);
+        return t;
+    };
+    const api = vm.runInNewContext(`
+        let ecosystemReady = false;
+        let paymentProtocol = null;
+        let _ecoInitState = null;
+        let _ecoInitAttempts = 0;
+        let _ecoInitTimer = null;
+        let workerStarts = 0;
+        const ecosystem = {
+            calls: 0, fail: null, absorbCalls: 0,
+            initialize: async () => {
+                ecosystem.calls++;
+                if (ecosystem.fail) throw ecosystem.fail;
+                return { initialized: true, migrated: false };
+            },
+            absorbLegacyLedgerPage: async () => { ecosystem.absorbCalls++; return 0; },
+        };
+        const createEcosystemPaymentService = () => ({ initialize: async () => ({ initialized: true }) });
+        const startEcoWorker = () => { workerStarts++; };
+        const ecoRepairPendingAdClaims = async () => {};
+        const ECO_SIGNING_KEY = null, SOLANA_PAYMENT_WALLET = 'w';
+        const SKR_TOKEN_DECIMALS = 6, SKR_TOKEN_MINT = 'm', USDC_MINT = 'u', USDT_MINT = 't';
+        const treasuryFetchTransaction = async () => null;
+        const getPriceBand = () => null, evaluatePaymentAmount = () => null;
+        const treasuryUserByPaymentCode = async () => null, paymentCodeFor = () => '', treasuryBoundUsers = async () => [];
+        const creditSolanaSubscription = async () => ({}), recordVerifiedPremiumPayment = async () => ({}), resumePremiumPayment = async () => ({});
+        const dbGetAsync = async () => null, ecoGetPromoPolicy = async () => null;
+        const DEFAULT_REGISTRY = {};
+        ${extractMarked('ECO_INIT')}
+        ;({ ecoTryInitialize, ecosystem,
+            state: () => ({ ecosystemReady, paymentProtocol, _ecoInitState, _ecoInitAttempts, _ecoInitTimer, workerStarts }) })
+    `, { console, setTimeout: fakeSetTimeout });
+
+    const boom = Object.assign(new Error('ecosystem_timelines has an unknown shape'), { code: 'SCHEMA_VERSION_UNSUPPORTED' });
+    api.ecosystem.fail = boom;
+    // Must RESOLVE (not reject): the readiness chain finishes null on ecosystem
+    // failure — only ensurePaceSeekerSchema may reject readiness.
+    const resolved = await api.ecoTryInitialize();
+    assert.equal(resolved, undefined, 'ecoTryInitialize resolves even when the core throws');
+    let st = api.state();
+    assert.equal(st.ecosystemReady, false, 'ecosystem failure leaves legacy compatibility mode');
+    assert.equal(st.paymentProtocol, null);
+    assert.equal(st._ecoInitState.ok, false);
+    assert.equal(st._ecoInitState.code, 'SCHEMA_VERSION_UNSUPPORTED');
+    assert.match(st._ecoInitState.message, /unknown shape/);
+    assert.equal(st._ecoInitState.attempts, 1);
+    assert.ok(st._ecoInitState.at > 0, 'failure timestamp recorded');
+    assert.equal(timers.length, 1, 'retry scheduled');
+    assert.equal(timers[0].unrefd, true, 'retry timer unref’d');
+    assert.equal(timers[0].ms, 60000, 'first retry after 60s');
+
+    // A second failure doubles the backoff (still unref’d).
+    timers[0].fn();
+    await new Promise((r) => setTimeout(r, 0));
+    st = api.state();
+    assert.equal(st._ecoInitState.ok, false);
+    assert.equal(st._ecoInitState.attempts, 2);
+    assert.equal(timers.length, 2);
+    assert.equal(timers[1].ms, 120000, 'backoff doubles');
+    assert.equal(timers[1].unrefd, true);
+
+    // Core recovers: the scheduled retry flips the server to ready, runs the
+    // post-baseline absorb sweep, starts the worker, and stops retrying.
+    api.ecosystem.fail = null;
+    timers[1].fn();
+    await new Promise((r) => setTimeout(r, 0));
+    st = api.state();
+    assert.equal(st.ecosystemReady, true);
+    assert.ok(st.paymentProtocol, 'payment protocol created on recovery');
+    assert.equal(st._ecoInitState.ok, true);
+    assert.equal(st._ecoInitState.attempts, 3);
+    assert.equal(st.workerStarts, 1, 'worker started on recovery');
+    assert.equal(api.ecosystem.absorbCalls, 1, 'baseline_v2 already existed -> one-shot absorb sweep ran');
+    assert.equal(timers.length, 2, 'no further retry scheduled');
+});
+
+test('admin eco-accounts payload exposes ecosystem init state (real route, VM-extracted)', async () => {
+    const handlers = {};
+    const api = vm.runInNewContext(`
+        let ecosystemReady = false;
+        let _ecoInitState = { ok: false, code: 'SCHEMA_VERSION_UNSUPPORTED', message: 'bad shape', at: 12345, attempts: 2 };
+        const app = { get: (p, mw, h) => { handlers[p] = h; } };
+        const adminAuth = (req, res, next) => next();
+        const dbAllAsync = async () => [];
+        const dbGetAsync = async () => ({ n: 0 });
+        ${extractMarked('ADMIN_ECO_ACCOUNTS')}
+        ;({ handlers })
+    `, { console, handlers });
+    const res = { statusCode: 200, body: null, json(o) { this.body = o; }, status(c) { this.statusCode = c; return this; } };
+    await api.handlers['/admin/api/eco-accounts']({}, res);
+    assert.ok(res.body.ecosystem, 'payload carries an ecosystem status block');
+    assert.equal(res.body.ecosystem.ready, false);
+    assert.equal(res.body.ecosystem.legacyMode, true);
+    const init = res.body.ecosystem.init;
+    assert.equal(init.ok, false);
+    assert.equal(init.code, 'SCHEMA_VERSION_UNSUPPORTED');
+    assert.equal(init.message, 'bad shape');
+    assert.equal(init.at, 12345);
+    assert.equal(init.attempts, 2);
+});
+
+// ---------------------------------------------------------------------------
+// /admin/api/eco-accounts pagination + entitlements, /admin/api/eco-jobs
+// ---------------------------------------------------------------------------
+
+// Compat tables the eco-accounts route reads plus everything
+// createEcosystemService.initialize()/migrateBaseline expects.
+const ECO_ADMIN_DDL = [
+    `CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)`,
+    `CREATE TABLE user_plans (user_id INTEGER PRIMARY KEY, plan_gb INTEGER, premium_gb INTEGER, premium_expires_at INTEGER, status TEXT, expires_at INTEGER, grace_until INTEGER, trial_until INTEGER, deleted_at INTEGER, payment_type TEXT, payment_at INTEGER, updated_at INTEGER)`,
+    `CREATE TABLE files (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, filename TEXT, size INTEGER)`,
+    `CREATE TABLE ecosystem_accounts (account_id TEXT PRIMARY KEY, primary_wallet TEXT, created_at INTEGER, ad_strict INTEGER DEFAULT 0, x_handle TEXT, tg_username TEXT, cherry_state TEXT)`,
+    `CREATE TABLE ecosystem_members (account_id TEXT NOT NULL, app TEXT NOT NULL, identity TEXT NOT NULL, wallet TEXT, linked_at INTEGER, wallet_verified INTEGER DEFAULT 0, wallet_changed_at INTEGER, PRIMARY KEY (app, identity))`,
+    `CREATE TABLE stealthlynk_subs (account_id TEXT PRIMARY KEY, sub_until INTEGER, source_app TEXT, source_kind TEXT, provenance TEXT, updated_at INTEGER)`,
+    `CREATE TABLE ad_claims (id INTEGER PRIMARY KEY AUTOINCREMENT, account_id TEXT NOT NULL, week_key INTEGER NOT NULL, platform TEXT, post_url TEXT UNIQUE, code TEXT, author_handle TEXT, status TEXT DEFAULT 'pending', created_at INTEGER, verified_at INTEGER, verify_attempts INTEGER DEFAULT 0, granted_at INTEGER, app TEXT, tier_gb INTEGER, UNIQUE(account_id, week_key))`,
+    `CREATE TABLE solana_payments (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, tx_signature TEXT UNIQUE NOT NULL, sol_amount REAL, skr_amount REAL, payment_token TEXT, tier_gb INTEGER, duration TEXT DEFAULT 'monthly', created_at INTEGER, verified_at INTEGER, entitlement_applied_at INTEGER)`,
+    `CREATE TABLE solana_subscription_credits (tx_signature TEXT PRIMARY KEY,user_id INTEGER NOT NULL,source TEXT NOT NULL,payment_at INTEGER NOT NULL,expires_before INTEGER,expires_after INTEGER NOT NULL,detail TEXT,created_at INTEGER NOT NULL)`,
+    `CREATE TABLE solana_wallet_bindings (wallet TEXT NOT NULL,user_id INTEGER NOT NULL,verified_at INTEGER NOT NULL,PRIMARY KEY(wallet,user_id))`,
+    `CREATE TABLE paceseeker_devices (device_hash TEXT PRIMARY KEY, first_seen INTEGER, last_seen INTEGER, sub_status TEXT, sub_until INTEGER, ad_until INTEGER, sub_signature TEXT, wallet_address TEXT)`,
+    `CREATE TABLE paceseeker_revenue (signature TEXT PRIMARY KEY, device_hash TEXT, paid_at INTEGER, paid_with TEXT, plan TEXT, usd_at_checkout REAL, amount_atomic INTEGER, reported_at INTEGER, eco_verified INTEGER DEFAULT 0)`,
+];
+
+const mkEcoAdminDb = async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ecoadmin-'));
+    createdDirs.push(dir);
+    const dbPath = path.join(dir, 'test.db');
+    const h = await openDb(dbPath);
+    for (const ddl of ECO_ADMIN_DDL) await h.run(ddl);
+    return { h, dbPath };
+};
+
+// Run the real marked route bodies in a VM with the test's own deps —
+// production code paths, fixture state.
+const mkEcoAdminHandlers = (sandbox) => {
+    const handlers = {};
+    vm.runInNewContext(`
+        ${extractMarked('ADMIN_ECO_ACCOUNTS')}
+        ${extractMarked('ADMIN_ECO_JOBS')}
+    `, {
+        console, handlers,
+        app: { get: (p, mw, h) => { handlers[p] = h; } },
+        adminAuth: (req, res, next) => next(),
+        ...sandbox,
+    });
+    return handlers;
+};
+
+const mkAdminRes = () => ({
+    statusCode: 200, body: null,
+    json(o) { this.body = o; return this; },
+    status(c) { this.statusCode = c; return this; },
+});
+
+test('admin eco-accounts: pagination total/offset/limit, members+subs scoped to page', async () => {
+    const { h } = await mkEcoAdminDb();
+    for (let i = 1; i <= 5; i++) {
+        await h.run(`INSERT INTO ecosystem_accounts (account_id, created_at) VALUES (?, ?)`, [`acct${i}`, 1000 + i]);
+    }
+    await h.run(`INSERT INTO ecosystem_members (account_id, app, identity, linked_at) VALUES ('acct4', 'paceseeker', 'dev_x', 1)`);
+    await h.run(`INSERT INTO stealthlynk_subs (account_id, sub_until, source_kind) VALUES ('acct4', 999, 'payment')`);
+    const handlers = mkEcoAdminHandlers({
+        ecosystemReady: false, _ecoInitState: { ok: false, code: 'X', message: 'm', at: 1, attempts: 1 },
+        dbGetAsync: h.get, dbAllAsync: h.all,
+    });
+    const res = mkAdminRes();
+    await handlers['/admin/api/eco-accounts']({ query: { offset: '1', limit: '2' } }, res);
+    assert.equal(res.statusCode, 200);
+    assert.equal(res.body.total, 5, 'total counts all accounts');
+    assert.equal(res.body.offset, 1);
+    assert.equal(res.body.limit, 2);
+    assert.equal(res.body.accounts.length, 2);
+    // ORDER BY created_at DESC: acct5, acct4 | acct3, acct2, acct1
+    assert.equal(res.body.accounts[0].account_id, 'acct4', 'page slice is deterministic');
+    assert.equal(res.body.accounts[0].members.length, 1, 'page member rows still joined');
+    assert.equal(res.body.accounts[0].sub_until, 999);
+    assert.ok(!('entitlements' in res.body.accounts[0]), 'legacy mode omits entitlements');
+    // limit clamps at 500
+    const res2 = mkAdminRes();
+    await handlers['/admin/api/eco-accounts']({ query: { offset: '0', limit: '99999' } }, res2);
+    assert.equal(res2.body.limit, 500);
+    await h.close();
+});
+
+test('admin eco-accounts: entitlements come from a real read-only snapshot', async () => {
+    const { h, dbPath } = await mkEcoAdminDb();
+    const clock = { t: Date.now() };
+    const svc = createEcosystemService({ sqlite3, dbPath, now: () => clock.t });
+    await svc.initialize();
+    await h.run(`INSERT INTO users (id,email) VALUES (1,'a@b.c')`);
+    const acct = await svc.ensureAccount('photolynk', '1', {});
+    const projCalls = [];
+    const ecoSpy = {
+        ...svc,
+        resolveAccount: (id, opts) => { projCalls.push(opts); return svc.resolveAccount(id, opts); },
+    };
+    const handlers = mkEcoAdminHandlers({
+        ecosystemReady: true, _ecoInitState: { ok: true, code: null, message: null, at: 1, attempts: 1 },
+        dbGetAsync: h.get, dbAllAsync: h.all, ecosystem: ecoSpy,
+    });
+    const projBefore = await h.all(`SELECT * FROM ecosystem_projection_state ORDER BY app, identity`);
+    const plansBefore = await h.all(`SELECT * FROM user_plans ORDER BY user_id`);
+    const res = mkAdminRes();
+    await handlers['/admin/api/eco-accounts']({ query: {} }, res);
+    const a = res.body.accounts.find((x) => x.account_id === acct);
+    assert.ok(a, 'account in page');
+    assert.ok(a.entitlements, 'snapshot attached');
+    assert.equal(a.entitlements.members.length, 1);
+    assert.equal(a.entitlements.members[0].app, 'photolynk');
+    assert.equal(a.entitlements.members[0].identity, '1');
+    assert.ok(projCalls.length >= 1, 'resolveAccount invoked');
+    assert.ok(projCalls.every((o) => o && o.project === false), 'admin reads never project');
+    const projAfter = await h.all(`SELECT * FROM ecosystem_projection_state ORDER BY app, identity`);
+    const plansAfter = await h.all(`SELECT * FROM user_plans ORDER BY user_id`);
+    assert.deepEqual(projAfter, projBefore, 'projection state untouched by the read');
+    assert.deepEqual(plansAfter, plansBefore, 'user_plans untouched by the read');
+    await h.close();
+});
+
+test('admin eco-accounts: per-account resolve failure isolates to entitlementsError', async () => {
+    const { h } = await mkEcoAdminDb();
+    await h.run(`INSERT INTO ecosystem_accounts (account_id, created_at) VALUES ('good', 2)`);
+    await h.run(`INSERT INTO ecosystem_accounts (account_id, created_at) VALUES ('bad', 1)`);
+    const handlers = mkEcoAdminHandlers({
+        ecosystemReady: true, _ecoInitState: { ok: true, code: null, message: null, at: 1, attempts: 1 },
+        dbGetAsync: h.get, dbAllAsync: h.all,
+        ecosystem: {
+            resolveAccount: async (id) => {
+                if (id === 'bad') { const e = new Error('nope'); e.code = 'RESOLVE_BOOM'; throw e; }
+                return { accountId: id, revision: 7, sharedUntil: 42, members: [], sources: [] };
+            },
+        },
+    });
+    const res = mkAdminRes();
+    await handlers['/admin/api/eco-accounts']({ query: {} }, res);
+    assert.equal(res.statusCode, 200, 'page survives a per-account failure');
+    const good = res.body.accounts.find((x) => x.account_id === 'good');
+    const bad = res.body.accounts.find((x) => x.account_id === 'bad');
+    assert.equal(good.entitlements.revision, 7);
+    assert.equal(bad.entitlements, null);
+    assert.equal(bad.entitlementsError, 'RESOLVE_BOOM');
+    await h.close();
+});
+
+test('admin eco-jobs: counts + rows with parsed subjects; legacy mode short-circuits', async () => {
+    const { h, dbPath } = await mkEcoAdminDb();
+    const clock = { t: Date.now() };
+    const svc = createEcosystemService({ sqlite3, dbPath, now: () => clock.t });
+    await svc.initialize(); // creates ecosystem_jobs
+    const WALLET = 'WALLETaaaabbbbccccddddeeeeffffgg';
+    await h.run(
+        `INSERT INTO ecosystem_jobs (job_key,kind,reference_id,payload_json,state,attempts,next_attempt_at,last_error_code,created_at,updated_at)
+         VALUES ('job:sigPEND','verify_solana','sigPEND',?,'pending',2,?,?,?,?)`,
+        [JSON.stringify({ subjects: [{ app: 'paceseeker', identity: 'dev_aaaa', wallet: WALLET }] }),
+         clock.t + 60000, 'PAYMENT_ACCOUNT_UNVERIFIED', clock.t, clock.t]);
+    await h.run(
+        `INSERT INTO ecosystem_jobs (job_key,kind,reference_id,payload_json,state,attempts,next_attempt_at,last_error_code,created_at,updated_at)
+         VALUES ('job:sigDONE','verify_solana','sigDONE','{"subjects":[]}','done',1,?,?,?,?)`,
+        [clock.t, null, clock.t, clock.t]);
+    const handlers = mkEcoAdminHandlers({
+        ecosystemReady: true, _ecoInitState: { ok: true, code: null, message: null, at: 1, attempts: 1 },
+        dbGetAsync: h.get, dbAllAsync: h.all, ecosystem: svc,
+    });
+    const res = mkAdminRes();
+    await handlers['/admin/api/eco-jobs']({ query: {} }, res);
+    assert.equal(res.body.counts.pending, 1);
+    assert.equal(res.body.counts.done, 1);
+    assert.equal(res.body.counts.leased, 0);
+    assert.equal(res.body.jobs.length, 2);
+    const pending = res.body.jobs.find((j) => j.signature === 'sigPEND');
+    assert.equal(pending.state, 'pending');
+    assert.equal(pending.attempts, 2);
+    assert.equal(pending.last_error_code, 'PAYMENT_ACCOUNT_UNVERIFIED');
+    assert.equal(pending.subjects.length, 1);
+    assert.equal(pending.subjects[0].app, 'paceseeker');
+    assert.equal(pending.subjects[0].identity, 'dev_aaaa');
+    assert.equal(pending.subjects[0].wallet, 'WALLETaa…ffgg', 'wallet truncated 8+4');
+    // Legacy mode: no queue access at all.
+    const handlersLegacy = mkEcoAdminHandlers({
+        ecosystemReady: false, _ecoInitState: { ok: false, code: 'X', message: 'm', at: 1, attempts: 1 },
+        dbGetAsync: h.get, dbAllAsync: h.all, ecosystem: svc,
+    });
+    const res2 = mkAdminRes();
+    await handlersLegacy['/admin/api/eco-jobs']({ query: {} }, res2);
+    assert.equal(res2.body.legacyMode, true);
+    assert.equal(Object.keys(res2.body.counts).length, 0);
+    assert.equal(res2.body.jobs.length, 0);
     await h.close();
 });
