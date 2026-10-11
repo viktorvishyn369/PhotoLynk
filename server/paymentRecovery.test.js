@@ -113,7 +113,7 @@ async function makeFixtureDb() {
         id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL,
         tx_signature TEXT UNIQUE NOT NULL, sol_amount REAL, skr_amount REAL,
         payment_token TEXT, tier_gb INTEGER, duration TEXT DEFAULT 'monthly',
-        created_at INTEGER, verified_at INTEGER,
+        created_at INTEGER, verified_at INTEGER, entitlement_applied_at INTEGER,
         FOREIGN KEY(user_id) REFERENCES users(id))`);
     await h.run(`CREATE TABLE solana_subscription_credits (
         tx_signature TEXT PRIMARY KEY, user_id INTEGER NOT NULL, source TEXT NOT NULL,
@@ -126,6 +126,19 @@ async function makeFixtureDb() {
     await h.run(`CREATE TABLE treasury_scan_seen (signature TEXT PRIMARY KEY, seen_at INTEGER, outcome TEXT, user_id INTEGER, detail TEXT)`);
     await h.run(`CREATE TABLE files (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, filename TEXT)`);
     await h.run(`CREATE TABLE devices (user_id INTEGER, device_uuid TEXT, device_name TEXT, last_seen INTEGER, PRIMARY KEY(user_id, device_uuid))`);
+    // Eco mirror + token-account cache + purge targets (minimal shapes; the
+    // audit tests only exercise account/user-level deletes/upserts).
+    await h.run(`CREATE TABLE skr_token_accounts (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, address TEXT UNIQUE)`);
+    await h.run(`CREATE TABLE stealthlynk_accounts (user_id INTEGER PRIMARY KEY, sub_until INTEGER, updated_at INTEGER)`);
+    await h.run(`CREATE TABLE stealthlynk_subs (account_id TEXT PRIMARY KEY, user_id INTEGER, sub_until INTEGER,
+        source_app TEXT, source_kind TEXT, provenance TEXT, updated_at INTEGER)`);
+    await h.run(`CREATE TABLE stealthlynk_members (user_id INTEGER, app TEXT, sub_until INTEGER, updated_at INTEGER)`);
+    await h.run(`CREATE TABLE ecosystem_members (account_id TEXT, app TEXT, identity TEXT, PRIMARY KEY(account_id, app, identity))`);
+    await h.run(`CREATE TABLE paceseeker_devices (device_hash TEXT PRIMARY KEY, sub_until INTEGER)`);
+    await h.run(`CREATE TABLE plan_history (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, action TEXT, details TEXT, created_at INTEGER)`);
+    for (const t of ['cloud_chunks', 'cloud_device_state', 'platform_hashes']) {
+        await h.run(`CREATE TABLE ${t} (user_id INTEGER)`);
+    }
     await h.close();
     return { dbPath, dir };
 }
@@ -1477,6 +1490,8 @@ const loadSubVerifyRoutes = (over = {}) => {
         verifySkrTokenTransaction: async () => ({ success: true, receivedAmount: 100, blockTime: Math.floor(Date.now() / 1000) - 60, memo: 'PhotoLynk:sub:100:monthly', sender: PAYER }),
         respondVerificationFailure: (res, _r, msg) => res.status(400).json({ error: msg }),
         requirePaymentMemo: () => true,
+        treasuryBoundUsers: async () => [],
+        treasuryMarkSeen: async () => {},
         creditSolanaSubscription: async () => ({ expiresAt: Date.now() + 1e6, alreadyProcessed: false, planGb: 100, status: 'active' }),
         ecoEnsureAccount: async () => ({}),
         ecoFloorSub: async () => {},
@@ -1903,5 +1918,1017 @@ test('real creditor concurrency: 3 distinct signatures stack +90d, repeat adds n
     const plan2 = await h.get(`SELECT * FROM user_plans WHERE user_id = 7`);
     assert.equal(plan2.expires_at, plan.expires_at, 'duplicate must not extend the term');
     assert.equal((await h.all(`SELECT * FROM solana_payments`)).length, 3);
+    await h.close();
+});
+
+// ===========================================================================
+// FINAL AUDIT BLOCK - mutation gates, CAS plan state, autopurge interlock,
+// premium ledger-first resume, durable scanner pages, token-account union.
+// Real server.js regions via VM markers; temp SQLite only; no live RPC.
+// ===========================================================================
+
+const Module = require('module');
+const NFT_BALANCE_PATH = path.join(__dirname, '..', 'nft-service', 'balance.js');
+const NFT_BALANCE_SRC = fs.readFileSync(NFT_BALANCE_PATH, 'utf8');
+const mkNftDbPath = () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nftbal-'));
+    createdDirs.push(dir);
+    return path.join(dir, 'nft.db');
+};
+const loadNftBalance = (nftDbPath) => {
+    const nftRequire = Module.createRequire(NFT_BALANCE_PATH);
+    const mod = { exports: {} };
+    vm.runInNewContext(NFT_BALANCE_SRC, {
+        require: (id) => (id === './config' ? { DB_PATH: nftDbPath } : nftRequire(id)),
+        module: mod, exports: mod.exports, console,
+        __dirname: path.dirname(NFT_BALANCE_PATH), __filename: NFT_BALANCE_PATH,
+    });
+    return mod.exports;
+};
+const nftAll = (nftDbPath, sql, params = []) => {
+    const Database = Module.createRequire(NFT_BALANCE_PATH)('better-sqlite3');
+    const d = new Database(nftDbPath);
+    try { return d.prepare(sql).all(...params); } finally { d.close(); }
+};
+
+const ensurePlanRowStub = (h) => async (userId) => {
+    await h.run(`INSERT OR IGNORE INTO user_plans (user_id, updated_at) VALUES (?, ?)`, [userId, Date.now()]);
+    return h.get(`SELECT * FROM user_plans WHERE user_id = ?`, [userId]);
+};
+
+const loadPremiumPlan = (h, dbPath, over = {}) => vm.runInNewContext(
+    `${extractMarked('PREMIUM_PLAN_HELPERS')}\n${extractMarked('PREMIUM_RESUME')}\n;({ parsePremiumPurchaseTime, ensurePremiumStorageCapacity, ensurePremiumStorageCapacityUnlocked, activateSolanaPremiumPlan, resumePremiumPayment })`,
+    {
+        console, paymentRecovery, DB_PATH: dbPath,
+        dbGetAsync: h.get, dbRunAsync: h.run, dbAllAsync: h.all,
+        ensurePlanRow: ensurePlanRowStub(h),
+        GB_BYTES: 1e9, readCapacityJson: () => null,
+        PREMIUM_STORAGE_GB: 1000,
+        PREMIUM_STORAGE_DURATION_MS: 365 * 24 * 60 * 60 * 1000,
+        PREMIUM_PRICE_USD: 49.99,
+        nftService: { balance: { setPremium: () => {}, recordPayment: () => {}, getPremiumStatus: () => ({ isPremium: true }), getBalance: () => ({ balanceUsd: 0 }) } },
+        ...over,
+    });
+
+// --- mutation gates ---------------------------------------------------------
+test('gates: 16 concurrent distinct-user credits all commit, no SQLITE_BUSY', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    const N = 16;
+    await h.run(`INSERT INTO users (id,email) VALUES ${Array.from({ length: N }, (_, i) => `(${i + 1},'u${i + 1}@x')`).join(',')}`);
+    const credit = createSubscriptionCreditor(creditDefaults(dbPath));
+    const T0 = Date.now() - 60_000;
+    const results = await Promise.all(Array.from({ length: N }, (_, i) =>
+        credit(basePayment({ userId: i + 1, paymentAt: T0 }))));
+    assert.ok(results.every((r) => !r.alreadyProcessed));
+    assert.equal((await h.all(`SELECT * FROM solana_payments`)).length, N);
+    for (let i = 1; i <= N; i++) {
+        const p = await h.get(`SELECT status, expires_at FROM user_plans WHERE user_id = ?`, [i]);
+        assert.equal(p.status, 'active', `user ${i} not credited`);
+        assert.ok(p.expires_at > Date.now());
+    }
+    await h.close();
+});
+
+// --- CAS plan state ---------------------------------------------------------
+const loadPlanState = (h) => vm.runInNewContext(
+    `${extractMarked('CAS_PLAN_STATE')}\n${extractMarked('QUOTA_PROFILE')}\n${extractMarked('SUBSCRIPTION_STATE')}\n;({ compareAndSetPlanState, resolveSubscriptionState, getUserQuotaProfileFromRow })`,
+    {
+        console,
+        dbRunAsync: h.run, dbGetAsync: h.get, dbAllAsync: h.all,
+        ensurePlanRow: ensurePlanRowStub(h),
+        getUserUsedBytes: async () => 0, getUserQuotaBytes: async () => 0,
+        TRIAL_COMPLIMENTARY_DAYS: 3, SUBSCRIPTION_GRACE_DAYS: 7, GB_BYTES: 1e9,
+    });
+
+test('compareAndSetPlanState (real code): stale snapshot cannot overwrite a committed renewal', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    await h.run(`INSERT INTO users (id,email) VALUES (1,'a@x')`);
+    const old = Date.now() - 1000;
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,status,expires_at,updated_at) VALUES (1,100,'active',?,?)`, [old, old]);
+    const { compareAndSetPlanState } = loadPlanState(h);
+    const snapshot = await h.get(`SELECT * FROM user_plans WHERE user_id = 1`);
+    // A renewal commits AFTER the snapshot was read.
+    const renewal = old + 100 * 864e5;
+    await h.run(`UPDATE user_plans SET status='active', expires_at=?, updated_at=? WHERE user_id=1`, [renewal, Date.now()]);
+    const applied = await compareAndSetPlanState(1, snapshot, { status: 'expired', deletedAt: Date.now(), now: Date.now() });
+    assert.equal(applied, false, 'CAS must refuse to tombstone a row renewed after the snapshot');
+    const after = await h.get(`SELECT status, expires_at, deleted_at FROM user_plans WHERE user_id=1`);
+    assert.equal(after.status, 'active');
+    assert.equal(after.expires_at, renewal);
+    assert.ok(!after.deleted_at);
+    // Control: a CAS whose tuple still matches DOES apply.
+    const fresh = await h.get(`SELECT * FROM user_plans WHERE user_id=1`);
+    const g = Date.now() + 1000;
+    assert.equal(await compareAndSetPlanState(1, fresh, { status: 'grace', graceUntil: g, now: Date.now() }), true);
+    const after2 = await h.get(`SELECT status, grace_until FROM user_plans WHERE user_id=1`);
+    assert.equal(after2.status, 'grace');
+    assert.equal(after2.grace_until, g);
+    await h.close();
+});
+
+test('resolveSubscriptionState (real code): lazy transitions write once; readOnly never writes', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    const now = Date.now();
+    await h.run(`INSERT INTO users (id,email) VALUES (1,'a@x'),(2,'b@x'),(3,'c@x')`);
+    // user 1: expired paid plan, no grace yet -> transitions to grace
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,status,expires_at,updated_at) VALUES (1,100,'active',?,?)`, [now - 3600e3, now - 3600e3]);
+    // user 2: trial whose complimentary window already lapsed
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,status,trial_until,updated_at) VALUES (2,50,'trial',?,?)`, [now - 10 * 864e5, now - 10 * 864e5]);
+    // user 3: live paid plan -> stays active
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,status,expires_at,updated_at) VALUES (3,100,'active',?,?)`, [now + 10 * 864e5, now]);
+    const { resolveSubscriptionState } = loadPlanState(h);
+
+    const r1 = await resolveSubscriptionState(1);
+    assert.equal(r1.status, 'grace');
+    const row1 = await h.get(`SELECT status, grace_until FROM user_plans WHERE user_id=1`);
+    assert.equal(row1.status, 'grace');
+    assert.ok(row1.grace_until > now, 'grace_until written by the transition');
+
+    const r2 = await resolveSubscriptionState(2);
+    assert.equal(r2.status, 'trial_complimentary_expired');
+    const row2 = await h.get(`SELECT status, deleted_at FROM user_plans WHERE user_id=2`);
+    assert.equal(row2.status, 'expired');
+    assert.ok(row2.deleted_at > 0, 'complimentary expiry must tombstone');
+
+    const r3 = await resolveSubscriptionState(3);
+    assert.equal(r3.status, 'active');
+
+    // readOnly computes state but never transitions the stored row.
+    await h.run(`INSERT INTO users (id,email) VALUES (4,'d@x')`);
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,status,expires_at,updated_at) VALUES (4,100,'active',?,?)`, [now - 3600e3, now]);
+    const r4 = await resolveSubscriptionState(4, { readOnly: true });
+    assert.equal(r4.status, 'grace');
+    const row4 = await h.get(`SELECT status, grace_until FROM user_plans WHERE user_id=4`);
+    assert.equal(row4.status, 'active', 'readOnly must not write');
+    assert.ok(!row4.grace_until);
+    await h.close();
+});
+
+// --- autopurge interlock -----------------------------------------------------
+const loadPurge = (h, dbPath, fakeFs) => vm.runInNewContext(
+    `${extractMarked('USER_PURGE')}\n;({ purgeUserEverywhere })`,
+    {
+        console, path, paymentRecovery, DB_PATH: dbPath,
+        require: (id) => (id === '../nft-service' ? { balance: { deleteUserData: () => ({}) } } : require(id)),
+        dbGetAsync: h.get, dbAllAsync: h.all, dbRunAsync: h.run,
+        PURGE_RETENTION_DAYS: 10, TRIAL_COMPLIMENTARY_DAYS: 3,
+        CLOUD_DIR: '/nonexistent/cloud', CHUNKS_DIR: '/nonexistent/chunks',
+        NFT_DIR: '/nonexistent/nft', UPLOAD_DIR: '/nonexistent/up',
+        fs: fakeFs,
+        getStealthCloudAllPossibleUserKeys: () => ['u7', 's7'],
+        sanitizeUserKey: (v) => v,
+        getWalletTransferInboxDir: () => null,
+        clearStealthCloudDedupCachesForKeys: () => {},
+        safeDeleteFromTable: async (t, w, p) => (await h.run(`DELETE FROM ${t} WHERE ${w}`, p)).changes || 0,
+    });
+
+test('purge gate (real code): a concurrent credit wins the account gate - zero fs deletes', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    const now = Date.now();
+    await h.run(`INSERT INTO users (id,email,user_uuid,storage_uuid) VALUES (7,'m@x','u7','s7')`);
+    await h.run(`INSERT INTO user_plans (user_id,status,deleted_at,updated_at) VALUES (7,'expired',?,?)`, [now - 30 * 864e5, now - 30 * 864e5]);
+    const rmCalls = [];
+    const { purgeUserEverywhere } = loadPurge(h, dbPath, {
+        existsSync: () => true,
+        promises: { rm: async (d) => { rmCalls.push(d); } },
+    });
+    const credit = createSubscriptionCreditor(creditDefaults(dbPath));
+    // The credit registers on the account gate first; the purge queues behind
+    // it and must see the renewed entitlement when it finally runs.
+    const creditP = credit(basePayment({ userId: 7, paymentAt: now - 60_000 }));
+    await new Promise((r) => setImmediate(r));
+    const purgeRes = await purgeUserEverywhere(7, { reason: 'autopurge_retention' });
+    const creditRes = await creditP;
+    assert.equal(creditRes.alreadyProcessed, false);
+    assert.equal(purgeRes.skipped, true);
+    assert.equal(purgeRes.reason, 'entitlement_changed');
+    assert.equal(rmCalls.length, 0, 'no filesystem deletion may run once the plan is live again');
+    assert.ok(await h.get(`SELECT id FROM users WHERE id = 7`), 'user row must survive');
+    await h.close();
+});
+
+test('stale-plan migration (real code): live NULL-expiry premium never gets a tombstone', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    const now = Date.now();
+    await h.run(`INSERT INTO users (id,email) VALUES (1,'a@x'),(2,'b@x'),(3,'c@x'),(4,'d@x'),(5,'e@x'),(6,'f@x')`);
+    // u1: expired paid plan BUT live premium with NULL expiry - a legacy
+    // grant must not be treated as expired premium.
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,premium_gb,status,expires_at,updated_at) VALUES (1,100,1000,'active',?,?)`, [now - 3600e3, now]);
+    // u2: same with premium_expires_at = 0 - also treated as live legacy.
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,premium_gb,premium_expires_at,status,expires_at,updated_at) VALUES (2,100,1000,0,'active',?,?)`, [now - 3600e3, now]);
+    // u3: control - expired paid plan, no premium -> transitions to grace.
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,status,expires_at,updated_at) VALUES (3,100,'active',?,?)`, [now - 3600e3, now]);
+    // u4: lapsed complimentary trial + NULL-expiry premium -> no tombstone.
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,premium_gb,status,trial_until,updated_at) VALUES (4,50,1000,'trial',?,?)`, [now - 10 * 864e5, now]);
+    // u5: control - grace over, premium expiry POSITIVE and past -> tombstone.
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,premium_gb,premium_expires_at,status,grace_until,updated_at) VALUES (5,100,500,?,'grace',?,?)`, [now - 864e5, now - 3600e3, now]);
+    const migrate = vm.runInNewContext(
+        `${extractMarked('CAS_PLAN_STATE')}\n${extractMarked('STALE_PLAN_MIGRATION')}\n;migrateStalePlanStates`,
+        {
+            console, dbAllAsync: h.all, dbRunAsync: h.run, dbGetAsync: h.get,
+            TRIAL_COMPLIMENTARY_DAYS: 3, SUBSCRIPTION_GRACE_DAYS: 7,
+        });
+    await migrate();
+    const p1 = await h.get(`SELECT status, deleted_at FROM user_plans WHERE user_id=1`);
+    assert.equal(p1.deleted_at ?? 0, 0, 'NULL-expiry premium must not be tombstoned (staleActive branch)');
+    const p2 = await h.get(`SELECT status, deleted_at FROM user_plans WHERE user_id=2`);
+    assert.equal(p2.deleted_at ?? 0, 0, 'zero-expiry premium must not be tombstoned either');
+    const p3 = await h.get(`SELECT status FROM user_plans WHERE user_id=3`);
+    assert.equal(p3.status, 'grace', 'control: expired paid plan still transitions');
+    const p4 = await h.get(`SELECT status, deleted_at FROM user_plans WHERE user_id=4`);
+    assert.equal(p4.deleted_at ?? 0, 0, 'trial+NULL-expiry premium keeps its slot');
+    assert.equal(p4.status, 'trial');
+    const p5 = await h.get(`SELECT status, deleted_at FROM user_plans WHERE user_id=5`);
+    assert.equal(p5.status, 'expired', 'control: positive-past premium expiry still tombstones');
+    assert.ok(p5.deleted_at > 0);
+    await h.close();
+});
+
+test('purge gate (real code): NULL-expiry premium blocks autopurge at the recheck', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    const now = Date.now();
+    await h.run(`INSERT INTO users (id,email,user_uuid,storage_uuid) VALUES (7,'m@x','u7','s7')`);
+    await h.run(`INSERT INTO user_plans (user_id,status,premium_gb,deleted_at,updated_at) VALUES (7,'expired',1000,?,?)`, [now - 30 * 864e5, now - 30 * 864e5]);
+    const rmCalls = [];
+    const { purgeUserEverywhere } = loadPurge(h, dbPath, {
+        existsSync: () => true,
+        promises: { rm: async (d) => { rmCalls.push(d); } },
+    });
+    const res = await purgeUserEverywhere(7, { reason: 'autopurge_retention' });
+    assert.equal(res.skipped, true);
+    assert.equal(res.reason, 'entitlement_changed');
+    assert.equal(rmCalls.length, 0);
+    assert.ok(await h.get(`SELECT id FROM users WHERE id = 7`));
+    await h.close();
+});
+
+test('purge gate (real code): still-expired user is deleted normally', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    const now = Date.now();
+    await h.run(`INSERT INTO users (id,email,user_uuid,storage_uuid) VALUES (7,'m@x','u7','s7')`);
+    await h.run(`INSERT INTO user_plans (user_id,status,deleted_at,updated_at) VALUES (7,'expired',?,?)`, [now - 30 * 864e5, now - 30 * 864e5]);
+    const rmCalls = [];
+    const { purgeUserEverywhere } = loadPurge(h, dbPath, {
+        existsSync: () => true,
+        promises: { rm: async (d) => { rmCalls.push(d); } },
+    });
+    const res = await purgeUserEverywhere(7, { reason: 'autopurge_retention' });
+    assert.equal(res.ok, true);
+    assert.ok(!res.skipped);
+    assert.ok(rmCalls.length > 0, 'filesystem dirs removed');
+    assert.ok(!(await h.get(`SELECT id FROM users WHERE id = 7`)), 'user row deleted');
+    await h.close();
+});
+
+// --- premium purchase-time parsing + capacity + activation -------------------
+test('parsePremiumPurchaseTime (real code): ms number, ISO-Z, SQLite UTC all parse; junk -> null', () => {
+    const { parsePremiumPurchaseTime } = loadPremiumPlan(
+        { get: async () => null, run: async () => ({}), all: async () => [] }, '/unused.db');
+    const iso = Date.parse('2024-01-15T10:30:00Z');
+    assert.equal(parsePremiumPurchaseTime(iso), iso);
+    assert.equal(parsePremiumPurchaseTime('2024-01-15T10:30:00Z'), iso);
+    assert.equal(parsePremiumPurchaseTime('2024-01-15 10:30:00'), iso, 'SQLite UTC must equal ISO-Z');
+    assert.equal(parsePremiumPurchaseTime('2024-01-15 10:30:00.5'), null, 'non-exact SQLite form rejected');
+    for (const bad of [null, undefined, '', 'garbage', '2024-13-99 99:99:99', -5, 0, NaN, Infinity]) {
+        assert.equal(parsePremiumPurchaseTime(bad), null, `must reject ${String(bad)}`);
+    }
+});
+
+test('premium capacity (real code): two users race one slot - writer gate serializes', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    await h.run(`INSERT INTO users (id,email) VALUES (1,'a@x'),(2,'b@x')`);
+    const fns = loadPremiumPlan(h, dbPath, {
+        readCapacityJson: () => ({ totalBytes: 1020 * 1e9 }), // exactly one 1000GB slot + 20GB safety
+    });
+    const now = Date.now();
+    const [r1, r2] = await Promise.all([
+        paymentRecovery.withAccountMutation(dbPath, 1, () => fns.activateSolanaPremiumPlan(1, now, { now, paymentType: 'sol' })),
+        paymentRecovery.withAccountMutation(dbPath, 2, () => fns.activateSolanaPremiumPlan(2, now, { now, paymentType: 'sol' })),
+    ]);
+    assert.equal([r1, r2].filter((r) => r.storageAllocated).length, 1, 'exactly one allocation may win the last slot');
+    assert.equal([r1, r2].filter((r) => r.capacityExceeded).length, 1);
+    const allocated = await h.all(`SELECT user_id FROM user_plans WHERE premium_gb = 1000`);
+    assert.equal(allocated.length, 1);
+    await h.close();
+});
+
+test('activateSolanaPremiumPlan (real code): no yearly reset; paid monthly type preserved; expired not revived', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    const now = Date.now();
+    await h.run(`INSERT INTO users (id,email) VALUES (7,'m@x'),(8,'n@x'),(9,'o@x')`);
+    // user 7: live paid monthly - premium must not steal its payment_type
+    const liveExp = now + 20 * 864e5;
+    const payAt = now - 10 * 864e5;
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,status,expires_at,payment_type,payment_at,updated_at) VALUES (7,100,'active',?,'solana',?,?)`, [liveExp, payAt, payAt]);
+    const fns = loadPremiumPlan(h, dbPath);
+    const purchased = now - 10 * 864e5;
+
+    const r1 = await fns.activateSolanaPremiumPlan(7, purchased, { now, paymentType: 'sol' });
+    assert.equal(r1.storageAllocated, true);
+    const p1 = await h.get(`SELECT * FROM user_plans WHERE user_id=7`);
+    assert.equal(p1.premium_gb, 1000);
+    assert.equal(p1.payment_type, 'solana', 'live paid plan keeps its provenance');
+    assert.equal(p1.payment_at, payAt);
+    assert.equal(p1.expires_at, liveExp, 'subscription expiry untouched');
+    assert.equal(p1.plan_gb, 100);
+    const exp1 = p1.premium_expires_at;
+    assert.ok(Math.abs(exp1 - (purchased + 365 * 864e5)) < 2000);
+
+    // Repeat activation must NOT roll the year forward.
+    const later = now + 5 * 864e5;
+    await fns.activateSolanaPremiumPlan(7, purchased, { now: later, paymentType: 'sol' });
+    const p2 = await h.get(`SELECT premium_expires_at FROM user_plans WHERE user_id=7`);
+    assert.equal(p2.premium_expires_at, exp1, 'repeat activation must not extend the year');
+
+    // A LONGER incoming expiry still wins via MAX (never shorten).
+    const longerExp = exp1 + 10 * 864e5;
+    await h.run(`UPDATE user_plans SET premium_expires_at=? WHERE user_id=7`, [longerExp]);
+    await fns.activateSolanaPremiumPlan(7, purchased, { now: later, paymentType: 'sol' });
+    const p3 = await h.get(`SELECT premium_expires_at FROM user_plans WHERE user_id=7`);
+    assert.equal(p3.premium_expires_at, longerExp, 'existing longer expiry preserved');
+
+    // user 8: known purchase >1y ago + live premium WITHOUT expiry -> the
+    // proven (past) anchor is persisted once; no fresh year, no revive.
+    const oldPurchase = now - 400 * 864e5;
+    await h.run(`INSERT INTO user_plans (user_id,premium_gb,status,updated_at) VALUES (8,1000,'none',?)`, [now]);
+    const r8 = await fns.activateSolanaPremiumPlan(8, oldPurchase, { now, paymentType: 'sol' });
+    assert.equal(r8.storageAllocated, false);
+    const p8 = await h.get(`SELECT premium_gb, premium_expires_at FROM user_plans WHERE user_id=8`);
+    assert.equal(p8.premium_gb, 1000);
+    assert.equal(p8.premium_expires_at, oldPurchase + 365 * 864e5, 'proven past anchor persisted - not an unlimited NULL grant');
+    assert.ok(p8.premium_expires_at < now);
+
+    // user 9: fully expired stored expiry must not revive either.
+    const oldExp = now - 5 * 864e5;
+    await h.run(`INSERT INTO user_plans (user_id,premium_gb,premium_expires_at,status,updated_at) VALUES (9,1000,?,'none',?)`, [oldExp, now]);
+    const r9 = await fns.activateSolanaPremiumPlan(9, oldPurchase, { now, paymentType: 'sol' });
+    assert.equal(r9.storageAllocated, false);
+    const p9 = await h.get(`SELECT premium_expires_at FROM user_plans WHERE user_id=9`);
+    assert.equal(p9.premium_expires_at, oldExp, 'existing positive expiry is never rewritten');
+    await h.close();
+});
+
+test('activateSolanaPremiumPlan (real code): past purchase anchor + NEWER live expiry still reports allocated', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    const now = Date.now();
+    await h.run(`INSERT INTO users (id,email) VALUES (7,'m@x'),(8,'n@x')`);
+    const fns = loadPremiumPlan(h, dbPath);
+    // user 7: an old receipt arrives while the stored expiry is still live -
+    // the live allocation must report as allocated, with expiry preserved.
+    const liveExp = now + 200 * 864e5;
+    const oldPurchase = now - 400 * 864e5;
+    await h.run(`INSERT INTO user_plans (user_id,premium_gb,premium_expires_at,status,updated_at) VALUES (7,1000,?,'none',?)`, [liveExp, now]);
+    const r7 = await fns.activateSolanaPremiumPlan(7, oldPurchase, { now, paymentType: 'sol' });
+    assert.equal(r7.storageAllocated, true, 'live existing allocation is not reported as missing');
+    assert.equal(r7.premiumGb, 1000);
+    const p7 = await h.get(`SELECT premium_gb, premium_expires_at FROM user_plans WHERE user_id=7`);
+    assert.equal(p7.premium_gb, 1000);
+    assert.equal(p7.premium_expires_at, liveExp, 'live expiry preserved - no extension, no truncation');
+    // Control: same past anchor against an EXPIRED allocation -> not allocated.
+    await h.run(`INSERT INTO user_plans (user_id,premium_gb,premium_expires_at,status,updated_at) VALUES (8,1000,?,'none',?)`, [now - 864e5, now]);
+    const r8 = await fns.activateSolanaPremiumPlan(8, oldPurchase, { now, paymentType: 'sol' });
+    assert.equal(r8.storageAllocated, false);
+    assert.equal(r8.premiumGb, 0);
+    await h.close();
+});
+
+// --- nft-service balance.js idempotency (REAL module, temp DB) ---------------
+test('nft balance (real module): setPremium/recordPayment idempotent; foreign receipt -> PAYMENT_CONFLICT', async () => {
+    const nftDb = mkNftDbPath();
+    const bal = loadNftBalance(nftDb);
+    bal.setPremium(7, 'receiptA', 'solana');
+    assert.equal(bal.isPremium(7), true);
+    // Same user, same receipt: no mint-count/expiry reset, bookkeeping repaired idempotently.
+    bal.setPremium(7, 'receiptA', 'solana');
+    bal.recordPayment(7, 'premium_49', 49.99, 'receiptA', 'solana');
+    bal.recordPayment(7, 'premium_49', 49.99, 'receiptA', 'solana');
+    assert.equal(nftAll(nftDb, `SELECT * FROM nft_payments WHERE receipt_id='receiptA'`).length, 1);
+    assert.equal(nftAll(nftDb, `SELECT * FROM nft_used_receipts WHERE receipt_id='receiptA'`).length, 1);
+    // Foreign user reusing the same receipt -> hard conflict both ways.
+    assert.throws(() => bal.setPremium(8, 'receiptA', 'solana'), (e) => e.code === 'PAYMENT_CONFLICT');
+    assert.throws(() => bal.recordPayment(8, 'premium_49', 49.99, 'receiptA', 'solana'), (e) => e.code === 'PAYMENT_CONFLICT');
+    assert.equal(bal.isPremium(8), false, 'foreign receipt must not grant premium');
+    // A receipt-less recordPayment still inserts (legacy IAP callers).
+    bal.recordPayment(7, 'deposit_15', 15, null, 'ios');
+    assert.equal(nftAll(nftDb, `SELECT * FROM nft_payments WHERE user_id=7 AND payment_type='deposit_15'`).length, 1);
+});
+
+// --- resumePremiumPayment: ledger-first, retryable, conflict-checked ---------
+const seedPremiumLedger = async (h, { sig, userId = 7, token = 'SOL', duration = 'premium', tierGb = 0, createdAt, applied = null }) =>
+    h.run(
+        `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, skr_amount, payment_token, tier_gb, duration, created_at, verified_at, entitlement_applied_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+        [userId, sig, token === 'SOL' ? 0.5 : null, token === 'SKR' ? 106.2 : null, token, tierGb, duration, createdAt, createdAt, applied]);
+
+test('resumePremiumPayment (real code): failed attempts retry to completion exactly once', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    const nftDb = mkNftDbPath();
+    const bal = loadNftBalance(nftDb);
+    await h.run(`INSERT INTO users (id,email) VALUES (7,'m@x')`);
+    const createdAt = Date.now() - 30 * 864e5;
+    await seedPremiumLedger(h, { sig: 'prem1', createdAt });
+
+    // Drive the REAL resumePremiumPayment with a balance module whose effects
+    // fail in sequence: NFT premium down, then tax record down, then healthy.
+    let failSetPremium = true, failRecord = true;
+    const flaky = {
+        ...bal,
+        setPremium: (u, s, p) => { if (failSetPremium) throw new Error('nft premium down'); return bal.setPremium(u, s, p); },
+        recordPayment: (...a) => { if (failRecord) throw new Error('tax record down'); return bal.recordPayment(...a); },
+    };
+    const fns = loadPremiumPlan(h, dbPath, { nftService: { balance: flaky } });
+    const marker = () => h.get(`SELECT entitlement_applied_at FROM solana_payments WHERE tx_signature='prem1'`);
+
+    // Attempt 1: setPremium throws before any effect.
+    await assert.rejects(fns.resumePremiumPayment({ user_id: 7, tx_signature: 'prem1' }), /nft premium down/);
+    assert.equal((await marker()).entitlement_applied_at, null);
+    assert.equal(bal.isPremium(7), false);
+
+    // Attempt 2: NFT premium lands, tax record throws -> marker still NULL.
+    failSetPremium = false;
+    await assert.rejects(fns.resumePremiumPayment({ user_id: 7, tx_signature: 'prem1' }), /tax record down/);
+    assert.equal((await marker()).entitlement_applied_at, null, 'partial effects must not mark the row complete');
+    assert.equal(bal.isPremium(7), true, 'NFT effect persists for the retry to build on');
+
+    // Attempt 3: full success - marker stamped, premium_49 recorded once.
+    failRecord = false;
+    const out = await fns.resumePremiumPayment({ user_id: 7, tx_signature: 'prem1' });
+    assert.equal(out.applied, true);
+    assert.ok((await marker()).entitlement_applied_at > 0);
+    assert.equal(nftAll(nftDb, `SELECT * FROM nft_payments WHERE receipt_id='prem1'`).length, 1, 'premium_49 recorded exactly once');
+    const planA = await h.get(`SELECT premium_gb, premium_expires_at, payment_type FROM user_plans WHERE user_id=7`);
+    assert.equal(planA.premium_gb, 1000);
+    assert.ok(Math.abs(planA.premium_expires_at - (createdAt + 365 * 864e5)) < 2000, 'year anchored to purchase, not to retry time');
+    assert.equal(planA.payment_type, 'premium_sol');
+
+    // Attempt 4: marker set -> complete no-op, year NOT reset, no extra rows.
+    const out2 = await fns.resumePremiumPayment({ user_id: 7, tx_signature: 'prem1' });
+    assert.equal(out2.applied, false);
+    const planB = await h.get(`SELECT premium_expires_at FROM user_plans WHERE user_id=7`);
+    assert.equal(planB.premium_expires_at, planA.premium_expires_at, 'completed marker => no re-activation, no year reset');
+    assert.equal(nftAll(nftDb, `SELECT * FROM nft_used_receipts WHERE receipt_id='prem1'`).length, 1);
+    assert.equal(nftAll(nftDb, `SELECT * FROM nft_payments WHERE receipt_id='prem1'`).length, 1);
+    await h.close();
+});
+
+test('resumePremiumPayment (real code): foreign/malformed canonical row -> PAYMENT_CONFLICT before any effect', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    const nftDb = mkNftDbPath();
+    const bal = loadNftBalance(nftDb);
+    await h.run(`INSERT INTO users (id,email) VALUES (7,'m@x'),(8,'n@x')`);
+    const createdAt = Date.now() - 60_000;
+    await seedPremiumLedger(h, { sig: 'premF', userId: 8, createdAt });   // row belongs to user 8
+    await seedPremiumLedger(h, { sig: 'premSub', userId: 7, tierGb: 100, duration: 'monthly', createdAt }); // not premium
+    const fns = loadPremiumPlan(h, dbPath, { nftService: { balance: bal } });
+    await assert.rejects(fns.resumePremiumPayment({ user_id: 7, tx_signature: 'premF' }), (e) => e.code === 'PAYMENT_CONFLICT');
+    await assert.rejects(fns.resumePremiumPayment({ user_id: 7, tx_signature: 'premSub' }), (e) => e.code === 'PAYMENT_CONFLICT');
+    await assert.rejects(fns.resumePremiumPayment({ user_id: 7, tx_signature: 'missing' }), (e) => e.code === 'PAYMENT_CONFLICT');
+    assert.equal(bal.isPremium(7), false);
+    assert.equal(bal.isPremium(8), false);
+    assert.equal((await h.get(`SELECT entitlement_applied_at FROM solana_payments WHERE tx_signature='premF'`)).entitlement_applied_at, null);
+    await h.close();
+});
+
+// --- /api/premium/activate-storage: unknown-origin anchoring ------------------
+test('activate-storage route (real code): unknown origin anchors once, SQLite-UTC and expired handled', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    const now = Date.now();
+    await h.run(`INSERT INTO users (id,email) VALUES (7,'m@x'),(8,'n@x'),(9,'o@x')`);
+    const sqliteUtc = (ms) => new Date(ms).toISOString().slice(0, 19).replace('T', ' ');
+
+    const fns = loadPremiumPlan(h, dbPath);
+    const nftStatus = {};
+    const routes = {};
+    vm.runInNewContext(`${extractMarked('PREMIUM_ACTIVATE_ROUTE')}\n;null`, {
+        console, paymentRecovery, DB_PATH: dbPath,
+        app: { post: (p, mw, handler) => { routes[p] = (req, res) => { mw(req, res, () => {}); return handler(req, res); }; } },
+        authenticateToken: (req, res, next) => { req.user = { id: req.body.__uid }; next(); },
+        nftService: { balance: { getPremiumStatus: (uid) => nftStatus[uid] || { isPremium: true, purchasedAt: null } } },
+        ensurePlanRow: ensurePlanRowStub(h),
+        parsePremiumPurchaseTime: fns.parsePremiumPurchaseTime,
+        activateSolanaPremiumPlan: fns.activateSolanaPremiumPlan,
+        resolveSubscriptionState: async () => ({ status: 'active' }),
+        dbGetAsync: h.get, dbRunAsync: h.run,
+        PREMIUM_STORAGE_DURATION_MS: 365 * 864e5,
+    });
+    const route = routes['/api/premium/activate-storage'];
+    const call = (uid) => { const res = mkRes(); return route({ body: { __uid: uid }, headers: {} }, res).then(() => res); };
+
+    // user 7: known purchase via SQLite-UTC purchased_at -> anchor = purchase.
+    const p7 = now - 10 * 864e5;
+    nftStatus[7] = { isPremium: true, purchasedAt: sqliteUtc(p7) };
+    const res7 = await call(7);
+    assert.equal(res7.statusCode, 200);
+    const e1 = (await h.get(`SELECT premium_expires_at FROM user_plans WHERE user_id=7`)).premium_expires_at;
+    assert.ok(Math.abs(e1 - (p7 + 365 * 864e5)) < 2000, `anchor must be the purchase, got delta ${e1 - p7}`);
+    // Second call: same anchor, no re-extension.
+    const res7b = await call(7);
+    assert.equal(res7b.statusCode, 200);
+    assert.equal((await h.get(`SELECT premium_expires_at FROM user_plans WHERE user_id=7`)).premium_expires_at, e1);
+
+    // user 8: NO known purchase, no stored expiry -> anchors at now ONCE;
+    // the stored expiry then anchors every later call (never re-extends).
+    const res8 = await call(8);
+    assert.equal(res8.statusCode, 200);
+    const e8 = (await h.get(`SELECT premium_expires_at FROM user_plans WHERE user_id=8`)).premium_expires_at;
+    assert.ok(e8 > now, 'first unknown call allocates a live year');
+    await new Promise((r) => setTimeout(r, 25));
+    const res8b = await call(8);
+    assert.equal(res8b.statusCode, 200);
+    const e8b = (await h.get(`SELECT premium_expires_at FROM user_plans WHERE user_id=8`)).premium_expires_at;
+    assert.equal(e8b, e8, 'unknown-origin repeat derives anchor from stored expiry - no rolling year');
+
+    // user 9: known purchase >1y old + premium_gb>0 + NULL expiry -> past
+    // anchor persisted once, storage NOT revived, repeats keep the anchor.
+    const p9 = now - 400 * 864e5;
+    nftStatus[9] = { isPremium: true, purchasedAt: sqliteUtc(p9) };
+    await h.run(`INSERT INTO user_plans (user_id,premium_gb,status,updated_at) VALUES (9,1000,'none',?)`, [now]);
+    const res9 = await call(9);
+    assert.equal(res9.statusCode, 200);
+    const p9row = await h.get(`SELECT premium_gb, premium_expires_at FROM user_plans WHERE user_id=9`);
+    const p9Anchor = Math.floor(p9 / 1000) * 1000 + 365 * 864e5; // SQLite UTC truncates to seconds
+    assert.equal(p9row.premium_expires_at, p9Anchor, 'proven past anchor persisted');
+    assert.ok(p9row.premium_expires_at < now, 'expired premium is NOT revived');
+    await call(9);
+    assert.equal((await h.get(`SELECT premium_expires_at FROM user_plans WHERE user_id=9`)).premium_expires_at, p9Anchor);
+    await h.close();
+});
+
+// --- premium verify routes: foreign -> 400, same-user resume -> 200 -----------
+const loadPremiumVerifyRoutes = (over = {}) => {
+    const routes = {};
+    evalServer('PREMIUM_VERIFY_ROUTES', 'null', {
+        app: { post: (p, h) => { routes[p] = h; } },
+        jwt: { verify: () => ({ id: 1 }) },
+        JWT_SECRET: 'test-secret',
+        SOLANA_PAYMENT_WALLET: TREASURY,
+        SKR_TOKEN_MINT: SKR_MINT,
+        SKR_TOKEN_DECIMALS: SKR_DECIMALS,
+        SKR_TOKEN_SYMBOL: 'SKR',
+        SKR_PREMIUM_MULTIPLIER: 1,
+        PREMIUM_PRICE_USD: 49.99,
+        paymentRecovery,
+        dbGetAsync: async () => null,
+        dbRunAsync: async () => ({}),
+        verifySolanaTransaction: async () => ({ success: true, receivedAmount: 0.5, blockTime: Math.floor(Date.now() / 1000) - 60, memo: 'PhotoLynk:premium:0:premium', sender: PAYER }),
+        verifySkrTokenTransaction: async () => ({ success: true, receivedRawAmount: 106207279, blockTime: Math.floor(Date.now() / 1000) - 60, memo: 'PhotoLynk:premium:0:premium', sender: PAYER }),
+        requirePaymentMemo: () => true,
+        resumePremiumPayment: async (row) => ({ applied: true, isPremium: true, premiumGb: 1000, balanceUsd: 0, cloudQuotaBytes: 1e12 }),
+        treasuryBoundUsers: async () => [],
+        treasuryMarkSeen: async () => {},
+        resolveSubscriptionState: async () => ({ status: 'active' }),
+        respondVerificationFailure: (res, _r, msg) => res.status(400).json({ error: msg }),
+        ecoEnsureAccount: async () => ({}),
+        ecoFloorSub: async () => {},
+        console,
+        ...over,
+    });
+    return routes;
+};
+const PREMIUM_ROUTES = [['/api/solana/verify-premium-payment', 'premium'], ['/api/solana/verify-premium-skr-payment', 'premium_skr']];
+
+test('premium verify routes (real code): foreign-claimed signature -> 400 PAYMENT_CONFLICT, never 409', async () => {
+    let resumeCalls = 0;
+    const routes = loadPremiumVerifyRoutes({
+        dbGetAsync: async (sql) => {
+            if (sql.includes('FROM users')) return { id: 1, email: 'a@b' };
+            if (sql.includes('FROM solana_payments')) {
+                return { tx_signature: 'sig', user_id: 2, tier_gb: 0, duration: 'premium', payment_token: 'SOL' };
+            }
+            return null;
+        },
+        resumePremiumPayment: async () => { resumeCalls++; return {}; },
+    });
+    for (const [p] of PREMIUM_ROUTES) {
+        const res = mkRes();
+        await routes[p](mkReq({ txSignature: 'sig' }), res);
+        assert.equal(res.statusCode, 400, `${p}: old clients treat any 409 as success - foreign sig must be 400`);
+        assert.equal(res.body.code, 'PAYMENT_CONFLICT');
+        assert.equal(res.body.retryable, false);
+    }
+    assert.equal(resumeCalls, 0, 'no effects may run for a foreign row');
+});
+
+test('premium verify routes (real code): same-user unapplied row -> resume + 200', async () => {
+    const resumed = [];
+    for (const [p, dur] of PREMIUM_ROUTES) {
+        resumed.length = 0;
+        const token = dur === 'premium' ? 'SOL' : 'SKR';
+        const routes = loadPremiumVerifyRoutes({
+            dbGetAsync: async (sql) => {
+                if (sql.includes('FROM users')) return { id: 1, email: 'a@b' };
+                if (sql.includes('FROM solana_payments')) {
+                    return { tx_signature: 'sig', user_id: 1, tier_gb: 0, duration: dur, payment_token: token, entitlement_applied_at: null };
+                }
+                return null;
+            },
+            resumePremiumPayment: async (row) => { resumed.push(row); return { applied: true, isPremium: true, premiumGb: 1000, balanceUsd: 0, cloudQuotaBytes: 1e12 }; },
+        });
+        const res = mkRes();
+        await routes[p](mkReq({ txSignature: '  sig  ' }), res);
+        assert.equal(res.statusCode, 200, `${p}: ${JSON.stringify(res.body)}`);
+        assert.equal(res.body.success, true);
+        assert.equal(res.body.isPremium, true);
+        assert.equal(resumed.length, 1, 'resume invoked exactly once');
+        assert.equal(resumed[0].tx_signature, 'sig', 'canonicalized signature row passed to resume');
+    }
+});
+
+// --- scanner: durable onPage persistence + pending replay ---------------------
+test('collectTreasurySignatures: onPage persist failure never advances the cursor', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    const st = stateStore(h);
+    const rpcOn = async () => mkSigs('p', 1, 3);
+    const out = await collectTreasurySignatures({
+        endpoints: ['ep'], address: 'A', rpcOn,
+        onPage: async () => { throw new Error('persist failed'); },
+        ...st, sleep: async () => {}, pageLimit: 100, maxSigs: 500, maxSweepPages: 4,
+    });
+    assert.equal(out.length, 0, 'unpersisted head page must not be consumed');
+    assert.equal(await st.getState(JSON.stringify(['history_v2', 'ep', 'A'])), null, 'cursor must not advance');
+    // Retry with a healthy onPage: same head page is collected and persisted.
+    const persisted = [];
+    const out2 = await collectTreasurySignatures({
+        endpoints: ['ep'], address: 'A', rpcOn,
+        onPage: async (entries) => { persisted.push(...entries.map((e) => e.signature)); },
+        ...st, sleep: async () => {}, pageLimit: 100, maxSigs: 500, maxSweepPages: 4,
+    });
+    assert.equal(out2.length, 3);
+    assert.deepEqual(persisted, out2.map((e) => e.signature));
+    await h.close();
+});
+
+test('treasuryCollectSignatures (real code): every page row lands in treasury_scan_seen as pending', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    const history = mkSigs('w', 1, 5);
+    const collect = evalServer('TREASURY_COLLECT_WRAPPER', 'treasuryCollectSignatures', {
+        console, paymentRecovery,
+        treasuryRpcOn: async (ep, m, params) => history.slice(0, params[1]?.limit || 100),
+        treasurySleep: async () => {},
+        dbGetAsync: h.get, dbRunAsync: h.run,
+        TREASURY_RPC_ENDPOINTS: ['ep1', 'ep2'],
+        TREASURY_SCAN_PAGE_LIMIT: 100, TREASURY_SCAN_MAX_SIGS: 500,
+    });
+    const out = await collect(TREASURY);
+    assert.equal(out.length, 5);
+    const seen = await h.all(`SELECT signature, outcome FROM treasury_scan_seen ORDER BY signature`);
+    assert.deepEqual(seen.map((r) => r.signature).sort(), out.map((e) => e.signature).sort());
+    assert.ok(seen.every((r) => r.outcome === 'pending'));
+    // Persist failure -> collector drops the page and holds the cursor.
+    const { dbPath: db2 } = await makeFixtureDb();
+    const h2 = await openDb(db2);
+    const collect2 = evalServer('TREASURY_COLLECT_WRAPPER', 'treasuryCollectSignatures', {
+        console, paymentRecovery,
+        treasuryRpcOn: async () => mkSigs('q', 1, 3),
+        treasurySleep: async () => {},
+        dbGetAsync: h2.get,
+        dbRunAsync: async (sql) => { if (sql.includes('treasury_scan_seen')) throw new Error('db full'); return h2.run(sql); },
+        TREASURY_RPC_ENDPOINTS: ['ep1'],
+        TREASURY_SCAN_PAGE_LIMIT: 100, TREASURY_SCAN_MAX_SIGS: 500,
+    });
+    const out2 = await collect2(TREASURY);
+    assert.equal(out2.length, 0, 'unpersisted pages are dropped for retry, not consumed');
+    assert.equal((await h2.all(`SELECT * FROM treasury_scan_seen`)).length, 0);
+    assert.equal((await h2.all(`SELECT * FROM treasury_scan_state`)).length, 0, 'no cursor advancement on persist failure');
+    await h.close();
+    await h2.close();
+});
+
+// --- token-account discovery: union across endpoints + persisted cache --------
+test('treasuryGetTokenAccounts (real code): union of all endpoints + cache; cache survives empty', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    // Persisted discovery cache lives in treasury_scan_state['skr_token_accounts'].
+    await h.run(`INSERT INTO treasury_scan_state (key, value, updated_at) VALUES ('skr_token_accounts', ?, ?)`,
+        [JSON.stringify(['cachedOld']), Date.now()]);
+    const loadDiscovery = (rpcImpl) => evalServer('TOKEN_ACCOUNT_DISCOVERY', 'treasuryGetTokenAccounts', {
+        console, paymentRecovery,
+        treasuryRpcOn: rpcImpl,
+        dbGetAsync: h.get, dbRunAsync: h.run,
+        TREASURY_RPC_ENDPOINTS: ['ep1', 'ep2'],
+        SOLANA_PAYMENT_WALLET: TREASURY, SKR_TOKEN_MINT: SKR_MINT,
+    });
+    const readCache = async () => JSON.parse((await h.get(`SELECT value FROM treasury_scan_state WHERE key='skr_token_accounts'`)).value);
+    // ep1 empty + ep2 nonempty + persisted cache -> union of all three sources.
+    const disc1 = loadDiscovery(async (ep) => (ep === 'ep1' ? { value: [] } : { value: [{ pubkey: 'newRpcAcct' }] }));
+    const u1 = await disc1();
+    assert.ok(u1.includes('cachedOld') && u1.includes('newRpcAcct'), `union must merge cache+RPC, got ${u1}`);
+    assert.deepEqual((await readCache()).sort(), ['cachedOld', 'newRpcAcct'], 'union persisted');
+    // ALL endpoints legitimately empty -> cached union still returned (never wiped).
+    const disc2 = loadDiscovery(async () => ({ value: [] }));
+    const u2 = await disc2();
+    assert.ok(u2.includes('cachedOld') && u2.includes('newRpcAcct'), 'all-empty discovery must retain persisted history');
+    // All endpoints fail -> cached union.
+    const disc3 = loadDiscovery(async () => { throw new Error('rpc down'); });
+    const u3 = await disc3();
+    assert.ok(u3.includes('cachedOld') && u3.includes('newRpcAcct'));
+    // Malformed results are skipped like errors; ep2 still contributes.
+    const disc4 = loadDiscovery(async (ep) => (ep === 'ep1' ? { value: 'not-array' } : { value: [{ pubkey: 'acctX' }] }));
+    const u4 = await disc4();
+    assert.ok(u4.includes('acctX') && u4.includes('cachedOld'));
+    // Malformed ELEMENTS are filtered: non-strings, blank and null pubkeys are
+    // dropped; a padded string is stored trimmed.
+    const disc5 = loadDiscovery(async () => ({
+        value: [{ pubkey: '  acctY  ' }, { pubkey: 42 }, { pubkey: '   ' }, { pubkey: null }, {}],
+    }));
+    const u5 = await disc5();
+    assert.ok(u5.includes('acctY'), 'padded pubkey must be stored trimmed');
+    assert.ok(!u5.includes('') && !u5.includes('42') && !u5.includes('null'),
+        `malformed elements leaked: ${JSON.stringify(u5)}`);
+    await h.close();
+});
+
+// --- scanner premium auto-recovery (SOL + SKR, no manual action) --------------
+const loadScanner = (over = {}) => evalServer('TREASURY_SCAN_RUN', 'treasuryScanOnce', {
+    console,
+    treasuryScanInFlight: false,
+    SOLANA_PAYMENT_WALLET: TREASURY,
+    SKR_TOKEN_MINT: SKR_MINT,
+    SKR_TOKEN_DECIMALS: SKR_DECIMALS,
+    SKR_SUBSCRIPTION_MULTIPLIER: 1,
+    SKR_PREMIUM_MULTIPLIER: 1,
+    PREMIUM_PRICE_USD: 49.99,
+    TREASURY_TX_MAX_AGE_MS: 30 * 24 * 60 * 60 * 1000,
+    TREASURY_SCAN_TX_DELAY_MS: 0,
+    PLAN_PRICES_USD: { 100: 10 },
+    ECO_BIND_MIN_TIER_GB: 400,
+    paymentRecovery,
+    treasuryGetTokenAccounts: async () => [],
+    treasuryCollectSignatures: async () => [],
+    treasurySleep: async () => {},
+    getUserPlanGb: async () => 0,
+    canDowngradeToTier: async () => true,
+    getPriceBand: async () => ({ min: 1, max: 100, latest: 10 }),
+    evaluatePaymentAmount: () => ({ ok: true, minAcceptable: 0.1 }),
+    creditSolanaSubscription: async () => { throw new Error('not a subscription'); },
+    ecoEnsureAccount: async () => ({}),
+    ecoFloorSub: async () => {},
+    ...over,
+});
+
+test('treasuryScanOnce (real code): SOL+SKR premium memos auto-recover end-to-end - no manual step', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    const nftDb = mkNftDbPath();
+    const bal = loadNftBalance(nftDb);
+    const createdSlot = Date.now() - 60_000;
+    await h.run(`INSERT INTO users (id,email) VALUES (7,'m@x')`);
+    // PAYER is cryptographically bound to user 7 (signed_wallet path).
+    await h.run(`INSERT INTO solana_wallet_bindings (wallet,user_id,verified_at) VALUES (?,?,?)`, [PAYER, 7, createdSlot]);
+    const premiumFns = loadPremiumPlan(h, dbPath, { nftService: { balance: bal } });
+    const scan = loadScanner({
+        resumePremiumPayment: premiumFns.resumePremiumPayment,
+        dbAllAsync: h.all, dbGetAsync: h.get, dbRunAsync: h.run,
+        treasuryCollectSignatures: async (addr) =>
+            addr === TREASURY ? [{ signature: 'premSol', slot: 1 }] : [{ signature: 'premSkr', slot: 2 }],
+        treasuryGetTokenAccounts: async () => ['acctSKR'],
+        treasuryMarkSeen: async (sig, outcome, uid, detail) =>
+            h.run(`INSERT OR REPLACE INTO treasury_scan_seen (signature,seen_at,outcome,user_id,detail) VALUES (?,?,?,?,?)`, [sig, Date.now(), outcome, uid, detail]),
+        treasuryFetchTransaction: async (sig) => (sig === 'premSol' ? solTx({}) : skrTx({})),
+        extractPhotoLynkMemo: () => 'PhotoLynk:premium:0:premium',
+        treasuryUserByPaymentCode: async () => null,
+        treasuryBoundUsers: loadBoundUsers(h),
+        getPriceBand: async (asset) => (asset === 'skr' ? { min: 0.9, max: 1.1, latest: 1 } : { min: 95, max: 110, latest: 100 }),
+        evaluatePaymentAmount: evaluatePayment, // REAL evaluator
+    });
+    const summary = await scan();
+    const seenRows = await h.all(`SELECT signature, outcome, detail FROM treasury_scan_seen`);
+    assert.equal(summary.errors, 0, JSON.stringify(seenRows));
+    const rows = await h.all(`SELECT * FROM solana_payments WHERE tx_signature IN ('premSol','premSkr') ORDER BY tx_signature`);
+    assert.equal(rows.length, 2);
+    const solRow = rows.find((r) => r.tx_signature === 'premSol');
+    const skrRow = rows.find((r) => r.tx_signature === 'premSkr');
+    assert.equal(solRow.user_id, 7); assert.equal(solRow.payment_token, 'SOL'); assert.equal(solRow.duration, 'premium'); assert.equal(solRow.tier_gb, 0);
+    assert.equal(skrRow.payment_token, 'SKR'); assert.equal(skrRow.duration, 'premium_skr');
+    assert.ok(solRow.entitlement_applied_at > 0 && skrRow.entitlement_applied_at > 0, 'both completed ledger-first');
+    // NFT + plan effects applied exactly once.
+    assert.equal(bal.isPremium(7), true);
+    assert.equal(nftAll(nftDb, `SELECT * FROM nft_payments WHERE user_id=7 AND payment_type='premium_49'`).length, 2);
+    const plan = await h.get(`SELECT premium_gb, premium_expires_at FROM user_plans WHERE user_id=7`);
+    assert.equal(plan.premium_gb, 1000);
+    // Subscription state untouched: no status/expires_at credit for premium.
+    assert.equal((await h.get(`SELECT status FROM user_plans WHERE user_id=7`)).status !== 'active', true);
+    const seen = await h.all(`SELECT signature, outcome FROM treasury_scan_seen WHERE signature IN ('premSol','premSkr')`);
+    assert.deepEqual(seen.map((r) => r.outcome).sort(), ['credited_premium', 'credited_premium']);
+    // Re-run: rows already complete -> 'already_credited', nothing re-applied.
+    const summary2 = await scan();
+    assert.equal(summary2.errors, 0);
+    assert.equal((await h.all(`SELECT * FROM solana_payments WHERE tx_signature IN ('premSol','premSkr')`)).length, 2);
+    assert.equal(nftAll(nftDb, `SELECT * FROM nft_payments WHERE user_id=7 AND payment_type='premium_49'`).length, 2);
+    await h.close();
+});
+
+test('treasuryScanOnce (real code): unapplied premium ledger rows resume at scan start; failures stay retryable', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    const nftDb = mkNftDbPath();
+    const bal = loadNftBalance(nftDb);
+    const createdAt = Date.now() - 5 * 864e5;
+    await h.run(`INSERT INTO users (id,email) VALUES (7,'m@x')`);
+    await seedPremiumLedger(h, { sig: 'pendPrem', userId: 7, token: 'SKR', duration: 'premium_skr', createdAt });
+    const premiumFns = loadPremiumPlan(h, dbPath, { nftService: { balance: bal } });
+    const scan = loadScanner({
+        resumePremiumPayment: premiumFns.resumePremiumPayment,
+        dbAllAsync: h.all, dbGetAsync: h.get, dbRunAsync: h.run,
+        treasuryCollectSignatures: async () => [],
+        treasuryGetTokenAccounts: async () => [],
+        treasuryMarkSeen: async () => {},
+        treasuryFetchTransaction: async () => null,
+        extractPhotoLynkMemo: () => null,
+        treasuryUserByPaymentCode: async () => null,
+        treasuryBoundUsers: loadBoundUsers(h),
+        verifyTreasuryTransaction: async () => ({ success: false }),
+    });
+    const summary = await scan();
+    assert.equal(summary.errors, 0);
+    const row = await h.get(`SELECT entitlement_applied_at FROM solana_payments WHERE tx_signature='pendPrem'`);
+    assert.ok(row.entitlement_applied_at > 0, 'startup resume completed the row');
+    assert.equal(bal.isPremium(7), true);
+    const plan = await h.get(`SELECT premium_gb, premium_expires_at, payment_type FROM user_plans WHERE user_id=7`);
+    assert.equal(plan.premium_gb, 1000);
+    assert.ok(Math.abs(plan.premium_expires_at - (createdAt + 365 * 864e5)) < 2000, 'anchored to original purchase');
+    assert.equal(plan.payment_type, 'premium_skr');
+    // Failure case: resume throws -> marker stays NULL, next run retries.
+    await seedPremiumLedger(h, { sig: 'pendFail', userId: 7, createdAt });
+    const scan2 = loadScanner({
+        resumePremiumPayment: async () => { throw new Error('nft down'); },
+        dbAllAsync: h.all, dbGetAsync: h.get, dbRunAsync: h.run,
+        treasuryCollectSignatures: async () => [],
+        treasuryGetTokenAccounts: async () => [],
+        treasuryMarkSeen: async () => {},
+        treasuryFetchTransaction: async () => null,
+        extractPhotoLynkMemo: () => null,
+        treasuryUserByPaymentCode: async () => null,
+        treasuryBoundUsers: loadBoundUsers(h),
+        verifyTreasuryTransaction: async () => ({ success: false }),
+    });
+    await scan2();
+    assert.equal((await h.get(`SELECT entitlement_applied_at FROM solana_payments WHERE tx_signature='pendFail'`)).entitlement_applied_at, null,
+        'a failed resume leaves the row retryable');
+    await h.close();
+});
+
+test('treasuryScanOnce (real code): collected sig with unapplied ledger row resumes via existing-row branch', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    const nftDb = mkNftDbPath();
+    const bal = loadNftBalance(nftDb);
+    const createdAt = Date.now() - 2 * 864e5;
+    await h.run(`INSERT INTO users (id,email) VALUES (7,'m@x')`);
+    await seedPremiumLedger(h, { sig: 'pendLate', userId: 7, createdAt });
+    const premiumFns = loadPremiumPlan(h, dbPath, { nftService: { balance: bal } });
+    const scan = loadScanner({
+        resumePremiumPayment: premiumFns.resumePremiumPayment,
+        // The startup resume batch deliberately misses this row (as if it
+        // were beyond the LIMIT-100 window) - the existing-row branch must
+        // still complete it, with the canonical row's tx_signature intact.
+        dbAllAsync: async (sql, p) => (String(sql).includes('entitlement_applied_at IS NULL') ? [] : h.all(sql, p)),
+        dbGetAsync: h.get, dbRunAsync: h.run,
+        treasuryCollectSignatures: async (addr) => (addr === TREASURY ? [{ signature: 'pendLate', slot: 1 }] : []),
+        treasuryGetTokenAccounts: async () => [],
+        treasuryMarkSeen: async (sig, outcome, uid, detail) =>
+            h.run(`INSERT OR REPLACE INTO treasury_scan_seen (signature,seen_at,outcome,user_id,detail) VALUES (?,?,?,?,?)`, [sig, Date.now(), outcome, uid, detail]),
+        treasuryFetchTransaction: async () => { throw new Error('fetch must not run - row already in ledger'); },
+        extractPhotoLynkMemo: () => null,
+        treasuryUserByPaymentCode: async () => null,
+        treasuryBoundUsers: loadBoundUsers(h),
+        verifyTreasuryTransaction: async () => ({ success: false }),
+    });
+    const summary = await scan();
+    assert.equal(summary.errors, 0);
+    assert.equal(summary.credited, 1, 'existing-row resume counts as credited');
+    const rows = await h.all(`SELECT * FROM solana_payments WHERE tx_signature='pendLate'`);
+    assert.equal(rows.length, 1, 'no second ledger insert');
+    assert.ok(rows[0].entitlement_applied_at > 0, 'marker completed by the existing-row resume');
+    assert.equal(bal.isPremium(7), true);
+    assert.equal((await h.get(`SELECT premium_gb FROM user_plans WHERE user_id=7`)).premium_gb, 1000);
+    const seen = await h.get(`SELECT outcome FROM treasury_scan_seen WHERE signature='pendLate'`);
+    assert.equal(seen.outcome, 'credited_premium');
+    await h.close();
+});
+
+test('treasuryScanOnce (real code): sticky pending skip permits entries outside the first-100 retry rows', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    // 100 older retryable rows fill the retry queue; a newer 'pending' entry
+    // must STILL be processed from the head even though it missed LIMIT 100.
+    for (let i = 0; i < 100; i++) {
+        await h.run(`INSERT INTO treasury_scan_seen (signature, seen_at, outcome) VALUES (?,?,?)`, [`old${i}`, i + 1, 'no_user']);
+    }
+    await h.run(`INSERT INTO treasury_scan_seen (signature, seen_at, outcome) VALUES ('pend1',?,'pending')`, [Date.now()]);
+    const marked = [];
+    const scan = loadScanner({
+        dbAllAsync: h.all, dbGetAsync: h.get, dbRunAsync: h.run,
+        treasuryCollectSignatures: async () => [{ signature: 'pend1', slot: 1 }],
+        treasuryMarkSeen: async (sig, outcome, uid, detail) => { marked.push([sig, outcome]); },
+        treasuryFetchTransaction: async () => solTx({}), // no memo
+        extractPhotoLynkMemo: () => null,
+        treasuryUserByPaymentCode: async () => null,
+        treasuryBoundUsers: loadBoundUsers(h),
+        verifyTreasuryTransaction: async () => ({ success: true }),
+    });
+    await scan();
+    const m = marked.find((a) => a[0] === 'pend1');
+    assert.ok(m, 'pending head entry must be processed even outside the first-100 retry window');
+    assert.equal(m[1], 'no_memo');
+    await h.close();
+});
+
+// --- pendingReplay guard in client sub routes ---------------------------------
+test('pendingReplay guard (real code): legacy codeless replay needs a verified binding', async () => {
+    for (const [p] of SUB_ROUTES) {
+        // Unbound replay -> 400 retryable PAYMENT_ACCOUNT_UNVERIFIED
+        let routes = loadSubVerifyRoutes({
+            dbGetAsync: async (sql) => (sql.includes('FROM users') ? { id: 1, email: 'a@b' } : null),
+            treasuryBoundUsers: async () => [],
+        });
+        let res = mkRes();
+        await routes[p](mkReq({ txSignature: 'sig', tierGb: 100, duration: 'monthly', pendingReplay: true }), res);
+        assert.equal(res.statusCode, 400, `${p}: unbound legacy replay must not credit`);
+        assert.equal(res.body.code, 'PAYMENT_ACCOUNT_UNVERIFIED');
+        assert.equal(res.body.retryable, true);
+
+        // Ambiguous binding (two users) -> same rejection
+        routes = loadSubVerifyRoutes({
+            dbGetAsync: async (sql) => (sql.includes('FROM users') ? { id: 1, email: 'a@b' } : null),
+            treasuryBoundUsers: async () => [{ id: 1 }, { id: 2 }],
+        });
+        res = mkRes();
+        await routes[p](mkReq({ txSignature: 'sig', tierGb: 100, duration: 'monthly', pendingReplay: true }), res);
+        assert.equal(res.statusCode, 400);
+        assert.equal(res.body.code, 'PAYMENT_ACCOUNT_UNVERIFIED');
+
+        // Bound to exactly this user -> proceeds to credit
+        routes = loadSubVerifyRoutes({
+            dbGetAsync: async (sql) => (sql.includes('FROM users') ? { id: 1, email: 'a@b' } : null),
+            treasuryBoundUsers: async () => [{ id: 1 }],
+        });
+        res = mkRes();
+        await routes[p](mkReq({ txSignature: 'sig', tierGb: 100, duration: 'monthly', pendingReplay: true }), res);
+        assert.equal(res.statusCode, 200, `${p}: trusted binding must allow replay, got ${JSON.stringify(res.body)}`);
+
+        // A coded memo never needs the flag (the code itself binds the user)
+        const codedMemo = 'PhotoLynk:sub:100:monthly:abcd1234';
+        routes = loadSubVerifyRoutes({
+            dbGetAsync: async (sql) => (sql.includes('FROM users') ? { id: 1, email: 'a@b' } : null),
+            treasuryBoundUsers: async () => { throw new Error('must not be called for coded memos'); },
+            verifySolanaTransaction: async () => ({ success: true, receivedAmount: 0.5, blockTime: Math.floor(Date.now() / 1000) - 60, memo: codedMemo, sender: PAYER }),
+            verifySkrTokenTransaction: async () => ({ success: true, receivedAmount: 100, blockTime: Math.floor(Date.now() / 1000) - 60, memo: codedMemo, sender: PAYER }),
+        });
+        res = mkRes();
+        await routes[p](mkReq({ txSignature: 'sig', tierGb: 100, duration: 'monthly', pendingReplay: true }), res);
+        assert.equal(res.statusCode, 200, `${p}: coded replay must not consult bound users`);
+    }
+});
+
+// --- eco mirror: stale floor cannot shorten; admin set-until still exact ------
+test('ecoApplySub (real code): stale renewal floor cannot shorten; admin set-until overrides', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    const now = Date.now();
+    await h.run(`INSERT INTO users (id,email) VALUES (7,'m@x')`);
+    const far = now + 300 * 864e5;
+    await h.run(`INSERT INTO stealthlynk_subs (account_id, sub_until, source_app, provenance, updated_at) VALUES ('acct7', ?, 'photolynk', 'sub-paid', ?)`, [far, now]);
+    await h.run(`INSERT INTO ecosystem_members (account_id, app, identity) VALUES ('acct7','photolynk','7'), ('acct7','paceseeker','devhash1')`);
+    await h.run(`INSERT INTO paceseeker_devices (device_hash, sub_until) VALUES ('devhash1', ?)`, [far]);
+    const ecoApplySub = evalServer('ECO_APPLY_SUB', 'ecoApplySub', {
+        console,
+        dbGetAsync: h.get, dbRunAsync: h.run, dbAllAsync: h.all,
+        ECO_PL_TIER_GB: 100,
+    });
+    // Stale floor (earlier expiry) must NOT shrink the shared record.
+    const near = now + 10 * 864e5;
+    const ret = await ecoApplySub('acct7', near, { sourceApp: 'photolynk', kind: 'paid', provenance: 'sub-paid', plTierGb: 100 });
+    assert.equal(ret, far, 'effective expiry returned, not the stale floor');
+    const sub = await h.get(`SELECT sub_until, source_app, provenance FROM stealthlynk_subs WHERE account_id='acct7'`);
+    assert.equal(sub.sub_until, far);
+    // The member materialization uses the EFFECTIVE max, not the stale value.
+    const planRow = await h.get(`SELECT expires_at FROM user_plans WHERE user_id=7`);
+    assert.equal(planRow.expires_at, far, 'member plan carries the effective max expiry');
+    assert.equal((await h.get(`SELECT sub_until FROM paceseeker_devices WHERE device_hash='devhash1'`)).sub_until, far);
+    // A LATER floor still raises the expiry.
+    const farther = now + 400 * 864e5;
+    await ecoApplySub('acct7', farther, { sourceApp: 'photolynk', kind: 'paid', provenance: 'sub-paid', plTierGb: 100 });
+    assert.equal((await h.get(`SELECT sub_until FROM stealthlynk_subs WHERE account_id='acct7'`)).sub_until, farther);
+    // Explicit admin set-until CAN shorten (intentional administrative override).
+    const adminSet = now + 30 * 864e5;
+    await ecoApplySub('acct7', adminSet, { sourceApp: 'admin', kind: 'paid', provenance: 'set-until' });
+    assert.equal((await h.get(`SELECT sub_until FROM stealthlynk_subs WHERE account_id='acct7'`)).sub_until, adminSet,
+        'admin set-until applies exactly');
     await h.close();
 });

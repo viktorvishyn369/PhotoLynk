@@ -5,6 +5,8 @@
 // dependency-injected so the logic can be regression-tested against temporary
 // SQLite databases and mocked RPC responses - never against live services.
 
+const path = require('path');
+
 const SYSTEM_PROGRAM_ID = '11111111111111111111111111111111';
 const TOKEN_PROGRAM_ID = 'TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA';
 const LAMPORTS_PER_SOL = 1000000000;
@@ -22,7 +24,42 @@ const VALID_DURATIONS = new Set(['monthly', 'yearly']);
 const MAX_SAFE_BIG = BigInt(Number.MAX_SAFE_INTEGER);
 
 // Outcomes the treasury scanner retries independently of sweep position.
-const RETRYABLE_OUTCOMES = ['no_user', 'code_no_match', 'conflict', 'rpc_error', 'underpaid'];
+// 'pending' marks a signature that was durably page-persisted but never
+// processed (crash/restart mid-run) - it must re-enter the queue immediately.
+// 'premium_manual' rows were logged by older scanner builds before automatic
+// premium recovery existed - re-evaluating them now credits them or records
+// a fresh retryable/terminal outcome.
+const RETRYABLE_OUTCOMES = ['no_user', 'code_no_match', 'conflict', 'rpc_error', 'underpaid', 'pending', 'premium_manual'];
+
+// ---------------------------------------------------------------------------
+// Keyed same-process mutation gates.
+//
+// SQLite's BEGIN IMMEDIATE gives cross-process atomicity, but inside this
+// process an autopurge/migration writer can still interleave a payment
+// credit, and a burst of concurrent BEGIN waiters (node-sqlite3's 4-slot
+// libuv pool) can starve the active writer so its COMMIT is never scheduled.
+// These promise-keyed gates order same-process work per (db,user) and per
+// database file. They are NOT cross-process locks and do no network work.
+// ---------------------------------------------------------------------------
+const mutationGateTails = new Map();
+const resolveGatePath = (dbPath) => {
+    try { return path.resolve(String(dbPath)); } catch (_) { return String(dbPath); }
+};
+const withKeyedGate = (key, fn) => {
+    const prev = mutationGateTails.get(key) || Promise.resolve();
+    const result = prev.then(() => fn());
+    // The stored tail swallows rejections so one failure never wedges the key.
+    const tail = result.catch(() => {});
+    mutationGateTails.set(key, tail);
+    tail.finally(() => {
+        if (mutationGateTails.get(key) === tail) mutationGateTails.delete(key);
+    });
+    return result;
+};
+const withAccountMutation = (dbPath, userId, fn) =>
+    withKeyedGate(`${resolveGatePath(dbPath)}::u:${String(userId)}`, fn);
+const withDatabaseWriter = (dbPath, fn) =>
+    withKeyedGate(`${resolveGatePath(dbPath)}::db`, fn);
 
 const UPSERT_WALLET_BINDING_SQL =
     `INSERT INTO solana_wallet_bindings(wallet,user_id,verified_at) VALUES (?,?,?) ` +
@@ -44,6 +81,16 @@ function parseSubscriptionMemo(memo) {
     const m = memo.match(SUB_MEMO_RE);
     if (!m) return null;
     return { tierGb: Number(m[1]), duration: m[2], code: m[3] || null };
+}
+
+// Premium one-time purchase memo: PhotoLynk:premium:0:premium[:<code8>]
+const PREMIUM_MEMO_RE = /^PhotoLynk:premium:0:premium(?::([0-9a-f]{8}))?$/;
+
+function parsePremiumMemo(memo) {
+    if (typeof memo !== 'string') return null;
+    const m = memo.match(PREMIUM_MEMO_RE);
+    if (!m) return null;
+    return { tierGb: 0, duration: 'premium', code: m[1] || null };
 }
 
 // Strict base58 decode - jsonParsed RPC returns raw instruction `data` base58
@@ -304,10 +351,12 @@ function createSubscriptionCreditor({ sqlite3, dbPath, computeExpiry, durations 
         throw codedError('BAD_CREDITOR_CONFIG', 'createSubscriptionCreditor requires {sqlite3, dbPath, computeExpiry, durations}');
     }
 
-    return async function credit({
+    // All DB work lives in this UNLOCKED helper - callers must never invoke
+    // it directly without the gates, and it must never re-acquire them.
+    const creditUnlocked = async ({
         userId, signature, token, amount, tierGb, duration,
         paymentAt, source, detail, preserveTier = false,
-    }) {
+    }) => {
         const uid = Number(userId);
         if (!Number.isInteger(uid) || uid <= 0) throw codedError('INVALID_INPUT', 'invalid userId');
         // Canonicalize before ANY query or write: '  sig  ' and 'sig' are the
@@ -434,6 +483,14 @@ function createSubscriptionCreditor({ sqlite3, dbPath, computeExpiry, durations 
             if (conn) await new Promise((resolve) => conn.close(() => resolve()));
         }
     };
+
+    // Account gate first (serializes vs autopurge/migration for THIS user),
+    // then the database-writer gate (bounds concurrent BEGIN IMMEDIATE
+    // waiters so the active writer can always schedule its COMMIT).
+    return async function credit(args) {
+        return withAccountMutation(dbPath, args?.userId, () =>
+            withDatabaseWriter(dbPath, () => creditUnlocked(args)));
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -454,6 +511,7 @@ function createSubscriptionCreditor({ sqlite3, dbPath, computeExpiry, durations 
 async function collectTreasurySignatures({
     endpoints, address, rpcOn,
     getState, setState, clearState,
+    onPage = null,
     sleep = async () => { },
     pageLimit = 100, maxSigs = 500, maxSweepPages = null,
     commitment = 'finalized',
@@ -470,12 +528,21 @@ async function collectTreasurySignatures({
         seen.add(sig);
         collected.push(entry);
     };
+    // Durable page persistence hook: invoked for EVERY fetched page BEFORE
+    // the entries are consumed and before the sweep cursor advances, so a
+    // crash after persistence still leaves every signature processable via
+    // the retry queue. A persistence failure must not advance the cursor.
+    const emitPage = async (entries) => {
+        if (typeof onPage !== 'function' || !Array.isArray(entries) || entries.length === 0) return;
+        await onPage(entries);
+    };
 
     for (const endpoint of endpoints || []) {
         let head;
         try {
             head = await rpcOn(endpoint, 'getSignaturesForAddress', [address, { limit: pageLimit, commitment }]);
             if (!Array.isArray(head)) throw codedError('RPC_MALFORMED', 'getSignaturesForAddress result is not a list');
+            await emitPage(head);
         } catch (e) {
             log(`[collectTreasurySignatures] head page failed on ${endpoint}: ${e.message}`);
             continue; // endpoint failed: other endpoints still sweep
@@ -505,6 +572,10 @@ async function collectTreasurySignatures({
             try {
                 page = await rpcOn(endpoint, 'getSignaturesForAddress', [address, { limit: pageLimit, commitment, before }]);
                 if (!Array.isArray(page)) throw codedError('RPC_MALFORMED', 'getSignaturesForAddress result is not a list');
+                // Persist the page BEFORE consuming it or moving the cursor:
+                // if the marker write fails the cursor stays put and the page
+                // is re-fetched (and re-persisted) on the next run.
+                await emitPage(page);
             } catch (e) {
                 log(`[collectTreasurySignatures] sweep page failed on ${endpoint}: ${e.message}`);
                 break; // leave the persisted cursor - resume next run
@@ -791,6 +862,7 @@ module.exports = {
     BASE58_ALPHABET,
     base58Decode,
     parseSubscriptionMemo,
+    parsePremiumMemo,
     extractPaymentMemo,
     extractTreasuryTransfer,
     boundUserIds,
@@ -802,6 +874,8 @@ module.exports = {
     verifyWalletOwnership,
     createTreasuryInspector,
     recoveryConfirmed,
+    withAccountMutation,
+    withDatabaseWriter,
     BASE58_SIG_RE,
     TX_MAX_AGE_MS,
 };

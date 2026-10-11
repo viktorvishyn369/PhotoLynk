@@ -1466,21 +1466,24 @@ app.post('/admin/api/migrate-expired-active-plans', adminAuth, async (req, res) 
         const graceMs = Math.max(0, SUBSCRIPTION_GRACE_DAYS) * 24 * 60 * 60 * 1000;
         const graceUntil = now + graceMs;
 
+        // Full snapshots: the CAS write re-checks every field the decision
+        // was computed from, so a renewal committed between SELECT and UPDATE
+        // can never be clobbered back to 'grace'.
         const rows = await dbAllAsync(
-            `SELECT user_id, expires_at FROM user_plans WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?`,
-            [now]
+            `SELECT * FROM user_plans WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?
+               AND (premium_gb IS NULL OR premium_gb = 0 OR (premium_expires_at IS NOT NULL AND premium_expires_at > 0 AND premium_expires_at <= ?))`,
+            [now, now]
         );
 
         let migrated = 0;
         const details = [];
         for (const row of rows) {
             try {
-                await dbRunAsync(
-                    `UPDATE user_plans SET status = 'grace', grace_until = ?, updated_at = ? WHERE user_id = ?`,
-                    [graceUntil, now, row.user_id]
-                );
-                migrated++;
-                details.push({ userId: row.user_id, expiresAt: row.expires_at, graceUntil });
+                const applied = await compareAndSetPlanState(row.user_id, row, { status: 'grace', graceUntil, now });
+                if (applied) {
+                    migrated++;
+                    details.push({ userId: row.user_id, expiresAt: row.expires_at, graceUntil });
+                }
             } catch (e) {
                 console.error(`[Admin] migrate failed for user ${row.user_id}:`, e);
             }
@@ -2203,6 +2206,204 @@ const ensurePlanRow = async (userId) => {
     return await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [userId]);
 };
 
+// === CAS_PLAN_STATE_BEGIN ===
+// Compare-and-set plan-state transition. The WHERE clause re-checks the
+// ENTIRE snapshot the caller computed its decision from, so a renewal (or
+// any other write) that committed after the SELECT can never be overwritten
+// by a stale expired/grace transition: the row simply fails to match, the
+// UPDATE changes 0 rows and the caller reruns against fresh state.
+// `row` must be a full user_plans snapshot; undefined fields bind as NULL.
+const compareAndSetPlanState = async (userId, row, { status, graceUntil, deletedAt, now } = {}) => {
+    if (!row) return false;
+    const updatedAt = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+    const result = await dbRunAsync(
+        `UPDATE user_plans SET status = ?, grace_until = ?, deleted_at = ?, updated_at = ?
+         WHERE user_id = ?
+           AND status IS ? AND expires_at IS ? AND trial_until IS ?
+           AND grace_until IS ? AND deleted_at IS ?
+           AND premium_gb IS ? AND premium_expires_at IS ?`,
+        [
+            status !== undefined ? status : (row.status ?? null),
+            graceUntil !== undefined ? graceUntil : (row.grace_until ?? null),
+            deletedAt !== undefined ? deletedAt : (row.deleted_at ?? null),
+            updatedAt,
+            userId,
+            row.status ?? null,
+            row.expires_at ?? null,
+            row.trial_until ?? null,
+            row.grace_until ?? null,
+            row.deleted_at ?? null,
+            row.premium_gb ?? null,
+            row.premium_expires_at ?? null,
+        ]
+    );
+    return !!(result && result.changes === 1);
+};
+// === CAS_PLAN_STATE_END ===
+
+// === PREMIUM_PLAN_HELPERS_BEGIN ===
+// Module-scope premium plan/storage helpers. They used to be nested inside
+// the nft-service mount block, which made /api/subscription/status's
+// self-heal throw a swallowed ReferenceError and kept the scanner from
+// resuming premium entitlements. `premiumUntil` anchors storage expiry to
+// the PURCHASE (purchasedAt + 1y): an existing positive expiry is never
+// shortened, an expired allocation is never silently revived by a stale
+// anchor, and a legacy NULL expiry is backfilled once from the purchase
+// origin instead of rolling a fresh year forward on every request.
+// Parses a premium purchase timestamp: positive finite ms numbers, ISO
+// strings carrying their own zone, or the exact SQLite UTC form
+// 'YYYY-MM-DD HH:mm:ss' (converted to 'T'+'Z' only for that form).
+// Anything else -> null.
+const parsePremiumPurchaseTime = (value) => {
+    if (value === null || value === undefined) return null;
+    if (typeof value === 'number' && Number.isFinite(value)) return value > 0 ? value : null;
+    const s = String(value).trim();
+    if (!s) return null;
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(s)) {
+        const t = Date.parse(`${s.replace(' ', 'T')}Z`);
+        return Number.isFinite(t) ? t : null;
+    }
+    // Only an explicit zone makes a string unambiguous - bare ISO local
+    // forms, fuzzy strings and junk all parse differently across engines.
+    if (!/(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(s)) return null;
+    const t = Date.parse(s);
+    return Number.isFinite(t) ? t : null;
+};
+
+const ensurePremiumStorageCapacityUnlocked = async (userId, now, premiumUntil) => {
+    const nowMs = Number.isFinite(Number(now)) ? Number(now) : Date.now();
+    const desiredUntil = Number.isFinite(Number(premiumUntil)) && Number(premiumUntil) > 0
+        ? Number(premiumUntil)
+        : nowMs + PREMIUM_STORAGE_DURATION_MS;
+    await ensurePlanRow(userId);
+    const existingRow = await dbGetAsync(`SELECT plan_gb, premium_gb, premium_expires_at, status, trial_until FROM user_plans WHERE user_id = ?`, [userId]);
+    const existingPremiumGb = existingRow && existingRow.premium_gb !== null && existingRow.premium_gb !== undefined ? Number(existingRow.premium_gb) : 0;
+    const existingExpiresAt = existingRow && existingRow.premium_expires_at ? Number(existingRow.premium_expires_at) : null;
+
+    // Desired expiry already in the past: never allocate fresh storage or
+    // revive an expired one. A proven-but-past anchor on a NULL-expiry grant
+    // is persisted once so an unlimited grant can't ride forever.
+    if (desiredUntil <= nowMs) {
+        if (existingPremiumGb > 0 && (!existingExpiresAt || existingExpiresAt <= 0)) {
+            await dbRunAsync(
+                `UPDATE user_plans SET premium_expires_at = ?, updated_at = ? WHERE user_id = ? AND (premium_expires_at IS NULL OR premium_expires_at = 0)`,
+                [desiredUntil, nowMs, userId]
+            );
+        }
+        const liveGb = existingPremiumGb > 0 && existingExpiresAt && existingExpiresAt > nowMs ? existingPremiumGb : 0;
+        // A live existing allocation counts as allocated even when the
+        // incoming purchase anchor is already past - no extension, just the
+        // truthful report so callers don't zero-out premiumGb.
+        return { premiumGb: liveGb, allocated: liveGb > 0 };
+    }
+
+    if (existingPremiumGb === PREMIUM_STORAGE_GB) {
+        // Never shorten: MAX keeps a longer existing expiry; a NULL legacy
+        // expiry is backfilled once from the purchase-anchored desiredUntil.
+        if (!existingExpiresAt || desiredUntil > existingExpiresAt) {
+            await dbRunAsync(
+                `UPDATE user_plans SET premium_expires_at = MAX(COALESCE(premium_expires_at,0), ?), updated_at = ? WHERE user_id = ?`,
+                [desiredUntil, nowMs, userId]
+            );
+        }
+        return { premiumGb: PREMIUM_STORAGE_GB, allocated: true };
+    }
+    if (existingPremiumGb > 0) {
+        await dbRunAsync(
+            `UPDATE user_plans SET premium_gb = ?, premium_expires_at = MAX(COALESCE(premium_expires_at,0), ?), updated_at = ? WHERE user_id = ?`,
+            [PREMIUM_STORAGE_GB, desiredUntil, nowMs, userId]
+        );
+        return { premiumGb: PREMIUM_STORAGE_GB, allocated: true };
+    }
+
+    const SAFETY_BYTES = 20 * GB_BYTES;
+    const capacity = readCapacityJson();
+    const totalServerBytes = capacity && typeof capacity.totalBytes === 'number' && Number.isFinite(capacity.totalBytes) ? capacity.totalBytes : null;
+
+    if (totalServerBytes !== null) {
+        const allocRow = await dbGetAsync(
+            `SELECT COALESCE(SUM(CASE WHEN plan_gb IS NOT NULL AND plan_gb > 0 AND (deleted_at IS NULL OR deleted_at = 0) AND status IN ('active','grace','trial') THEN plan_gb ELSE 0 END), 0) AS totalPlanGb,
+                    COALESCE(SUM(CASE WHEN premium_gb IS NOT NULL AND premium_gb > 0 AND (deleted_at IS NULL OR deleted_at = 0) AND (premium_expires_at IS NULL OR premium_expires_at > ?) THEN premium_gb ELSE 0 END), 0) AS totalPremiumGb
+               FROM user_plans`,
+            [nowMs]
+        );
+        const totalPlanGb = allocRow ? Number(allocRow.totalPlanGb) : 0;
+        const totalPremiumGb = allocRow ? Number(allocRow.totalPremiumGb) : 0;
+        const trialPlanGb = existingRow && String(existingRow.status || '') === 'trial' && Number(existingRow.trial_until) > nowMs
+            ? Math.max(0, Number(existingRow.plan_gb) || 0)
+            : 0;
+        const currentAllocatedBytes = (totalPlanGb + totalPremiumGb) * GB_BYTES;
+        const newAllocationBytes = PREMIUM_STORAGE_GB * GB_BYTES;
+        const availableBytes = totalServerBytes - currentAllocatedBytes + (trialPlanGb * GB_BYTES) - SAFETY_BYTES;
+
+        if (newAllocationBytes > availableBytes) {
+            return {
+                premiumGb: 0,
+                allocated: false,
+                capacityExceeded: true,
+                requiredBytes: newAllocationBytes,
+                availableBytes: Math.max(0, availableBytes),
+            };
+        }
+    }
+
+    await dbRunAsync(
+        `UPDATE user_plans SET premium_gb = ?, premium_expires_at = MAX(COALESCE(premium_expires_at,0), ?), updated_at = ? WHERE user_id = ?`,
+        [PREMIUM_STORAGE_GB, desiredUntil, nowMs, userId]
+    );
+    return { premiumGb: PREMIUM_STORAGE_GB, allocated: true };
+};
+// The read/capacity-check/write sequence must be atomic vs other premium
+// allocations, or two users could both pass the capacity check for the last
+// slot. Callers already hold the account gate - order is account -> writer,
+// and this is a fresh gate acquisition, never nested inside the Unlocked.
+const ensurePremiumStorageCapacity = (...args) =>
+    paymentRecovery.withDatabaseWriter(DB_PATH, () => ensurePremiumStorageCapacityUnlocked(...args));
+
+// Activate the premium entitlement's plan-side effects for a verified
+// premium payment. ensurePremiumStorageCapacity is the ONLY writer of
+// premium_gb/premium_expires_at (capacity failure no longer falls through
+// to a COALESCE'd 1000GB). The metadata write preserves an existing ACTIVE
+// paid plan's provenance, stamps the premium payment type only when no paid
+// plan is live, and clears the purge tombstone only when premium storage is
+// actually live. plan_gb/status/expires_at are never touched.
+const activateSolanaPremiumPlan = async (userId, purchaseTimestamp, options = {}) => {
+    const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
+    const purchasedAt = Number.isFinite(Number(purchaseTimestamp)) && Number(purchaseTimestamp) > 0 ? Number(purchaseTimestamp) : now;
+    const paymentType = options.paymentType === 'skr' ? 'premium_skr' : (options.paymentType === 'sol' ? 'premium_sol' : null);
+    const storageResult = await ensurePremiumStorageCapacity(userId, now, purchasedAt + PREMIUM_STORAGE_DURATION_MS);
+    await ensurePlanRow(userId);
+
+    if (storageResult.allocated) {
+        await dbRunAsync(
+            `UPDATE user_plans SET
+                payment_at = CASE WHEN COALESCE(expires_at,0) > ? AND payment_type IN ('solana','skr','apple','google','ecosystem','ad_claim') THEN payment_at ELSE COALESCE(payment_at,?) END,
+                payment_type = CASE WHEN COALESCE(expires_at,0) > ? AND payment_type IN ('solana','skr','apple','google','ecosystem','ad_claim') THEN payment_type ELSE COALESCE(?,payment_type) END,
+                deleted_at = CASE WHEN premium_gb > 0 AND premium_expires_at > ? THEN NULL ELSE deleted_at END,
+                updated_at = ?
+             WHERE user_id = ?`,
+            [now, purchasedAt, now, paymentType, now, now, userId]
+        );
+    }
+
+    return {
+        premiumGb: storageResult.allocated ? PREMIUM_STORAGE_GB : 0,
+        purchasedAt,
+        storageAllocated: !!storageResult.allocated,
+        capacityExceeded: !!storageResult.capacityExceeded,
+        requiredBytes: storageResult.requiredBytes || null,
+        availableBytes: storageResult.availableBytes || null,
+    };
+};
+
+// Assigned inside the nft-service mount block once the module initialized:
+// applies a premium ledger row's entitlement EXACTLY once (NFT premium +
+// tax record + plan effects) and stamps solana_payments.entitlement_applied_at
+// only after every step succeeded. Null when the NFT service is unavailable.
+let resumePremiumPayment = null;
+// === PREMIUM_PLAN_HELPERS_END ===
+
+// === QUOTA_PROFILE_BEGIN ===
 const getUserQuotaProfileFromRow = (row, now = Date.now()) => {
     const status = row && row.status ? String(row.status) : 'none';
     const planGbRaw = row && row.plan_gb !== null && row.plan_gb !== undefined ? Number(row.plan_gb) : 0;
@@ -2246,8 +2447,12 @@ const getUserQuotaProfileFromRow = (row, now = Date.now()) => {
         graceActive,
     };
 };
+// === QUOTA_PROFILE_END ===
 
-const resolveSubscriptionState = async (userId) => {
+// === SUBSCRIPTION_STATE_BEGIN ===
+// readOnly suppresses the lazy state transitions - used for the single
+// re-resolve after a CAS miss (never recurse a write path on stale data).
+const resolveSubscriptionState = async (userId, { readOnly = false } = {}) => {
     const now = Date.now();
     const row = await ensurePlanRow(userId);
     if (!row) return { allowed: false, status: 'none', premiumGb: 0, usedBytes: 0, quotaBytes: 0 };
@@ -2331,12 +2536,13 @@ const resolveSubscriptionState = async (userId) => {
     if (row.status === 'trial' && trialUntil && trialUntil > 0 && complimentaryUntil && complimentaryUntil < now) {
         if (premiumGb > 0) return await resolvePremiumState('premium_over_capacity', { complimentaryUntil });
         if (!deletedAt || deletedAt <= 0) {
-            try {
-                await dbRunAsync(
-                    `UPDATE user_plans SET status = 'expired', deleted_at = ?, updated_at = ? WHERE user_id = ?`,
-                    [now, now, userId]
-                );
-            } catch (e) { }
+            if (!readOnly) {
+                try {
+                    const applied = await compareAndSetPlanState(userId, row, { status: 'expired', deletedAt: now, now });
+                    if (!applied) return resolveSubscriptionState(userId, { readOnly: true });
+                    row.status = 'expired'; row.deleted_at = now;
+                } catch (e) { }
+            }
         }
         return {
             allowed: false,
@@ -2372,21 +2578,19 @@ const resolveSubscriptionState = async (userId) => {
 
     if (expiresAt && expiresAt > 0 && expiresAt <= now) {
         const gu = graceUntil;
-        if (!row.grace_until || Number(row.grace_until) <= 0) {
+        if ((!row.grace_until || Number(row.grace_until) <= 0) && !readOnly) {
             const nextUpdatedAt = Date.now();
-            await dbRunAsync(
-                `UPDATE user_plans SET status = ?, grace_until = ?, updated_at = ? WHERE user_id = ?`,
-                ['grace', gu, nextUpdatedAt, userId]
-            );
+            const applied = await compareAndSetPlanState(userId, row, { status: 'grace', graceUntil: gu, now: nextUpdatedAt });
+            if (!applied) return resolveSubscriptionState(userId, { readOnly: true });
+            row.status = 'grace'; row.grace_until = gu;
         }
         const allowedInGrace = !!(gu && gu > 0 && now <= gu);
-        if (!allowedInGrace && row.status !== 'expired' && premiumGb <= 0) {
+        if (!allowedInGrace && row.status !== 'expired' && premiumGb <= 0 && !readOnly) {
             try {
                 const nextUpdatedAt = Date.now();
-                await dbRunAsync(
-                    `UPDATE user_plans SET status = ?, deleted_at = COALESCE(deleted_at, ?), updated_at = ? WHERE user_id = ?`,
-                    ['expired', nextUpdatedAt, nextUpdatedAt, userId]
-                );
+                const applied = await compareAndSetPlanState(userId, row, { status: 'expired', deletedAt: deletedAt || nextUpdatedAt, now: nextUpdatedAt });
+                if (!applied) return resolveSubscriptionState(userId, { readOnly: true });
+                row.status = 'expired'; row.deleted_at = deletedAt || nextUpdatedAt;
             } catch (e) { }
         }
         if (premiumGb > 0) {
@@ -2447,6 +2651,7 @@ const resolveSubscriptionState = async (userId) => {
         quotaBytes,
     };
 };
+// === SUBSCRIPTION_STATE_END ===
 
 // Allow read-only access to StealthCloud data even without an active subscription.
 // We only block access after the data has been deleted server-side.
@@ -3128,7 +3333,19 @@ const clearStealthCloudDedupCachesForKeys = (keys) => {
     }
 };
 
+// === USER_PURGE_BEGIN ===
+// Account-gated wrapper: same-process serialization so an in-flight payment
+// credit (or premium resume) for this user always finishes before a purge
+// can delete anything, and vice versa. NOT a cross-process filesystem lock.
 const purgeUserEverywhere = async (userId, options = {}) => {
+    const uid = Number(userId);
+    if (!Number.isFinite(uid) || uid <= 0) {
+        throw new Error('Invalid userId');
+    }
+    return paymentRecovery.withAccountMutation(DB_PATH, uid, () => purgeUserEverywhereUnlocked(uid, options));
+};
+
+const purgeUserEverywhereUnlocked = async (userId, options = {}) => {
     const { deleteFiles = true, reason = 'manual', preserveNftData = false } = options || {};
     const uid = Number(userId);
     if (!Number.isFinite(uid) || uid <= 0) {
@@ -3172,6 +3389,36 @@ const purgeUserEverywhere = async (userId, options = {}) => {
         },
         nftDb: preserveNftData ? { preserved: true } : null,
     };
+
+    // Retention purges run under the account gate, but the gate only orders
+    // THIS process - re-read the live plan under the gate right before any
+    // filesystem deletion so a credit that committed between the autopurge
+    // candidate SELECT and now can never lose its files. Any live or renewed
+    // entitlement, or a tombstone that no longer satisfies the cutoff, makes
+    // this a skip - never a failure.
+    if (deleteFiles && reason === 'autopurge_retention') {
+        const plan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [uid]);
+        const now = Date.now();
+        const retentionCutoff = now - (PURGE_RETENTION_DAYS * 24 * 60 * 60 * 1000);
+        const pStatus = plan ? String(plan.status || '') : '';
+        const pExpires = Number(plan?.expires_at) || 0;
+        const pGrace = Number(plan?.grace_until) || 0;
+        const pTrial = Number(plan?.trial_until) || 0;
+        const pComplimentary = pTrial > 0 ? pTrial + Math.max(0, TRIAL_COMPLIMENTARY_DAYS) * 24 * 60 * 60 * 1000 : 0;
+        const pPremiumGb = Number(plan?.premium_gb) || 0;
+        const pPremiumExp = Number(plan?.premium_expires_at) || 0;
+        const pDeleted = Number(plan?.deleted_at) || 0;
+        const stillEntitled = !plan
+            || pStatus === 'active' || pStatus === 'trial' || pStatus === 'grace'
+            || pExpires > now
+            || pGrace > now
+            || pComplimentary > now
+            || (pPremiumGb > 0 && (!pPremiumExp || pPremiumExp > now))
+            || !(pDeleted > 0 && pDeleted < retentionCutoff);
+        if (stillEntitled) {
+            return { ok: true, userId: uid, skipped: true, reason: 'entitlement_changed' };
+        }
+    }
 
     if (deleteFiles) {
         const dirsToDelete = new Set();
@@ -3269,7 +3516,9 @@ const purgeUserEverywhere = async (userId, options = {}) => {
     console.log(`[UserPurge] Completed user=${uid} reason=${reason} files=${deleteFiles ? 'yes' : 'no'}`);
     return { ok: true, deleted };
 };
+// === USER_PURGE_END ===
 
+// === STALE_PLAN_MIGRATION_BEGIN ===
 const migrateStalePlanStates = async () => {
     const now = Date.now();
     const complimentaryMs = Math.max(0, TRIAL_COMPLIMENTARY_DAYS) * 24 * 60 * 60 * 1000;
@@ -3277,77 +3526,79 @@ const migrateStalePlanStates = async () => {
     let fixed = 0;
 
     // 1. Trial users whose complimentary period has ended → set status='expired', deleted_at
-    //    Old code left them stuck as 'trial' with no deleted_at
-    //    Skip users with active premium storage (1-year protection)
+    //    Old code left them stuck as 'trial' with no deleted_at.
+    //    Skip: active premium storage, a renewed/future paid expiry, or an
+    //    active grace window. Full snapshots - the CAS write re-checks the
+    //    exact row this decision was computed from.
     const staleTrials = await dbAllAsync(
-        `SELECT user_id, trial_until, deleted_at FROM user_plans
+        `SELECT * FROM user_plans
          WHERE status = 'trial' AND trial_until IS NOT NULL AND trial_until > 0
            AND (trial_until + ?) < ?
-           AND (premium_gb IS NULL OR premium_gb = 0 OR premium_expires_at IS NULL OR premium_expires_at < ?)`,
-        [complimentaryMs, now, now]
+           AND (expires_at IS NULL OR expires_at <= 0 OR expires_at <= ?)
+           AND (grace_until IS NULL OR grace_until <= 0 OR grace_until <= ?)
+           AND (premium_gb IS NULL OR premium_gb = 0 OR (premium_expires_at IS NOT NULL AND premium_expires_at > 0 AND premium_expires_at <= ?))`,
+        [complimentaryMs, now, now, now, now]
     );
+    let fixedTrials = 0;
     for (const row of staleTrials) {
         const complimentaryEnd = Number(row.trial_until) + complimentaryMs;
         const deletedAt = (row.deleted_at && Number(row.deleted_at) > 0) ? Number(row.deleted_at) : complimentaryEnd;
         try {
-            await dbRunAsync(
-                `UPDATE user_plans SET status = 'expired', deleted_at = ?, updated_at = ? WHERE user_id = ?`,
-                [deletedAt, now, row.user_id]
-            );
-            fixed++;
+            const applied = await compareAndSetPlanState(row.user_id, row, { status: 'expired', deletedAt, now });
+            if (applied) { fixed++; fixedTrials++; }
         } catch (e) {
             console.error(`[Migration] Failed to fix stale trial user ${row.user_id}:`, e.message);
         }
     }
-    if (staleTrials.length > 0) {
-        console.log(`[Migration] Fixed ${staleTrials.length} stale trial→expired users`);
+    if (fixedTrials > 0) {
+        console.log(`[Migration] Fixed ${fixedTrials} stale trial→expired users`);
     }
 
     // 2. Expired users without deleted_at → set deleted_at to now (start retention window)
-    //    Skip users with active premium storage
+    //    Skip users with active premium storage, a renewed paid expiry or an
+    //    active grace window.
     const staleExpired = await dbAllAsync(
-        `SELECT user_id FROM user_plans
+        `SELECT * FROM user_plans
          WHERE status = 'expired' AND (deleted_at IS NULL OR deleted_at <= 0)
-           AND (premium_gb IS NULL OR premium_gb = 0 OR premium_expires_at IS NULL OR premium_expires_at < ?)`,
-        [now]
+           AND (expires_at IS NULL OR expires_at <= 0 OR expires_at <= ?)
+           AND (grace_until IS NULL OR grace_until <= 0 OR grace_until <= ?)
+           AND (premium_gb IS NULL OR premium_gb = 0 OR (premium_expires_at IS NOT NULL AND premium_expires_at > 0 AND premium_expires_at <= ?))`,
+        [now, now, now]
     );
+    let fixedExpired = 0;
     for (const row of staleExpired) {
         try {
-            await dbRunAsync(
-                `UPDATE user_plans SET deleted_at = ?, updated_at = ? WHERE user_id = ?`,
-                [now, now, row.user_id]
-            );
-            fixed++;
+            const applied = await compareAndSetPlanState(row.user_id, row, { deletedAt: now, now });
+            if (applied) { fixed++; fixedExpired++; }
         } catch (e) {
             console.error(`[Migration] Failed to set deleted_at for expired user ${row.user_id}:`, e.message);
         }
     }
-    if (staleExpired.length > 0) {
-        console.log(`[Migration] Set deleted_at for ${staleExpired.length} expired users (starting retention window)`);
+    if (fixedExpired > 0) {
+        console.log(`[Migration] Set deleted_at for ${fixedExpired} expired users (starting retention window)`);
     }
 
     // 3. Active users with expired expires_at → migrate to grace
     //    (premium users are handled separately — they keep access via premium storage)
     const staleActive = await dbAllAsync(
-        `SELECT user_id, expires_at, grace_until FROM user_plans
-         WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?`,
-        [now]
+        `SELECT * FROM user_plans
+         WHERE status = 'active' AND expires_at IS NOT NULL AND expires_at > 0 AND expires_at <= ?
+           AND (premium_gb IS NULL OR premium_gb = 0 OR (premium_expires_at IS NOT NULL AND premium_expires_at > 0 AND premium_expires_at <= ?))`,
+        [now, now]
     );
+    let fixedActive = 0;
     for (const row of staleActive) {
         const expiresAt = Number(row.expires_at);
         const graceUntil = (row.grace_until && Number(row.grace_until) > 0) ? Number(row.grace_until) : (expiresAt + graceMs);
         try {
-            await dbRunAsync(
-                `UPDATE user_plans SET status = 'grace', grace_until = ?, updated_at = ? WHERE user_id = ?`,
-                [graceUntil, now, row.user_id]
-            );
-            fixed++;
+            const applied = await compareAndSetPlanState(row.user_id, row, { status: 'grace', graceUntil, now });
+            if (applied) { fixed++; fixedActive++; }
         } catch (e) {
             console.error(`[Migration] Failed to migrate active→grace for user ${row.user_id}:`, e.message);
         }
     }
-    if (staleActive.length > 0) {
-        console.log(`[Migration] Migrated ${staleActive.length} expired active→grace users`);
+    if (fixedActive > 0) {
+        console.log(`[Migration] Migrated ${fixedActive} expired active→grace users`);
     }
 
     // 4. Stored 'grace' users whose grace window already ended → expired.
@@ -3357,24 +3608,24 @@ const migrateStalePlanStates = async () => {
     //    stamped as grace_until - the retention clock starts when grace ended,
     //    not when we happened to notice.
     const staleGrace = await dbAllAsync(
-        `SELECT user_id, grace_until FROM user_plans
+        `SELECT * FROM user_plans
          WHERE status = 'grace' AND grace_until IS NOT NULL AND grace_until > 0 AND grace_until <= ?
-           AND (premium_gb IS NULL OR premium_gb = 0 OR premium_expires_at IS NULL OR premium_expires_at < ?)`,
-        [now, now]
+           AND (expires_at IS NULL OR expires_at <= 0 OR expires_at <= ?)
+           AND (premium_gb IS NULL OR premium_gb = 0 OR (premium_expires_at IS NOT NULL AND premium_expires_at > 0 AND premium_expires_at <= ?))`,
+        [now, now, now]
     );
+    let fixedGrace = 0;
     for (const row of staleGrace) {
+        const deletedAt = (row.deleted_at && Number(row.deleted_at) > 0) ? Number(row.deleted_at) : Number(row.grace_until);
         try {
-            await dbRunAsync(
-                `UPDATE user_plans SET status = 'expired', deleted_at = COALESCE(NULLIF(deleted_at, 0), ?), updated_at = ? WHERE user_id = ?`,
-                [Number(row.grace_until), now, row.user_id]
-            );
-            fixed++;
+            const applied = await compareAndSetPlanState(row.user_id, row, { status: 'expired', deletedAt, now });
+            if (applied) { fixed++; fixedGrace++; }
         } catch (e) {
             console.error(`[Migration] Failed to expire grace user ${row.user_id}:`, e.message);
         }
     }
-    if (staleGrace.length > 0) {
-        console.log(`[Migration] Expired ${staleGrace.length} stale grace users`);
+    if (fixedGrace > 0) {
+        console.log(`[Migration] Expired ${fixedGrace} stale grace users`);
     }
 
     // 5. Ecosystem members whose PhotoLynk user no longer exists — tombstones
@@ -3408,6 +3659,7 @@ const migrateStalePlanStates = async () => {
     }
     return fixed;
 };
+// === STALE_PLAN_MIGRATION_END ===
 
 const purgeExpiredComplimentaryUsers = async () => {
     const now = Date.now();
@@ -3420,7 +3672,7 @@ const purgeExpiredComplimentaryUsers = async () => {
          JOIN users u ON u.id = up.user_id
          WHERE up.deleted_at IS NOT NULL AND up.deleted_at > 0 AND up.deleted_at < ?
            AND up.status NOT IN ('active', 'trial', 'grace')
-           AND (up.premium_gb IS NULL OR up.premium_gb = 0 OR up.premium_expires_at IS NULL OR up.premium_expires_at < ?)`,
+           AND (up.premium_gb IS NULL OR up.premium_gb = 0 OR (up.premium_expires_at IS NOT NULL AND up.premium_expires_at > 0 AND up.premium_expires_at <= ?))`,
         [cutoff, now]
     );
 
@@ -3474,6 +3726,12 @@ const purgeExpiredComplimentaryUsers = async () => {
             if (!result || !result.ok) {
                 console.error(`[AutoPurge] purgeUserEverywhere failed for user ${uid}`);
                 errors++;
+                continue;
+            }
+            // The gated re-check refused this purge (an entitlement committed
+            // after the candidate SELECT) - a skip, not a purge, not an error.
+            if (result.skipped) {
+                console.log(`[AutoPurge] Skipped user ${uid} — entitlement changed (${result.reason})`);
                 continue;
             }
             console.log(`[AutoPurge] Purged user ${uid} (${row.email || row.user_uuid}) — expired ${ageDays}d ago, deleted_at=${deletedAtStr}. NFTs/certs preserved.`);
@@ -4569,8 +4827,15 @@ async function ecoMergeAccounts(targetId, sourceId) {
 // onlyApp limits member materialization to one app (ad weeks are app-local —
 // they must never light up the other ecosystem app). plTierGb overrides the
 // PhotoLynk plan size (ad weeks cap at ECO_AD_MAX_TIER_GB, not the bind tier).
+// === ECO_APPLY_SUB_BEGIN ===
 async function ecoApplySub(accountId, subUntil, { sourceApp, kind, provenance, onlyApp, plTierGb } = {}) {
     const now = Date.now();
+    // The shared expiry is a FLOOR for automatic writes: an out-of-order
+    // renewal mirror can never shorten what a newer payment already set, and
+    // provenance metadata only moves when the incoming expiry wins the MAX.
+    // An explicit admin 'set-until' keeps exact-set semantics so deliberate
+    // admin shortening still works.
+    const adminExactSet = sourceApp === 'admin' && provenance === 'set-until';
     // 'link_sync' is a propagation-only rewrite — it must never overwrite the
     // provenance columns, or every heartbeat would erase the real source
     // (payment sig / ad claim URL) from the shared record.
@@ -4578,16 +4843,30 @@ async function ecoApplySub(accountId, subUntil, { sourceApp, kind, provenance, o
         await dbRunAsync(`INSERT INTO stealthlynk_subs (account_id, sub_until, updated_at)
             VALUES (?, ?, ?)
             ON CONFLICT(account_id) DO UPDATE SET
-                sub_until = excluded.sub_until, updated_at = excluded.updated_at`,
+                sub_until = MAX(COALESCE(stealthlynk_subs.sub_until, 0), excluded.sub_until), updated_at = excluded.updated_at`,
             [accountId, subUntil, now]);
-    } else {
+    } else if (adminExactSet) {
         await dbRunAsync(`INSERT INTO stealthlynk_subs (account_id, sub_until, source_app, source_kind, provenance, updated_at)
             VALUES (?, ?, ?, ?, ?, ?)
             ON CONFLICT(account_id) DO UPDATE SET
                 sub_until = excluded.sub_until, source_app = excluded.source_app,
                 source_kind = excluded.source_kind, provenance = excluded.provenance, updated_at = excluded.updated_at`,
             [accountId, subUntil, sourceApp || null, kind || null, provenance || null, now]);
+    } else {
+        await dbRunAsync(`INSERT INTO stealthlynk_subs (account_id, sub_until, source_app, source_kind, provenance, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(account_id) DO UPDATE SET
+                sub_until = MAX(COALESCE(stealthlynk_subs.sub_until, 0), excluded.sub_until),
+                source_app = CASE WHEN excluded.sub_until >= COALESCE(stealthlynk_subs.sub_until, 0) THEN excluded.source_app ELSE stealthlynk_subs.source_app END,
+                source_kind = CASE WHEN excluded.sub_until >= COALESCE(stealthlynk_subs.sub_until, 0) THEN excluded.source_kind ELSE stealthlynk_subs.source_kind END,
+                provenance = CASE WHEN excluded.sub_until >= COALESCE(stealthlynk_subs.sub_until, 0) THEN excluded.provenance ELSE stealthlynk_subs.provenance END,
+                updated_at = excluded.updated_at`,
+            [accountId, subUntil, sourceApp || null, kind || null, provenance || null, now]);
     }
+    // Materialize the EFFECTIVE shared expiry (the MAX winner may exceed the
+    // incoming value when a newer payment landed first) into member rows.
+    const effectiveRow = await dbGetAsync(`SELECT sub_until FROM stealthlynk_subs WHERE account_id = ?`, [accountId]);
+    const effectiveUntil = Number.isFinite(Number(effectiveRow?.sub_until)) ? Number(effectiveRow.sub_until) : subUntil;
     const members = await dbAllAsync(`SELECT app, identity FROM ecosystem_members WHERE account_id = ?`, [accountId]);
     const planGb = Number(plTierGb) || ECO_PL_TIER_GB;
     for (const m of members) {
@@ -4608,16 +4887,17 @@ async function ecoApplySub(accountId, subUntil, { sourceApp, kind, provenance, o
                         expires_at = MAX(COALESCE(user_plans.expires_at, 0), excluded.expires_at),
                         payment_type = CASE WHEN excluded.expires_at > COALESCE(user_plans.expires_at, 0) THEN 'ecosystem' ELSE user_plans.payment_type END,
                         grace_until = NULL, deleted_at = NULL, updated_at = excluded.updated_at`,
-                    [Number(m.identity), planGb, subUntil, now]);
+                    [Number(m.identity), planGb, effectiveUntil, now]);
             } else if (m.app === 'paceseeker') {
                 await dbRunAsync(
                     `UPDATE paceseeker_devices SET sub_until = MAX(COALESCE(sub_until, 0), ?) WHERE device_hash = ?`,
-                    [subUntil, m.identity]);
+                    [effectiveUntil, m.identity]);
             }
         } catch (e) { console.warn('[Eco] propagate failed for', m.app, e.message); }
     }
-    return subUntil;
+    return effectiveUntil;
 }
+// === ECO_APPLY_SUB_END ===
 
 // Extend the shared sub by durationMs from now (or from current expiry if
 // still active — grants stack). A 'revoke' row blocks fresh grants too —
@@ -7567,42 +7847,39 @@ app.post('/api/lookup-wallet', authenticateToken, async (req, res) => {
 app.get('/api/subscription/status', authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
-        // Self-heal: if user is premium in nft-service but premium_gb not set in user_plans, fix it
+        // Self-heal: if user is premium in nft-service but premium_gb not set
+        // in user_plans, run the same activation path the verify routes use -
+        // capacity-checked, purchase-anchored, never a direct 1000GB bypass.
         try {
             const nftService = require('../nft-service');
             const premiumStatus = nftService.balance.getPremiumStatus(userId);
             if (premiumStatus && premiumStatus.isPremium) {
-                const row = await dbGetAsync(`SELECT premium_gb, premium_expires_at, status, expires_at, payment_type FROM user_plans WHERE user_id = ?`, [userId]);
-                const latestSolanaPremium = await dbGetAsync(
-                    `SELECT created_at
-                       FROM solana_payments
-                      WHERE user_id = ? AND duration = 'premium'
-                   ORDER BY created_at DESC
-                      LIMIT 1`,
-                    [userId]
-                );
-                if (latestSolanaPremium && (
-                    !row ||
-                    !row.premium_gb ||
-                    Number(row.premium_gb) !== PREMIUM_STORAGE_GB
-                )) {
-                    const healed = await activateSolanaPremiumPlan(userId, Number(latestSolanaPremium.created_at) || Date.now(), { now: Date.now() });
-                    console.log(`[Premium] Self-healed Solana premium plan for user ${userId} (storageAllocated=${healed.storageAllocated})`);
-                } else if (!latestSolanaPremium && (!row || !row.premium_gb || Number(row.premium_gb) !== PREMIUM_STORAGE_GB)) {
-                    const now = Date.now();
-                    await ensurePlanRow(userId);
-                    await dbRunAsync(
-                        `UPDATE user_plans SET premium_gb = ?, premium_expires_at = ?, updated_at = ? WHERE user_id = ?`,
-                        [PREMIUM_STORAGE_GB, now + PREMIUM_STORAGE_DURATION_MS, now, userId]
+                const row = await dbGetAsync(`SELECT premium_gb, premium_expires_at FROM user_plans WHERE user_id = ?`, [userId]);
+                const needsAllocation = !row || !row.premium_gb || Number(row.premium_gb) !== PREMIUM_STORAGE_GB;
+                const needsExpiry = !!(row && Number(row.premium_gb) === PREMIUM_STORAGE_GB && !row.premium_expires_at);
+                if (needsAllocation || needsExpiry) {
+                    const latestSolanaPremium = await dbGetAsync(
+                        `SELECT created_at
+                           FROM solana_payments
+                          WHERE user_id = ? AND duration IN ('premium','premium_skr')
+                       ORDER BY created_at DESC
+                          LIMIT 1`,
+                        [userId]
                     );
-                    console.log(`[Premium] Self-healed premium_gb=${PREMIUM_STORAGE_GB} for user ${userId}`);
-                } else if (row && row.premium_gb && Number(row.premium_gb) === PREMIUM_STORAGE_GB && !row.premium_expires_at) {
-                    const now = Date.now();
-                    await dbRunAsync(
-                        `UPDATE user_plans SET premium_expires_at = ?, updated_at = ? WHERE user_id = ?`,
-                        [now + PREMIUM_STORAGE_DURATION_MS, now, userId]
-                    );
-                    console.log(`[Premium] Self-healed premium_expires_at for user ${userId}`);
+                    let anchor = Number(latestSolanaPremium?.created_at) || null;
+                    if (!anchor) anchor = parsePremiumPurchaseTime(premiumStatus.purchasedAt);
+                    const healNow = Date.now();
+                    const healed = await paymentRecovery.withAccountMutation(DB_PATH, userId, async () => {
+                        if (!anchor) {
+                            // Stored expiry is itself a proven anchor; only a
+                            // fully unanchored grant backfills once from now.
+                            const existing = await dbGetAsync(`SELECT premium_expires_at FROM user_plans WHERE user_id = ?`, [userId]);
+                            const storedExpiry = Number(existing?.premium_expires_at) || 0;
+                            anchor = storedExpiry > 0 ? storedExpiry - PREMIUM_STORAGE_DURATION_MS : healNow;
+                        }
+                        return activateSolanaPremiumPlan(userId, anchor, { now: healNow });
+                    });
+                    console.log(`[Premium] Self-healed premium plan for user ${userId} (storageAllocated=${healed.storageAllocated})`);
                 }
             }
         } catch (_) { /* nft-service not available */ }
@@ -8258,6 +8535,23 @@ app.post('/api/solana/verify-payment', async (req, res) => {
             return;
         }
 
+        // Legacy-queue replay: an upgraded client retrying an OLD unowned
+        // pending entry marks pendingReplay + sends the codeless memo. That
+        // may only credit THIS user when server-side evidence already binds
+        // the payer to exactly this account (ed25519 wallet binding or a
+        // prior admin recovery). A coded memo needs no extra check - the
+        // payment code already proved the owner inside requirePaymentMemo.
+        if (req.body.pendingReplay === true && txVerification.memo === `PhotoLynk:sub:${normalizedTier}:${normDuration}`) {
+            const replayPaymentAt = Number(txVerification.blockTime) > 0 ? txVerification.blockTime * 1000 : Date.now();
+            const boundIds = paymentRecovery.boundUserIds(await treasuryBoundUsers(txVerification.sender, replayPaymentAt));
+            if (!(boundIds.length === 1 && Number(boundIds[0]) === Number(user.id))) {
+                if (boundIds.length === 0) {
+                    await treasuryMarkSeen(txSig, 'no_user', null, `pendingReplay sender=${txVerification.sender || 'unknown'}`);
+                }
+                return res.status(400).json({ code: 'PAYMENT_ACCOUNT_UNVERIFIED', error: 'Pending payment account is not verified', retryable: true });
+            }
+        }
+
         // Payment + plan + audit commit atomically (dedicated connection).
         const now = Date.now();
         const paymentAt = Number(txVerification.blockTime) > 0 ? txVerification.blockTime * 1000 : now;
@@ -8418,6 +8712,20 @@ app.post('/api/solana/verify-skr-payment', async (req, res) => {
         }
         if (!requirePaymentMemo(res, txVerification.memo, `PhotoLynk:sub:${normalizedTier}:${normDuration}`, user.id)) {
             return;
+        }
+
+        // Legacy-queue replay (same rule as the SOL route): a codeless memo
+        // replayed for a different account only credits when trusted payer
+        // evidence already binds the sender to exactly this user.
+        if (req.body.pendingReplay === true && txVerification.memo === `PhotoLynk:sub:${normalizedTier}:${normDuration}`) {
+            const replayPaymentAt = Number(txVerification.blockTime) > 0 ? txVerification.blockTime * 1000 : Date.now();
+            const boundIds = paymentRecovery.boundUserIds(await treasuryBoundUsers(txVerification.sender, replayPaymentAt));
+            if (!(boundIds.length === 1 && Number(boundIds[0]) === Number(user.id))) {
+                if (boundIds.length === 0) {
+                    await treasuryMarkSeen(txSig, 'no_user', null, `pendingReplay sender=${txVerification.sender || 'unknown'}`);
+                }
+                return res.status(400).json({ code: 'PAYMENT_ACCOUNT_UNVERIFIED', error: 'Pending payment account is not verified', retryable: true });
+            }
         }
 
         const now = Date.now();
@@ -8679,6 +8987,10 @@ const treasuryRpcOn = async (endpoint, method, params) => {
 };
 
 // First-success across TREASURY_RPC_ENDPOINTS. Throws when all fail.
+// Callers needing result-shape validation (e.g. token account discovery,
+// where a null/malformed body must not count as an answer) iterate
+// treasuryRpcOn themselves so they can distinguish endpoint errors from
+// valid empty results.
 const treasuryRpc = async (method, params) => {
     let lastErr = null;
     for (const endpoint of TREASURY_RPC_ENDPOINTS) {
@@ -8775,42 +9087,63 @@ const treasuryLegacyWalletCandidates = async (walletAddress) => {
 // at the ATA, whose address - not the wallet's - sits in the tx accountKeys,
 // so getSignaturesForAddress(paymentWallet) never sees SKR payments at all.
 // Scanning these token accounts is what makes the SKR path work.
+// === TOKEN_ACCOUNT_DISCOVERY_BEGIN ===
 const treasuryGetTokenAccounts = async () => {
-    try {
-        const result = await treasuryRpc('getTokenAccountsByOwner',
-            [SOLANA_PAYMENT_WALLET, { mint: SKR_TOKEN_MINT }, { encoding: 'jsonParsed' }]);
-        const accounts = (result?.value || []).map((a) => a?.pubkey).filter(Boolean);
-        if (accounts.length) {
-            // Persist one successful discovery so later runs survive RPC
-            // flakiness on the indexed call.
-            try {
-                await dbRunAsync(
-                    `INSERT OR REPLACE INTO treasury_scan_state (key, value, updated_at) VALUES ('skr_token_accounts', ?, ?)`,
-                    [JSON.stringify(accounts), Date.now()]
-                );
-            } catch (e) {
-                console.warn('[TreasuryScan] token account persist failed:', e.message);
-            }
-            console.log(`[TreasuryScan] token account discovery: ${accounts.length} account(s) via RPC`);
-            return accounts;
+    // UNION semantics: every endpoint that answers contributes its pubkeys,
+    // merged with the persisted discovery. A token account that was once
+    // discovered may be temporarily invisible (or closed while still holding
+    // unpaid historical signatures) - a currently-empty owner query must
+    // never wipe the historical scan set. Malformed/null/error responses
+    // skip that endpoint only; an RPC failure is never reported as "no
+    // accounts".
+    const discovered = new Set();
+    for (const endpoint of TREASURY_RPC_ENDPOINTS) {
+        let result;
+        try {
+            result = await treasuryRpcOn(endpoint, 'getTokenAccountsByOwner',
+                [SOLANA_PAYMENT_WALLET, { mint: SKR_TOKEN_MINT }, { encoding: 'jsonParsed' }]);
+        } catch (e) {
+            console.warn(`[TreasuryScan] token account discovery failed on ${endpoint}:`, e.message);
+            continue;
         }
-    } catch (e) {
-        console.warn('[TreasuryScan] token account discovery RPC failed:', e.message);
+        if (!result || !Array.isArray(result.value)) {
+            console.warn(`[TreasuryScan] token account discovery: malformed result on ${endpoint}`);
+            continue;
+        }
+        for (const a of result.value) {
+            const pubkey = typeof a?.pubkey === 'string' ? a.pubkey.trim() : '';
+            if (pubkey) discovered.add(pubkey);
+        }
     }
+    let stored = [];
     try {
         const row = await dbGetAsync(`SELECT value FROM treasury_scan_state WHERE key = 'skr_token_accounts'`, []);
-        const stored = row?.value ? JSON.parse(row.value) : null;
-        if (Array.isArray(stored) && stored.length) {
-            console.log(`[TreasuryScan] token account discovery: using ${stored.length} stored account(s) (RPC empty/failed)`);
-            return stored.filter((a) => typeof a === 'string' && a);
-        }
+        const parsed = row?.value ? JSON.parse(row.value) : null;
+        if (Array.isArray(parsed)) stored = parsed.filter((a) => typeof a === 'string' && a);
     } catch (e) {
         console.warn('[TreasuryScan] token account fallback read failed:', e.message);
     }
-    console.warn('[TreasuryScan] token account discovery: no accounts (RPC empty/failed, nothing stored)');
-    return [];
+    const union = [...new Set([...discovered, ...stored])];
+    if (!union.length) {
+        console.warn('[TreasuryScan] token account discovery: no accounts (RPC empty/failed, nothing stored)');
+        return [];
+    }
+    // Persist the union once discovery+read are complete - historical
+    // addresses are retained even when no endpoint currently lists them.
+    try {
+        await dbRunAsync(
+            `INSERT OR REPLACE INTO treasury_scan_state (key, value, updated_at) VALUES ('skr_token_accounts', ?, ?)`,
+            [JSON.stringify(union), Date.now()]
+        );
+    } catch (e) {
+        console.warn('[TreasuryScan] token account persist failed:', e.message);
+    }
+    console.log(`[TreasuryScan] token account discovery: ${union.length} account(s) (${discovered.size} via RPC, ${stored.length} persisted)`);
+    return union;
 };
+// === TOKEN_ACCOUNT_DISCOVERY_END ===
 
+// === TREASURY_COLLECT_WRAPPER_BEGIN ===
 // treasury_scan_state cursor helpers - the rolling sweep position survives
 // restarts, so a multi-page backlog drains over consecutive runs.
 const treasuryStateGet = async (key) => {
@@ -8831,6 +9164,22 @@ const treasuryStateClear = async (key) => {
 // page plus up to 4 backward pages from the persisted cursor each run (max
 // 500/endpoint/address). NEVER stops at a known signature - processed rows
 // are filtered later, so pagination cannot strand a backlog behind one.
+// Durable page persistence: every fetched page is written to
+// treasury_scan_seen as 'pending' BEFORE the sweep cursor advances, so a
+// crash mid-run leaves every collected signature processable via the retry
+// queue (outcome 'pending' is retryable and bypasses the terminal-skip).
+const treasuryPersistPage = async (entries) => {
+    for (const entry of entries || []) {
+        const sig = entry && entry.signature;
+        if (!sig) continue;
+        await dbRunAsync(
+            `INSERT OR IGNORE INTO treasury_scan_seen (signature, seen_at, outcome, user_id, detail)
+             VALUES (?, ?, 'pending', NULL, NULL)`,
+            [sig, Date.now()]
+        );
+    }
+};
+
 const treasuryCollectSignatures = (address) => paymentRecovery.collectTreasurySignatures({
     endpoints: TREASURY_RPC_ENDPOINTS,
     address,
@@ -8838,12 +9187,14 @@ const treasuryCollectSignatures = (address) => paymentRecovery.collectTreasurySi
     getState: treasuryStateGet,
     setState: treasuryStateSet,
     clearState: treasuryStateClear,
+    onPage: treasuryPersistPage,
     sleep: treasurySleep,
     pageLimit: TREASURY_SCAN_PAGE_LIMIT,
     maxSigs: TREASURY_SCAN_MAX_SIGS,
     maxSweepPages: 4,
     commitment: 'finalized',
 });
+// === TREASURY_COLLECT_WRAPPER_END ===
 
 // === TREASURY_FETCH_TX_BEGIN ===
 // getTransaction across endpoints: a null/empty result falls through to the
@@ -8874,6 +9225,33 @@ const treasuryScanOnce = async () => {
     const summary = { scanned: 0, credited: 0, already: 0, skipped: 0, errors: 0, startedAt: new Date().toISOString() };
     try {
         console.log('[TreasuryScan] run started');
+
+        // Premium ledger rows whose entitlement never finished applying
+        // (NFT activation or storage failure after the INSERT) are resumed
+        // BEFORE any new scan work - sequentially, errors logged not marked.
+        if (typeof resumePremiumPayment === 'function') {
+            try {
+                const pendingPremium = await dbAllAsync(
+                    `SELECT p.* FROM solana_payments p
+                     JOIN users u ON u.id = p.user_id
+                     WHERE p.duration IN ('premium','premium_skr')
+                       AND p.entitlement_applied_at IS NULL
+                     ORDER BY p.created_at ASC LIMIT 100`, []);
+                for (const p of pendingPremium || []) {
+                    try {
+                        const r = await resumePremiumPayment(p);
+                        if (r && r.applied) summary.credited++;
+                        console.log(`[TreasuryScan] premium resume ${p.tx_signature}: ${r?.applied ? 'applied' : 'already applied'}`);
+                    } catch (e) {
+                        console.warn(`[TreasuryScan] premium resume failed for ${p.tx_signature} - retryable:`, e.message);
+                        summary.errors++;
+                    }
+                }
+            } catch (e) {
+                console.warn('[TreasuryScan] premium resume query failed:', e.message);
+            }
+        }
+
         // SKR arrives at the treasury ATA, SOL at the wallet itself - scan
         // both, merge by signature, then process oldest->newest so crediting
         // order matches on-chain order.
@@ -8890,10 +9268,13 @@ const treasuryScanOnce = async () => {
         }
         // Old retryable outcomes are re-evaluated independently of the sweep
         // position - a user may have bound a wallet since the first pass.
+        // 'pending' = page-persisted but never processed (crash); it is also
+        // permitted through the sticky-skip below without the 100-row cap.
+        // 'premium_manual' rows predate automatic premium recovery.
         let retrySigs = [];
         try {
             const rows = await dbAllAsync(
-                `SELECT signature FROM treasury_scan_seen WHERE outcome IN ('no_user','code_no_match','conflict','rpc_error','underpaid') ORDER BY seen_at ASC LIMIT 100`, []);
+                `SELECT signature FROM treasury_scan_seen WHERE outcome IN ('no_user','code_no_match','conflict','rpc_error','underpaid','pending','premium_manual') ORDER BY seen_at ASC LIMIT 100`, []);
             retrySigs = (rows || []).map((r) => r.signature);
         } catch (e) { console.warn('[TreasuryScan] retry queue read failed:', e.message); }
         const { queue: sigInfos, retrySet } = paymentRecovery.buildScanQueue(collected, retrySigs);
@@ -8906,13 +9287,34 @@ const treasuryScanOnce = async () => {
                 if (info?.err) { await treasuryMarkSeen(signature, 'tx_failed_onchain', null, JSON.stringify(info.err).slice(0, 300)); continue; }
 
                 // Terminal outcomes are sticky; retry-queue sigs re-evaluate.
+                // 'pending' rows (page-persisted, never processed) re-enter
+                // immediately even past the 100-row retry cap.
                 const seenRow = await dbGetAsync(`SELECT outcome FROM treasury_scan_seen WHERE signature = ?`, [signature]);
-                if (seenRow && !retrySet.has(signature)) continue;
+                if (seenRow && !retrySet.has(signature) && seenRow.outcome !== 'pending') continue;
 
                 // Idempotency: client verify already credited this signature.
                 // Never overwrite credited_* provenance with already_credited.
-                const existing = await dbGetAsync(`SELECT 1 FROM solana_payments WHERE tx_signature = ?`, [signature]);
+                const existing = await dbGetAsync(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [signature]);
                 if (existing) {
+                    // A premium ledger row with an unapplied marker resumes
+                    // its entitlement instead of being skipped.
+                    if ((existing.duration === 'premium' || existing.duration === 'premium_skr') && !existing.entitlement_applied_at) {
+                        if (typeof resumePremiumPayment !== 'function') {
+                            await treasuryMarkSeen(signature, 'rpc_error', existing.user_id, 'premium entitlement callback unavailable; retry');
+                            summary.errors++;
+                            continue;
+                        }
+                        try {
+                            await resumePremiumPayment(existing);
+                            await treasuryMarkSeen(signature, 'credited_premium', existing.user_id, 'resumed premium entitlement');
+                            summary.credited++;
+                        } catch (e) {
+                            await treasuryMarkSeen(signature, e.code === 'PAYMENT_CONFLICT' ? 'conflict' : 'rpc_error', existing.user_id,
+                                `premium resume failed: ${String(e.message || e).slice(0, 200)}`);
+                            summary.errors++;
+                        }
+                        continue;
+                    }
                     if (!seenRow || !/^credited/.test(seenRow.outcome || '')) {
                         await treasuryMarkSeen(signature, 'already_credited');
                     }
@@ -8985,7 +9387,8 @@ const treasuryScanOnce = async () => {
                     continue;
                 }
                 const parsed = paymentRecovery.parseSubscriptionMemo(memo);
-                if (!parsed) {
+                const parsedPremium = !parsed ? paymentRecovery.parsePremiumMemo(memo) : null;
+                if (!parsed && !parsedPremium) {
                     if (typeof memo === 'string' && memo.startsWith('PhotoLynk:premium')) {
                         await treasuryMarkSeen(signature, 'premium_manual', null,
                             `premium inflow sender=${senderWallet} amount=${receivedUnits} ${transfer.token} - needs manual admin credit`);
@@ -8998,17 +9401,18 @@ const treasuryScanOnce = async () => {
                     summary.skipped++;
                     continue;
                 }
-                const normalizedTier = parsed.tierGb; // memo regex whitelists tiers
+                const normalizedTier = parsed ? parsed.tierGb : 0; // memo regex whitelists tiers
+                const memoCode = parsed ? parsed.code : parsedPremium.code;
 
                 // User binding: a payment code is authoritative; a codeless
                 // memo binds via ed25519-proven solana_wallet_bindings or an
                 // admin's prior explicit recovery of this same payer.
                 let user = null;
                 let via = 'payment_code';
-                if (parsed.code) {
-                    user = await treasuryUserByPaymentCode(parsed.code);
+                if (memoCode) {
+                    user = await treasuryUserByPaymentCode(memoCode);
                     if (!user) {
-                        await treasuryMarkSeen(signature, 'code_no_match', null, `code=${parsed.code} sender=${senderWallet}`);
+                        await treasuryMarkSeen(signature, 'code_no_match', null, `code=${memoCode} sender=${senderWallet}`);
                         console.warn(`[TreasuryScan] ${signature}: payment code matched no user - NOT credited`);
                         summary.skipped++;
                         continue;
@@ -9041,6 +9445,64 @@ const treasuryScanOnce = async () => {
                     }
                     user = boundRows.find((r) => Number(r.id) === boundIds[0]);
                     via = user?.source === 'admin_recovery' ? 'admin_recovery' : 'signed_wallet';
+                }
+
+                // Premium payments bypass the subscription creditor and the
+                // downgrade guard: ledger insert first, then the gated
+                // entitlement resume (NFT premium + tax record + plan effects,
+                // marked via entitlement_applied_at only on full success).
+                if (parsedPremium) {
+                    if (typeof resumePremiumPayment !== 'function') {
+                        await treasuryMarkSeen(signature, 'rpc_error', user.id, 'premium entitlement callback unavailable; retry');
+                        summary.errors++;
+                        continue;
+                    }
+                    const premiumUsd = PREMIUM_PRICE_USD * (isSkr ? SKR_PREMIUM_MULTIPLIER : 1);
+                    const premiumBand = await getPriceBand(isSkr ? 'skr' : 'sol');
+                    if (!premiumBand) {
+                        await treasuryMarkSeen(signature, 'rpc_error', user.id, 'Price feed unavailable; retry verification');
+                        summary.errors++;
+                        continue;
+                    }
+                    const premiumEval = evaluatePaymentAmount({ receivedUnits, expectedUsd: premiumUsd, band: premiumBand });
+                    if (!premiumEval.ok) {
+                        await treasuryMarkSeen(signature, 'underpaid', user.id,
+                            `received=${receivedUnits} min=${premiumEval.minAcceptable} expectedUsd=${premiumUsd}`);
+                        console.warn(`[TreasuryScan] ${signature}: underpaid premium for user ${user.id} - NOT credited`);
+                        summary.skipped++;
+                        continue;
+                    }
+                    const premiumDuration = isSkr ? 'premium_skr' : 'premium';
+                    const now = Date.now();
+                    try {
+                        await dbRunAsync(
+                            `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, skr_amount, payment_token, tier_gb, duration, created_at, verified_at)
+                             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                            [user.id, signature, isSkr ? 0 : receivedUnits, isSkr ? receivedUnits : 0, isSkr ? 'SKR' : 'SOL', 0, premiumDuration, paymentAt, now]
+                        );
+                    } catch (e) {
+                        if (!/UNIQUE/i.test(e.message || '')) throw e;
+                        const raced = await dbGetAsync(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [signature]);
+                        if (!raced || Number(raced.user_id) !== Number(user.id) || Number(raced.tier_gb) !== 0 || String(raced.duration || '') !== premiumDuration) {
+                            await treasuryMarkSeen(signature, 'conflict', null, 'premium ledger row mismatch');
+                            summary.skipped++;
+                            continue;
+                        }
+                    }
+                    const ledgerRow = await dbGetAsync(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [signature]);
+                    try {
+                        await resumePremiumPayment(ledgerRow);
+                    } catch (e) {
+                        await treasuryMarkSeen(signature, e.code === 'PAYMENT_CONFLICT' ? 'conflict' : 'rpc_error', user.id,
+                            `premium resume failed: ${String(e.message || e).slice(0, 200)}`);
+                        summary.errors++;
+                        continue;
+                    }
+                    await treasuryMarkSeen(signature, 'credited_premium', user.id,
+                        `premium ${transfer.token} sender=${senderWallet} amount=${receivedUnits} via=${via}`);
+                    console.log(`[TreasuryScan] CREDITED premium user ${user.id} (${user.email}) via ${signature}`);
+                    summary.credited++;
+                    continue;
                 }
 
                 // Downgrade guard - identical to the client verify path.
@@ -9357,6 +9819,14 @@ db.serialize(() => {
     db.run(`ALTER TABLE solana_payments ADD COLUMN payment_token TEXT`, (err) => {
         if (err && !String(err.message).includes('duplicate column')) {
             console.log('[DB] payment_token migration note:', err.message);
+        }
+    });
+    // Completion marker for the premium entitlement pipeline: NULL means the
+    // ledger row exists but NFT premium / tax record / plan effects still
+    // need (re)application - the scanner and verify routes resume them.
+    db.run(`ALTER TABLE solana_payments ADD COLUMN entitlement_applied_at INTEGER`, (err) => {
+        if (err && !String(err.message).includes('duplicate column')) {
+            console.log('[DB] entitlement_applied_at migration note:', err.message);
         }
     });
 });
@@ -14437,6 +14907,66 @@ try {
         return { discountPct: 0 };
     });
 
+    // Premium entitlement resume: applies a premium ledger row's effects
+    // EXACTLY once (NFT premium flag + tax payment record + plan/storage
+    // effects) under the account mutation gate, then stamps
+    // entitlement_applied_at. A failure anywhere leaves the marker NULL so
+    // the next scanner run / verify retry resumes the same row - a payment
+    // can never be half-applied and lost.
+    // === PREMIUM_RESUME_BEGIN ===
+    resumePremiumPayment = (paymentRow) => paymentRecovery.withAccountMutation(DB_PATH, Number(paymentRow?.user_id), async () => {
+        const row = await dbGetAsync(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [String(paymentRow?.tx_signature || '')]);
+        // The canonical row must match the caller's account-gated payment:
+        // same user, premium product (tier_gb 0), premium duration and a
+        // consistent SOL/SKR token - anything else is a hard conflict.
+        const token = String(row?.payment_token || 'SOL').toUpperCase();
+        if (!row
+            || Number(row.user_id) !== Number(paymentRow?.user_id)
+            || Number(row.tier_gb) !== 0
+            || (row.duration !== 'premium' && row.duration !== 'premium_skr')
+            || (token !== 'SOL' && token !== 'SKR')
+            || (token === 'SKR' ? 'premium_skr' : 'premium') !== row.duration) {
+            throw Object.assign(new Error('premium payment row missing or mismatched'), { code: 'PAYMENT_CONFLICT' });
+        }
+        const user = await dbGetAsync(`SELECT id FROM users WHERE id = ?`, [row.user_id]);
+        if (!user) {
+            throw Object.assign(new Error(`premium payment user ${row.user_id} missing`), { code: 'PAYMENT_CONFLICT' });
+        }
+        const platform = token === 'SKR' ? 'skr' : 'solana';
+        const now = Date.now();
+        let applied = false;
+        let activation = null;
+        if (!row.entitlement_applied_at) {
+            nftService.balance.setPremium(row.user_id, row.tx_signature, platform);
+            // Idempotent bookkeeping runs for EVERY apply - a crashed first
+            // attempt may have set premium without the tax row.
+            nftService.balance.recordPayment(row.user_id, 'premium_49', PREMIUM_PRICE_USD, row.tx_signature, platform);
+            activation = await activateSolanaPremiumPlan(row.user_id, Number(row.created_at) || now, { now, paymentType: token === 'SKR' ? 'skr' : 'sol' });
+            if (activation.capacityExceeded) {
+                console.log(`[Premium] Capacity check failed for user ${row.user_id}: entitlement applied without storage allocation`);
+            }
+            // The marker is the last write - only a fully applied
+            // entitlement completes the ledger row.
+            await dbRunAsync(
+                `UPDATE solana_payments SET entitlement_applied_at = ? WHERE tx_signature = ? AND user_id = ?`,
+                [Date.now(), row.tx_signature, row.user_id]
+            );
+            applied = true;
+        }
+        const premiumStatus = nftService.balance.getPremiumStatus(row.user_id);
+        const bal = nftService.balance.getBalance(row.user_id);
+        const plan = await dbGetAsync(`SELECT premium_gb FROM user_plans WHERE user_id = ?`, [row.user_id]);
+        return {
+            applied,
+            isPremium: !!premiumStatus.isPremium,
+            cloudQuotaBytes: premiumStatus.cloudQuotaBytes || 0,
+            balanceUsd: bal.balanceUsd,
+            premiumGb: Number(plan?.premium_gb) || 0,
+            capacityExceeded: !!(activation && activation.capacityExceeded),
+        };
+    });
+    // === PREMIUM_RESUME_END ===
+
     // Routes that grant value or move assets WITHOUT on-chain / receipt proof.
     // /credit and /upgrade-premium trust the client (no IAP receipt check) and
     // /transfer re-mints ANY tree asset to a caller-chosen wallet with no
@@ -14514,94 +15044,7 @@ try {
 
     // After nft-service mounts, add a dedicated endpoint for client to confirm premium storage
     // Client calls this right after a successful /api/nft-service/upgrade-premium response
-    const ensurePremiumStorageCapacity = async (userId, now) => {
-        await ensurePlanRow(userId);
-        const existingRow = await dbGetAsync(`SELECT plan_gb, premium_gb, premium_expires_at, status, trial_until FROM user_plans WHERE user_id = ?`, [userId]);
-        const existingPremiumGb = existingRow && existingRow.premium_gb !== null && existingRow.premium_gb !== undefined ? Number(existingRow.premium_gb) : 0;
-        if (existingPremiumGb === PREMIUM_STORAGE_GB) {
-            const existingExpiresAt = existingRow.premium_expires_at ? Number(existingRow.premium_expires_at) : null;
-            // Renew expired allocations; backfill missing expiration timestamps
-            if (!existingExpiresAt || existingExpiresAt <= now) {
-                await dbRunAsync(
-                    `UPDATE user_plans SET premium_expires_at = ?, updated_at = ? WHERE user_id = ?`,
-                    [now + PREMIUM_STORAGE_DURATION_MS, now, userId]
-                );
-            }
-            return { premiumGb: PREMIUM_STORAGE_GB, allocated: true };
-        }
-        if (existingPremiumGb > 0) {
-            await dbRunAsync(
-                `UPDATE user_plans SET premium_gb = ?, premium_expires_at = ?, updated_at = ? WHERE user_id = ?`,
-                [PREMIUM_STORAGE_GB, now + PREMIUM_STORAGE_DURATION_MS, now, userId]
-            );
-            return { premiumGb: PREMIUM_STORAGE_GB, allocated: true };
-        }
-
-        const SAFETY_BYTES = 20 * GB_BYTES;
-        const capacity = readCapacityJson();
-        const totalServerBytes = capacity && typeof capacity.totalBytes === 'number' && Number.isFinite(capacity.totalBytes) ? capacity.totalBytes : null;
-
-        if (totalServerBytes !== null) {
-            const allocRow = await dbGetAsync(
-                `SELECT COALESCE(SUM(CASE WHEN plan_gb IS NOT NULL AND plan_gb > 0 AND (deleted_at IS NULL OR deleted_at = 0) AND status IN ('active','grace','trial') THEN plan_gb ELSE 0 END), 0) AS totalPlanGb,
-                        COALESCE(SUM(CASE WHEN premium_gb IS NOT NULL AND premium_gb > 0 AND (deleted_at IS NULL OR deleted_at = 0) AND (premium_expires_at IS NULL OR premium_expires_at > ?) THEN premium_gb ELSE 0 END), 0) AS totalPremiumGb
-                   FROM user_plans`,
-                [now]
-            );
-            const totalPlanGb = allocRow ? Number(allocRow.totalPlanGb) : 0;
-            const totalPremiumGb = allocRow ? Number(allocRow.totalPremiumGb) : 0;
-            const trialPlanGb = existingRow && String(existingRow.status || '') === 'trial' && Number(existingRow.trial_until) > now
-                ? Math.max(0, Number(existingRow.plan_gb) || 0)
-                : 0;
-            const currentAllocatedBytes = (totalPlanGb + totalPremiumGb) * GB_BYTES;
-            const newAllocationBytes = PREMIUM_STORAGE_GB * GB_BYTES;
-            const availableBytes = totalServerBytes - currentAllocatedBytes + (trialPlanGb * GB_BYTES) - SAFETY_BYTES;
-
-            if (newAllocationBytes > availableBytes) {
-                return {
-                    premiumGb: 0,
-                    allocated: false,
-                    capacityExceeded: true,
-                    requiredBytes: newAllocationBytes,
-                    availableBytes: Math.max(0, availableBytes),
-                };
-            }
-        }
-
-        await dbRunAsync(
-            `UPDATE user_plans SET premium_gb = ?, premium_expires_at = ?, updated_at = ? WHERE user_id = ?`,
-            [PREMIUM_STORAGE_GB, now + PREMIUM_STORAGE_DURATION_MS, now, userId]
-        );
-        return { premiumGb: PREMIUM_STORAGE_GB, allocated: true };
-    };
-    const activateSolanaPremiumPlan = async (userId, purchaseTimestamp, options = {}) => {
-        const now = Number.isFinite(Number(options.now)) ? Number(options.now) : Date.now();
-        const purchasedAt = Number.isFinite(Number(purchaseTimestamp)) && Number(purchaseTimestamp) > 0 ? Number(purchaseTimestamp) : now;
-        const paymentType = options.paymentType === 'skr' ? 'premium_skr' : (options.paymentType === 'sol' ? 'premium_sol' : null);
-        const storageResult = await ensurePremiumStorageCapacity(userId, now);
-        await ensurePlanRow(userId);
-
-        await dbRunAsync(
-            `UPDATE user_plans
-                SET premium_gb = COALESCE(premium_gb, ?),
-                    premium_expires_at = COALESCE(premium_expires_at, ?),
-                    payment_at = COALESCE(payment_at, ?),
-                    payment_type = COALESCE(?, payment_type),
-                    deleted_at = NULL,
-                    updated_at = ?
-              WHERE user_id = ?`,
-            [PREMIUM_STORAGE_GB, now + PREMIUM_STORAGE_DURATION_MS, purchasedAt, paymentType, now, userId]
-        );
-
-        return {
-            premiumGb: storageResult.allocated ? PREMIUM_STORAGE_GB : 0,
-            purchasedAt,
-            storageAllocated: !!storageResult.allocated,
-            capacityExceeded: !!storageResult.capacityExceeded,
-            requiredBytes: storageResult.requiredBytes || null,
-            availableBytes: storageResult.availableBytes || null,
-        };
-    };
+    // === PREMIUM_ACTIVATE_ROUTE_BEGIN ===
     app.post('/api/premium/activate-storage', authenticateToken, async (req, res) => {
         try {
             const userId = req.user.id;
@@ -14612,36 +15055,50 @@ try {
             }
             await ensurePlanRow(userId);
 
-            // Check if already activated (re-activation is always allowed)
-            const existingRow = await dbGetAsync(`SELECT premium_gb FROM user_plans WHERE user_id = ?`, [userId]);
-            const alreadyAllocated = existingRow && Number(existingRow.premium_gb) > 0;
-
-            if (!alreadyAllocated) {
-                const storageResult = await ensurePremiumStorageCapacity(userId, Date.now());
-                if (!storageResult.allocated && storageResult.capacityExceeded) {
-                    console.log(`[Premium] Capacity check failed: need ${storageResult.requiredBytes} bytes, available ${storageResult.availableBytes} bytes`);
-                    return res.status(507).json({
-                        error: 'Insufficient server capacity for premium storage',
-                        code: 'CAPACITY_EXCEEDED',
-                        requiredBytes: storageResult.requiredBytes,
-                        availableBytes: storageResult.availableBytes,
-                    });
+            // Anchor the storage expiry to the ORIGINAL purchase so repeated
+            // calls never roll the year forward.
+            let purchasedAt = parsePremiumPurchaseTime(premiumStatus.purchasedAt);
+            if (!purchasedAt) {
+                const ledger = await dbGetAsync(
+                    `SELECT created_at FROM solana_payments WHERE user_id = ? AND duration IN ('premium','premium_skr') ORDER BY created_at ASC LIMIT 1`,
+                    [userId]
+                );
+                purchasedAt = parsePremiumPurchaseTime(ledger?.created_at);
+            }
+            const now = Date.now();
+            const planActivation = await paymentRecovery.withAccountMutation(DB_PATH, userId, async () => {
+                let anchor = purchasedAt;
+                if (!anchor) {
+                    // Unknown purchase origin: the stored expiry, if any, is
+                    // itself a proven anchor (expiry = purchase + duration).
+                    // Only a completely unanchored grant backfills once from
+                    // now - it never re-extends on later calls.
+                    const existing = await dbGetAsync(`SELECT premium_expires_at FROM user_plans WHERE user_id = ?`, [userId]);
+                    const storedExpiry = Number(existing?.premium_expires_at) || 0;
+                    anchor = storedExpiry > 0 ? storedExpiry - PREMIUM_STORAGE_DURATION_MS : now;
                 }
+                return activateSolanaPremiumPlan(userId, anchor, { now });
+            });
+            if (!planActivation.storageAllocated && planActivation.capacityExceeded) {
+                console.log(`[Premium] Capacity check failed: need ${planActivation.requiredBytes} bytes, available ${planActivation.availableBytes} bytes`);
+                return res.status(507).json({
+                    error: 'Insufficient server capacity for premium storage',
+                    code: 'CAPACITY_EXCEEDED',
+                    requiredBytes: planActivation.requiredBytes,
+                    availableBytes: planActivation.availableBytes,
+                });
             }
 
-            const now = Date.now();
-            await dbRunAsync(
-                `UPDATE user_plans SET premium_gb = ?, premium_expires_at = ?, updated_at = ? WHERE user_id = ?`,
-                [PREMIUM_STORAGE_GB, now + PREMIUM_STORAGE_DURATION_MS, now, userId]
-            );
-            console.log(`[Premium] Set premium_gb=${PREMIUM_STORAGE_GB} for user ${userId}`);
+            console.log(`[Premium] Activated premium storage for user ${userId} (purchasedAt=${purchasedAt || 'unknown'})`);
             const st = await resolveSubscriptionState(userId);
-            return res.json({ ok: true, premiumGb: PREMIUM_STORAGE_GB, subscription: st });
+            return res.json({ ok: true, premiumGb: planActivation.premiumGb, subscription: st });
         } catch (e) {
             console.error('[Premium] Failed to activate storage:', e.message);
             return res.status(500).json({ error: 'Failed to activate premium storage' });
         }
     });
+    // === PREMIUM_ACTIVATE_ROUTE_END ===
+    // === PREMIUM_VERIFY_ROUTES_BEGIN ===
     // Verify Solana premium payment — one-time $49.99 purchase paid in SOL
     app.post('/api/solana/verify-premium-payment', async (req, res) => {
         const { txSignature, solAmount, paymentWallet } = req.body;
@@ -14665,6 +15122,30 @@ try {
         if (paymentWallet && paymentWallet !== SOLANA_PAYMENT_WALLET) {
             return res.status(400).json({ error: 'Invalid payment wallet' });
         }
+        const txSig = String(txSignature || '').trim();
+        if (!txSig) {
+            return res.status(400).json({ error: 'Missing required field: txSignature' });
+        }
+        // This account's premium-SOL ledger row: same user, tier_gb=0,
+        // duration 'premium' and a legacy NULL/'SOL' token.
+        const matchesPremiumSolRow = (row) => !!row
+            && Number(row.tier_gb) === 0
+            && String(row.duration || '') === 'premium'
+            && (!row.payment_token || String(row.payment_token).toUpperCase() === 'SOL');
+        const respondResumed = async (row) => {
+            const resumed = await resumePremiumPayment(row);
+            const st = await resolveSubscriptionState(row.user_id);
+            return res.json({
+                success: true,
+                alreadyProcessed: !resumed.applied,
+                isPremium: resumed.isPremium,
+                cloudQuotaBytes: resumed.cloudQuotaBytes,
+                balanceUsd: resumed.balanceUsd,
+                premiumGb: resumed.premiumGb,
+                expiresAt: null,
+                subscription: st,
+            });
+        };
 
         try {
             const user = await dbGetAsync(`SELECT id, email FROM users WHERE id = ?`, [decoded.id]);
@@ -14672,10 +15153,17 @@ try {
                 return res.status(404).json({ error: 'User not found' });
             }
 
-            // Check if already premium
-            const existingPremium = nftService.balance.getPremiumStatus(user.id);
-            if (existingPremium && existingPremium.isPremium) {
-                return res.status(409).json({ error: 'Already premium', isPremium: true });
+            // Ledger FIRST: a recorded payment resumes its entitlement even
+            // when the user is already premium (an old "Already premium" 409
+            // would hide an incomplete grant forever). A signature claimed
+            // for a DIFFERENT account or product is a hard 400 - old clients
+            // treated any 409 as success.
+            const existingTx = await dbGetAsync(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [txSig]);
+            if (existingTx) {
+                if (Number(existingTx.user_id) === Number(user.id) && matchesPremiumSolRow(existingTx)) {
+                    return await respondResumed(existingTx);
+                }
+                return res.status(400).json({ error: 'Transaction belongs to a different account or purchase', code: 'PAYMENT_CONFLICT', retryable: false });
             }
 
             // Expected USD computed server-side — client-claimed solAmount ignored
@@ -14683,57 +15171,53 @@ try {
             console.log('[Solana Premium] Client-claimed solAmount (ignored for enforcement):', solAmount);
 
             // Verify transaction on Solana blockchain
-            const txVerification = await verifySolanaTransaction(txSignature, expectedUsd);
+            const txVerification = await verifySolanaTransaction(txSig, expectedUsd);
             if (!txVerification.success) {
                 return respondVerificationFailure(res, txVerification, 'Transaction verification failed');
             }
             if (!requirePaymentMemo(res, txVerification.memo, 'PhotoLynk:premium:0:premium', user.id)) {
                 return;
             }
-
-            // Check if this transaction was already processed
-            const existingTx = await dbGetAsync(
-                `SELECT * FROM solana_payments WHERE tx_signature = ?`,
-                [txSignature]
-            );
-            if (existingTx) {
-                return res.status(409).json({ error: 'Transaction already processed' });
+            // Legacy-queue replay (same rule as the subscription routes): a
+            // codeless premium memo only credits THIS account when trusted
+            // payer evidence binds the sender to exactly this user.
+            if (req.body.pendingReplay === true && txVerification.memo === 'PhotoLynk:premium:0:premium') {
+                const replayPaymentAt = Number(txVerification.blockTime) > 0 ? txVerification.blockTime * 1000 : Date.now();
+                const boundIds = paymentRecovery.boundUserIds(await treasuryBoundUsers(txVerification.sender, replayPaymentAt));
+                if (!(boundIds.length === 1 && Number(boundIds[0]) === Number(user.id))) {
+                    if (boundIds.length === 0) {
+                        await treasuryMarkSeen(txSig, 'no_user', null, `pendingReplay sender=${txVerification.sender || 'unknown'}`);
+                    }
+                    return res.status(400).json({ code: 'PAYMENT_ACCOUNT_UNVERIFIED', error: 'Pending payment account is not verified', retryable: true });
+                }
             }
 
-            // Record the payment in solana_payments table — ON-CHAIN amount
+            // Ledger first, entitlement second: the INSERT is the durable
+            // record of the verified payment; resumePremiumPayment applies
+            // NFT premium + tax record + plan effects exactly once.
             const now = Date.now();
-            await dbRunAsync(
-                `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, tier_gb, duration, created_at, verified_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                [user.id, txSignature, txVerification.receivedAmount || 0, 0, 'premium', now, now]
-            );
-
-            // Activate premium in nft-service DB
-            const premiumResult = nftService.balance.setPremium(user.id, txSignature, 'solana');
-            const bal = nftService.balance.getBalance(user.id);
-
-            // Record payment for IRS tax tracking
-            if (!premiumResult.isDuplicate) {
-                nftService.balance.recordPayment(user.id, 'premium_49', 49.99, txSignature, 'solana');
+            const paymentAt = Number(txVerification.blockTime) > 0 ? txVerification.blockTime * 1000 : now;
+            try {
+                await dbRunAsync(
+                    `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, tier_gb, duration, created_at, verified_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                    [user.id, txSig, txVerification.receivedAmount || 0, 0, 'premium', paymentAt, now]
+                );
+            } catch (e) {
+                if (!/UNIQUE/i.test(e.message || '')) throw e;
+                // Lost the insert race: re-read and apply the same rules -
+                // same user+product resumes, anything else conflicts.
+                const raced = await dbGetAsync(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [txSig]);
+                if (!raced) throw e;
+                if (Number(raced.user_id) === Number(user.id) && matchesPremiumSolRow(raced)) {
+                    return await respondResumed(raced);
+                }
+                return res.status(400).json({ error: 'Transaction belongs to a different account or purchase', code: 'PAYMENT_CONFLICT', retryable: false });
             }
+            const ledgerRow = await dbGetAsync(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [txSig]);
 
-            const planActivation = await activateSolanaPremiumPlan(user.id, now, { now, paymentType: 'sol' });
-            if (planActivation.capacityExceeded) {
-                console.log(`[Solana Premium] Capacity check failed but payment already accepted. User ${user.id} will get premium entitlement without storage allocation.`);
-            }
-
-            console.log(`[Solana Premium] Payment verified: ${txSignature} - User ${user.email}`);
-
-            const st = await resolveSubscriptionState(user.id);
-            return res.json({
-                success: true,
-                isPremium: premiumResult.isPremium,
-                cloudQuotaBytes: premiumResult.cloudQuotaBytes,
-                balanceUsd: bal.balanceUsd,
-                premiumGb: planActivation.premiumGb,
-                expiresAt: null,
-                subscription: st,
-            });
+            console.log(`[Solana Premium] Payment verified: ${txSig} - User ${user.email}`);
+            return await respondResumed(ledgerRow);
         } catch (e) {
             console.error('[Solana Premium] Payment verification error:', e);
             return res.status(500).json({ error: 'Premium payment verification failed' });
@@ -14767,6 +15251,30 @@ try {
         if (tokenSymbol && tokenSymbol !== SKR_TOKEN_SYMBOL) {
             return res.status(400).json({ error: 'Invalid token symbol' });
         }
+        const txSig = String(txSignature || '').trim();
+        if (!txSig) {
+            return res.status(400).json({ error: 'Missing required field: txSignature' });
+        }
+        // This account's premium-SKR ledger row: same user, tier_gb=0,
+        // duration 'premium_skr' and token 'SKR'.
+        const matchesPremiumSkrRow = (row) => !!row
+            && Number(row.tier_gb) === 0
+            && String(row.duration || '') === 'premium_skr'
+            && String(row.payment_token || '').toUpperCase() === 'SKR';
+        const respondResumed = async (row) => {
+            const resumed = await resumePremiumPayment(row);
+            const st = await resolveSubscriptionState(row.user_id);
+            return res.json({
+                success: true,
+                alreadyProcessed: !resumed.applied,
+                isPremium: resumed.isPremium,
+                cloudQuotaBytes: resumed.cloudQuotaBytes,
+                balanceUsd: resumed.balanceUsd,
+                premiumGb: resumed.premiumGb,
+                expiresAt: null,
+                subscription: st,
+            });
+        };
 
         try {
             const user = await dbGetAsync(`SELECT id, email FROM users WHERE id = ?`, [decoded.id]);
@@ -14774,9 +15282,15 @@ try {
                 return res.status(404).json({ error: 'User not found' });
             }
 
-            const existingPremium = nftService.balance.getPremiumStatus(user.id);
-            if (existingPremium && existingPremium.isPremium) {
-                return res.status(409).json({ error: 'Already premium', isPremium: true });
+            // Ledger first (same as the SOL premium route): recorded rows
+            // resume their entitlement; foreign/mismatched signatures are a
+            // hard 400, never a generic "already processed" 409.
+            const existingTx = await dbGetAsync(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [txSig]);
+            if (existingTx) {
+                if (Number(existingTx.user_id) === Number(user.id) && matchesPremiumSkrRow(existingTx)) {
+                    return await respondResumed(existingTx);
+                }
+                return res.status(400).json({ error: 'Transaction belongs to a different account or purchase', code: 'PAYMENT_CONFLICT', retryable: false });
             }
 
             // Expected USD computed server-side (with SKR premium multiplier) —
@@ -14784,58 +15298,52 @@ try {
             const expectedUsd = PREMIUM_PRICE_USD * SKR_PREMIUM_MULTIPLIER;
             console.log('[Solana Premium SKR] Client-claimed skrAmount (ignored for enforcement):', skrAmount);
 
-            const txVerification = await verifySkrTokenTransaction(txSignature, expectedUsd, SKR_TOKEN_MINT);
+            const txVerification = await verifySkrTokenTransaction(txSig, expectedUsd, SKR_TOKEN_MINT);
             if (!txVerification.success) {
                 return respondVerificationFailure(res, txVerification, 'SKR transaction verification failed');
             }
             if (!requirePaymentMemo(res, txVerification.memo, 'PhotoLynk:premium:0:premium', user.id)) {
                 return;
             }
-
-            const existingTx = await dbGetAsync(
-                `SELECT * FROM solana_payments WHERE tx_signature = ?`,
-                [txSignature]
-            );
-            if (existingTx) {
-                return res.status(409).json({ error: 'Transaction already processed' });
+            // Legacy-queue replay guard (codeless premium memo only).
+            if (req.body.pendingReplay === true && txVerification.memo === 'PhotoLynk:premium:0:premium') {
+                const replayPaymentAt = Number(txVerification.blockTime) > 0 ? txVerification.blockTime * 1000 : Date.now();
+                const boundIds = paymentRecovery.boundUserIds(await treasuryBoundUsers(txVerification.sender, replayPaymentAt));
+                if (!(boundIds.length === 1 && Number(boundIds[0]) === Number(user.id))) {
+                    if (boundIds.length === 0) {
+                        await treasuryMarkSeen(txSig, 'no_user', null, `pendingReplay sender=${txVerification.sender || 'unknown'}`);
+                    }
+                    return res.status(400).json({ code: 'PAYMENT_ACCOUNT_UNVERIFIED', error: 'Pending payment account is not verified', retryable: true });
+                }
             }
 
             const now = Date.now();
-            await dbRunAsync(
-                `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, skr_amount, payment_token, tier_gb, duration, created_at, verified_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                [user.id, txSignature, 0, txVerification.receivedAmount || 0, 'SKR', 0, 'premium_skr', now, now]
-            );
-
-            const premiumResult = nftService.balance.setPremium(user.id, txSignature, 'skr');
-            const bal = nftService.balance.getBalance(user.id);
-
-            if (!premiumResult.isDuplicate) {
-                nftService.balance.recordPayment(user.id, 'premium_49', 49.99, txSignature, 'skr');
+            const paymentAt = Number(txVerification.blockTime) > 0 ? txVerification.blockTime * 1000 : now;
+            try {
+                await dbRunAsync(
+                    `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, skr_amount, payment_token, tier_gb, duration, created_at, verified_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [user.id, txSig, 0, txVerification.receivedAmount || 0, 'SKR', 0, 'premium_skr', paymentAt, now]
+                );
+            } catch (e) {
+                if (!/UNIQUE/i.test(e.message || '')) throw e;
+                const raced = await dbGetAsync(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [txSig]);
+                if (!raced) throw e;
+                if (Number(raced.user_id) === Number(user.id) && matchesPremiumSkrRow(raced)) {
+                    return await respondResumed(raced);
+                }
+                return res.status(400).json({ error: 'Transaction belongs to a different account or purchase', code: 'PAYMENT_CONFLICT', retryable: false });
             }
+            const ledgerRow = await dbGetAsync(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [txSig]);
 
-            const planActivation = await activateSolanaPremiumPlan(user.id, now, { now, paymentType: 'skr' });
-            if (planActivation.capacityExceeded) {
-                console.log(`[Solana Premium SKR] Capacity check failed but payment already accepted. User ${user.id} will get premium entitlement without storage allocation.`);
-            }
-
-            console.log(`[Solana Premium SKR] Payment verified: ${txSignature} - User ${user.email}`);
-
-            const st = await resolveSubscriptionState(user.id);
-            return res.json({
-                success: true,
-                isPremium: premiumResult.isPremium,
-                cloudQuotaBytes: premiumResult.cloudQuotaBytes,
-                balanceUsd: bal.balanceUsd,
-                premiumGb: planActivation.premiumGb,
-                expiresAt: null,
-                subscription: st,
-            });
+            console.log(`[Solana Premium SKR] Payment verified: ${txSig} - User ${user.email}`);
+            return await respondResumed(ledgerRow);
         } catch (e) {
             console.error('[Solana Premium SKR] Payment verification error:', e);
             return res.status(500).json({ error: 'Premium SKR payment verification failed' });
         }
     });
+    // === PREMIUM_VERIFY_ROUTES_END ===
 
     console.log('[NFT Service] Mounted at /api/nft-service');
 } catch (nftServiceErr) {
