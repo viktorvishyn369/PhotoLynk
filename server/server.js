@@ -8683,9 +8683,11 @@ async function verifySkrTokenTransaction(txSignature, expectedUsd, expectedToken
 //   1. Signature must not already be in solana_payments (idempotent - client
 //      verify wins, scanner never double-credits).
 //   2. Memo must parse as PhotoLynk:sub:<tier>:<duration>[:<code>] or
-//      PhotoLynk:premium:0:premium[:<code>]. No memo / unparseable memo ->
-//      logged as 'no_memo' and NEVER credited (amount alone cannot identify
-//      the product or the buyer).
+//      PhotoLynk:premium:0:premium[:<code>]. A memo-less inflow is credited
+//      ONLY when the sender wallet resolves to exactly one user AND the
+//      amount fits exactly one tier/duration price window
+//      ('credited_sub_inferred'); anything else is logged 'no_memo' or
+//      'no_memo_ambiguous' and never credited.
 //   3. User binding: a memo with a 4th-segment code binds via
 //      paymentCodeFor(userId). Without a code the sender wallet must match
 //      exactly one users.wallet_address row. Code present but resolving to a
@@ -8705,9 +8707,38 @@ const TREASURY_SCAN_FIRST_DELAY_MS = 3 * 60 * 1000;   // 3min after boot
 const TREASURY_SCAN_PAGE_LIMIT = 100;                  // signatures per getSignaturesForAddress page
 const TREASURY_SCAN_MAX_SIGS = 500;                    // hard cap on signatures processed per run
 const TREASURY_SCAN_TX_DELAY_MS = 400;                 // spacing between getTransaction RPC calls
+// The configured endpoint first, mainnet-beta as fallback: public RPCs reject
+// indexed calls (getTokenAccountsByOwner) and serve shallow signature history.
+const TREASURY_RPC_ENDPOINTS = [SOLANA_RPC_ENDPOINT, 'https://api.mainnet-beta.solana.com'].filter((v, i, a) => a.indexOf(v) === i);
 let treasuryScanInFlight = false;
 
 const treasurySleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Single-endpoint call - throws on transport error OR a JSON-RPC error body so
+// callers can fall through to the next endpoint.
+const treasuryRpcOn = async (endpoint, method, params) => {
+    const res = await axios.post(endpoint, {
+        jsonrpc: '2.0', id: 1, method, params,
+    }, { timeout: 30000 });
+    if (res.data?.error) {
+        throw new Error(`RPC error ${res.data.error.code}: ${res.data.error.message}`);
+    }
+    return res.data?.result;
+};
+
+// First-success across TREASURY_RPC_ENDPOINTS. Throws when all fail.
+const treasuryRpc = async (method, params) => {
+    let lastErr = null;
+    for (const endpoint of TREASURY_RPC_ENDPOINTS) {
+        try {
+            return await treasuryRpcOn(endpoint, method, params);
+        } catch (e) {
+            lastErr = e;
+            console.warn(`[TreasuryScan] RPC ${method} failed on ${endpoint}:`, e.message);
+        }
+    }
+    throw lastErr || new Error('no treasury RPC endpoints configured');
+};
 
 const treasuryMarkSeen = async (signature, outcome, userId = null, detail = null) => {
     try {
@@ -8805,53 +8836,87 @@ const treasuryExtractInflow = (tx) => {
 // Scanning these token accounts is what makes the SKR path work.
 const treasuryGetTokenAccounts = async () => {
     try {
-        const res = await axios.post(SOLANA_RPC_ENDPOINT, {
-            jsonrpc: '2.0', id: 1,
-            method: 'getTokenAccountsByOwner',
-            params: [SOLANA_PAYMENT_WALLET, { mint: SKR_TOKEN_MINT }, { encoding: 'jsonParsed' }],
-        }, { timeout: 30000 });
-        return (res.data?.result?.value || []).map((a) => a?.pubkey).filter(Boolean);
+        const result = await treasuryRpc('getTokenAccountsByOwner',
+            [SOLANA_PAYMENT_WALLET, { mint: SKR_TOKEN_MINT }, { encoding: 'jsonParsed' }]);
+        const accounts = (result?.value || []).map((a) => a?.pubkey).filter(Boolean);
+        if (accounts.length) {
+            // Persist one successful discovery so later runs survive RPC
+            // flakiness on the indexed call.
+            try {
+                await dbRunAsync(
+                    `INSERT OR REPLACE INTO treasury_scan_state (key, value, updated_at) VALUES ('skr_token_accounts', ?, ?)`,
+                    [JSON.stringify(accounts), Date.now()]
+                );
+            } catch (e) {
+                console.warn('[TreasuryScan] token account persist failed:', e.message);
+            }
+            console.log(`[TreasuryScan] token account discovery: ${accounts.length} account(s) via RPC`);
+            return accounts;
+        }
     } catch (e) {
-        console.warn('[TreasuryScan] token account discovery failed:', e.message);
-        return [];
+        console.warn('[TreasuryScan] token account discovery RPC failed:', e.message);
     }
+    try {
+        const row = await dbGetAsync(`SELECT value FROM treasury_scan_state WHERE key = 'skr_token_accounts'`, []);
+        const stored = row?.value ? JSON.parse(row.value) : null;
+        if (Array.isArray(stored) && stored.length) {
+            console.log(`[TreasuryScan] token account discovery: using ${stored.length} stored account(s) (RPC empty/failed)`);
+            return stored.filter((a) => typeof a === 'string' && a);
+        }
+    } catch (e) {
+        console.warn('[TreasuryScan] token account fallback read failed:', e.message);
+    }
+    console.warn('[TreasuryScan] token account discovery: no accounts (RPC empty/failed, nothing stored)');
+    return [];
 };
 
 // Page newest->oldest on ONE address until a signature we already know about
 // (treasury_scan_seen or solana_payments) or the per-run cap. Backlogged runs
 // reach every payment; steady-state runs stop after the first page.
+// Every endpoint is walked - public RPCs serve shallow history, so the merge
+// picks up older payments a single endpoint would miss. Outcomes 'no_memo'/
+// 'no_user' are NOT treated as known: they stay eligible for re-evaluation
+// (memo-less attribution may resolve them later).
 const treasuryCollectSignatures = async (address) => {
     const collected = [];
-    let beforeCursor = undefined;
-    let keepPaging = true;
-    while (keepPaging && collected.length < TREASURY_SCAN_MAX_SIGS) {
-        const params = { limit: TREASURY_SCAN_PAGE_LIMIT, commitment: 'confirmed' };
-        if (beforeCursor) params.before = beforeCursor;
-        const sigRes = await axios.post(SOLANA_RPC_ENDPOINT, {
-            jsonrpc: '2.0',
-            id: 1,
-            method: 'getSignaturesForAddress',
-            params: [address, params],
-        }, { timeout: 30000 });
-        const page = Array.isArray(sigRes.data?.result) ? sigRes.data.result : [];
-        if (page.length === 0) break;
-        for (const entry of page) {
-            const sig = entry?.signature;
-            if (!sig) continue;
-            if (collected.some((s) => s.signature === sig)) { keepPaging = false; break; } // dup at page boundary
-            const alreadyKnown = await dbGetAsync(
-                `SELECT 1 FROM treasury_scan_seen WHERE signature = ?
-                 UNION SELECT 1 FROM solana_payments WHERE tx_signature = ? LIMIT 1`,
-                [sig, sig]
-            );
-            if (alreadyKnown) { keepPaging = false; break; } // reached processed history
-            collected.push(entry);
-            if (collected.length >= TREASURY_SCAN_MAX_SIGS) break;
+    const collectedSet = new Set();
+    for (const endpoint of TREASURY_RPC_ENDPOINTS) {
+        const walkSeen = new Set();
+        let beforeCursor = undefined;
+        let keepPaging = true;
+        while (keepPaging && collected.length < TREASURY_SCAN_MAX_SIGS) {
+            const params = { limit: TREASURY_SCAN_PAGE_LIMIT, commitment: 'confirmed' };
+            if (beforeCursor) params.before = beforeCursor;
+            let page = [];
+            try {
+                const result = await treasuryRpcOn(endpoint, 'getSignaturesForAddress', [address, params]);
+                page = Array.isArray(result) ? result : [];
+            } catch (e) {
+                console.warn(`[TreasuryScan] getSignaturesForAddress(${address}) failed on ${endpoint}:`, e.message);
+                break;
+            }
+            if (page.length === 0) break;
+            for (const entry of page) {
+                const sig = entry?.signature;
+                if (!sig) continue;
+                if (walkSeen.has(sig)) { keepPaging = false; break; } // dup at page boundary
+                walkSeen.add(sig);
+                if (collectedSet.has(sig)) continue; // already queued via another endpoint
+                const alreadyKnown = await dbGetAsync(
+                    `SELECT 1 FROM treasury_scan_seen WHERE signature = ? AND outcome NOT IN ('no_memo','no_user')
+                     UNION SELECT 1 FROM solana_payments WHERE tx_signature = ? LIMIT 1`,
+                    [sig, sig]
+                );
+                if (alreadyKnown) { keepPaging = false; break; } // reached processed history
+                collectedSet.add(sig);
+                collected.push(entry);
+                if (collected.length >= TREASURY_SCAN_MAX_SIGS) break;
+            }
+            if (page.length < TREASURY_SCAN_PAGE_LIMIT) break; // exhausted history
+            beforeCursor = page[page.length - 1]?.signature;
+            if (!beforeCursor) break;
+            await treasurySleep(300);
         }
-        if (page.length < TREASURY_SCAN_PAGE_LIMIT) break; // exhausted history
-        beforeCursor = page[page.length - 1]?.signature;
-        if (!beforeCursor) break;
-        await treasurySleep(300);
     }
     return collected;
 };
@@ -8895,19 +8960,19 @@ const treasuryScanOnce = async () => {
             // Idempotency: client verify already credited this signature
             const existing = await dbGetAsync(`SELECT 1 FROM solana_payments WHERE tx_signature = ?`, [signature]);
             if (existing) { await treasuryMarkSeen(signature, 'already_credited'); summary.already++; continue; }
-            const seen = await dbGetAsync(`SELECT 1 FROM treasury_scan_seen WHERE signature = ?`, [signature]);
+            // 'no_memo'/'no_user' are non-terminal: re-evaluate them so
+            // memo-less attribution gets another chance each run.
+            const seen = await dbGetAsync(
+                `SELECT 1 FROM treasury_scan_seen WHERE signature = ? AND outcome NOT IN ('no_memo','no_user')`,
+                [signature]
+            );
             if (seen) continue;
 
             summary.scanned++;
             let tx = null;
             try {
-                const txRes = await axios.post(SOLANA_RPC_ENDPOINT, {
-                    jsonrpc: '2.0',
-                    id: 1,
-                    method: 'getTransaction',
-                    params: [signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0, commitment: 'confirmed' }],
-                }, { timeout: 30000 });
-                tx = txRes.data?.result || null;
+                tx = await treasuryRpc('getTransaction',
+                    [signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0, commitment: 'confirmed' }]) || null;
             } catch (e) {
                 console.warn(`[TreasuryScan] getTransaction RPC error for ${signature}:`, e.message);
             }
@@ -8919,14 +8984,51 @@ const treasuryScanOnce = async () => {
             const { solLamports, skrRaw, senderWallet } = treasuryExtractInflow(tx);
             if (solLamports <= 0 && skrRaw <= 0) { await treasuryMarkSeen(signature, 'no_inflow'); summary.skipped++; continue; }
 
+            const isSkr = skrRaw > 0;
+            const receivedUnits = isSkr
+                ? skrRaw / Math.pow(10, SKR_TOKEN_DECIMALS)
+                : solLamports / LAMPORTS_PER_SOL;
+
             const memo = extractPhotoLynkMemo(tx);
-            const parsed = treasuryParseMemo(memo);
+            let parsed = treasuryParseMemo(memo);
             if (!parsed) {
-                await treasuryMarkSeen(signature, 'no_memo', null,
-                    `sender=${senderWallet || 'unknown'} solLamports=${solLamports} skrRaw=${skrRaw} memo=${memo ? 'unparseable' : 'none'}`);
-                console.warn(`[TreasuryScan] ${signature}: inflow without valid PhotoLynk memo - sender=${senderWallet} sol=${solLamports} skrRaw=${skrRaw} - NOT credited`);
-                summary.skipped++;
-                continue;
+                // Memo-less attribution: the sender wallet must resolve to
+                // exactly one user (wallet_address is only set by an
+                // ed25519-signed login, so this is cryptographic proof of the
+                // payer) AND the amount must land in exactly ONE tier/duration
+                // price window. Zero or multiple candidates -> ambiguous,
+                // never credited. Premium is never inferred.
+                const senderUser = senderWallet ? await treasuryUserByWallet(senderWallet) : null;
+                if (!senderUser) {
+                    await treasuryMarkSeen(signature, 'no_memo', null,
+                        `sender=${senderWallet || 'unknown'} solLamports=${solLamports} skrRaw=${skrRaw} memo=${memo ? 'unparseable' : 'none'}`);
+                    console.warn(`[TreasuryScan] ${signature}: inflow without valid PhotoLynk memo - sender=${senderWallet} sol=${solLamports} skrRaw=${skrRaw} - NOT credited`);
+                    summary.skipped++;
+                    continue;
+                }
+                const band = await getPriceBand(isSkr ? 'skr' : 'sol');
+                if (!band) { summary.errors++; continue; } // no price -> retryable next run
+                const candidates = [];
+                for (const tierKey of Object.keys(PLAN_PRICES_USD)) {
+                    const tierGb = normalizeTierGb(tierKey);
+                    if (!tierGb) continue;
+                    for (const duration of ['monthly', 'yearly']) {
+                        const expectedUsd = (PLAN_PRICES_USD[tierGb] || 0) * (duration === 'yearly' ? 12 : 1) * (isSkr ? SKR_SUBSCRIPTION_MULTIPLIER : 1);
+                        const evalResult = evaluatePaymentAmount({ receivedUnits, expectedUsd, band });
+                        const maxAcceptable = Number.isFinite(evalResult.expectedAtLatest) ? evalResult.expectedAtLatest * 1.25 : Infinity;
+                        if (evalResult.ok && receivedUnits <= maxAcceptable) {
+                            candidates.push({ tierGb, duration, expectedUsd });
+                        }
+                    }
+                }
+                if (candidates.length !== 1) {
+                    await treasuryMarkSeen(signature, 'no_memo_ambiguous', null,
+                        `sender=${senderWallet} amount=${receivedUnits} ${isSkr ? 'SKR' : 'SOL'} candidates=${JSON.stringify(candidates)}`);
+                    console.warn(`[TreasuryScan] ${signature}: memo-less inflow from ${senderWallet} matched ${candidates.length} tier/duration windows - NOT credited`);
+                    summary.skipped++;
+                    continue;
+                }
+                parsed = { kind: 'sub', tierGb: candidates[0].tierGb, duration: candidates[0].duration, code: null, inferred: true };
             }
 
             // User binding: memo code is authoritative; fall back to sender
@@ -8959,11 +9061,6 @@ const treasuryScanOnce = async () => {
                     continue;
                 }
             }
-
-            const isSkr = skrRaw > 0;
-            const receivedUnits = isSkr
-                ? skrRaw / Math.pow(10, SKR_TOKEN_DECIMALS)
-                : solLamports / LAMPORTS_PER_SOL;
 
             if (parsed.kind === 'sub') {
                 const normalizedTier = normalizeTierGb(parsed.tierGb);
@@ -9029,7 +9126,8 @@ const treasuryScanOnce = async () => {
                     }
                 } catch (e) { console.warn('[TreasuryScan] Eco mirror failed:', e.message); }
 
-                await treasuryMarkSeen(signature, 'credited_sub', user.id, `tier=${normalizedTier}GB ${parsed.duration} ${isSkr ? 'SKR' : 'SOL'} expires=${new Date(expiresAt).toISOString()}`);
+                await treasuryMarkSeen(signature, parsed.inferred ? 'credited_sub_inferred' : 'credited_sub', user.id,
+                    `tier=${normalizedTier}GB ${parsed.duration} ${isSkr ? 'SKR' : 'SOL'} expires=${new Date(expiresAt).toISOString()}${parsed.inferred ? ` inferred sender=${senderWallet} amount=${receivedUnits}` : ''}`);
                 console.log(`[TreasuryScan] CREDITED user ${user.id} (${user.email}): ${normalizedTier}GB ${parsed.duration} via ${signature}`);
                 summary.credited++;
             } else {
@@ -9073,9 +9171,15 @@ app.post('/api/admin/treasury-scan', adminAuth, async (req, res) => {
 
 app.get('/api/admin/treasury-scan-log', adminAuth, async (req, res) => {
     try {
-        const rows = await dbAllAsync(
-            `SELECT signature, seen_at, outcome, user_id, detail FROM treasury_scan_seen ORDER BY seen_at DESC LIMIT 200`, []
-        );
+        const signature = typeof req.query.signature === 'string' && req.query.signature.trim()
+            ? req.query.signature.trim() : null;
+        const rows = signature
+            ? await dbAllAsync(
+                `SELECT signature, seen_at, outcome, user_id, detail FROM treasury_scan_seen WHERE signature = ? ORDER BY seen_at DESC LIMIT 200`, [signature]
+            )
+            : await dbAllAsync(
+                `SELECT signature, seen_at, outcome, user_id, detail FROM treasury_scan_seen ORDER BY seen_at DESC LIMIT 200`, []
+            );
         res.json({ entries: rows });
     } catch (e) {
         res.status(500).json({ error: e.message });
@@ -9093,6 +9197,13 @@ db.serialize(() => {
         outcome TEXT,
         user_id INTEGER,
         detail TEXT
+    )`);
+    // Scanner key/value state - currently persists the discovered SKR token
+    // accounts so one successful discovery survives later RPC flakiness.
+    db.run(`CREATE TABLE IF NOT EXISTS treasury_scan_state (
+        key TEXT PRIMARY KEY,
+        value TEXT,
+        updated_at INTEGER
     )`);
     db.run(`CREATE TABLE IF NOT EXISTS paceseeker_devices (
         device_hash TEXT PRIMARY KEY,
