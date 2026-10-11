@@ -566,3 +566,104 @@ test('quote status route: pending/applied for the owner, 404 cross-identity, 503
         await closeDb(conn);
     }
 });
+
+// A quote is evidence, never grounds to reject an otherwise valid on-chain
+// payment: expired/underpaid quotes still bind (all identity terms matched)
+// while pricing falls back to the live band; unknown/mismatching quotes are
+// ignored entirely and never reach quote consumption.
+test('quoted PL payment landing 10min after issue applies via band, quote still binds', async () => {
+    const { conn, clock, txMap, ecosystem, protocol, signingKey } = await mkStack();
+    await runOn(conn, `INSERT INTO users (id,email) VALUES (1,'a@b.c')`);
+    await ecosystem.ensureAccount('photolynk', '1', {});
+    const q = await protocol.issueQuote({ app: 'photolynk', identity: '1', productId: 'photolynk.storage_400', token: 'SOL', payerWallet: P1 });
+    const p = JSON.parse(q.payload);
+    // Paid 10 minutes after issue - past the 5-minute quote TTL. The amount
+    // differs from the quote's exact atomic charge but satisfies the live band.
+    const lamports = Number(p.amountAtomic) + 100_000;
+    const sig = SIG('qexp10');
+    txMap.set(sig, mkSolTx({
+        sig, payer: P1, lamports, blockTime: secsNow(clock) + 600,
+        memos: ['PhotoLynk:sub:400:monthly', `SLQ1|${q.quoteId}`],
+    }));
+    const r = await protocol.processSignature(sig, { subjects: [] });
+    assert.equal(r.status, 'applied', 'expired quote falls back to band pricing, never rejects');
+    assert.equal(r.identity, '1', 'attribution retained from the quote payload');
+    const paidAtMs = (secsNow(clock) + 600) * 1000;
+    const rec = await getOn(conn, `SELECT quote_id, evidence_json FROM ecosystem_receipts WHERE signature = ?`, [sig]);
+    assert.equal(rec.quote_id, q.quoteId, 'receipt retains the quote binding');
+    const ev = JSON.parse(rec.evidence_json || '{}');
+    assert.equal(ev.quoteFallback, 'QUOTE_EXPIRED', 'fallback is recorded in evidence');
+    const qrow = await getOn(conn, `SELECT used_signature FROM ecosystem_payment_quotes WHERE quote_id = ?`, [q.quoteId]);
+    assert.equal(qrow.used_signature, sig, 'quote consumed by this signature');
+    // quote-status route resolves to applied for the owner
+    const app = express();
+    app.use(express.json());
+    mountEcosystemRoutes(app, {
+        caller: async () => ({ app: 'photolynk', identity: '1' }), ready: () => true,
+        protocol: () => protocol, ecosystem, signKey: signingKey, registry: DEFAULT_REGISTRY,
+    });
+    const server = app.listen(0);
+    await new Promise((res) => server.once('listening', res));
+    try {
+        const st = await (await fetch(
+            `http://127.0.0.1:${server.address().port}/api/ecosystem/payment-quotes/${q.quoteId}/status`)).json();
+        assert.equal(st.status, 'applied');
+        assert.equal(st.signature, sig);
+    } finally {
+        server.close();
+    }
+    // The receipt's paid_at is 10min ahead of the clock - resolve at paid_at
+    // where the benefit is live.
+    const snap = await ecosystem.resolveIdentity('photolynk', '1', { at: paidAtMs + 1000 });
+    assert.equal(snap.entitlement.planGb, 400, 'full tier granted from the band-valid amount');
+    assert.equal(snap.entitlement.expiresAt, paidAtMs + 30 * 24 * 60 * 60 * 1000);
+    await closeDb(conn);
+});
+
+test('quoted PS payment below the quote amount but within live band applies', async () => {
+    const { conn, clock, txMap, ecosystem, protocol } = await mkStack();
+    await runOn(conn, `INSERT INTO paceseeker_devices (device_hash) VALUES (?)`, [DEV1]);
+    // Attribution needs a proven wallet even when the quote supplies the
+    // subject - same requirement as an accepted quote.
+    await ecosystem.ensureAccount('paceseeker', DEV1, { wallet: P1, proofKind: 'bind', proofRef: 'p1' });
+    const q = await protocol.issueQuote({ app: 'paceseeker', identity: DEV1, productId: 'paceseeker.monthly', token: 'SOL', payerWallet: P1 });
+    const p = JSON.parse(q.payload);
+    // 95% of the quoted charge: UNDERPAID vs the quote, but >= the live
+    // band's ~92% floor - the payment must apply, not conflict.
+    const lamports = Math.floor(Number(p.amountAtomic) * 0.95);
+    const sig = SIG('psunder');
+    txMap.set(sig, mkSolTx({
+        sig, payer: P1, lamports, blockTime: secsNow(clock),
+        memos: [`PS1|monthly|${clock.t}|deadbeef`, `SLQ1|${q.quoteId}`],
+    }));
+    const r = await protocol.processSignature(sig, { subjects: [] });
+    assert.equal(r.status, 'applied', JSON.stringify(r));
+    assert.equal(r.identity, DEV1, 'subject attribution retained from the fallback quote');
+    const rec = await getOn(conn, `SELECT quote_id, evidence_json FROM ecosystem_receipts WHERE signature = ?`, [sig]);
+    assert.equal(rec.quote_id, q.quoteId);
+    assert.equal(JSON.parse(rec.evidence_json || '{}').quoteFallback, 'UNDERPAID');
+    const qrow = await getOn(conn, `SELECT used_signature FROM ecosystem_payment_quotes WHERE quote_id = ?`, [q.quoteId]);
+    assert.equal(qrow.used_signature, sig);
+    await closeDb(conn);
+});
+
+test('unknown SLQ1 quote memo on a band-valid PL payment applies with no binding', async () => {
+    const { conn, clock, txMap, ecosystem, protocol } = await mkStack();
+    await runOn(conn, `INSERT INTO users (id,email) VALUES (1,'a@b.c')`);
+    await ecosystem.ensureAccount('photolynk', '1', {});
+    // Attribution without a quote subject: the payer wallet is bound to uid 1
+    // before the payment lands (verified_at <= paidAt).
+    await runOn(conn, `INSERT INTO solana_wallet_bindings (wallet,user_id,verified_at) VALUES (?,1,?)`, [P1, clock.t - 60_000]);
+    const sig = SIG('unkqte');
+    txMap.set(sig, mkSolTx({
+        sig, payer: P1, lamports: 40_000_000, blockTime: secsNow(clock),
+        memos: ['PhotoLynk:sub:400:monthly', `SLQ1|${'f'.repeat(32)}`],
+    }));
+    const r = await protocol.processSignature(sig, { subjects: [] });
+    assert.equal(r.status, 'applied', 'an unknown quote id never rejects a valid payment');
+    assert.equal(r.identity, '1', 'attributed via the proven wallet binding');
+    const rec = await getOn(conn, `SELECT quote_id, evidence_json FROM ecosystem_receipts WHERE signature = ?`, [sig]);
+    assert.equal(rec.quote_id, null, 'no quote binding is stored');
+    assert.equal(JSON.parse(rec.evidence_json || '{}').quoteIgnored, 'QUOTE_UNKNOWN');
+    await closeDb(conn);
+});

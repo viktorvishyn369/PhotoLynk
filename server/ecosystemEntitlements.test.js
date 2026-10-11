@@ -1602,3 +1602,90 @@ test('absorbLegacyLedgerPage (worker/init sweep) absorbs late legacy writes for 
     assert.equal(Number(plan.expires_at), legacyExp);
     await closeDb(conn);
 });
+
+// ---- F1: ad/admin/store plan time never leaks into the SHARED floor --------
+// The pre-core bind gate (plan_gb >= 400 AND a bindable payment_type) applies
+// in BOTH the baseline seed and post-baseline absorption. The receipt-derived
+// floor (paid_at + duration / credits.expires_after) is paid time and stays.
+test('F1 baseline: ad_claim plan expiry is member-local, shared floor is paid time only', async () => {
+    const { svc, conn, clock } = await mk();
+    const t0 = clock.t;
+    const paid = t0 - 2 * DAY_MS;
+    const paidEnd = paid + 30 * DAY_MS;
+    const planExp = paidEnd + 7 * DAY_MS; // ad week stacked on top of paid time
+    await runOn(conn, `INSERT INTO users (id,email) VALUES (1,'a@b.c')`);
+    await runOn(conn, `INSERT INTO user_plans (user_id,plan_gb,status,expires_at,payment_type,payment_at,updated_at)
+        VALUES (1,400,'active',?,'ad_claim',?,?)`, [planExp, paid, t0]);
+    await runOn(conn, `INSERT INTO solana_payments (user_id,tx_signature,tier_gb,duration,created_at,verified_at) VALUES (1,'sigF1ad',400,'monthly',?,?)`, [paid, paid]);
+    await runOn(conn, `INSERT INTO solana_subscription_credits (tx_signature,user_id,source,payment_at,expires_before,expires_after,created_at) VALUES ('sigF1ad',1,'solana',?,NULL,?,?)`, [paid, paidEnd, paid]);
+    await runOn(conn, `INSERT INTO ecosystem_accounts (account_id,created_at) VALUES ('acctF1a',?)`, [t0]);
+    await runOn(conn, `INSERT INTO ecosystem_members (account_id,app,identity,linked_at) VALUES ('acctF1a','photolynk','1',?),('acctF1a','paceseeker',?,?)`, [t0, DEV1, t0]);
+    await svc.initialize();
+    const res = await svc.resolveAccount('acctF1a', { at: t0 });
+    assert.equal(res.sharedUntil, paidEnd, 'shared floor is paid+30d - the stacked ad week stays local');
+    assert.equal(res.apps.paceseeker.expiresAt, paidEnd, 'PS member sees only the paid shared term');
+    assert.equal(res.apps.photolynk.expiresAt, planExp, 'the local PL benefit keeps the full live expiry');
+    await closeDb(conn);
+});
+
+test('F1 baseline: bindable solana plan expiry feeds the shared floor', async () => {
+    const { svc, conn, clock } = await mk();
+    const t0 = clock.t;
+    const paid = t0 - 2 * DAY_MS;
+    const planExp = paid + 30 * DAY_MS + 7 * DAY_MS; // paid time + extra paid/renewal time
+    await runOn(conn, `INSERT INTO users (id,email) VALUES (1,'a@b.c')`);
+    await runOn(conn, `INSERT INTO user_plans (user_id,plan_gb,status,expires_at,payment_type,payment_at,updated_at)
+        VALUES (1,400,'active',?,'solana',?,?)`, [planExp, paid, t0]);
+    await runOn(conn, `INSERT INTO solana_payments (user_id,tx_signature,tier_gb,duration,created_at,verified_at) VALUES (1,'sigF1so',400,'monthly',?,?)`, [paid, paid]);
+    await runOn(conn, `INSERT INTO solana_subscription_credits (tx_signature,user_id,source,payment_at,expires_before,expires_after,created_at) VALUES ('sigF1so',1,'solana',?,NULL,?,?)`, [paid, paid + 30 * DAY_MS, paid]);
+    await runOn(conn, `INSERT INTO ecosystem_accounts (account_id,created_at) VALUES ('acctF1s',?)`, [t0]);
+    await runOn(conn, `INSERT INTO ecosystem_members (account_id,app,identity,linked_at) VALUES ('acctF1s','photolynk','1',?),('acctF1s','paceseeker',?,?)`, [t0, DEV1, t0]);
+    await svc.initialize();
+    const res = await svc.resolveAccount('acctF1s', { at: t0 });
+    assert.equal(res.sharedUntil, planExp, 'a bindable payment_type plan feeds the shared floor');
+    assert.equal(res.apps.paceseeker.expiresAt, planExp);
+    await closeDb(conn);
+});
+
+test('F1 absorb: legacy-mode ad_claim plan expiry stays out of the shared floor', async () => {
+    const { svc, conn, clock } = await mk();
+    await svc.initialize(); // baseline_v2 on an empty DB
+    await runOn(conn, `INSERT INTO users (id,email) VALUES (1,'a@b.c')`);
+    const acct = await svc.ensureAccount('photolynk', '1', {});
+    await runOn(conn, `INSERT INTO ecosystem_members (account_id,app,identity,linked_at) VALUES (?,'paceseeker',?,?)`, [acct, DEV1, clock.t]);
+    const t0 = clock.t;
+    const paidEnd = t0 + 30 * DAY_MS;
+    const planExp = paidEnd + 7 * DAY_MS;
+    // Legacy-mode write while the core was down: payment + credits + plan with
+    // an ad week stacked on top - payment_type is NOT a bindable value.
+    await runOn(conn, `INSERT INTO solana_payments (user_id,tx_signature,tier_gb,duration,payment_token,created_at,verified_at) VALUES (1,'sigF1ab',400,'monthly','SOL',?,?)`, [t0, t0]);
+    await runOn(conn, `INSERT INTO solana_subscription_credits (tx_signature,user_id,source,payment_at,expires_before,expires_after,detail,created_at) VALUES ('sigF1ab',1,'solana',?,0,?,NULL,?)`, [t0, paidEnd, t0]);
+    await runOn(conn, `INSERT INTO user_plans (user_id,plan_gb,status,expires_at,payment_type,payment_at,updated_at) VALUES (1,400,'active',?,'ad_claim',?,?)`, [planExp, t0, t0]);
+    await svc.resolveIdentity('photolynk', '1', { project: true });
+    const rec = await getOn(conn, `SELECT legacy_accounted FROM ecosystem_receipts WHERE signature='sigF1ab'`);
+    assert.ok(rec && Number(rec.legacy_accounted) === 1, 'payment absorbed as legacy_accounted');
+    const res = await svc.resolveAccount(acct, { at: t0 });
+    assert.equal(res.sharedUntil, paidEnd, 'shared is paid+30d - the ad week never propagates');
+    assert.equal(res.apps.paceseeker.expiresAt, paidEnd);
+    assert.equal(res.apps.photolynk.expiresAt, planExp, 'the member keeps the full live expiry locally');
+    await closeDb(conn);
+});
+
+test('F1 absorb: legacy-mode bindable plan expiry feeds the shared floor', async () => {
+    const { svc, conn, clock } = await mk();
+    await svc.initialize();
+    await runOn(conn, `INSERT INTO users (id,email) VALUES (1,'a@b.c')`);
+    const acct = await svc.ensureAccount('photolynk', '1', {});
+    await runOn(conn, `INSERT INTO ecosystem_members (account_id,app,identity,linked_at) VALUES (?,'paceseeker',?,?)`, [acct, DEV1, clock.t]);
+    const t0 = clock.t;
+    const paidEnd = t0 + 30 * DAY_MS;
+    const planExp = paidEnd + 7 * DAY_MS;
+    await runOn(conn, `INSERT INTO solana_payments (user_id,tx_signature,tier_gb,duration,payment_token,created_at,verified_at) VALUES (1,'sigF1sb',400,'monthly','SOL',?,?)`, [t0, t0]);
+    await runOn(conn, `INSERT INTO solana_subscription_credits (tx_signature,user_id,source,payment_at,expires_before,expires_after,detail,created_at) VALUES ('sigF1sb',1,'solana',?,0,?,NULL,?)`, [t0, paidEnd, t0]);
+    await runOn(conn, `INSERT INTO user_plans (user_id,plan_gb,status,expires_at,payment_type,payment_at,updated_at) VALUES (1,400,'active',?,'solana',?,?)`, [planExp, t0, t0]);
+    await svc.resolveIdentity('photolynk', '1', { project: true });
+    const res = await svc.resolveAccount(acct, { at: t0 });
+    assert.equal(res.sharedUntil, planExp, 'bindable plan expiry feeds the shared floor');
+    assert.equal(res.apps.paceseeker.expiresAt, planExp);
+    await closeDb(conn);
+});

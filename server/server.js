@@ -9825,13 +9825,17 @@ async function verifyTreasuryTransaction(txSignature, expectedUsd, token) {
         return { success: false, code: e.code || 'MEMO_MISMATCH', error: e.message };
     }
 
-    // A transaction carrying an SLQ1 quote reference must satisfy the quote,
-    // not just the legacy memo/price path: full quote validation happens
-    // here, and the creditor consumes it atomically with the core receipt.
-    // A malformed quote memo rejects the whole payment - it can never be
-    // silently dropped and paid as a full-price legacy purchase.
+    // A quote is evidence, never grounds to reject an otherwise valid
+    // on-chain payment: an expired or underpaid quote still binds its id
+    // (identity terms all matched before the amount/expiry check) so the
+    // creditor consumes it and quote-status polling resolves, but the amount
+    // falls back to the live band check exactly like an unquoted payment.
+    // An unknown, mismatching, or unverifiable quote - or a core that is
+    // down - means ignore it entirely: its id must never reach the creditor.
+    // Only a malformed SLQ1 memo (extractor MEMO_MISMATCH) rejects.
     let quoteId = null;
     let quoteSubjectId = null;
+    let quoteAccepted = false;
     try {
         const eco = paymentRecovery.extractEcosystemMemo(tx);
         if (eco && eco.quoteId) {
@@ -9839,18 +9843,32 @@ async function verifyTreasuryTransaction(txSignature, expectedUsd, token) {
                 return { success: false, code: 'MEMO_MISMATCH', error: 'Quote memo on a non-PhotoLynk payment' };
             }
             if (!paymentProtocol || !ecosystemReady) {
-                return { success: false, code: 'PROTOCOL_UNAVAILABLE', retryable: true, error: 'Payment protocol not ready - retry shortly' };
+                console.warn(`[Solana] quote ${eco.quoteId} ignored - core unavailable; band pricing applies`);
+            } else {
+                const qc = await paymentProtocol.quoteCheck(eco.quoteId, {
+                    app: eco.app, productId: eco.productId, duration: eco.duration,
+                    token, payer: transfer.senderWallet, rawAmount: transfer.rawAmount,
+                    paidAt: blockTimeSec * 1000,
+                });
+                if (qc.ok) {
+                    quoteId = eco.quoteId;
+                    quoteAccepted = true;
+                    quoteSubjectId = qc.payload && qc.payload.subjectId != null ? String(qc.payload.subjectId) : null;
+                } else if (qc.code === 'QUOTE_EXPIRED' || qc.code === 'UNDERPAID') {
+                    quoteId = eco.quoteId;
+                    const qrow = await dbGetAsync(
+                        `SELECT payload FROM ecosystem_payment_quotes WHERE quote_id = ?`, [String(eco.quoteId)]).catch(() => null);
+                    let qp = null;
+                    try { qp = JSON.parse(qrow && qrow.payload || '{}'); } catch (_) { qp = null; }
+                    quoteSubjectId = qp && qp.subjectId != null ? String(qp.subjectId) : null;
+                    if (quoteSubjectId == null) quoteId = null; // unreadable payload - a foreign binding would conflict
+                    console.warn(`[Solana] quote ${eco.quoteId} fallback (${qc.code}) - band pricing applies`);
+                } else if (qc.code === 'QUOTE_UNKNOWN' || qc.code === 'QUOTE_MISMATCH' || qc.code === 'QUOTE_SIGNATURE_INVALID') {
+                    console.warn(`[Solana] quote ${eco.quoteId} ignored (${qc.code}) - band pricing applies`);
+                } else {
+                    return { success: false, code: qc.code, retryable: !!qc.retryable, error: `payment quote ${eco.quoteId}: ${qc.code}` };
+                }
             }
-            const qc = await paymentProtocol.quoteCheck(eco.quoteId, {
-                app: eco.app, productId: eco.productId, duration: eco.duration,
-                token, payer: transfer.senderWallet, rawAmount: transfer.rawAmount,
-                paidAt: blockTimeSec * 1000,
-            });
-            if (!qc.ok) {
-                return { success: false, code: qc.code, retryable: !!qc.retryable, error: `payment quote ${eco.quoteId}: ${qc.code}` };
-            }
-            quoteId = eco.quoteId;
-            quoteSubjectId = qc.payload && qc.payload.subjectId != null ? String(qc.payload.subjectId) : null;
         }
     } catch (e) {
         return { success: false, code: e.code || 'MEMO_MISMATCH', error: e.message };
@@ -9858,14 +9876,14 @@ async function verifyTreasuryTransaction(txSignature, expectedUsd, token) {
 
     // Enforce the on-chain amount against the server-side USD expectation and
     // the recent price band (protects against underpayment and replayed
-    // commission txs that share the payment wallet). A validated quote fixes
-    // the atomic amount at issue time - it is never re-priced by a live band
-    // that may have moved or vanished since the quote was issued.
-    const band = quoteId ? { latest: 0 } : await getPriceBand(isSkr ? 'skr' : 'sol');
+    // commission txs that share the payment wallet). Only an ACCEPTED quote
+    // fixes the atomic amount at issue time - a fallback or ignored quote is
+    // re-priced by the live band exactly like an unquoted payment.
+    const band = quoteAccepted ? { latest: 0 } : await getPriceBand(isSkr ? 'skr' : 'sol');
     if (!band) {
         return { success: false, code: 'PRICE_UNAVAILABLE', retryable: true, error: 'Price feed unavailable, retry later' };
     }
-    const evalResult = quoteId ? { ok: true } : evaluatePaymentAmount({ receivedUnits: transfer.amount, expectedUsd, band });
+    const evalResult = quoteAccepted ? { ok: true } : evaluatePaymentAmount({ receivedUnits: transfer.amount, expectedUsd, band });
     if (!evalResult.ok) {
         console.log(`[Solana] Underpaid: received ${transfer.amount} ${token}, expected ~${evalResult.expectedAtLatest} (min ${evalResult.minAcceptable}) for $${expectedUsd}`);
         return {

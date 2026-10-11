@@ -1122,7 +1122,8 @@ test('inspector: conflicting memos surface as coded failure', async () => {
 // ===========================================================================
 // verifyTreasuryTransaction - REAL server.js code, VM-loaded with stubs
 // ===========================================================================
-const mkVerifySandbox = ({ tx, band = { latest: 150, min: 140, max: 160, sampleCount: 3 } }) => {
+const mkVerifySandbox = ({ tx, band = { latest: 150, min: 140, max: 160, sampleCount: 3 },
+    paymentProtocol = null, ecosystemReady = false, dbGetAsync = async () => null }) => {
     const calls = [];
     const sandbox = {
         paymentRecovery,
@@ -1137,6 +1138,7 @@ const mkVerifySandbox = ({ tx, band = { latest: 150, min: 140, max: 160, sampleC
         SOLANA_PAYMENT_WALLET: TREASURY,
         SKR_TOKEN_MINT: SKR_MINT,
         SKR_TOKEN_DECIMALS: SKR_DECIMALS,
+        paymentProtocol, ecosystemReady, dbGetAsync,
     };
     const fns = evalServer('VERIFY_TREASURY_TX',
         '{ verifyTreasuryTransaction, verifySolanaTransaction, verifySkrTokenTransaction }', sandbox);
@@ -1192,6 +1194,70 @@ test('verifyTreasuryTransaction (real server code): missing meta is retryable, n
     assert.equal(r.code, 'TX_UNAVAILABLE');
     assert.equal(r.retryable, true);
     assert.equal(calls.length, 5); // retried the full cadence before giving up
+});
+
+// A quote is evidence, never grounds to reject an otherwise valid on-chain
+// payment: expired/underpaid quotes keep their binding but the amount is
+// re-priced by the live band; unknown/mismatching quotes and a down core are
+// ignored entirely. Only a malformed SLQ1 memo still rejects.
+test('verifyTreasuryTransaction (real code): QUOTE_EXPIRED keeps the binding but prices by band', async () => {
+    const quoteId = 'a'.repeat(32);
+    let qcSeen = null;
+    const { verifySolanaTransaction } = mkVerifySandbox({
+        tx: solTx({ memo: 'PhotoLynk:sub:400:monthly', extraIxs: [memoIx(`SLQ1|${quoteId}`)] }),
+        paymentProtocol: {
+            quoteCheck: async (qid, args) => {
+                qcSeen = { qid, args };
+                return { ok: false, code: 'QUOTE_EXPIRED', retryable: false };
+            },
+        },
+        ecosystemReady: true,
+        dbGetAsync: async () => ({ payload: JSON.stringify({ subjectId: '42' }) }),
+    });
+    const r = await verifySolanaTransaction('sig', 1.75);
+    assert.equal(r.success, true, JSON.stringify(r));
+    assert.equal(r.quoteId, quoteId, 'fallback quote id still binds for the creditor/status poll');
+    assert.equal(r.quoteSubjectId, '42', 'subject attribution survives the fallback');
+    assert.equal(qcSeen.qid, quoteId);
+});
+
+test('verifyTreasuryTransaction (real code): core down + quote memo verifies by band, not PROTOCOL_UNAVAILABLE', async () => {
+    const quoteId = 'b'.repeat(32);
+    const { verifySolanaTransaction } = mkVerifySandbox({
+        tx: solTx({ memo: 'PhotoLynk:sub:400:monthly', extraIxs: [memoIx(`SLQ1|${quoteId}`)] }),
+        paymentProtocol: null,
+        ecosystemReady: false,
+    });
+    const r = await verifySolanaTransaction('sig', 1.75);
+    assert.equal(r.success, true, JSON.stringify(r));
+    assert.equal(r.quoteId, null, 'an unverifiable quote never reaches the creditor');
+    assert.equal(r.quoteSubjectId, null);
+});
+
+test('verifyTreasuryTransaction (real code): payer-mismatched quote is ignored, band pricing applies', async () => {
+    const quoteId = 'c'.repeat(32);
+    const { verifySolanaTransaction } = mkVerifySandbox({
+        tx: solTx({ memo: 'PhotoLynk:sub:400:monthly', extraIxs: [memoIx(`SLQ1|${quoteId}`)] }),
+        paymentProtocol: {
+            quoteCheck: async () => ({ ok: false, code: 'QUOTE_MISMATCH', retryable: false }),
+        },
+        ecosystemReady: true,
+    });
+    const r = await verifySolanaTransaction('sig', 1.75);
+    assert.equal(r.success, true, JSON.stringify(r));
+    assert.equal(r.quoteId, null, 'mismatching quote id must never reach consumeQuote');
+    assert.equal(r.quoteSubjectId, null);
+});
+
+test('verifyTreasuryTransaction (real code): malformed SLQ1 memo still rejects', async () => {
+    const { verifySolanaTransaction } = mkVerifySandbox({
+        tx: solTx({ memo: 'PhotoLynk:sub:400:monthly', extraIxs: [memoIx('SLQ1|NOTHEXATALL')] }),
+        paymentProtocol: { quoteCheck: async () => ({ ok: true }) },
+        ecosystemReady: true,
+    });
+    const r = await verifySolanaTransaction('sig', 1.75);
+    assert.equal(r.success, false);
+    assert.equal(r.code, 'MEMO_MISMATCH');
 });
 
 // ===========================================================================

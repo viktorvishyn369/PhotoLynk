@@ -17,6 +17,14 @@ const TOKEN_ENUM = {
     photolynk: new Set(['SOL', 'SKR']),
 };
 const SHARED_VALUE_CENTS = 399;
+// A user_plans row may stack non-payment time on top of paid expiry (ad week,
+// admin edit, store row). Only bindable payment types at the bind tier may
+// feed the shared floor — the same gate the pre-core mirror used.
+const BINDABLE_PLAN_PAYMENT_TYPES = new Set(['', 'solana', 'skr', 'ecosystem', 'apple', 'google']);
+const BIND_MIN_TIER_GB = 400;
+const bindablePlan = (plan) => !!plan
+    && Number(plan.plan_gb) >= BIND_MIN_TIER_GB
+    && BINDABLE_PLAN_PAYMENT_TYPES.has(plan.payment_type == null ? '' : String(plan.payment_type));
 
 const DEFAULT_REGISTRY = {
     version: 2,
@@ -784,7 +792,8 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
         let plan = null;
         if (planEv) { try { plan = (JSON.parse(planEv.payload_json || '{}') || {}).plan || null; } catch (_) { plan = null; } }
         if (plan && latest && isQualifying(latest.product_id) && String(plan.status) === 'active'
-            && plan.expires_at != null && Number(plan.expires_at) > now()) {
+            && plan.expires_at != null && Number(plan.expires_at) > now()
+            && bindablePlan(plan)) {
             floor = Math.max(floor, Number(plan.expires_at));
         }
         await insertEvent(tx, {
@@ -1911,7 +1920,12 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
                          ORDER BY paid_at DESC, signature DESC LIMIT 1`, [id]);
                     const latestProduct = latest && own(registry.products, latest.product_id);
                     const qualifies = !!(latestProduct && latestProduct.ecosystem && !latestProduct.premium);
-                    const sharedTarget = (qualifies && String(plan.status) === 'active' && exp != null && exp > now()) ? exp : 0;
+                    // Same pre-core gate as the baseline seed: only a
+                    // bindable payment-type plan at the bind tier may feed
+                    // the shared floor — ad weeks, admin edits and store
+                    // rows stay member-local.
+                    const sharedTarget = (qualifies && String(plan.status) === 'active' && exp != null && exp > now()
+                        && bindablePlan(plan)) ? exp : 0;
                     if (sharedTarget > 0) {
                         const sharedNow = await tx.get(
                             `SELECT MAX(COALESCE(b.expires_at,0)) AS m FROM ecosystem_benefits b

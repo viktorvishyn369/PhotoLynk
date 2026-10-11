@@ -260,6 +260,18 @@ function createEcosystemPaymentService({
         return { ok: true, quote: row, payload: p };
     };
 
+    // Subject attribution for an expired/underpaid quote: quoteCheck already
+    // authenticated the row's signature and matched app/product/duration/
+    // token/payer before reaching amount/expiry, so its stored subjectId is
+    // still trustworthy for binding.
+    const quoteSubjectFor = async (quoteId) => {
+        try {
+            const row = await ecosystem.readTransaction((tx) => loadQuote(tx, quoteId));
+            const p = row ? JSON.parse(row.payload || '{}') : null;
+            return p && p.subjectId != null ? String(p.subjectId) : null;
+        } catch (_) { return null; }
+    };
+
     // ------------------------------------------------------------------
     // Chain inspection
     // ------------------------------------------------------------------
@@ -380,15 +392,43 @@ function createEcosystemPaymentService({
             return { status: insp.retryable ? 'pending' : 'conflict', code: insp.code, retryable: !!insp.retryable };
         }
 
+        // A quote is evidence, never grounds to reject an otherwise valid
+        // on-chain payment. An expired or underpaid quote still binds
+        // (app/product/duration/token/payer all matched before the amount or
+        // expiry check failed) - the price falls back to the live band check
+        // exactly like an unquoted payment. An unknown, mismatching, or
+        // unverifiable quote is ignored entirely: its id must never reach
+        // consumeQuoteInTransaction (a nonempty mismatching id would conflict).
         let quoted = null;
+        let quoteId = null;
+        let quoteSubjectId = null;
+        let quoteEvidence = null;
         if (insp.quoteId) {
             const qc = await quoteCheck(insp.quoteId, {
                 app: insp.app, productId: insp.productId, duration: insp.duration,
                 token: insp.transfer.token, payer: insp.transfer.senderWallet,
                 rawAmount: insp.transfer.rawAmount, paidAt: insp.paidAt,
             });
-            if (!qc.ok) return { status: qc.retryable ? 'pending' : 'conflict', code: qc.code, retryable: !!qc.retryable };
-            quoted = qc.payload;
+            if (qc.ok) {
+                quoted = qc.payload;
+                quoteId = insp.quoteId;
+                quoteSubjectId = qc.payload && qc.payload.subjectId != null ? String(qc.payload.subjectId) : null;
+            } else if (qc.code === 'QUOTE_EXPIRED' || qc.code === 'UNDERPAID') {
+                quoteId = insp.quoteId;
+                quoteSubjectId = await quoteSubjectFor(insp.quoteId);
+                if (quoteSubjectId == null) {
+                    // Without the subject the receipt may attribute elsewhere
+                    // and consumeQuote would conflict - ignore it entirely.
+                    quoteId = null;
+                    quoteEvidence = { quoteIgnored: 'QUOTE_PAYLOAD_UNREADABLE' };
+                } else {
+                    quoteEvidence = { quoteFallback: qc.code };
+                }
+            } else if (qc.code === 'QUOTE_UNKNOWN' || qc.code === 'QUOTE_MISMATCH' || qc.code === 'QUOTE_SIGNATURE_INVALID') {
+                quoteEvidence = { quoteIgnored: qc.code };
+            } else {
+                return { status: qc.retryable ? 'pending' : 'conflict', code: qc.code, retryable: !!qc.retryable };
+            }
         }
 
         const price = await priceCheck({
@@ -406,12 +446,12 @@ function createEcosystemPaymentService({
             // attributed by the core across ALL proven PS holders of the payer
             // wallet - reported subjects are telemetry, never attribution, and
             // cannot conceal a globally ambiguous wallet.
-            const deviceHash = quoted ? String(quoted.subjectId) : null;
+            const deviceHash = quoteSubjectId;
             const r = await ecosystem.applyPaceSeekerPayment({
                 signature: sig, payerWallet: payer, token: insp.transfer.token, mint: insp.transfer.mint,
                 amountAtomic: String(insp.transfer.rawAmount), paidAt: insp.paidAt, verifiedAt: _now(),
-                quoteId: insp.quoteId || null,
-                evidence: { slot: insp.slot, memo: insp.memo, subjects: subjects || [], flagged: price.flagged || null },
+                quoteId,
+                evidence: { slot: insp.slot, memo: insp.memo, subjects: subjects || [], flagged: price.flagged || null, ...(quoteEvidence || {}) },
             }, { deviceHash });
             if (r && r.ok === false) {
                 return { status: r.retryable ? 'pending' : 'conflict', code: r.code || 'PAYMENT_ACCOUNT_UNVERIFIED', retryable: !!r.retryable };
@@ -423,7 +463,7 @@ function createEcosystemPaymentService({
         }
 
         if (insp.app === 'photolynk') {
-            let uid = quoted ? Number(quoted.subjectId) : null;
+            let uid = quoteSubjectId != null ? Number(quoteSubjectId) : null;
             if (!Number.isSafeInteger(uid) || uid <= 0) {
                 if (insp.code) {
                     const owners = await usersByPaymentCode(insp.code);
@@ -448,8 +488,8 @@ function createEcosystemPaymentService({
                         userId: uid, signature: sig, token: insp.transfer.token,
                         amount: insp.transfer.amount, amountAtomic: String(insp.transfer.rawAmount),
                         payerWallet: payer, mint: insp.transfer.mint, paymentAt: insp.paidAt,
-                        quoteId: insp.quoteId || null,
-                        evidence: { slot: insp.slot, memo: insp.memo },
+                        quoteId,
+                        evidence: { slot: insp.slot, memo: insp.memo, ...(quoteEvidence || {}) },
                     });
                 } catch (e) {
                     if (e && e.code === 'PAYMENT_CONFLICT') return { status: 'conflict', code: 'PAYMENT_CONFLICT', retryable: false };
@@ -485,10 +525,10 @@ function createEcosystemPaymentService({
                 r = await creditSubscription({
                     userId: uid, signature: sig, token: insp.transfer.token,
                     amount: insp.transfer.amount, amountAtomic: String(insp.transfer.rawAmount),
-                    payerWallet: payer, mint: insp.transfer.mint, quoteId: insp.quoteId || null,
+                    payerWallet: payer, mint: insp.transfer.mint, quoteId,
                     tierGb: insp.tierGb, duration: insp.duration, paymentAt: insp.paidAt,
                     source: 'protocol', detail: `memo=${insp.memo}`,
-                    evidence: { slot: insp.slot, memo: insp.memo },
+                    evidence: { slot: insp.slot, memo: insp.memo, ...(quoteEvidence || {}) },
                 });
             } catch (e) {
                 if (e && e.code === 'PAYMENT_CONFLICT') return { status: 'conflict', code: 'PAYMENT_CONFLICT', retryable: false };
