@@ -8110,6 +8110,7 @@ const respondVerificationFailure = (res, txVerification, fallbackError) => {
 // New clients append a per-user payment code as a 4th memo segment, binding
 // the tx to the purchasing account so a stranger's on-chain payment cannot be
 // claimed on a different account.
+// === PAYMENT_CODE_ROUTE_BEGIN ===
 const paymentCodeFor = (userId) => crypto
     .createHmac('sha256', JWT_SECRET)
     .update(`plpay:${userId}`)
@@ -8124,8 +8125,12 @@ const requirePaymentMemo = (res, memo, expected, userId) => {
     return false;
 };
 
-// The per-user payment code new clients embed in the payment memo.
+// The per-user payment code new clients embed in the payment memo. Issued
+// only when the code provably resolves back to exactly this account - a
+// collision or missing user must never hand out an unusable code (the new
+// client aborts before charging on this response).
 app.get('/api/solana/payment-code', async (req, res) => {
+    res.set('Cache-Control', 'no-store');
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
         return res.status(401).json({ error: 'Authorization token required' });
@@ -8136,8 +8141,22 @@ app.get('/api/solana/payment-code', async (req, res) => {
     } catch (e) {
         return res.status(401).json({ error: 'Invalid or expired token' });
     }
-    return res.json({ code: paymentCodeFor(decoded.id) });
+    if (!decoded?.id) {
+        return res.status(503).json({ error: 'Payment account verification unavailable', code: 'PAYMENT_ACCOUNT_UNAVAILABLE' });
+    }
+    try {
+        const code = paymentCodeFor(decoded.id);
+        const owner = await treasuryUserByPaymentCode(code);
+        if (!owner || Number(owner.id) !== Number(decoded.id)) {
+            return res.status(503).json({ error: 'Payment account verification unavailable', code: 'PAYMENT_ACCOUNT_UNAVAILABLE' });
+        }
+        return res.json({ code });
+    } catch (e) {
+        console.error('[Solana] payment-code lookup failed:', e.message);
+        return res.status(503).json({ error: 'Payment account verification unavailable', code: 'PAYMENT_ACCOUNT_UNAVAILABLE' });
+    }
 });
+// === PAYMENT_CODE_ROUTE_END ===
 
 // === CLIENT_SUB_VERIFY_ROUTES_BEGIN ===
 // Verify Solana payment transaction
@@ -8615,8 +8634,9 @@ async function verifySkrTokenTransaction(txSignature, expectedUsd, expectedToken
 //      ALL users are scanned and exactly one must match (HMAC collision ->
 //      no match). Without a code the sender wallet must resolve via
 //      solana_wallet_bindings (written only by ed25519-verified logins /
-//      eco bind-wallet) to exactly one user. users.wallet_address is
-//      user-editable and never consulted. Code vs bound-wallet mismatch ->
+//      eco bind-wallet) OR a prior admin_recovery credit that already
+//      attributed this exact payer to exactly one user. users.wallet_address
+//      is user-editable and never consulted. Code vs bound-wallet mismatch ->
 //      'conflict', never credited.
 //   4. The received amount still has to pass the same price-band check the
 //      verify endpoints use (guards against underpayment + price drift), and
@@ -8689,6 +8709,7 @@ const treasuryMarkSeen = async (signature, outcome, userId = null, detail = null
 // cadence (a few dozen txs every 6h). ALL matches are gathered: exactly one
 // wins, a collision is ambiguous and treated as no match. DB errors propagate
 // so the caller retries the signature instead of recording a terminal miss.
+// === PAYMENT_CODE_RESOLVER_BEGIN ===
 const treasuryUserByPaymentCode = async (code) => {
     if (!code) return null;
     const users = await dbAllAsync(`SELECT id, email FROM users`, []);
@@ -8699,20 +8720,42 @@ const treasuryUserByPaymentCode = async (code) => {
     }
     return null;
 };
+// === PAYMENT_CODE_RESOLVER_END ===
 
-// Verified sender binding rows: ONLY solana_wallet_bindings counts (rows are
-// written exclusively after an ed25519-verified wallet login or eco
-// bind-wallet). users.wallet_address is user-editable and proves nothing.
-// Returns ALL bound rows - ambiguity must be decided by the caller (multi
-// owner -> 'conflict'), never hidden as a null "no match". DB errors
-// propagate (retryable).
-const treasuryBoundUsers = async (walletAddress) => {
+// === TREASURY_BOUND_USERS_BEGIN ===
+// Verified sender attribution rows: ed25519-proven solana_wallet_bindings
+// (source 'signed_wallet') MERGED with accounts an admin already attributed
+// this payer to via explicit treasury recovery (source 'admin_recovery').
+// users.wallet_address is user-editable and proves nothing; generic payment
+// history is never consulted. Returns ALL distinct rows - ambiguity is the
+// caller's decision (multi owner -> 'conflict'), never hidden as a null
+// "no match". DB errors propagate (retryable).
+const treasuryBoundUsers = async (walletAddress, paymentAt) => {
     if (!walletAddress) return [];
-    return dbAllAsync(
+    const merged = new Map();
+    const proofRows = await dbAllAsync(
         `SELECT DISTINCT u.id, u.email FROM users u JOIN solana_wallet_bindings b ON b.user_id = u.id WHERE b.wallet = ?`,
         [walletAddress]
     );
+    for (const r of proofRows || []) {
+        merged.set(Number(r.id), { id: r.id, email: r.email, source: 'signed_wallet' });
+    }
+    if (Number.isFinite(Number(paymentAt)) && Number(paymentAt) > 0) {
+        const auditRows = await dbAllAsync(
+            `SELECT c.user_id,c.source,c.detail,c.payment_at,p.tier_gb,p.duration,u.email
+             FROM solana_subscription_credits c
+             JOIN solana_payments p ON p.tx_signature = c.tx_signature AND p.user_id = c.user_id
+             JOIN users u ON u.id = c.user_id
+             WHERE c.source = 'admin_recovery' AND c.payment_at <= ?`,
+            [Number(paymentAt)]
+        );
+        for (const r of paymentRecovery.approvedRecoveryUsers(walletAddress, paymentAt, auditRows)) {
+            if (!merged.has(r.id)) merged.set(r.id, r); // signed proof wins for the same id
+        }
+    }
+    return [...merged.values()];
 };
+// === TREASURY_BOUND_USERS_END ===
 
 // Legacy attribution candidates for the admin preview ONLY: wallet_address and
 // wallet-derived legacy email/alias forms. Never proof of ownership.
@@ -8958,8 +9001,10 @@ const treasuryScanOnce = async () => {
                 const normalizedTier = parsed.tierGb; // memo regex whitelists tiers
 
                 // User binding: a payment code is authoritative; a codeless
-                // memo binds ONLY via solana_wallet_bindings (ed25519-proven).
+                // memo binds via ed25519-proven solana_wallet_bindings or an
+                // admin's prior explicit recovery of this same payer.
                 let user = null;
+                let via = 'payment_code';
                 if (parsed.code) {
                     user = await treasuryUserByPaymentCode(parsed.code);
                     if (!user) {
@@ -8968,9 +9013,9 @@ const treasuryScanOnce = async () => {
                         summary.skipped++;
                         continue;
                     }
-                    // A verified binding to a different user - or a wallet
-                    // bound to MULTIPLE users - conflicts with the code.
-                    const boundIds = paymentRecovery.boundUserIds(await treasuryBoundUsers(senderWallet));
+                    // A verified/approved binding to a different user - or a
+                    // wallet bound to MULTIPLE users - conflicts with the code.
+                    const boundIds = paymentRecovery.boundUserIds(await treasuryBoundUsers(senderWallet, paymentAt));
                     if (boundIds.length > 1 || (boundIds.length === 1 && boundIds[0] !== Number(user.id))) {
                         await treasuryMarkSeen(signature, 'conflict', null,
                             `codeUser=${user.id} boundIds=${boundIds.join('|') || 'none'}`);
@@ -8979,7 +9024,7 @@ const treasuryScanOnce = async () => {
                         continue;
                     }
                 } else {
-                    const boundRows = await treasuryBoundUsers(senderWallet);
+                    const boundRows = await treasuryBoundUsers(senderWallet, paymentAt);
                     const boundIds = paymentRecovery.boundUserIds(boundRows);
                     if (boundIds.length > 1) {
                         await treasuryMarkSeen(signature, 'conflict', null,
@@ -8995,6 +9040,7 @@ const treasuryScanOnce = async () => {
                         continue;
                     }
                     user = boundRows.find((r) => Number(r.id) === boundIds[0]);
+                    via = user?.source === 'admin_recovery' ? 'admin_recovery' : 'signed_wallet';
                 }
 
                 // Downgrade guard - identical to the client verify path.
@@ -9037,7 +9083,7 @@ const treasuryScanOnce = async () => {
                         duration: parsed.duration,
                         paymentAt,
                         source: 'treasury_scan',
-                        detail: `sender=${senderWallet} memo=${memo}`,
+                        detail: `sender=${senderWallet} memo=${memo} via=${via}`,
                         preserveTier: true,
                     });
                 } catch (e) {
@@ -9123,8 +9169,7 @@ const inspectTreasuryPayment = paymentRecovery.createTreasuryInspector({
     getPaymentBySignature: async (sig) => dbGetAsync(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [sig]),
     getPlanByUser: async (id) => dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [id]),
     resolvePaymentCode: treasuryUserByPaymentCode,
-    getBoundUsersByWallet: async (w) => dbAllAsync(
-        `SELECT DISTINCT u.id, u.email FROM users u JOIN solana_wallet_bindings b ON b.user_id = u.id WHERE b.wallet = ?`, [w]),
+    getBoundUsersByWallet: async (w, at) => treasuryBoundUsers(w, at),
     getLegacyWalletCandidates: treasuryLegacyWalletCandidates,
     getPriceBand,
     evaluatePayment: evaluatePaymentAmount,
@@ -9233,6 +9278,7 @@ db.serialize(() => {
     // Audit trail for every subscription credit (payment + plan written
     // atomically by paymentRecovery.createSubscriptionCreditor).
     db.run(`CREATE TABLE IF NOT EXISTS solana_subscription_credits (tx_signature TEXT PRIMARY KEY,user_id INTEGER NOT NULL,source TEXT NOT NULL,payment_at INTEGER NOT NULL,expires_before INTEGER,expires_after INTEGER NOT NULL,detail TEXT,created_at INTEGER NOT NULL)`);
+    db.run(`CREATE INDEX IF NOT EXISTS idx_sol_subscription_credits_source_time ON solana_subscription_credits(source,payment_at)`);
     // Cryptographically proven wallet<->user bindings (ed25519-verified logins
     // and eco bind-wallet only - never /api/save-wallet).
     db.run(`CREATE TABLE IF NOT EXISTS solana_wallet_bindings (wallet TEXT NOT NULL,user_id INTEGER NOT NULL,verified_at INTEGER NOT NULL,PRIMARY KEY(wallet,user_id))`);

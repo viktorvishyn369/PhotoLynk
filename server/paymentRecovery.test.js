@@ -1593,3 +1593,315 @@ test('treasuryScanOnce (real code): null price band -> rpc_error marked, retryab
     assert.equal(m[2], 7);
     assert.match(m[3], /Price feed unavailable/);
 });
+
+// ===========================================================================
+// GET /api/solana/payment-code - REAL route + REAL HMAC + REAL resolver:
+// code issued only when it provably resolves back to the same single user.
+// ===========================================================================
+const mkCodeRoute = (over = {}) => {
+    const routes = {};
+    const fns = evalServer('PAYMENT_CODE_ROUTE', '({ paymentCodeFor, requirePaymentMemo })', {
+        app: { get: (p, h) => { routes[p] = h; }, post: () => {} },
+        jwt: { verify: () => ({ id: 7 }) },
+        JWT_SECRET: 'test-secret',
+        crypto: require('crypto'),
+        treasuryUserByPaymentCode: async () => null,
+        respondVerificationFailure: (res, r) => res.status(400).json({ error: r.error, code: r.code }),
+        console,
+        ...over,
+    });
+    return { route: routes['/api/solana/payment-code'], ...fns };
+};
+const mkCodeReq = (auth = 'Bearer t') => ({ headers: { authorization: auth } });
+const mkCodeRes = () => {
+    const out = { statusCode: 200, body: null, headers: {} };
+    out.set = (k, v) => { out.headers[k] = v; };
+    out.status = (c) => { out.statusCode = c; return out; };
+    out.json = (b) => { out.body = b; return out; };
+    return out;
+};
+
+test('payment-code route (real code): unique resolvable user -> 8-hex code + no-store', async () => {
+    const { route, paymentCodeFor } = mkCodeRoute({
+        treasuryUserByPaymentCode: async (code) => (code === paymentCodeFor(7) ? { id: 7, email: 'u@x' } : null),
+    });
+    const res = mkCodeRes();
+    await route(mkCodeReq(), res);
+    assert.equal(res.statusCode, 200);
+    assert.match(res.body.code, /^[0-9a-f]{8}$/);
+    assert.equal(res.body.code, paymentCodeFor(7));
+    assert.equal(res.headers['Cache-Control'], 'no-store');
+});
+
+test('payment-code route (real code): unresolvable/deleted user or collision -> 503, NO code', async () => {
+    // Resolver returns null (deleted user / collision / any mismatch)
+    let { route } = mkCodeRoute({ treasuryUserByPaymentCode: async () => null });
+    let res = mkCodeRes();
+    await route(mkCodeReq(), res);
+    assert.equal(res.statusCode, 503);
+    assert.equal(res.body.code, 'PAYMENT_ACCOUNT_UNAVAILABLE');
+    assert.equal(res.body.code?.length === 8 && /^[0-9a-f]{8}$/.test(res.body.code), false);
+    assert.equal(res.headers['Cache-Control'], 'no-store');
+
+    // Resolver resolves to a DIFFERENT user id
+    ({ route } = mkCodeRoute({ treasuryUserByPaymentCode: async () => ({ id: 99, email: 'x@y' }) }));
+    res = mkCodeRes();
+    await route(mkCodeReq(), res);
+    assert.equal(res.statusCode, 503);
+
+    // DB failure -> 503, no code
+    ({ route } = mkCodeRoute({ treasuryUserByPaymentCode: async () => { throw new Error('db down'); } }));
+    res = mkCodeRes();
+    await route(mkCodeReq(), res);
+    assert.equal(res.statusCode, 503);
+    assert.equal(res.body.code, 'PAYMENT_ACCOUNT_UNAVAILABLE');
+
+    // Expired/malformed JWT -> 401 unchanged
+    ({ route } = mkCodeRoute({ jwt: { verify: () => { throw new Error('bad'); } } }));
+    res = mkCodeRes();
+    await route(mkCodeReq(), res);
+    assert.equal(res.statusCode, 401);
+    assert.equal(res.body.code, undefined);
+    res = mkCodeRes();
+    await route(mkCodeReq(null), res);
+    assert.equal(res.statusCode, 401);
+});
+
+test('payment-code resolver (real code): exactly-one match wins, zero/collision -> null', async () => {
+    const code4 = (id) => `code${id}`; // paymentCodeFor stub: deterministic per id
+    const resolve = evalServer('PAYMENT_CODE_RESOLVER', 'treasuryUserByPaymentCode', {
+        paymentCodeFor: code4,
+        dbAllAsync: async () => [{ id: 7, email: 'a' }, { id: 8, email: 'b' }],
+    });
+    assert.deepEqual(await resolve('code7'), { id: 7, email: 'a' });
+    assert.equal(await resolve('nope'), null);
+    const collide = evalServer('PAYMENT_CODE_RESOLVER', 'treasuryUserByPaymentCode', {
+        paymentCodeFor: () => 'same',
+        dbAllAsync: async () => [{ id: 7, email: 'a' }, { id: 8, email: 'b' }],
+    });
+    assert.equal(await collide('same'), null, 'collision must not pick a first match');
+});
+
+test('requirePaymentMemo (real code): legacy codeless memo still accepted; coded memo binds; mismatch rejects', () => {
+    const { requirePaymentMemo, paymentCodeFor } = mkCodeRoute();
+    const res = mkCodeRes();
+    assert.equal(requirePaymentMemo(res, 'PhotoLynk:sub:100:monthly', 'PhotoLynk:sub:100:monthly', 7), true);
+    assert.equal(requirePaymentMemo(res, `PhotoLynk:sub:100:monthly:${paymentCodeFor(7)}`, 'PhotoLynk:sub:100:monthly', 7), true);
+    assert.equal(requirePaymentMemo(res, `PhotoLynk:sub:100:monthly:${paymentCodeFor(8)}`, 'PhotoLynk:sub:100:monthly', 7), false);
+    assert.equal(res.body.code, 'MEMO_MISMATCH');
+});
+
+// ===========================================================================
+// Admin-confirmed payer evidence: approvedRecoveryUsers + REAL
+// treasuryBoundUsers (merged signed-proof + prior admin recovery) on temp DB.
+// ===========================================================================
+const loadBoundUsers = (h) => evalServer('TREASURY_BOUND_USERS', 'treasuryBoundUsers', {
+    dbAllAsync: h.all,
+    paymentRecovery,
+});
+
+const seedAdminApproval = async (h, { sig, userId, wallet, tier = 100, dur = 'monthly', paymentAt, admin = 'admin', detailMemo, source = 'admin_recovery', detail }) => {
+    await h.run(
+        `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, payment_token, tier_gb, duration, created_at, verified_at) VALUES (?,?,?,?,?,?,?,?)`,
+        [userId, sig, 0.5, 'SOL', tier, dur, paymentAt, paymentAt]);
+    await h.run(
+        `INSERT INTO solana_subscription_credits (tx_signature,user_id,source,payment_at,expires_before,expires_after,detail,created_at) VALUES (?,?,?,?,?,?,?,?)`,
+        [sig, userId, source, paymentAt, null, paymentAt + 1000, detail ?? JSON.stringify({ payer: wallet, memo: detailMemo ?? `PhotoLynk:sub:${tier}:${dur}`, admin }), Date.now()]);
+};
+
+test('treasuryBoundUsers (real code): prior admin recovery qualifies the payer - and only that', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    const bound = loadBoundUsers(h);
+    const T0 = Date.now() - 60_000;
+    await h.run(`INSERT INTO users (id, email) VALUES (7, 'mike@x'), (8, 'other@x')`);
+    await seedAdminApproval(h, { sig: 'old1', userId: 7, wallet: PAYER, paymentAt: T0 });
+
+    // Happy path: new payment later than the approval -> evidence for user 7
+    let rows = await bound(PAYER, T0 + 1);
+    assert.deepEqual(JSON.parse(JSON.stringify(rows)),
+        [{ id: 7, email: 'mike@x', source: 'admin_recovery' }]);
+
+    // Same wallet, payment BEFORE the approval -> the approval postdates it, no evidence
+    assert.deepEqual(JSON.parse(JSON.stringify(await bound(PAYER, T0 - 1))), []);
+
+    // Different payer -> no evidence
+    assert.deepEqual(JSON.parse(JSON.stringify(await bound(OTHER, T0 + 1))), []);
+
+    // Malformed detail JSON -> dropped
+    const { dbPath: db2 } = await makeFixtureDb();
+    const h2 = await openDb(db2);
+    await h2.run(`INSERT INTO users (id, email) VALUES (7, 'mike@x')`);
+    await seedAdminApproval(h2, { sig: 'old2', userId: 7, wallet: PAYER, paymentAt: T0, detail: '{not json' });
+    assert.deepEqual(JSON.parse(JSON.stringify(await loadBoundUsers(h2)(PAYER, T0 + 1))), []);
+
+    // Detail names a different payer -> dropped
+    const { dbPath: db3 } = await makeFixtureDb();
+    const h3 = await openDb(db3);
+    await h3.run(`INSERT INTO users (id, email) VALUES (7, 'mike@x')`);
+    await seedAdminApproval(h3, { sig: 'old3', userId: 7, wallet: PAYER, paymentAt: T0, detail: JSON.stringify({ payer: OTHER, memo: 'PhotoLynk:sub:100:monthly', admin: 'admin' }) });
+    assert.deepEqual(JSON.parse(JSON.stringify(await loadBoundUsers(h3)(PAYER, T0 + 1))), []);
+
+    // Non-admin source -> dropped
+    const { dbPath: db4 } = await makeFixtureDb();
+    const h4 = await openDb(db4);
+    await h4.run(`INSERT INTO users (id, email) VALUES (7, 'mike@x')`);
+    await seedAdminApproval(h4, { sig: 'old4', userId: 7, wallet: PAYER, paymentAt: T0, source: 'treasury_scan' });
+    assert.deepEqual(JSON.parse(JSON.stringify(await loadBoundUsers(h4)(PAYER, T0 + 1))), []);
+
+    // Ledger/payment tier inconsistent with the approved memo -> dropped
+    const { dbPath: db5 } = await makeFixtureDb();
+    const h5 = await openDb(db5);
+    await h5.run(`INSERT INTO users (id, email) VALUES (7, 'mike@x')`);
+    await seedAdminApproval(h5, { sig: 'old5', userId: 7, wallet: PAYER, paymentAt: T0, tier: 200, detailMemo: 'PhotoLynk:sub:100:monthly' });
+    assert.deepEqual(JSON.parse(JSON.stringify(await loadBoundUsers(h5)(PAYER, T0 + 1))), []);
+
+    // Well-formed admin_recovery credit but NO matching solana_payments
+    // ledger row -> the JOIN must drop it, no evidence.
+    const { dbPath: db6 } = await makeFixtureDb();
+    const h6 = await openDb(db6);
+    await h6.run(`INSERT INTO users (id, email) VALUES (7, 'mike@x')`);
+    await h6.run(
+        `INSERT INTO solana_subscription_credits (tx_signature,user_id,source,payment_at,expires_before,expires_after,detail,created_at) VALUES (?,?,?,?,?,?,?,?)`,
+        ['orphan', 7, 'admin_recovery', T0, null, T0 + 1000, JSON.stringify({ payer: PAYER, memo: 'PhotoLynk:sub:100:monthly', admin: 'admin' }), Date.now()]);
+    assert.deepEqual(JSON.parse(JSON.stringify(await loadBoundUsers(h6)(PAYER, T0 + 1))), []);
+
+    // Ledger row exists but belongs to a DIFFERENT user than the credit row
+    // -> the JOIN's user_id equality must drop it.
+    const { dbPath: db7 } = await makeFixtureDb();
+    const h7 = await openDb(db7);
+    await h7.run(`INSERT INTO users (id, email) VALUES (7, 'mike@x'), (8, 'other@x')`);
+    await h7.run(
+        `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, payment_token, tier_gb, duration, created_at, verified_at) VALUES (?,?,?,?,?,?,?,?)`,
+        [8, 'split', 0.5, 'SOL', 100, 'monthly', T0, T0]);
+    await h7.run(
+        `INSERT INTO solana_subscription_credits (tx_signature,user_id,source,payment_at,expires_before,expires_after,detail,created_at) VALUES (?,?,?,?,?,?,?,?)`,
+        ['split', 7, 'admin_recovery', T0, null, T0 + 1000, JSON.stringify({ payer: PAYER, memo: 'PhotoLynk:sub:100:monthly', admin: 'admin' }), Date.now()]);
+    assert.deepEqual(JSON.parse(JSON.stringify(await loadBoundUsers(h7)(PAYER, T0 + 1))), []);
+
+    // Credit + ledger consistent but the USERS row is gone (deleted
+    // account) -> the users JOIN must drop it.
+    const { dbPath: db8 } = await makeFixtureDb();
+    const h8 = await openDb(db8);
+    await seedAdminApproval(h8, { sig: 'gone', userId: 7, wallet: PAYER, paymentAt: T0 });
+    assert.deepEqual(JSON.parse(JSON.stringify(await loadBoundUsers(h8)(PAYER, T0 + 1))), []);
+
+    await Promise.all([h.close(), h2.close(), h3.close(), h4.close(), h5.close(), h6.close(), h7.close(), h8.close()]);
+});
+
+test('treasuryBoundUsers (real code): signed proof + admin evidence merge; ambiguity returns ALL ids', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    const bound = loadBoundUsers(h);
+    const T0 = Date.now() - 60_000;
+    await h.run(`INSERT INTO users (id, email) VALUES (7, 'mike@x'), (8, 'other@x'), (9, 'third@x')`);
+    // Signed proof: PAYER -> user 7
+    await h.run(`INSERT INTO solana_wallet_bindings (wallet,user_id,verified_at) VALUES (?,?,?)`, [PAYER, 7, T0]);
+    let rows = await bound(PAYER, T0 + 1);
+    assert.deepEqual(JSON.parse(JSON.stringify(rows)),
+        [{ id: 7, email: 'mike@x', source: 'signed_wallet' }]);
+
+    // Same user also admin-approved -> still one row, signed proof wins the label
+    await seedAdminApproval(h, { sig: 'old6', userId: 7, wallet: PAYER, paymentAt: T0 - 1 });
+    rows = await bound(PAYER, T0 + 1);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].source, 'signed_wallet');
+
+    // A second admin-approved owner -> BOTH ids surface (conflict, never first-match)
+    await seedAdminApproval(h, { sig: 'old7', userId: 8, wallet: PAYER, paymentAt: T0 - 1 });
+    rows = await bound(PAYER, T0 + 1);
+    assert.deepEqual(paymentRecovery.boundUserIds(rows).sort(), [7, 8]);
+    await h.close();
+});
+
+// ===========================================================================
+// Scanner auto-credit: a codeless payment from a payer an admin previously
+// recovered is credited automatically - no confirmation step, no code.
+// ===========================================================================
+test('treasuryScanOnce (real code): codeless SOL+SKR auto-credit to admin-approved payer account', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    const T0 = Date.now() - 3600_000;
+    await h.run(`INSERT INTO users (id, email) VALUES (7, 'mike@x')`);
+    // Admin previously recovered a payment from PAYER to user 7 (explicit approval)
+    await seedAdminApproval(h, { sig: 'oldSol', userId: 7, wallet: PAYER, paymentAt: T0 });
+    await h.run(
+        `INSERT INTO solana_payments (user_id, tx_signature, skr_amount, payment_token, tier_gb, duration, created_at, verified_at) VALUES (?,?,?,?,?,?,?,?)`,
+        [7, 'oldSkr', 50, 'SKR', 100, 'monthly', T0, T0]);
+    await h.run(
+        `INSERT INTO solana_subscription_credits (tx_signature,user_id,source,payment_at,expires_before,expires_after,detail,created_at) VALUES (?,?,?,?,?,?,?,?)`,
+        ['oldSkr', 7, 'admin_recovery', T0, null, T0 + 1000, JSON.stringify({ payer: PAYER, memo: 'PhotoLynk:sub:100:monthly', admin: 'admin' }), Date.now()]);
+
+    const marked = [];
+    const scan = evalServer('TREASURY_SCAN_RUN', 'treasuryScanOnce', {
+        treasuryScanInFlight: false,
+        SOLANA_PAYMENT_WALLET: TREASURY,
+        SKR_TOKEN_MINT: SKR_MINT,
+        SKR_TOKEN_DECIMALS: SKR_DECIMALS,
+        SKR_SUBSCRIPTION_MULTIPLIER: 1,
+        TREASURY_TX_MAX_AGE_MS: 30 * 24 * 60 * 60 * 1000,
+        TREASURY_SCAN_TX_DELAY_MS: 0,
+        PLAN_PRICES_USD: { 100: 10 },
+        ECO_BIND_MIN_TIER_GB: 400,
+        paymentRecovery,
+        treasuryGetTokenAccounts: async () => [],
+        treasuryCollectSignatures: async () => [{ signature: 'newSol', slot: 1 }, { signature: 'newSkr', slot: 2 }],
+        dbAllAsync: h.all,   // real SQL: retry queue + binding + admin-credit joins
+        dbGetAsync: h.get,   // real SQL: seen rows + existing payments
+        treasuryMarkSeen: async (...a) => { marked.push(a); },
+        treasuryFetchTransaction: async (sig) => (sig === 'newSol' ? solTx({}) : skrTx({})),
+        treasurySleep: async () => {},
+        extractPhotoLynkMemo: () => 'PhotoLynk:sub:100:monthly', // codeless
+        treasuryUserByPaymentCode: async () => null,
+        treasuryBoundUsers: loadBoundUsers(h),                   // REAL merged resolver
+        getUserPlanGb: async () => 0,
+        canDowngradeToTier: async () => true,
+        getPriceBand: async () => ({ min: 1, max: 100, latest: 10 }),
+        evaluatePaymentAmount: () => ({ ok: true, minAcceptable: 0.1 }),
+        creditSolanaSubscription: createSubscriptionCreditor(creditDefaults(dbPath)),
+        ecoEnsureAccount: async () => ({}),
+        ecoFloorSub: async () => {},
+    });
+    const summary = await scan();
+    assert.equal(summary.credited, 2, JSON.stringify(marked));
+    const pays = await h.all(`SELECT tx_signature, user_id, payment_token FROM solana_payments WHERE tx_signature IN ('newSol','newSkr')`);
+    assert.equal(pays.length, 2);
+    assert.ok(pays.every((p) => p.user_id === 7));
+    const audit = await h.all(`SELECT source, detail FROM solana_subscription_credits WHERE tx_signature IN ('newSol','newSkr')`);
+    assert.ok(audit.every((a) => a.source === 'treasury_scan' && a.detail.includes('via=admin_recovery')),
+        'credit detail must record admin_recovery provenance');
+    // Second run: same signatures -> already recorded, not double-credited
+    marked.length = 0;
+    const summary2 = await scan();
+    assert.equal(summary2.credited, 0);
+    assert.equal((await h.all(`SELECT * FROM solana_payments WHERE tx_signature IN ('newSol','newSkr')`)).length, 2);
+    await h.close();
+});
+
+test('real creditor concurrency: 3 distinct signatures stack +90d, repeat adds nothing', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    const T0 = Date.now() - 60_000;
+    await h.run(`INSERT INTO users (id, email) VALUES (7, 'mike@x')`);
+    const credit = createSubscriptionCreditor(creditDefaults(dbPath));
+    const sigs = ['c1', 'c2', 'c3'];
+    const results = await Promise.all(sigs.map((s) => credit({
+        userId: 7, signature: s, token: 'SOL', amount: 0.5, tierGb: 100,
+        duration: 'monthly', paymentAt: T0, source: 'treasury_scan', detail: 'x',
+    })));
+    assert.ok(results.every((r) => !r.alreadyProcessed));
+    const plan = await h.get(`SELECT * FROM user_plans WHERE user_id = 7`);
+    const monthMs = PLAN_DURATION_MS.monthly;
+    assert.ok(Math.abs(plan.expires_at - (T0 + 3 * monthMs)) < 10,
+        `3 monthly credits must stack ~90d, got expires_at delta ${plan.expires_at - T0} vs ${3 * monthMs}`);
+    // Re-crediting one signature is a no-op duplicate
+    const dup = await credit({
+        userId: 7, signature: 'c1', token: 'SOL', amount: 0.5, tierGb: 100,
+        duration: 'monthly', paymentAt: T0, source: 'treasury_scan', detail: 'x',
+    });
+    assert.equal(dup.alreadyProcessed, true);
+    const plan2 = await h.get(`SELECT * FROM user_plans WHERE user_id = 7`);
+    assert.equal(plan2.expires_at, plan.expires_at, 'duplicate must not extend the term');
+    assert.equal((await h.all(`SELECT * FROM solana_payments`)).length, 3);
+    await h.close();
+});

@@ -534,6 +534,27 @@ const boundUserIds = (rows) => [...new Set((rows || [])
     .map((r) => Number(r?.id))
     .filter((n) => Number.isInteger(n) && n > 0))];
 
+// Accounts an ADMIN already attributed this payer wallet to via the explicit
+// treasury-recovery flow. Rows come from the solana_subscription_credits JOIN
+// solana_payments JOIN users query in server.js - this is prior recorded
+// approval evidence, not cryptographic ownership and not payment-history
+// inference: the row must be an admin_recovery credit whose detail JSON names
+// this exact payer, carries the matching memo tier/duration, and predates the
+// payment now being attributed. Returns [] on any doubt.
+function approvedRecoveryUsers(walletAddress, paymentAt, rows) {
+    const out = new Map();
+    if (!walletAddress || !Number.isFinite(Number(paymentAt))) return [];
+    for (const row of rows || []) {
+        if (row.source !== 'admin_recovery' || !(Number(row.payment_at) > 0) || Number(row.payment_at) > Number(paymentAt)) continue;
+        let detail; try { detail = JSON.parse(row.detail); } catch { continue; }
+        const memo = parseSubscriptionMemo(detail?.memo);
+        if (detail?.payer !== walletAddress || typeof detail.admin !== 'string' || !detail.admin || !memo || memo.tierGb !== Number(row.tier_gb) || memo.duration !== row.duration) continue;
+        const id = Number(row.user_id);
+        if (Number.isInteger(id) && id > 0) out.set(id, { id, email: row.email, source: 'admin_recovery' });
+    }
+    return [...out.values()];
+}
+
 // Merge freshly collected entries with the retry queue (old retryable scan
 // outcomes). Returns { queue, retrySet } - queue entries keep their RPC info,
 // retrySet marks signatures exempt from the sticky seen-outcome skip.
@@ -686,7 +707,7 @@ function createTreasuryInspector({
         // uniquely bound to a different user conflicts even when a valid
         // HMAC code is present (the code names the recipient, but the payer's
         // proven wallet must not contradict it).
-        const boundRows = transfer.senderWallet ? (await getBoundUsersByWallet(transfer.senderWallet)) || [] : [];
+        const boundRows = transfer.senderWallet ? (await getBoundUsersByWallet(transfer.senderWallet, paymentAt)) || [] : [];
         const boundIds = boundUserIds(boundRows);
         if (boundIds.length > 1) {
             return { ok: false, status: 409, code: 'ATTRIBUTION_CONFLICT', error: 'Payer wallet is bound to multiple users' };
@@ -708,7 +729,9 @@ function createTreasuryInspector({
             if (boundIds.length === 1 && boundIds[0] !== uid) {
                 return { ok: false, status: 409, code: 'ATTRIBUTION_CONFLICT', error: 'Payer wallet is verified-bound to a different user' };
             }
-            attribution = boundIds.length === 1 ? 'verified_wallet' : 'admin_required';
+            const boundRow = boundRows.find((r) => Number(r.id) === boundIds[0]);
+            attribution = boundIds.length !== 1 ? 'admin_required'
+                : (boundRow?.source === 'admin_recovery' ? 'prior_admin_assignment' : 'verified_wallet');
         }
 
         const existing = await getPaymentBySignature(sig);
@@ -771,6 +794,7 @@ module.exports = {
     extractPaymentMemo,
     extractTreasuryTransfer,
     boundUserIds,
+    approvedRecoveryUsers,
     samePaymentRow,
     createSubscriptionCreditor,
     collectTreasurySignatures,
