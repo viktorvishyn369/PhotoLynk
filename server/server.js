@@ -9098,11 +9098,23 @@ const treasuryScanOnce = async () => {
                 const solanaExpiry = computePaidSubscriptionExpiry({ currentPlan, purchaseAt: now, durationMs });
                 const expiresAt = solanaExpiry.expiresAt;
 
-                await dbRunAsync(
-                    `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, skr_amount, payment_token, tier_gb, duration, created_at, verified_at)
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-                    [user.id, signature, isSkr ? 0 : receivedUnits, isSkr ? receivedUnits : 0, isSkr ? 'SKR' : 'SOL', normalizedTier, parsed.duration, now, now]
-                );
+                // tx_signature is UNIQUE: if the client's /verify-* landed
+                // between our idempotency check and here, this INSERT throws
+                // and the plan is never touched - the client credit stands.
+                try {
+                    await dbRunAsync(
+                        `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, skr_amount, payment_token, tier_gb, duration, created_at, verified_at)
+                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                        [user.id, signature, isSkr ? 0 : receivedUnits, isSkr ? receivedUnits : 0, isSkr ? 'SKR' : 'SOL', normalizedTier, parsed.duration, now, now]
+                    );
+                } catch (e) {
+                    if (/UNIQUE|constraint/i.test(e.message || '')) {
+                        await treasuryMarkSeen(signature, 'already_credited', user.id, 'lost race to client verify');
+                        summary.already++;
+                        continue;
+                    }
+                    throw e;
+                }
                 await dbRunAsync(
                     `INSERT INTO user_plans (user_id, plan_gb, status, expires_at, trial_carryover_applied_at, updated_at)
                      VALUES (?, ?, 'active', ?, ?, ?)
