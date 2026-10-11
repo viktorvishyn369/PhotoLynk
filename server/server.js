@@ -8799,6 +8799,63 @@ const treasuryExtractInflow = (tx) => {
     return { solLamports, skrRaw, senderWallet: skrAuthority || feePayer };
 };
 
+// Discover the treasury's SKR token accounts. CRITICAL: SPL transfers arrive
+// at the ATA, whose address - not the wallet's - sits in the tx accountKeys,
+// so getSignaturesForAddress(paymentWallet) never sees SKR payments at all.
+// Scanning these token accounts is what makes the SKR path work.
+const treasuryGetTokenAccounts = async () => {
+    try {
+        const res = await axios.post(SOLANA_RPC_ENDPOINT, {
+            jsonrpc: '2.0', id: 1,
+            method: 'getTokenAccountsByOwner',
+            params: [SOLANA_PAYMENT_WALLET, { mint: SKR_TOKEN_MINT }, { encoding: 'jsonParsed' }],
+        }, { timeout: 30000 });
+        return (res.data?.result?.value || []).map((a) => a?.pubkey).filter(Boolean);
+    } catch (e) {
+        console.warn('[TreasuryScan] token account discovery failed:', e.message);
+        return [];
+    }
+};
+
+// Page newest->oldest on ONE address until a signature we already know about
+// (treasury_scan_seen or solana_payments) or the per-run cap. Backlogged runs
+// reach every payment; steady-state runs stop after the first page.
+const treasuryCollectSignatures = async (address) => {
+    const collected = [];
+    let beforeCursor = undefined;
+    let keepPaging = true;
+    while (keepPaging && collected.length < TREASURY_SCAN_MAX_SIGS) {
+        const params = { limit: TREASURY_SCAN_PAGE_LIMIT, commitment: 'confirmed' };
+        if (beforeCursor) params.before = beforeCursor;
+        const sigRes = await axios.post(SOLANA_RPC_ENDPOINT, {
+            jsonrpc: '2.0',
+            id: 1,
+            method: 'getSignaturesForAddress',
+            params: [address, params],
+        }, { timeout: 30000 });
+        const page = Array.isArray(sigRes.data?.result) ? sigRes.data.result : [];
+        if (page.length === 0) break;
+        for (const entry of page) {
+            const sig = entry?.signature;
+            if (!sig) continue;
+            if (collected.some((s) => s.signature === sig)) { keepPaging = false; break; } // dup at page boundary
+            const alreadyKnown = await dbGetAsync(
+                `SELECT 1 FROM treasury_scan_seen WHERE signature = ?
+                 UNION SELECT 1 FROM solana_payments WHERE tx_signature = ? LIMIT 1`,
+                [sig, sig]
+            );
+            if (alreadyKnown) { keepPaging = false; break; } // reached processed history
+            collected.push(entry);
+            if (collected.length >= TREASURY_SCAN_MAX_SIGS) break;
+        }
+        if (page.length < TREASURY_SCAN_PAGE_LIMIT) break; // exhausted history
+        beforeCursor = page[page.length - 1]?.signature;
+        if (!beforeCursor) break;
+        await treasurySleep(300);
+    }
+    return collected;
+};
+
 // Parse a PhotoLynk product memo -> {kind:'sub'|'premium', tierGb, duration, code} | null
 const treasuryParseMemo = (memo) => {
     if (typeof memo !== 'string') return null;
@@ -8815,45 +8872,21 @@ const treasuryScanOnce = async () => {
     const summary = { scanned: 0, credited: 0, already: 0, skipped: 0, errors: 0, startedAt: new Date().toISOString() };
     try {
         console.log('[TreasuryScan] run started');
-        // Page newest->oldest until we hit a signature we already know about
-        // (in treasury_scan_seen or solana_payments) or reach the per-run cap.
-        // Backlogged runs still reach every payment; steady-state runs stop
-        // after the first page.
+        // SKR arrives at the treasury ATA, SOL at the wallet itself - scan
+        // both, merge by signature, then process oldest->newest so crediting
+        // order matches on-chain order.
+        const scanAddresses = [SOLANA_PAYMENT_WALLET, ...(await treasuryGetTokenAccounts())];
+        console.log(`[TreasuryScan] scanning ${scanAddresses.length} address(es): ${scanAddresses.join(', ')}`);
+        const seenSigs = new Set();
         const sigInfos = [];
-        let beforeCursor = undefined;
-        let keepPaging = true;
-        while (keepPaging && sigInfos.length < TREASURY_SCAN_MAX_SIGS) {
-            const params = { limit: TREASURY_SCAN_PAGE_LIMIT, commitment: 'confirmed' };
-            if (beforeCursor) params.before = beforeCursor;
-            const sigRes = await axios.post(SOLANA_RPC_ENDPOINT, {
-                jsonrpc: '2.0',
-                id: 1,
-                method: 'getSignaturesForAddress',
-                params: [SOLANA_PAYMENT_WALLET, params],
-            }, { timeout: 30000 });
-            const page = Array.isArray(sigRes.data?.result) ? sigRes.data.result : [];
-            if (page.length === 0) break;
-            for (const entry of page) {
-                const sig = entry?.signature;
-                if (!sig) continue;
-                if (sigInfos.some((s) => s.signature === sig)) { keepPaging = false; break; } // dup at page boundary
-                const alreadyKnown = await dbGetAsync(
-                    `SELECT 1 FROM treasury_scan_seen WHERE signature = ?
-                     UNION SELECT 1 FROM solana_payments WHERE tx_signature = ? LIMIT 1`,
-                    [sig, sig]
-                );
-                if (alreadyKnown) { keepPaging = false; break; } // reached processed history
-                sigInfos.push(entry);
-                if (sigInfos.length >= TREASURY_SCAN_MAX_SIGS) break;
+        for (const addr of scanAddresses) {
+            const entries = await treasuryCollectSignatures(addr);
+            for (const e of entries) {
+                if (!seenSigs.has(e.signature)) { seenSigs.add(e.signature); sigInfos.push(e); }
             }
-            if (page.length < TREASURY_SCAN_PAGE_LIMIT) break; // exhausted history
-            beforeCursor = page[page.length - 1]?.signature;
-            if (!beforeCursor) break;
-            await treasurySleep(300);
         }
+        sigInfos.sort((a, b) => (Number(a.slot) || 0) - (Number(b.slot) || 0));
 
-        // Process oldest->newest so crediting order matches on-chain order.
-        sigInfos.reverse();
         for (const info of sigInfos) {
             const signature = info?.signature;
             if (!signature) continue;
