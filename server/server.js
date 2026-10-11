@@ -8674,11 +8674,393 @@ async function verifySkrTokenTransaction(txSignature, expectedUsd, expectedToken
     };
 }
 
+// ---------------------------------------------------------------------------
+// Treasury watchdog: periodically scans recent inflows to SOLANA_PAYMENT_WALLET
+// and credits subscription/premium payments that the client never reported
+// (app killed between broadcast and /verify-*, or a failed verify retry chain).
+//
+// Precision rules - a payment is only credited when attribution is certain:
+//   1. Signature must not already be in solana_payments (idempotent - client
+//      verify wins, scanner never double-credits).
+//   2. Memo must parse as PhotoLynk:sub:<tier>:<duration>[:<code>] or
+//      PhotoLynk:premium:0:premium[:<code>]. No memo / unparseable memo ->
+//      logged as 'no_memo' and NEVER credited (amount alone cannot identify
+//      the product or the buyer).
+//   3. User binding: a memo with a 4th-segment code binds via
+//      paymentCodeFor(userId). Without a code the sender wallet must match
+//      exactly one users.wallet_address row. Code present but resolving to a
+//      different user than the sender wallet -> 'conflict', never credited.
+//   4. The received amount still has to pass the same price-band check the
+//      verify endpoints use (guards against underpayment + price drift).
+//   5. Downgrade guard identical to the client path (storage > target tier ->
+//      'downgrade_blocked', never credited).
+//
+// treasury_scan_seen records one terminal outcome per signature so skipped txs
+// are not re-evaluated every cycle; transient RPC errors stay unmarked and are
+// retried on the next run.
+// ---------------------------------------------------------------------------
+
+const TREASURY_SCAN_INTERVAL_MS = 6 * 60 * 60 * 1000; // every 6h
+const TREASURY_SCAN_FIRST_DELAY_MS = 3 * 60 * 1000;   // 3min after boot
+const TREASURY_SCAN_PAGE_LIMIT = 100;                  // signatures per getSignaturesForAddress page
+const TREASURY_SCAN_MAX_SIGS = 500;                    // hard cap on signatures processed per run
+const TREASURY_SCAN_TX_DELAY_MS = 400;                 // spacing between getTransaction RPC calls
+let treasuryScanInFlight = false;
+
+const treasurySleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+const treasuryMarkSeen = async (signature, outcome, userId = null, detail = null) => {
+    try {
+        await dbRunAsync(
+            `INSERT OR REPLACE INTO treasury_scan_seen (signature, seen_at, outcome, user_id, detail)
+             VALUES (?, ?, ?, ?, ?)`,
+            [signature, Date.now(), outcome, userId, detail ? String(detail).slice(0, 500) : null]
+        );
+    } catch (e) {
+        console.warn('[TreasuryScan] markSeen failed:', e.message);
+    }
+};
+
+// Resolve a memo's optional 4th-segment payment code to a user id.
+// paymentCodeFor is an HMAC, so this is a per-user compare - fine at this
+// cadence (a few dozen txs every 6h).
+const treasuryUserByPaymentCode = async (code) => {
+    if (!code) return null;
+    try {
+        const users = await dbAllAsync(`SELECT id, email FROM users`, []);
+        for (const u of users || []) {
+            if (u && u.id && paymentCodeFor(u.id) === code) return u;
+        }
+    } catch (e) {
+        console.warn('[TreasuryScan] code lookup failed:', e.message);
+    }
+    return null;
+};
+
+// Exact single-wallet match - zero or multiple matches are both 'no user'.
+const treasuryUserByWallet = async (walletAddress) => {
+    if (!walletAddress) return null;
+    try {
+        const rows = await dbAllAsync(
+            `SELECT id, email FROM users WHERE wallet_address = ?`, [walletAddress]
+        );
+        if (rows && rows.length === 1) return rows[0];
+        if (rows && rows.length > 1) {
+            console.warn(`[TreasuryScan] wallet ${walletAddress} maps to ${rows.length} users - ambiguous, skipping attribution`);
+        }
+    } catch (e) {
+        console.warn('[TreasuryScan] wallet lookup failed:', e.message);
+    }
+    return null;
+};
+
+// Parse the treasury-bound deltas + sender out of a jsonParsed transaction.
+const treasuryExtractInflow = (tx) => {
+    const accountKeys = (tx?.transaction?.message?.accountKeys || []).map(
+        (k) => (typeof k === 'string' ? k : k?.pubkey || '')
+    );
+    const feePayer = accountKeys[0] || null;
+
+    // SOL delta on the payment wallet (lamports)
+    let solLamports = 0;
+    const walletIdx = accountKeys.indexOf(SOLANA_PAYMENT_WALLET);
+    if (walletIdx >= 0) {
+        const pre = Number(tx?.meta?.preBalances?.[walletIdx] || 0);
+        const post = Number(tx?.meta?.postBalances?.[walletIdx] || 0);
+        if (post > pre) solLamports = post - pre;
+    }
+
+    // SKR delta on the payment wallet's token accounts (raw units)
+    let skrRaw = 0;
+    let skrAuthority = null;
+    const preTokenBalances = Array.isArray(tx?.meta?.preTokenBalances) ? tx.meta.preTokenBalances : [];
+    const postTokenBalances = Array.isArray(tx?.meta?.postTokenBalances) ? tx.meta.postTokenBalances : [];
+    for (const postBalance of postTokenBalances) {
+        if (postBalance?.owner !== SOLANA_PAYMENT_WALLET) continue;
+        if (postBalance?.mint !== SKR_TOKEN_MINT) continue;
+        const preBalance = preTokenBalances.find((e) => e.accountIndex === postBalance.accountIndex);
+        const delta = Number(postBalance?.uiTokenAmount?.amount || 0) - Number(preBalance?.uiTokenAmount?.amount || 0);
+        if (delta > 0) skrRaw += delta;
+    }
+
+    // SPL transfer instruction also reveals the sending authority (owner wallet)
+    const allInstructions = [
+        ...(tx?.transaction?.message?.instructions || []),
+        ...((tx?.meta?.innerInstructions || []).flatMap((ii) => ii.instructions || [])),
+    ];
+    for (const ix of allInstructions) {
+        if (ix.program !== 'spl-token') continue;
+        const pType = ix.parsed?.type;
+        if (pType !== 'transfer' && pType !== 'transferChecked') continue;
+        const info = ix.parsed?.info;
+        if (info && info.authority) { skrAuthority = info.authority; break; }
+    }
+
+    return { solLamports, skrRaw, senderWallet: skrAuthority || feePayer };
+};
+
+// Parse a PhotoLynk product memo -> {kind:'sub'|'premium', tierGb, duration, code} | null
+const treasuryParseMemo = (memo) => {
+    if (typeof memo !== 'string') return null;
+    const sub = memo.match(/^PhotoLynk:sub:(\d+):(monthly|yearly)(?::([0-9a-fA-F]{4,64}))?$/);
+    if (sub) return { kind: 'sub', tierGb: Number(sub[1]), duration: sub[2], code: sub[3] || null };
+    const prem = memo.match(/^PhotoLynk:premium:0:premium(?::([0-9a-fA-F]{4,64}))?$/);
+    if (prem) return { kind: 'premium', tierGb: 0, duration: 'premium', code: prem[1] || null };
+    return null;
+};
+
+const treasuryScanOnce = async () => {
+    if (treasuryScanInFlight) return { ok: false, reason: 'already_running' };
+    treasuryScanInFlight = true;
+    const summary = { scanned: 0, credited: 0, already: 0, skipped: 0, errors: 0, startedAt: new Date().toISOString() };
+    try {
+        console.log('[TreasuryScan] run started');
+        // Page newest->oldest until we hit a signature we already know about
+        // (in treasury_scan_seen or solana_payments) or reach the per-run cap.
+        // Backlogged runs still reach every payment; steady-state runs stop
+        // after the first page.
+        const sigInfos = [];
+        let beforeCursor = undefined;
+        let keepPaging = true;
+        while (keepPaging && sigInfos.length < TREASURY_SCAN_MAX_SIGS) {
+            const params = { limit: TREASURY_SCAN_PAGE_LIMIT, commitment: 'confirmed' };
+            if (beforeCursor) params.before = beforeCursor;
+            const sigRes = await axios.post(SOLANA_RPC_ENDPOINT, {
+                jsonrpc: '2.0',
+                id: 1,
+                method: 'getSignaturesForAddress',
+                params: [SOLANA_PAYMENT_WALLET, params],
+            }, { timeout: 30000 });
+            const page = Array.isArray(sigRes.data?.result) ? sigRes.data.result : [];
+            if (page.length === 0) break;
+            for (const entry of page) {
+                const sig = entry?.signature;
+                if (!sig) continue;
+                if (sigInfos.some((s) => s.signature === sig)) { keepPaging = false; break; } // dup at page boundary
+                const alreadyKnown = await dbGetAsync(
+                    `SELECT 1 FROM treasury_scan_seen WHERE signature = ?
+                     UNION SELECT 1 FROM solana_payments WHERE tx_signature = ? LIMIT 1`,
+                    [sig, sig]
+                );
+                if (alreadyKnown) { keepPaging = false; break; } // reached processed history
+                sigInfos.push(entry);
+                if (sigInfos.length >= TREASURY_SCAN_MAX_SIGS) break;
+            }
+            if (page.length < TREASURY_SCAN_PAGE_LIMIT) break; // exhausted history
+            beforeCursor = page[page.length - 1]?.signature;
+            if (!beforeCursor) break;
+            await treasurySleep(300);
+        }
+
+        // Process oldest->newest so crediting order matches on-chain order.
+        sigInfos.reverse();
+        for (const info of sigInfos) {
+            const signature = info?.signature;
+            if (!signature) continue;
+            if (info?.err) { await treasuryMarkSeen(signature, 'tx_failed_onchain', null, JSON.stringify(info.err).slice(0, 300)); continue; }
+
+            // Idempotency: client verify already credited this signature
+            const existing = await dbGetAsync(`SELECT 1 FROM solana_payments WHERE tx_signature = ?`, [signature]);
+            if (existing) { await treasuryMarkSeen(signature, 'already_credited'); summary.already++; continue; }
+            const seen = await dbGetAsync(`SELECT 1 FROM treasury_scan_seen WHERE signature = ?`, [signature]);
+            if (seen) continue;
+
+            summary.scanned++;
+            let tx = null;
+            try {
+                const txRes = await axios.post(SOLANA_RPC_ENDPOINT, {
+                    jsonrpc: '2.0',
+                    id: 1,
+                    method: 'getTransaction',
+                    params: [signature, { encoding: 'jsonParsed', maxSupportedTransactionVersion: 0, commitment: 'confirmed' }],
+                }, { timeout: 30000 });
+                tx = txRes.data?.result || null;
+            } catch (e) {
+                console.warn(`[TreasuryScan] getTransaction RPC error for ${signature}:`, e.message);
+            }
+            if (!tx) { summary.errors++; continue; } // unmarked -> retried next run
+            await treasurySleep(TREASURY_SCAN_TX_DELAY_MS);
+
+            if (tx.meta && tx.meta.err) { await treasuryMarkSeen(signature, 'tx_failed_onchain'); continue; }
+
+            const { solLamports, skrRaw, senderWallet } = treasuryExtractInflow(tx);
+            if (solLamports <= 0 && skrRaw <= 0) { await treasuryMarkSeen(signature, 'no_inflow'); summary.skipped++; continue; }
+
+            const memo = extractPhotoLynkMemo(tx);
+            const parsed = treasuryParseMemo(memo);
+            if (!parsed) {
+                await treasuryMarkSeen(signature, 'no_memo', null,
+                    `sender=${senderWallet || 'unknown'} solLamports=${solLamports} skrRaw=${skrRaw} memo=${memo ? 'unparseable' : 'none'}`);
+                console.warn(`[TreasuryScan] ${signature}: inflow without valid PhotoLynk memo - sender=${senderWallet} sol=${solLamports} skrRaw=${skrRaw} - NOT credited`);
+                summary.skipped++;
+                continue;
+            }
+
+            // User binding: memo code is authoritative; fall back to sender
+            // wallet only when the memo carries no code.
+            let user = null;
+            if (parsed.code) {
+                user = await treasuryUserByPaymentCode(parsed.code);
+                if (!user) {
+                    await treasuryMarkSeen(signature, 'code_no_match', null, `code=${parsed.code} sender=${senderWallet}`);
+                    console.warn(`[TreasuryScan] ${signature}: payment code matched no user - NOT credited`);
+                    summary.skipped++;
+                    continue;
+                }
+                // If a sender wallet is known AND maps to a different user,
+                // the signals conflict - never guess.
+                const walletUser = await treasuryUserByWallet(senderWallet);
+                if (walletUser && walletUser.id !== user.id) {
+                    await treasuryMarkSeen(signature, 'conflict', null,
+                        `codeUser=${user.id} walletUser=${walletUser.id}`);
+                    console.warn(`[TreasuryScan] ${signature}: memo code vs sender wallet conflict (code->${user.id}, wallet->${walletUser.id}) - NOT credited`);
+                    summary.skipped++;
+                    continue;
+                }
+            } else {
+                user = await treasuryUserByWallet(senderWallet);
+                if (!user) {
+                    await treasuryMarkSeen(signature, 'no_user', null, `sender=${senderWallet} memo=${memo}`);
+                    console.warn(`[TreasuryScan] ${signature}: no memo code and sender ${senderWallet} matches no registered wallet - NOT credited`);
+                    summary.skipped++;
+                    continue;
+                }
+            }
+
+            const isSkr = skrRaw > 0;
+            const receivedUnits = isSkr
+                ? skrRaw / Math.pow(10, SKR_TOKEN_DECIMALS)
+                : solLamports / LAMPORTS_PER_SOL;
+
+            if (parsed.kind === 'sub') {
+                const normalizedTier = normalizeTierGb(parsed.tierGb);
+                if (!normalizedTier) {
+                    await treasuryMarkSeen(signature, 'bad_tier', user.id, `tier=${parsed.tierGb}`);
+                    summary.skipped++;
+                    continue;
+                }
+                // Downgrade guard - identical to the client verify path.
+                const currentPlanGb = await getUserPlanGb(user.id);
+                if (currentPlanGb && normalizedTier < currentPlanGb) {
+                    const canDowngrade = await canDowngradeToTier(user.id, normalizedTier);
+                    if (!canDowngrade) {
+                        await treasuryMarkSeen(signature, 'downgrade_blocked', user.id, `target=${normalizedTier}GB current=${currentPlanGb}GB`);
+                        console.warn(`[TreasuryScan] ${signature}: would downgrade user ${user.id} below storage usage - NOT credited`);
+                        summary.skipped++;
+                        continue;
+                    }
+                }
+                const expectedUsd = (PLAN_PRICES_USD[normalizedTier] || 0) * (parsed.duration === 'yearly' ? 12 : 1) * (isSkr ? SKR_SUBSCRIPTION_MULTIPLIER : 1);
+                const band = await getPriceBand(isSkr ? 'skr' : 'sol');
+                if (!band) { summary.errors++; continue; } // retryable next run
+                const evalResult = evaluatePaymentAmount({ receivedUnits, expectedUsd, band });
+                if (!evalResult.ok) {
+                    await treasuryMarkSeen(signature, 'underpaid', user.id,
+                        `received=${receivedUnits} min=${evalResult.minAcceptable} expectedUsd=${expectedUsd}`);
+                    console.warn(`[TreasuryScan] ${signature}: underpaid for user ${user.id} (received ${receivedUnits}, min ${evalResult.minAcceptable}) - NOT credited`);
+                    summary.skipped++;
+                    continue;
+                }
+
+                const now = Date.now();
+                const durationMs = PLAN_DURATION_MS[parsed.duration] || PLAN_DURATION_MS.monthly;
+                const currentPlan = await dbGetAsync(`SELECT * FROM user_plans WHERE user_id = ?`, [user.id]);
+                const solanaExpiry = computePaidSubscriptionExpiry({ currentPlan, purchaseAt: now, durationMs });
+                const expiresAt = solanaExpiry.expiresAt;
+
+                await dbRunAsync(
+                    `INSERT INTO solana_payments (user_id, tx_signature, sol_amount, skr_amount, payment_token, tier_gb, duration, created_at, verified_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    [user.id, signature, isSkr ? 0 : receivedUnits, isSkr ? receivedUnits : 0, isSkr ? 'SKR' : 'SOL', normalizedTier, parsed.duration, now, now]
+                );
+                await dbRunAsync(
+                    `INSERT INTO user_plans (user_id, plan_gb, status, expires_at, trial_carryover_applied_at, updated_at)
+                     VALUES (?, ?, 'active', ?, ?, ?)
+                     ON CONFLICT(user_id) DO UPDATE SET
+                        plan_gb = excluded.plan_gb,
+                        status = 'active',
+                        expires_at = MAX(COALESCE(user_plans.expires_at, 0), excluded.expires_at),
+                        trial_carryover_applied_at = COALESCE(excluded.trial_carryover_applied_at, user_plans.trial_carryover_applied_at),
+                        payment_type = ?,
+                        payment_at = excluded.updated_at,
+                        grace_until = NULL,
+                        deleted_at = NULL,
+                        updated_at = excluded.updated_at`,
+                    [user.id, normalizedTier, expiresAt, solanaExpiry.trialCarryoverAppliedAt, now, isSkr ? 'skr' : 'solana']
+                );
+                try {
+                    if (normalizedTier >= ECO_BIND_MIN_TIER_GB) {
+                        const uw = await dbGetAsync(`SELECT wallet_address FROM users WHERE id = ?`, [user.id]);
+                        const acct = await ecoEnsureAccount('photolynk', user.id, uw?.wallet_address || null, { verified: true });
+                        await ecoFloorSub(acct, expiresAt, { sourceApp: 'photolynk', kind: 'payment', provenance: signature, allowRevoked: true });
+                    }
+                } catch (e) { console.warn('[TreasuryScan] Eco mirror failed:', e.message); }
+
+                await treasuryMarkSeen(signature, 'credited_sub', user.id, `tier=${normalizedTier}GB ${parsed.duration} ${isSkr ? 'SKR' : 'SOL'} expires=${new Date(expiresAt).toISOString()}`);
+                console.log(`[TreasuryScan] CREDITED user ${user.id} (${user.email}): ${normalizedTier}GB ${parsed.duration} via ${signature}`);
+                summary.credited++;
+            } else {
+                // Premium payment detected + attributed, but premium activation
+                // (nftService + capacity-gated storage allocation) lives in the
+                // NFT block scope. A half-done auto-credit is worse than a
+                // manual one - log it for the admin instead of crediting.
+                const expectedUsd = PREMIUM_PRICE_USD * (isSkr ? SKR_PREMIUM_MULTIPLIER : 1);
+                const band = await getPriceBand(isSkr ? 'skr' : 'sol');
+                if (!band) { summary.errors++; continue; }
+                const evalResult = evaluatePaymentAmount({ receivedUnits, expectedUsd, band });
+                await treasuryMarkSeen(signature, 'premium_manual', user.id,
+                    `attributed premium payment ${isSkr ? 'SKR' : 'SOL'} amount=${receivedUnits} bandOk=${evalResult.ok} - needs manual admin credit`);
+                console.warn(`[TreasuryScan] ${signature}: attributed PREMIUM payment for user ${user.id} (${user.email}), amount ${receivedUnits} ${isSkr ? 'SKR' : 'SOL'} - logged for manual credit, not auto-applied`);
+                summary.skipped++;
+                continue;
+            }
+        }
+        summary.finishedAt = new Date().toISOString();
+        console.log('[TreasuryScan] run complete:', JSON.stringify(summary));
+        return { ok: true, ...summary };
+    } catch (e) {
+        summary.errors++;
+        console.error('[TreasuryScan] run failed:', e.message);
+        return { ok: false, error: e.message, ...summary };
+    } finally {
+        treasuryScanInFlight = false;
+    }
+};
+
+// 6h cadence + one early run after boot. .unref so the interval never holds
+// the process open on its own.
+setTimeout(() => { treasuryScanOnce().catch(() => {}); }, TREASURY_SCAN_FIRST_DELAY_MS).unref?.();
+setInterval(() => { treasuryScanOnce().catch(() => {}); }, TREASURY_SCAN_INTERVAL_MS).unref?.();
+
+// Manual trigger + outcome visibility for the admin panel.
+app.post('/api/admin/treasury-scan', adminAuth, async (req, res) => {
+    const result = await treasuryScanOnce();
+    res.json(result);
+});
+
+app.get('/api/admin/treasury-scan-log', adminAuth, async (req, res) => {
+    try {
+        const rows = await dbAllAsync(
+            `SELECT signature, seen_at, outcome, user_id, detail FROM treasury_scan_seen ORDER BY seen_at DESC LIMIT 200`, []
+        );
+        res.json({ entries: rows });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
+});
+
 // PaceSeeker device-bound trial registry. First-write-wins on trial start so a
 // reinstall keeps the original expiry instead of resetting the clock.
 // Serialized: unsynchronized ALTERs race each other for the schema lock and a
 // random subset silently fails (the empty callbacks swallow SQLITE_BUSY).
 db.serialize(() => {
+    db.run(`CREATE TABLE IF NOT EXISTS treasury_scan_seen (
+        signature TEXT PRIMARY KEY,
+        seen_at INTEGER,
+        outcome TEXT,
+        user_id INTEGER,
+        detail TEXT
+    )`);
     db.run(`CREATE TABLE IF NOT EXISTS paceseeker_devices (
         device_hash TEXT PRIMARY KEY,
         first_seen INTEGER,
