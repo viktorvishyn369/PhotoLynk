@@ -16,6 +16,7 @@ const nacl = require('tweetnacl');
 const naclUtil = require('tweetnacl-util');
 const updater = require('./updater');
 const paymentRecovery = require('./paymentRecovery');
+const { ensurePaceSeekerSchema, createSubscriptionReadiness } = require('./subscriptionSchema');
 let sharp;
 try { sharp = require('sharp'); console.log('[Server] sharp loaded'); } catch (e) { sharp = null; console.log('[Server] sharp failed to load:', e.message); }
 
@@ -358,6 +359,11 @@ app.use('/api/nft/ipfs-pin', express.raw({ type: '*/*', limit: '40mb' }));
 // Allow larger JSON payloads (on-chain SVG data URIs for NFT payment image tokens)
 app.use(express.json({ limit: '25mb' }));
 
+const subscriptionReadiness = createSubscriptionReadiness();
+for (const prefix of ['/api/ecosystem', '/api/paceseeker', '/api/solana', '/api/subscription', '/api/premium', '/api/cloud', '/admin/api']) {
+    app.use(prefix, subscriptionReadiness.middleware);
+}
+
 // Serve static files from public directory (company website assets)
 app.use('/images', express.static(path.join(__dirname, 'public', 'images')));
 app.use('/paceseeker', express.static(path.join(__dirname, 'public', 'paceseeker')));
@@ -572,6 +578,10 @@ table{min-width:100%;width:auto}
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
     <input type="text" id="search" placeholder="Search by user, .skr, email, ID, status, plan..." oninput="applyFilters()"/>
   </div>
+  <select id="ps-presence-filter" style="display:none;padding:6px 10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:12px;font-weight:600" onchange="loadPsUsers()">
+    <option value="all" selected>All accounts</option>
+    <option value="recent">Recently online</option>
+  </select>
   <div class="filter-pills" id="status-filters"></div>
 </div>
 <div class="table-wrap">
@@ -703,6 +713,7 @@ function switchApp(app){
   document.getElementById('eco-table').style.display='none';
   document.getElementById('eco-claims').style.display='none';
   document.getElementById('empty').style.display='none';
+  document.getElementById('ps-presence-filter').style.display=ps?'':'none';
   document.getElementById('search').placeholder=ps?'Search device hash, IP, wallet or SNS name...':eco?'Search account id, wallet, handle or identity...':'Search by user, .skr, email, ID, status, plan...';
   if(eco){
     if(ecoLoaded){document.getElementById('eco-table').style.display='';updateStats();buildFilters();applyFilters()}
@@ -792,7 +803,9 @@ function ecoSubAction(accountId,action){
 
 async function loadPsUsers(){
   try{
-    var r=await fetch('/admin/api/paceseeker-users');var d=await r.json();
+    var psel=document.getElementById('ps-presence-filter');
+    var url=(psel&&psel.value==='recent')?'/admin/api/paceseeker-users':'/admin/api/paceseeker-users?all=1';
+    var r=await fetch(url);var d=await r.json();
     if(!r.ok)throw new Error(d.error||'Failed');
     serverTime=d.server_time||'';
     psUsers=d.users||[];psRevenue=d.revenue||{count:0,usd:0};psLoaded=true;
@@ -903,16 +916,19 @@ function payTip(u){var p=[];if(u.sub_paid_at_date)p.push('paid '+new Date(u.sub_
 
 function subBadge(st,untilIso,u){
   var m={paid:{t:'Paid',c:'var(--success)'},invite:{t:'Invite',c:'var(--accent)'},trial:{t:'Trial',c:'var(--trial)'}};var s=m[st];
+  var verified=u&&u.payment_verification==='chain_checked';
+  if(st==='paid')s={t:verified?'Chain checked':'Reported paid',c:'var(--success)'};
   var pay=u&&u.sub_signature?u:null;
   var eco=u&&u.eco_sub_until&&u.eco_sub_until>Date.now()?u:null;
   // Expired/no active sub but a past payment was recorded - keep provenance visible.
   if(!s&&!eco){
-    if(pay)return'<span class="mini-tag" style="color:var(--muted);cursor:pointer" title="'+payTip(pay)+' - click to copy sig" onclick="copyUuid(this,&apos;'+pay.sub_signature+'&apos;)">ex-paid</span>';
+    if(pay)return'<span class="mini-tag" style="color:var(--muted);cursor:pointer" title="'+payTip(pay)+' (client-reported) - click to copy sig" onclick="copyUuid(this,&apos;'+pay.sub_signature+'&apos;)">ex-paid</span>';
     return'<span class="date-cell">-</span>';
   }
   var tip=untilIso?new Date(untilIso).toLocaleDateString('en-GB',{day:'2-digit',month:'short'}):'';
   var copyable=pay&&st==='paid';
-  var title=(untilIso?('until '+new Date(untilIso).toLocaleString()):'')+(pay?('\\n'+payTip(pay)+(copyable?' - click to copy sig':'')):'');
+  var title=(untilIso?('until '+new Date(untilIso).toLocaleString()+' (client-reported)'):'')+(pay?('\\n'+payTip(pay)+(copyable?' - click to copy sig':'')):'');
+  if(st==='paid')title+='\\n'+(verified?'Payment verified on-chain':'Payment reported by client - not yet chain-verified');
   var ecoKind=u&&u.eco_source_kind==='ad_claim'?'·Ad':u&&u.eco_source_kind==='payment'?'·Paid':'';
   var ecoTag=eco?(' <span class="mini-tag" style="color:var(--accent)" title="StealthLynk ecosystem sub ('+(u.eco_source_kind||'?')+') until '+new Date(u.eco_sub_until_date||u.eco_sub_until).toLocaleString()+'">Eco'+ecoKind+'</span>'):'';
   if(!s&&eco)return'<span class="mini-tag" style="color:var(--success)" title="'+(u.eco_source_kind||'ecosystem')+'">Eco'+(u.eco_source_kind==='ad_claim'?' Ad':'')+(u.eco_sub_until_date?'&nbsp;'+new Date(u.eco_sub_until_date).toLocaleDateString('en-GB',{day:'2-digit',month:'short'}):'')+'</span>';
@@ -969,7 +985,7 @@ async function loadUsers(){
     adminStats=d.admin_stats||adminStats;
     solPriceUsd=d.sol_price_usd||0;
     skrPriceUsd=d.skr_price_usd||0;
-    allUsers=d.users.map(function(u){return{id:u.id,email:u.email||'',alias_email:u.alias_email||'',display_handle:u.display_handle||'',user_uuid:u.user_uuid||'',device_uuids:u.device_uuids||'',last_login:u.last_login||0,last_login_date:u.last_login_date,storage_used:u.storage_used_bytes||0,storage_quota:u.storage_quota_bytes||0,file_count:u.file_count||0,plan_gb:u.plan.plan_gb||0,premium_gb:u.plan.premium_gb||0,status:u.plan.effective_status||u.plan.status||'none',trial_until:u.plan.trial_until,trial_until_date:u.plan.trial_until_date,expires_at:u.plan.expires_at,expires_at_date:u.plan.expires_at_date,grace_until:u.plan.grace_until,created_at:u.user_created_at,created_at_date:u.user_created_at_date,payment_type:u.plan.payment_type||'',payment_at:u.plan.payment_at,payment_at_date:u.plan.payment_at_date,updated_at:u.plan.updated_at,updated_at_date:u.plan.updated_at_date,nft_is_premium:u.nft.is_premium,nft_mints:u.nft.mint_count||0,nft_paid_mints:u.nft.paid_mint_count||0,nft_free_premium_mints:u.nft.free_premium_mint_count||0,nft_premium_total_mints:u.nft.premium_mint_count||0,nft_free_remaining:u.nft.free_mints_remaining||0,nft_balance:u.nft.balance_usd||0,nft_total_paid:u.nft.total_paid_usd||0,nft_total_purchased:u.nft.total_purchased_usd||0,nft_total_spent:u.nft.total_spent_usd||0,nft_payments:u.nft.payments||[],sol_payments:u.solana.payments||[],sol_total_paid:u.solana.total_paid_sol||0,skr_total_paid:u.solana.total_paid_skr||0,sol_usd_realtime:u.solana.sol_usd_realtime||0,skr_usd_realtime:u.solana.skr_usd_realtime||0,apple_google_usd:u.apple_google_usd||0,total_usd_realtime:u.total_usd_realtime||0,total_paid:(u.total_usd_realtime||0),eco_account_id:u.eco_account_id||null,eco_sub_until:u.eco_sub_until||0,eco_sub_until_date:u.eco_sub_until_date||null,eco_source_kind:u.eco_source_kind||'',eco_source_app:u.eco_source_app||''}});
+    allUsers=d.users.map(function(u){return{id:u.id,email:u.email||'',alias_email:u.alias_email||'',display_handle:u.display_handle||'',user_uuid:u.user_uuid||'',device_uuids:u.device_uuids||'',last_login:u.last_login||0,last_login_date:u.last_login_date,storage_used:u.storage_used_bytes||0,storage_quota:u.storage_quota_bytes||0,file_count:u.file_count||0,plan_gb:u.plan.plan_gb||0,premium_gb:u.plan.premium_gb||0,premium_expires_at:u.plan.premium_expires_at_date||null,premium_gb_allocated:u.plan.premium_gb_allocated||0,status:u.plan.effective_status||u.plan.status||'none',trial_until:u.plan.trial_until,trial_until_date:u.plan.trial_until_date,expires_at:u.plan.expires_at,expires_at_date:u.plan.expires_at_date,grace_until:u.plan.grace_until,created_at:u.user_created_at,created_at_date:u.user_created_at_date,payment_type:u.plan.payment_type||'',payment_at:u.plan.payment_at,payment_at_date:u.plan.payment_at_date,updated_at:u.plan.updated_at,updated_at_date:u.plan.updated_at_date,nft_is_premium:u.nft.is_premium,nft_mints:u.nft.mint_count||0,nft_paid_mints:u.nft.paid_mint_count||0,nft_free_premium_mints:u.nft.free_premium_mint_count||0,nft_premium_total_mints:u.nft.premium_mint_count||0,nft_free_remaining:u.nft.free_mints_remaining||0,nft_balance:u.nft.balance_usd||0,nft_total_paid:u.nft.total_paid_usd||0,nft_total_purchased:u.nft.total_purchased_usd||0,nft_total_spent:u.nft.total_spent_usd||0,nft_payments:u.nft.payments||[],sol_payments:u.solana.payments||[],sol_total_paid:u.solana.total_paid_sol||0,skr_total_paid:u.solana.total_paid_skr||0,sol_usd_realtime:u.solana.sol_usd_realtime||0,skr_usd_realtime:u.solana.skr_usd_realtime||0,apple_google_usd:u.apple_google_usd||0,total_usd_realtime:u.total_usd_realtime||0,total_paid:(u.total_usd_realtime||0),eco_account_id:u.eco_account_id||null,eco_sub_until:u.eco_sub_until||0,eco_sub_until_date:u.eco_sub_until_date||null,eco_source_kind:u.eco_source_kind||'',eco_source_app:u.eco_source_app||''}});
     updateStats();buildFilters();applyFilters();
     document.getElementById('loading').style.display='none';
     if(activeApp==='photolynk')document.getElementById('users-table').style.display='';
@@ -993,8 +1009,11 @@ function updateStats(){
     var precent=psUsers.filter(function(u){return u.last_seen&&(Date.now()-u.last_seen)<86400000*7}).length;
     var ponline=psUsers.filter(function(u){return u.last_seen&&(Date.now()-u.last_seen)<150000}).length;
     var psubs=psUsers.filter(function(u){return u.sub_status==='paid'||u.sub_status==='invite'}).length;
+    var pexpired=psUsers.filter(function(u){return u.status==='expired'}).length;
+    var pverified=psRevenue.verifiedCount||0;
+    var ppending=psRevenue.pendingCount||0;
     var pst=serverTime?'<span>Server: <b>'+new Date(serverTime).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+'</b></span>':'';
-    document.getElementById('header-stats').innerHTML=pst+'<span>Devices: <b>'+ptotal+'</b></span><span>Online: <b>'+ponline+'</b></span><span>In trial: <b>'+ptrials+'</b></span><span>Subs: <b>'+psubs+'</b></span><span>Expired: <b>'+(ptotal-ptrials)+'</b></span><span>7d active: <b>'+precent+'</b></span><span>Revenue: <b>$'+(psRevenue.usd||0).toFixed(2)+'</b></span><span>Payments: <b>'+(psRevenue.count||0)+'</b></span>';
+    document.getElementById('header-stats').innerHTML=pst+'<span>Devices: <b>'+ptotal+'</b></span><span>Online: <b>'+ponline+'</b></span><span>In trial: <b>'+ptrials+'</b></span><span>Reported paid/invite: <b>'+psubs+'</b></span><span>Expired: <b>'+pexpired+'</b></span><span>7d active: <b>'+precent+'</b></span><span>Reported checkout USD (unverified): <b>$'+(psRevenue.usd||0).toFixed(2)+'</b></span><span>Reported payments: <b>'+(psRevenue.count||0)+'</b></span><span>Chain-checked: <b>'+pverified+'</b></span><span>Pending reports: <b>'+ppending+'</b></span>';
     return;
   }
   var total=allUsers.length;
@@ -1556,6 +1575,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 p.grace_until,
                 p.payment_type,
                 p.payment_at,
+                p.deleted_at,
                 p.updated_at as plan_updated_at,
                 COALESCE(cc.storage_used, 0) AS storage_used_bytes,
                 COALESCE(fc.file_count, 0) AS file_count
@@ -1621,39 +1641,6 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
         } catch (_) { }
 
         // Compute effective subscription status from raw plan fields (read-only, mirrors resolveSubscriptionState)
-        const computeEffectiveStatus = (u) => {
-            const now = Date.now();
-            const dbStatus = u.plan_status || 'none';
-            const expiresAt = u.expires_at ? Number(u.expires_at) : null;
-            const graceUntil = u.grace_until ? Number(u.grace_until) : null;
-            const trialUntil = u.trial_until ? Number(u.trial_until) : null;
-            const premGb = u.premium_gb && Number(u.premium_gb) > 0 ? Number(u.premium_gb) : 0;
-            const complimentaryMs = Math.max(0, TRIAL_COMPLIMENTARY_DAYS) * 24 * 60 * 60 * 1000;
-            const complimentaryUntil = trialUntil ? (trialUntil + complimentaryMs) : null;
-            const graceMs = Math.max(0, SUBSCRIPTION_GRACE_DAYS) * 24 * 60 * 60 * 1000;
-
-            // Active paid plans still expire. Expired active accounts go through grace → expired like everyone else.
-            if (dbStatus === 'active' || dbStatus === 'grace') {
-                if (!expiresAt || expiresAt > now) return 'active';
-                const gu = graceUntil && graceUntil > 0 ? graceUntil : (expiresAt + graceMs);
-                const inGrace = gu && gu > 0 ? now <= gu : false;
-                return premGb > 0 ? 'premium_only' : (inGrace ? 'grace' : 'expired');
-            }
-            if (trialUntil && trialUntil > now) return 'trial';
-            if (dbStatus === 'trial' && trialUntil && trialUntil > 0 && complimentaryUntil && now <= complimentaryUntil) {
-                return premGb > 0 ? 'premium_only' : 'trial_complimentary';
-            }
-            if (dbStatus === 'trial' && trialUntil && trialUntil > 0 && complimentaryUntil && complimentaryUntil < now) {
-                return premGb > 0 ? 'premium_only' : 'trial_complimentary_expired';
-            }
-            if (expiresAt && expiresAt > 0 && expiresAt <= now) {
-                const gu = graceUntil && graceUntil > 0 ? graceUntil : (expiresAt + graceMs);
-                const inGrace = gu && gu > 0 ? now <= gu : false;
-                return premGb > 0 ? 'premium_only' : (inGrace ? 'grace' : 'expired');
-            }
-            return premGb > 0 ? 'premium_only' : dbStatus;
-        };
-
         const countStoredNftImages = (user) => {
             try {
                 const keys = new Set();
@@ -1720,7 +1707,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
         // Fetch real-time crypto prices for USD conversion
         const [solPriceUsd, skrPriceUsd] = await Promise.all([fetchSolPriceUsd(), fetchSkrPriceUsd()]);
 
-        const formattedUsers = users.map(user => {
+        const formattedUsers = await Promise.all(users.map(async user => {
             const nftPayments = nftPaymentsByUser[user.id] || [];
             const premium = nftPremiumByUser[user.id] || {};
             const nftMintStats = nftMintStatsByUser[user.id] || {};
@@ -1757,11 +1744,12 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
             }
             const totalUsdRealtime = totalNftPaid + solUsdRealtime + skrUsdRealtime + appleGoogleUsd;
             // Compute effective storage quota in bytes
-            const planQuotaBytes = (user.plan_gb || 0) * 1073741824;
-            const premiumQuotaBytes = premium.cloudQuotaBytes || ((user.premium_gb || 0) * 1073741824);
-            const totalQuotaBytes = planQuotaBytes + premiumQuotaBytes;
-
-            const effectiveStatus = computeEffectiveStatus(user);
+            // Active paid plans still expire. Expired active accounts go through grace → expired like everyone else.
+            const planRow = { ...user, status: user.plan_status, updated_at: user.plan_updated_at };
+            const quotaProfile = getUserQuotaProfileFromRow(planRow);
+            const totalQuotaBytes = Math.floor(quotaProfile.totalQuotaGb * GB_BYTES);
+            const entitlement = await resolveSubscriptionState(user.id, { readOnly: true, planRow, knownUsedBytes: user.storage_used_bytes || 0, knownQuotaBytes: totalQuotaBytes });
+            const effectiveStatus = entitlement.status;
             const displayHandle = deriveAdminDisplayHandle(user.seeker_id, user.alias_email, user.email);
             const ecoRow = ecoByUser[String(user.id)] || null;
             const ecoUntil = Number(ecoRow?.eco_sub_until) || 0;
@@ -1784,7 +1772,8 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 file_count: user.file_count || 0,
                 plan: {
                     plan_gb: user.plan_gb,
-                    premium_gb: user.premium_gb,
+                    premium_gb: quotaProfile.premiumGb,
+                    premium_gb_allocated: user.premium_gb,
                     premium_expires_at: user.premium_expires_at,
                     premium_expires_at_date: user.premium_expires_at ? new Date(user.premium_expires_at).toISOString() : null,
                     status: user.plan_status,
@@ -1831,7 +1820,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 eco_source_kind: ecoRow?.eco_source_kind || '',
                 eco_source_app: ecoRow?.eco_source_app || '',
             };
-        });
+        }));
 
         return res.json({
             total_users: formattedUsers.length,
@@ -2452,16 +2441,16 @@ const getUserQuotaProfileFromRow = (row, now = Date.now()) => {
 // === SUBSCRIPTION_STATE_BEGIN ===
 // readOnly suppresses the lazy state transitions - used for the single
 // re-resolve after a CAS miss (never recurse a write path on stale data).
-const resolveSubscriptionState = async (userId, { readOnly = false } = {}) => {
+const resolveSubscriptionState = async (userId, { readOnly = false, planRow, knownUsedBytes, knownQuotaBytes } = {}) => {
     const now = Date.now();
-    const row = await ensurePlanRow(userId);
+    const row = readOnly && planRow !== undefined ? planRow : await ensurePlanRow(userId);
     if (!row) return { allowed: false, status: 'none', premiumGb: 0, usedBytes: 0, quotaBytes: 0 };
     const planInfo = getUserQuotaProfileFromRow(row, now);
     const { planGb, premiumGb, expiresAt, graceUntil, trialUntil, complimentaryUntil, deletedAt, updatedAt, paidPlanActive, trialActive } = planInfo;
 
     // Always compute accurate usage + quota so the app can display it regardless of plan state
-    const usedBytes = await getUserUsedBytes(userId);
-    const quotaBytes = await getUserQuotaBytes(userId);
+    const usedBytes = readOnly && knownUsedBytes !== undefined ? knownUsedBytes : await getUserUsedBytes(userId);
+    const quotaBytes = readOnly && knownQuotaBytes !== undefined ? knownQuotaBytes : await getUserQuotaBytes(userId);
 
     const resolvePremiumState = async (overflowStatus, extra = {}) => {
         const premiumQuotaBytes = premiumGb > 0 ? Math.floor(premiumGb * GB_BYTES) : 0;
@@ -2714,6 +2703,9 @@ const requireUploadSubscription = async (req, res, next) => {
     }
 };
 
+let resolveUserPlansMigration;
+const userPlansMigrationDone = new Promise((resolve) => { resolveUserPlansMigration = resolve; });
+
 db.serialize(() => {
     // Users table
     db.run(`CREATE TABLE IF NOT EXISTS users (
@@ -2841,7 +2833,7 @@ db.serialize(() => {
 
     // Migrate existing DBs: add missing columns to user_plans
     db.all(`PRAGMA table_info(user_plans)`, [], (err, cols) => {
-        if (err) return;
+        if (err) { resolveUserPlansMigration(); return; }
         const names = Array.isArray(cols) ? cols.map(c => c && c.name).filter(Boolean) : [];
         if (!names.includes('plan_gb')) {
             db.run(`ALTER TABLE user_plans ADD COLUMN plan_gb INTEGER`, [], () => { });
@@ -2893,7 +2885,7 @@ db.serialize(() => {
         }
 
         db.all(`PRAGMA table_info(user_plans)`, [], (err2, cols2) => {
-            if (err2) return;
+            if (err2) { resolveUserPlansMigration(); return; }
             const names2 = Array.isArray(cols2) ? cols2.map(c => c && c.name).filter(Boolean) : [];
             const now = Date.now();
 
@@ -2939,6 +2931,7 @@ db.serialize(() => {
                     }
                 );
             }
+            resolveUserPlansMigration();
         });
     });
 
@@ -5194,6 +5187,11 @@ const ECO_CLAIM_RECHECK_MS = 20 * 60 * 1000;
 const ECO_CLAIM_MAX_ATTEMPTS = 6;
 async function ecoRecheckPendingClaims() {
     try {
+        const schemaErr = await subscriptionReadiness.wait;
+        if (schemaErr) {
+            console.warn('[Eco] claim recheck skipped - subscription schema unavailable:', schemaErr.message);
+            return;
+        }
         const rows = await dbAllAsync(
             `SELECT id, account_id, platform, post_url, code FROM ad_claims
              WHERE status = 'pending' AND verify_attempts < ? ORDER BY created_at ASC LIMIT 25`,
@@ -6297,7 +6295,12 @@ async function verifyPsPaymentTx(signature) {
     const ixs = [...(msg.instructions || []), ...((tx.meta?.innerInstructions || []).flatMap(i => i.instructions || []))];
     const hasMemo = ixs.some(ix => {
         const pid = ix.programId || '';
-        const data = typeof ix.parsed === 'string' ? ix.parsed : (ix.data ? Buffer.from(ix.data, 'base64').toString('utf8') : '');
+        let data = '';
+        if (typeof ix.parsed === 'string') data = ix.parsed;
+        else if (ix.data) {
+            const decoded = paymentRecovery.base58Decode(String(ix.data));
+            if (decoded) data = Buffer.from(decoded).toString('utf8');
+        }
         return (pid === 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr' || pid === 'Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo') && data.startsWith('PS1|');
     });
     if (!hasMemo) return fail();
@@ -6425,19 +6428,30 @@ app.get('/admin/api/paceseeker-users', adminAuth, (req, res) => {
     // but are hidden from the admin list so stale rows don't clutter the view.
     const cutoff = now - 3600000;
     const showAll = req.query.all === '1'; // escape hatch: /admin/api/paceseeker-users?all=1 lists dormant devices too
-    db.all(showAll ? 'SELECT * FROM paceseeker_devices ORDER BY last_seen DESC' : 'SELECT * FROM paceseeker_devices WHERE last_seen >= ? ORDER BY last_seen DESC', showAll ? [] : [cutoff], (err, rows) => {
+    const deviceSql = `SELECT d.*, COALESCE(r.eco_verified,0) AS payment_verified
+        FROM paceseeker_devices d
+        LEFT JOIN paceseeker_revenue r ON r.signature = d.sub_signature AND r.device_hash = d.device_hash`;
+    db.all(showAll ? deviceSql + ' ORDER BY d.last_seen DESC' : deviceSql + ' WHERE d.last_seen >= ? ORDER BY d.last_seen DESC', showAll ? [] : [cutoff], (err, rows) => {
         if (err) {
             return res.status(500).json({ error: err.message });
         }
         // Lifetime revenue from the append-only ledger - counts every payment
         // ever reported, including devices since hidden or purged.
-        db.get('SELECT COUNT(*) AS cnt, COALESCE(SUM(usd_at_checkout),0) AS usd FROM paceseeker_revenue', [], (eR, rev) => {
+        db.get('SELECT COUNT(*) AS cnt, COALESCE(SUM(usd_at_checkout),0) AS usd, COALESCE(SUM(CASE WHEN eco_verified = 1 THEN 1 ELSE 0 END),0) AS verified_count FROM paceseeker_revenue', [], (eR, rev) => {
+        if (eR) {
+            return res.status(500).json({ error: eR.message });
+        }
         db.all(`SELECT m.identity, m.account_id, s.sub_until AS eco_sub_until, s.source_kind AS eco_source_kind FROM ecosystem_members m LEFT JOIN stealthlynk_subs s ON s.account_id = m.account_id WHERE m.app = 'paceseeker'`, [], (eM, mems) => {
+        if (eM) {
+            return res.status(500).json({ error: eM.message });
+        }
         const ecoByDevice = {};
         (mems || []).forEach(m => { ecoByDevice[m.identity] = m; });
+        const revCount = (rev && rev.cnt) || 0;
+        const revVerified = (rev && rev.verified_count) || 0;
         res.json({
             server_time: new Date().toISOString(),
-            revenue: { count: (rev && rev.cnt) || 0, usd: (rev && rev.usd) || 0 },
+            revenue: { count: revCount, usd: (rev && rev.usd) || 0, verifiedCount: revVerified, pendingCount: revCount - revVerified, usdSource: 'client_reported' },
             users: (rows || []).map(r => {
                 const eco = ecoByDevice[r.device_hash];
                 const ecoUntil = Number(eco && eco.eco_sub_until) || 0;
@@ -6456,6 +6470,7 @@ app.get('/admin/api/paceseeker-users', adminAuth, (req, res) => {
                 sub_status: r.sub_status || 'none',
                 sub_until: r.sub_until || null,
                 sub_signature: r.sub_signature || '',
+                payment_verification: !r.sub_signature ? 'none' : (Number(r.payment_verified) === 1 ? 'chain_checked' : 'reported'),
                 ad_until: r.ad_until || null,
                 ad_until_date: r.ad_until ? new Date(r.ad_until).toISOString() : null,
                 sub_paid_at: r.sub_paid_at || null,
@@ -9224,6 +9239,12 @@ const treasuryScanOnce = async () => {
     treasuryScanInFlight = true;
     const summary = { scanned: 0, credited: 0, already: 0, skipped: 0, errors: 0, startedAt: new Date().toISOString() };
     try {
+        const schemaErr = await subscriptionReadiness.wait;
+        if (schemaErr) {
+            summary.finishedAt = new Date().toISOString();
+            console.warn('[TreasuryScan] skipped - subscription schema unavailable:', schemaErr.message);
+            return { ok: false, reason: 'schema_unavailable', error: schemaErr.message, ...summary };
+        }
         console.log('[TreasuryScan] run started');
 
         // Premium ledger rows whose entitlement never finished applying
@@ -17549,6 +17570,13 @@ const startHttps = () => {
         });
     }
 };
+
+userPlansMigrationDone.then(() => ensurePaceSeekerSchema(db)).then(
+    () => subscriptionReadiness.finish(null),
+    (err) => {
+        console.error('[Schema] subscription schema unavailable:', err && err.message);
+        subscriptionReadiness.finish(err);
+    });
 
 // Only start listeners when run directly (node server.js) — requiring this
 // module (e.g. unit tests) must not bind ports.

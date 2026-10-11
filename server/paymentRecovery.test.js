@@ -1572,6 +1572,7 @@ test('treasuryScanOnce (real code): null price band -> rpc_error marked, retryab
     const marked = [];
     const scan = evalServer('TREASURY_SCAN_RUN', 'treasuryScanOnce', {
         treasuryScanInFlight: false,
+        subscriptionReadiness: { wait: Promise.resolve(null) },
         SOLANA_PAYMENT_WALLET: TREASURY,
         SKR_TOKEN_MINT: SKR_MINT,
         SKR_TOKEN_DECIMALS: SKR_DECIMALS,
@@ -1850,6 +1851,7 @@ test('treasuryScanOnce (real code): codeless SOL+SKR auto-credit to admin-approv
     const marked = [];
     const scan = evalServer('TREASURY_SCAN_RUN', 'treasuryScanOnce', {
         treasuryScanInFlight: false,
+        subscriptionReadiness: { wait: Promise.resolve(null) },
         SOLANA_PAYMENT_WALLET: TREASURY,
         SKR_TOKEN_MINT: SKR_MINT,
         SKR_TOKEN_DECIMALS: SKR_DECIMALS,
@@ -2657,6 +2659,7 @@ test('treasuryGetTokenAccounts (real code): union of all endpoints + cache; cach
 const loadScanner = (over = {}) => evalServer('TREASURY_SCAN_RUN', 'treasuryScanOnce', {
     console,
     treasuryScanInFlight: false,
+    subscriptionReadiness: { wait: Promise.resolve(null) },
     SOLANA_PAYMENT_WALLET: TREASURY,
     SKR_TOKEN_MINT: SKR_MINT,
     SKR_TOKEN_DECIMALS: SKR_DECIMALS,
@@ -2930,5 +2933,508 @@ test('ecoApplySub (real code): stale renewal floor cannot shorten; admin set-unt
     await ecoApplySub('acct7', adminSet, { sourceApp: 'admin', kind: 'paid', provenance: 'set-until' });
     assert.equal((await h.get(`SELECT sub_until FROM stealthlynk_subs WHERE account_id='acct7'`)).sub_until, adminSet,
         'admin set-until applies exactly');
+    await h.close();
+});
+
+const extractBetween = (startAnchor, endAnchor) => {
+    const i = SERVER_SRC.indexOf(startAnchor);
+    const j = i >= 0 ? SERVER_SRC.indexOf(endAnchor, i + startAnchor.length) : -1;
+    assert.ok(i >= 0 && j > i, `anchors not found: ${startAnchor} .. ${endAnchor}`);
+    return SERVER_SRC.slice(i, j);
+};
+
+const loadReadOnlyResolver = (over = {}) => vm.runInNewContext(
+    `${extractMarked('CAS_PLAN_STATE')}\n${extractMarked('QUOTA_PROFILE')}\n${extractMarked('SUBSCRIPTION_STATE')}\n;({ compareAndSetPlanState, resolveSubscriptionState, getUserQuotaProfileFromRow })`,
+    {
+        console,
+        dbRunAsync: async () => { throw new Error('db write must not run'); },
+        dbGetAsync: async () => { throw new Error('db read must not run'); },
+        dbAllAsync: async () => { throw new Error('db read must not run'); },
+        ensurePlanRow: async () => { throw new Error('planRow supplied - no lazy row'); },
+        getUserUsedBytes: async () => { throw new Error('knownUsedBytes supplied'); },
+        getUserQuotaBytes: async () => { throw new Error('knownQuotaBytes supplied'); },
+        TRIAL_COMPLIMENTARY_DAYS: 3, SUBSCRIPTION_GRACE_DAYS: 7, GB_BYTES: 1e9,
+        ...over,
+    });
+
+test('resolveSubscriptionState readOnly supplied-row: expired/active premium, live grace, paid', async () => {
+    const { resolveSubscriptionState } = loadReadOnlyResolver();
+    const now = Date.now();
+    const resolve = (row) => resolveSubscriptionState(1, { readOnly: true, planRow: row, knownUsedBytes: 0, knownQuotaBytes: 0 });
+    assert.equal((await resolve({ status: 'expired', expires_at: now - 40 * 864e5, premium_gb: 1000, premium_expires_at: now - 864e5 })).status, 'expired');
+    assert.equal((await resolve({ status: 'expired', expires_at: now - 40 * 864e5, premium_gb: 1000, premium_expires_at: now + 864e5 })).status, 'premium_only');
+    assert.equal((await resolve({ status: 'grace', expires_at: now - 864e5, grace_until: now + 5 * 864e5, premium_gb: 1000, premium_expires_at: now + 864e5 })).status, 'grace');
+    assert.equal((await resolve({ status: 'active', expires_at: now + 10 * 864e5, plan_gb: 400 })).status, 'active');
+});
+
+test('resolveSubscriptionState readOnly supplied snapshot performs no DB access', async () => {
+    const { resolveSubscriptionState, getUserQuotaProfileFromRow } = loadReadOnlyResolver();
+    const now = Date.now();
+    const st = await resolveSubscriptionState(9, { readOnly: true, planRow: { status: 'expired', expires_at: now - 40 * 864e5, premium_gb: 1000, premium_expires_at: now + 864e5 }, knownUsedBytes: 7, knownQuotaBytes: 1000e9 });
+    assert.equal(st.status, 'premium_only');
+    assert.equal(st.usedBytes, 7);
+    assert.equal(st.quotaBytes, 1000e9);
+    const activePrem = getUserQuotaProfileFromRow({ status: 'active', plan_gb: 400, expires_at: now + 864e5, premium_gb: 1000, premium_expires_at: now + 864e5 });
+    assert.equal(activePrem.totalQuotaGb, 1400);
+    const expiredPrem = getUserQuotaProfileFromRow({ status: 'active', plan_gb: 400, expires_at: now + 864e5, premium_gb: 1000, premium_expires_at: now - 1000 });
+    assert.equal(expiredPrem.premiumGb, 0);
+    assert.equal(expiredPrem.totalQuotaGb, 400);
+    assert.equal(Math.floor(expiredPrem.totalQuotaGb * 1e9), 400e9);
+});
+
+const loadAdminUsersRoute = (over = {}) => {
+    const captured = {};
+    vm.runInNewContext(
+        `${extractMarked('CAS_PLAN_STATE')}\n${extractMarked('QUOTA_PROFILE')}\n${extractMarked('SUBSCRIPTION_STATE')}\n${extractBetween("app.get('/admin/api/users', adminAuth", 'Admin API: delete user completely')}`,
+        {
+            console, fs, path, Date, JSON, Number, String, Math, Set, Map,
+            app: { get: (p, ...a) => { captured.handler = a[a.length - 1]; } },
+            adminAuth: () => { },
+            require: (id) => { if (id === '../nft-service') throw new Error('nft-service unavailable'); return require(id); },
+            NFT_DIR: '/nonexistent-nft-dir',
+            TRIAL_COMPLIMENTARY_DAYS: 3, SUBSCRIPTION_GRACE_DAYS: 7, GB_BYTES: 1e9,
+            PLAN_PRICES_USD: { 100: 10, 200: 20, 400: 40, 1000: 100 }, PREMIUM_PRICE_USD: 49.99,
+            sanitizeUserKey: (v) => (v === null || v === undefined || v === '' ? null : String(v)),
+            deriveAdminDisplayHandle: (...vals) => (vals.find((v) => v) || ''),
+            fetchSolPriceUsd: async () => 200,
+            fetchSkrPriceUsd: async () => 1,
+            getUserUsedBytes: async () => 0,
+            ...over,
+        });
+    return captured.handler;
+};
+
+test('admin users route (real handler): read-only resolver statuses + decimal GB quota', async () => {
+    const { dbPath } = await makeFixtureDb();
+    const h = await openDb(dbPath);
+    await h.run(`ALTER TABLE cloud_chunks ADD COLUMN size INTEGER`);
+    await h.run(`ALTER TABLE users ADD COLUMN seeker_id TEXT`);
+    await h.run(`ALTER TABLE users ADD COLUMN created_at INTEGER`);
+    const now = Date.now();
+    for (const u of [11, 12, 13, 14, 15]) await h.run(`INSERT INTO users (id, email) VALUES (?, ?)`, [u, `u${u}@x`]);
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,status,expires_at,premium_gb,premium_expires_at) VALUES (11,400,'active',?,0,NULL)`, [now + 30 * 864e5]);
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,status,expires_at,premium_gb,premium_expires_at) VALUES (12,100,'expired',?,1000,?)`, [now - 40 * 864e5, now - 864e5]);
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,status,expires_at,premium_gb,premium_expires_at) VALUES (13,100,'expired',?,1000,?)`, [now - 40 * 864e5, now + 100 * 864e5]);
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,status,expires_at,grace_until,premium_gb,premium_expires_at) VALUES (14,200,'grace',?,?,1000,?)`, [now - 864e5, now + 5 * 864e5, now + 100 * 864e5]);
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,status,expires_at,premium_gb,premium_expires_at,deleted_at) VALUES (15,100,'expired',?,0,NULL,?)`, [now - 40 * 864e5, now - 864e5]);
+    const allQueries = [];
+    const handler = loadAdminUsersRoute({
+        dbAllAsync: async (sql, params) => { allQueries.push(sql); return h.all(sql, params); },
+        dbGetAsync: async () => { throw new Error('resolver must not read'); },
+        dbRunAsync: async () => { throw new Error('resolver must not write'); },
+        ensurePlanRow: async () => { throw new Error('readOnly with planRow must not call ensurePlanRow'); },
+        getUserQuotaBytes: async () => { throw new Error('knownQuotaBytes supplied'); },
+    });
+    const res = resStub();
+    await handler({ query: {} }, res);
+    assert.equal(res.statusCode, 200, JSON.stringify(res.body).slice(0, 400));
+    const byId = Object.fromEntries(res.body.users.map((u) => [u.id, u]));
+    assert.equal(byId[11].plan.effective_status, 'active');
+    assert.equal(byId[11].storage_quota_bytes, Math.floor(400 * 1e9));
+    assert.equal(byId[12].plan.effective_status, 'expired');
+    assert.equal(byId[12].plan.premium_gb, 0);
+    assert.equal(byId[12].plan.premium_gb_allocated, 1000);
+    assert.ok(byId[12].plan.premium_expires_at > 0);
+    assert.ok(byId[12].plan.premium_expires_at_date);
+    assert.equal(byId[13].plan.effective_status, 'premium_only');
+    assert.equal(byId[13].plan.premium_gb, 1000);
+    assert.equal(byId[13].storage_quota_bytes, Math.floor(1000 * 1e9));
+    assert.equal(byId[14].plan.effective_status, 'grace');
+    assert.equal(byId[14].storage_quota_bytes, Math.floor((200 + 1000) * 1e9));
+    assert.equal(byId[15].plan.effective_status, 'deleted');
+    assert.equal(allQueries.length, 3, `queries: ${allQueries.map((q) => q.slice(0, 60)).join(' | ')}`);
+    await h.close();
+});
+
+const loadAdminPageScript = (over = {}) => {
+    const captured = {};
+    vm.runInNewContext(extractMarked('ADMIN_PAGE_ROUTE'), {
+        app: { get: (p, ...a) => { captured.handler = a[a.length - 1]; } },
+        adminAuth: () => { }, ADMIN_HTML_TITLE: 'T', console,
+    });
+    const res = { setHeader() { }, send(html) { this.html = html; } };
+    captured.handler({}, res);
+    assert.ok(res.html, 'admin HTML emitted');
+    const scripts = [...res.html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+    const els = {};
+    const mkEl = () => ({
+        style: {}, dataset: {}, value: '', innerHTML: '', textContent: '', placeholder: '',
+        checked: false, disabled: false,
+        classList: { add() { }, remove() { }, toggle() { } },
+        querySelector: () => null, querySelectorAll: () => [],
+        appendChild() { }, remove() { }, select() { }, addEventListener() { },
+    });
+    const documentStub = {
+        getElementById: (id) => (els[id] = els[id] || mkEl()),
+        querySelector: () => null,
+        querySelectorAll: () => [],
+        createElement: () => mkEl(),
+        addEventListener: () => { },
+        body: mkEl(),
+    };
+    const fetches = [];
+    const fetchStub = async (url, opts) => {
+        fetches.push(url);
+        const payload = typeof over.responder === 'function' ? over.responder(url, opts) : (over.payload || {});
+        return { ok: payload.ok !== false, status: payload.status || 200, json: async () => (payload.body !== undefined ? payload.body : payload) };
+    };
+    const ctx = vm.createContext({
+        console, document: documentStub, fetch: fetchStub,
+        setInterval: () => 0, setTimeout: () => 0,
+        navigator: { clipboard: { writeText: async () => { } } },
+        window: {}, prompt: () => null, confirm: () => true,
+        Date, JSON, Math, Promise, Number, String, Object, Array,
+    });
+    vm.runInContext(scripts.join('\n'), ctx);
+    return { ctx, els, fetches, html: res.html };
+};
+
+test('admin inline script (emitted): loadUsers preserves premium expiry and allocation', async () => {
+    const iso = '2030-01-02T03:04:05.000Z';
+    const { ctx } = loadAdminPageScript({
+        responder: () => ({
+            server_time: iso,
+            users: [{
+                id: 1, email: 'a@x',
+                plan: { plan_gb: 100, premium_gb: 0, premium_gb_allocated: 1000, premium_expires_at: 1893476645000, premium_expires_at_date: iso, status: 'expired', effective_status: 'expired' },
+                nft: {}, solana: {},
+            }],
+        }),
+    });
+    await ctx.loadUsers();
+    assert.equal(ctx.allUsers.length, 1);
+    assert.equal(ctx.allUsers[0].premium_expires_at, iso);
+    assert.equal(ctx.allUsers[0].premium_gb_allocated, 1000);
+});
+
+test('admin inline script (emitted): presence filter fetches all=1; header verification facts', async () => {
+    const psBody = {
+        server_time: '2026-01-01T00:00:00.000Z',
+        revenue: { count: 3, usd: 11.97, verifiedCount: 1, pendingCount: 2, usdSource: 'client_reported' },
+        users: [
+            { device_hash: 'd1hash', status: 'expired', sub_status: 'paid', sub_signature: 'sigA', payment_verification: 'chain_checked', last_seen: 1, trial_expires_at: 1, first_seen: 1 },
+            { device_hash: 'd2hash', status: 'trial', sub_status: 'trial', last_seen: 2, trial_expires_at: 2, first_seen: 1 },
+            { device_hash: 'd3hash', status: 'expired', sub_status: 'none', last_seen: 3, trial_expires_at: 1, first_seen: 1 },
+        ],
+    };
+    const { ctx, els, fetches, html } = loadAdminPageScript({ responder: (url) => (url.includes('paceseeker') ? psBody : { users: [] }) });
+    assert.ok(html.includes('id="ps-presence-filter"'), 'presence select emitted in admin HTML');
+    ctx.switchApp('paceseeker');
+    assert.equal(els['ps-presence-filter'].style.display, '');
+    els['ps-presence-filter'].value = 'all';
+    await ctx.loadPsUsers();
+    assert.ok(fetches.some((u) => u === '/admin/api/paceseeker-users?all=1'), `fetches: ${fetches.join(',')}`);
+    const statsHtml = els['header-stats'].innerHTML;
+    assert.match(statsHtml, /Reported checkout USD \(unverified\): <b>\$11\.97<\/b>/);
+    assert.match(statsHtml, /Expired: <b>2<\/b>/);
+    assert.match(statsHtml, /Chain-checked: <b>1<\/b>/);
+    assert.match(statsHtml, /Pending reports: <b>2<\/b>/);
+    const rep = ctx.subBadge('paid', '2030-02-01T00:00:00.000Z', { sub_signature: 'sigB', payment_verification: 'reported' });
+    assert.ok(rep.includes('Reported paid'), rep);
+    assert.ok(rep.includes('client-reported'), rep);
+    const chk = ctx.subBadge('paid', '2030-02-01T00:00:00.000Z', { sub_signature: 'sigB', payment_verification: 'chain_checked' });
+    assert.ok(chk.includes('Chain checked'), chk);
+    els['ps-presence-filter'].value = 'recent';
+    await ctx.loadPsUsers();
+    assert.ok(fetches.some((u) => u === '/admin/api/paceseeker-users'), 'recent must use the default route');
+    ctx.switchApp('photolynk');
+    assert.equal(els['ps-presence-filter'].style.display, 'none');
+});
+
+const loadPsUsersRoute = (db) => {
+    const captured = {};
+    vm.runInNewContext(extractBetween("app.get('/admin/api/paceseeker-users'", 'PaceSeeker invite code tracker'), {
+        app: { get: (p, ...a) => { captured.handler = a[a.length - 1]; } },
+        adminAuth: () => { }, db, console, Date, JSON, Number, String,
+    });
+    return captured.handler;
+};
+
+const callPsUsers = (handler, query) => new Promise((resolve) => {
+    const res = {
+        statusCode: 200, body: undefined,
+        status(c) { this.statusCode = c; return this; },
+        json(b) { this.body = b; resolve(this); return this; },
+    };
+    handler({ query: query || {} }, res);
+});
+
+async function makePsAdminDb() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'psadmin-'));
+    createdDirs.push(dir);
+    const h = await openDb(path.join(dir, 'test.db'));
+    await h.run(`CREATE TABLE paceseeker_devices (
+        device_hash TEXT PRIMARY KEY, first_seen INTEGER, last_seen INTEGER,
+        trial_started_at INTEGER, trial_expires_at INTEGER, version_code INTEGER,
+        last_ip TEXT, sub_status TEXT, sub_until INTEGER, last_country_code TEXT,
+        sub_signature TEXT, sub_paid_at INTEGER, sub_paid_with TEXT, sub_plan TEXT,
+        sub_usd REAL, sub_amount_atomic INTEGER, wallet_address TEXT, wallet_domain TEXT,
+        ad_until INTEGER)`);
+    await h.run(`CREATE TABLE paceseeker_revenue (
+        signature TEXT PRIMARY KEY, device_hash TEXT, paid_at INTEGER, paid_with TEXT,
+        plan TEXT, usd_at_checkout REAL, amount_atomic INTEGER, reported_at INTEGER,
+        eco_verified INTEGER DEFAULT 0)`);
+    await h.run(`CREATE TABLE ecosystem_members (
+        account_id TEXT NOT NULL, app TEXT NOT NULL, identity TEXT NOT NULL,
+        wallet TEXT, linked_at INTEGER, wallet_verified INTEGER DEFAULT 0,
+        wallet_changed_at INTEGER, PRIMARY KEY (app, identity))`);
+    await h.run(`CREATE TABLE stealthlynk_subs (
+        account_id TEXT PRIMARY KEY, sub_until INTEGER, source_app TEXT,
+        source_kind TEXT, provenance TEXT, updated_at INTEGER)`);
+    return h;
+}
+
+test('PS admin route (real handler): verified vs pending reports, USD stays client-reported', async () => {
+    const h = await makePsAdminDb();
+    const now = Date.now();
+    await h.run(`INSERT INTO paceseeker_revenue (signature,device_hash,paid_at,paid_with,plan,usd_at_checkout,amount_atomic,reported_at,eco_verified) VALUES ('sigV','d1',?,'SOL','sub',3.99,1,?,1)`, [now, now]);
+    await h.run(`INSERT INTO paceseeker_revenue (signature,device_hash,paid_at,paid_with,plan,usd_at_checkout,amount_atomic,reported_at,eco_verified) VALUES ('sigU','d2',?,'USDC','sub',3.99,1,?,0)`, [now, now]);
+    await h.run(`INSERT INTO paceseeker_revenue (signature,device_hash,paid_at,paid_with,plan,usd_at_checkout,amount_atomic,reported_at,eco_verified) VALUES ('sigX','d9',?,'SKR','sub',3.99,1,?,0)`, [now, now]);
+    await h.run(`INSERT INTO paceseeker_devices (device_hash,first_seen,last_seen,trial_started_at,trial_expires_at,sub_status,sub_signature) VALUES ('d1',?,?,?,?,'paid','sigV')`, [now - 9e6, now, now - 9e6, now + 6e5]);
+    await h.run(`INSERT INTO paceseeker_devices (device_hash,first_seen,last_seen,trial_started_at,trial_expires_at,sub_status,sub_signature) VALUES ('d2',?,?,?,?,'paid','sigU')`, [now - 9e6, now, now - 9e6, now + 6e5]);
+    await h.run(`INSERT INTO paceseeker_devices (device_hash,first_seen,last_seen,trial_started_at,trial_expires_at,sub_status,sub_signature) VALUES ('d3',?,?,?,?,'none',NULL)`, [now - 9e6, now, now - 9e6, now - 8e7]);
+    await h.run(`INSERT INTO paceseeker_devices (device_hash,first_seen,last_seen,trial_started_at,trial_expires_at,sub_status,sub_signature) VALUES ('d4',?,?,?,?,'paid','sigV')`, [now - 9e6, now, now - 9e6, now + 6e5]);
+    const res = await callPsUsers(loadPsUsersRoute(h.conn), { all: '1' });
+    assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+    assert.equal(res.body.revenue.count, 3);
+    assert.ok(Math.abs(res.body.revenue.usd - 11.97) < 1e-6);
+    assert.equal(res.body.revenue.verifiedCount, 1);
+    assert.equal(res.body.revenue.pendingCount, 2);
+    assert.equal(res.body.revenue.usdSource, 'client_reported');
+    const byDev = Object.fromEntries(res.body.users.map((u) => [u.device_hash, u]));
+    assert.equal(byDev.d1.payment_verification, 'chain_checked');
+    assert.equal(byDev.d2.payment_verification, 'reported');
+    assert.equal(byDev.d3.payment_verification, 'none');
+    assert.equal(byDev.d4.payment_verification, 'reported');
+    await h.close();
+});
+
+test('PS admin route (real handler): aggregate or membership query failure -> 500', async () => {
+    const errDb = (failOn) => ({
+        all: (sql, params, cb) => {
+            const f = typeof params === 'function' ? params : cb;
+            if ((failOn === 'devices' && sql.includes('paceseeker_devices')) || (failOn === 'members' && sql.includes('ecosystem_members'))) return f(new Error('db down'));
+            return f(null, []);
+        },
+        get: (sql, params, cb) => {
+            const f = typeof params === 'function' ? params : cb;
+            if (failOn === 'revenue') return f(new Error('db down'));
+            return f(null, { cnt: 0, usd: 0, verified_count: 0 });
+        },
+    });
+    const resRev = await callPsUsers(loadPsUsersRoute(errDb('revenue')), {});
+    assert.equal(resRev.statusCode, 500);
+    const resMem = await callPsUsers(loadPsUsersRoute(errDb('members')), {});
+    assert.equal(resMem.statusCode, 500);
+});
+
+async function makeSchemaFixtureDb() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'subschema-'));
+    createdDirs.push(dir);
+    const h = await openDb(path.join(dir, 'test.db'));
+    await h.run(`CREATE TABLE ecosystem_members (
+        account_id TEXT NOT NULL, app TEXT NOT NULL, identity TEXT NOT NULL,
+        wallet TEXT, linked_at INTEGER, wallet_verified INTEGER DEFAULT 0,
+        wallet_changed_at INTEGER, PRIMARY KEY (app, identity))`);
+    await h.run(`CREATE TABLE ecosystem_accounts (account_id TEXT PRIMARY KEY, primary_wallet TEXT, created_at INTEGER)`);
+    await h.run(`CREATE TABLE stealthlynk_subs (account_id TEXT PRIMARY KEY, sub_until INTEGER, source_app TEXT, source_kind TEXT, provenance TEXT, updated_at INTEGER)`);
+    await h.run(`CREATE TABLE user_plans (user_id INTEGER PRIMARY KEY, status TEXT, plan_gb INTEGER, expires_at INTEGER, premium_gb INTEGER, premium_expires_at INTEGER, deleted_at INTEGER, grace_until INTEGER, trial_until INTEGER, updated_at INTEGER)`);
+    await h.run(`CREATE TABLE solana_payments (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, tx_signature TEXT UNIQUE NOT NULL, sol_amount REAL, created_at INTEGER, entitlement_applied_at INTEGER)`);
+    return h;
+}
+
+test('subscriptionSchema: fresh DB initializes PS tables; prerequisites verified', async () => {
+    const { ensurePaceSeekerSchema } = require('./subscriptionSchema');
+    const h = await makeSchemaFixtureDb();
+    await ensurePaceSeekerSchema(h.conn);
+    const devCols = new Set((await h.all(`PRAGMA table_info(paceseeker_devices)`)).map((c) => c.name));
+    for (const c of ['device_hash', 'first_seen', 'last_seen', 'trial_started_at', 'trial_expires_at', 'version_code', 'last_ip', 'sub_status', 'sub_until', 'last_country_code', 'sub_signature', 'sub_paid_at', 'sub_paid_with', 'sub_plan', 'sub_usd', 'sub_amount_atomic', 'wallet_address', 'wallet_domain', 'ad_until']) {
+        assert.ok(devCols.has(c), `paceseeker_devices missing ${c}`);
+    }
+    const revCols = new Set((await h.all(`PRAGMA table_info(paceseeker_revenue)`)).map((c) => c.name));
+    for (const c of ['signature', 'device_hash', 'paid_at', 'paid_with', 'plan', 'usd_at_checkout', 'amount_atomic', 'reported_at', 'eco_verified']) {
+        assert.ok(revCols.has(c), `paceseeker_revenue missing ${c}`);
+    }
+    await h.close();
+});
+
+test('subscriptionSchema: legacy PS tables gain columns without losing rows; idempotent re-run', async () => {
+    const { ensurePaceSeekerSchema } = require('./subscriptionSchema');
+    const h = await makeSchemaFixtureDb();
+    await h.run(`CREATE TABLE paceseeker_devices (device_hash TEXT PRIMARY KEY, first_seen INTEGER, last_seen INTEGER, trial_started_at INTEGER, trial_expires_at INTEGER, version_code INTEGER, last_ip TEXT)`);
+    await h.run(`INSERT INTO paceseeker_devices (device_hash,first_seen,last_seen) VALUES ('dev1',11,22)`);
+    await h.run(`CREATE TABLE paceseeker_revenue (signature TEXT PRIMARY KEY, device_hash TEXT, paid_at INTEGER, paid_with TEXT, plan TEXT, usd_at_checkout REAL, amount_atomic INTEGER, reported_at INTEGER)`);
+    await h.run(`INSERT INTO paceseeker_revenue (signature,usd_at_checkout) VALUES ('sig1',3.99)`);
+    await ensurePaceSeekerSchema(h.conn);
+    assert.equal((await h.get(`SELECT device_hash,first_seen FROM paceseeker_devices`)).first_seen, 11);
+    assert.equal((await h.get(`SELECT usd_at_checkout FROM paceseeker_revenue`)).usd_at_checkout, 3.99);
+    await ensurePaceSeekerSchema(h.conn);
+    const devCols = new Set((await h.all(`PRAGMA table_info(paceseeker_devices)`)).map((c) => c.name));
+    assert.ok(devCols.has('ad_until') && devCols.has('wallet_domain') && devCols.has('sub_signature'));
+    assert.equal((await h.get(`SELECT device_hash FROM paceseeker_devices`)).device_hash, 'dev1');
+    await h.close();
+});
+
+test('subscriptionSchema: stale duplicate-column error tolerated only when re-read confirms column', async () => {
+    const { ensurePaceSeekerSchema } = require('./subscriptionSchema');
+    const h = await makeSchemaFixtureDb();
+    await h.run(`CREATE TABLE paceseeker_devices (device_hash TEXT PRIMARY KEY, first_seen INTEGER, last_seen INTEGER, trial_started_at INTEGER, trial_expires_at INTEGER, version_code INTEGER, last_ip TEXT)`);
+    await h.run(`ALTER TABLE paceseeker_devices ADD COLUMN sub_status TEXT`);
+    let masked = true;
+    const wrapped = {
+        run: (sql, params, cb) => h.conn.run(sql, params, cb),
+        all: (sql, params, cb) => {
+            if (sql.includes('table_info(paceseeker_devices)') && masked) {
+                masked = false;
+                return h.conn.all(sql, params, (e, rows) => cb(e, (rows || []).filter((r) => r.name !== 'sub_status')));
+            }
+            return h.conn.all(sql, params, cb);
+        },
+    };
+    await ensurePaceSeekerSchema(wrapped);
+    const devCols = new Set((await h.all(`PRAGMA table_info(paceseeker_devices)`)).map((c) => c.name));
+    for (const c of ['sub_status', 'ad_until', 'sub_signature', 'wallet_domain']) assert.ok(devCols.has(c), `missing ${c}`);
+    await h.close();
+});
+
+test('subscriptionSchema: missing required prerequisite schema rejects', async () => {
+    const { ensurePaceSeekerSchema } = require('./subscriptionSchema');
+    const h = await makeSchemaFixtureDb();
+    await h.run(`DROP TABLE user_plans`);
+    await h.run(`CREATE TABLE user_plans (user_id INTEGER PRIMARY KEY, status TEXT, plan_gb INTEGER, expires_at INTEGER, premium_gb INTEGER)`);
+    await assert.rejects(() => ensurePaceSeekerSchema(h.conn), /premium/);
+    await h.close();
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'subschema-empty-'));
+    createdDirs.push(dir);
+    const h2 = await openDb(path.join(dir, 'test.db'));
+    await assert.rejects(() => ensurePaceSeekerSchema(h2.conn));
+    await h2.close();
+});
+
+test('subscriptionReadiness: middleware holds until finish; injected failure -> 503', async () => {
+    const { createSubscriptionReadiness } = require('./subscriptionSchema');
+    const readiness = createSubscriptionReadiness();
+    let nextCalls = 0;
+    const res = resStub();
+    const held = readiness.middleware({}, res, () => { nextCalls++; });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(nextCalls, 0, 'request must be held until schema readiness resolves');
+    readiness.finish(new Error('schema down'));
+    await held;
+    assert.equal(nextCalls, 0);
+    assert.equal(res.statusCode, 503);
+    assert.equal(res.body.code, 'SUBSCRIPTION_SCHEMA_UNAVAILABLE');
+    const ok = createSubscriptionReadiness();
+    const res2 = resStub();
+    const held2 = ok.middleware({}, res2, () => { nextCalls++; });
+    ok.finish(null);
+    await held2;
+    assert.equal(nextCalls, 1);
+    assert.equal(res2.statusCode, 200);
+});
+
+test('subscriptionReadiness: non-duplicate DB failure propagates into 503', async () => {
+    const { ensurePaceSeekerSchema, createSubscriptionReadiness } = require('./subscriptionSchema');
+    const failingDb = {
+        run: (sql, params, cb) => { const f = typeof params === 'function' ? params : cb; f(new Error('disk I/O error')); },
+        all: (sql, params, cb) => { const f = typeof params === 'function' ? params : cb; f(null, []); },
+    };
+    const readiness = createSubscriptionReadiness();
+    let nextCalls = 0;
+    const res = resStub();
+    const held = readiness.middleware({}, res, () => { nextCalls++; });
+    ensurePaceSeekerSchema(failingDb).then(() => readiness.finish(null), (err) => readiness.finish(err));
+    await held;
+    assert.equal(nextCalls, 0);
+    assert.equal(res.statusCode, 503);
+    assert.equal(res.body.code, 'SUBSCRIPTION_SCHEMA_UNAVAILABLE');
+});
+
+test('treasuryScanOnce (real code): schema unavailable -> structured skip, no scan work', async () => {
+    const scan = evalServer('TREASURY_SCAN_RUN', 'treasuryScanOnce', {
+        treasuryScanInFlight: false,
+        subscriptionReadiness: { wait: Promise.resolve(new Error('ps schema down')) },
+        treasuryCollectSignatures: async () => { throw new Error('must not scan'); },
+        dbAllAsync: async () => { throw new Error('must not read'); },
+    });
+    const r = await scan();
+    assert.equal(r.ok, false);
+    assert.equal(r.reason, 'schema_unavailable');
+    assert.equal(r.errors, 0);
+});
+
+const loadVerifyPsPaymentTx = (over = {}) => {
+    const calls = [];
+    const fn = vm.runInNewContext(
+        `${extractBetween('const _psPayVerifyCache = new Map();', 'async function ecoMirrorPsPayment')}\n;({ verifyPsPaymentTx })`,
+        {
+            console,
+            axios: {
+                post: async (url, body) => {
+                    calls.push({ url, body });
+                    return { data: { result: over.tx } };
+                },
+            },
+            paymentRecovery,
+            getPriceBand: over.getPriceBand || (async () => ({ latest: 200 })),
+            PS_TREASURY_WALLET: TREASURY,
+            PS_ECO_STABLE_MINTS: {},
+            PS_ECO_SKR_MINT: SKR_MINT,
+            PS_ECO_MIN_PAYMENT_USD: 1,
+            process: { env: {} },
+            Buffer, Date, JSON, Math, Number, String, Object,
+        }).verifyPsPaymentTx;
+    return { fn, calls };
+};
+
+test('verifyPsPaymentTx (real code): parsed + raw base58 PS1 memos pass; malformed encoding rejects', async () => {
+    const psTx = (memoInstruction) => ({
+        blockTime: Math.floor(Date.now() / 1000),
+        meta: { err: null, preBalances: [5e9, 1e9], postBalances: [4e9, 2e9], preTokenBalances: [], postTokenBalances: [], innerInstructions: [] },
+        transaction: {
+            message: {
+                accountKeys: [PAYER, TREASURY],
+                instructions: [
+                    { program: 'system', parsed: { type: 'transfer', info: { source: PAYER, destination: TREASURY, lamports: '100000000' } } },
+                    memoInstruction,
+                ],
+            },
+        },
+    });
+    const memo = 'PS1|monthly|1700000000|abcd1234';
+    const parsed = loadVerifyPsPaymentTx({ tx: psTx(memoIx(memo)) });
+    const r1 = await parsed.fn('sigParsed' + 'X'.repeat(80));
+    assert.equal(r1.ok, true, JSON.stringify(r1));
+    assert.equal(r1.payer, PAYER);
+    assert.equal(parsed.calls.length, 1);
+    const raw = loadVerifyPsPaymentTx({ tx: psTx(memoDataIx(memo)) });
+    const r2 = await raw.fn('sigRaw' + 'Y'.repeat(80));
+    assert.equal(r2.ok, true, JSON.stringify(r2));
+    const bad = loadVerifyPsPaymentTx({ tx: psTx({ programId: MEMO_PROGRAM_ID, data: Buffer.from(memo, 'utf8').toString('base64') }) });
+    const r3 = await bad.fn('sigBad' + 'Z'.repeat(80));
+    assert.equal(r3.ok, false);
+});
+
+test('subscriptionReadiness: verifier waits behind pending callback-style user_plans migration', async () => {
+    const { ensurePaceSeekerSchema } = require('./subscriptionSchema');
+    const h = await makeSchemaFixtureDb();
+    await h.run(`DROP TABLE user_plans`);
+    await h.run(`CREATE TABLE user_plans (user_id INTEGER PRIMARY KEY, status TEXT, plan_gb INTEGER, expires_at INTEGER)`);
+    await h.run(`CREATE TABLE users (id INTEGER PRIMARY KEY)`);
+    await assert.rejects(() => ensurePaceSeekerSchema(h.conn), /premium/);
+    let migrationResolve;
+    const migrationDone = new Promise((r) => { migrationResolve = r; });
+    vm.runInNewContext(
+        extractBetween('// Migrate existing DBs: add missing columns to user_plans', '// Migrate existing DBs: add user_uuid'),
+        {
+            db: h.conn, console, Date,
+            resolveUserPlansMigration: () => migrationResolve(),
+        });
+    const gated = migrationDone.then(() => ensurePaceSeekerSchema(h.conn));
+    await migrationDone;
+    await new Promise((res, rej) => h.conn.serialize(() => h.conn.run('SELECT 1', [], (e) => (e ? rej(e) : res()))));
+    await gated;
+    const cols = new Set((await h.all(`PRAGMA table_info(user_plans)`)).map((c) => c.name));
+    assert.ok(cols.has('premium_gb') && cols.has('premium_expires_at'));
     await h.close();
 });
