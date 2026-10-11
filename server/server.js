@@ -10737,6 +10737,54 @@ app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req
     }
 });
 
+// Batch existence check for mid-file resume. The client computes
+// content-addressed chunkIds deterministically (same fileKey + baseNonce16
+// persisted across attempts) and asks which already landed - resume then
+// uploads only the missing tail instead of restarting a multi-GB file
+// from chunk zero.
+app.post('/api/cloud/chunks/exists-batch', authenticateToken, blockDeletedSubscription, (req, res) => {
+    const ids = Array.isArray(req.body?.chunkIds) ? req.body.chunkIds : [];
+    if (ids.length === 0) return res.json({ existing: [] });
+    if (ids.length > 10000) return res.status(400).json({ error: 'Too many chunk ids' });
+
+    const { chunksDir } = ensureStealthCloudUserDirs(req.user);
+    const allKeys = getStealthCloudAllPossibleUserKeys(req.user);
+    const chunksUsersRoot = CHUNKS_DIR ? path.join(CHUNKS_DIR, 'users') : path.join(CLOUD_DIR, 'users');
+    const dirs = [chunksDir];
+    for (const key of allKeys) {
+        if (!key || key === 'unknown') continue;
+        dirs.push(path.join(chunksUsersRoot, key, 'chunks'));
+    }
+
+    const existing = [];
+    for (const rawId of ids) {
+        const id = String(rawId || '').toLowerCase();
+        if (!/^[a-f0-9]{64}$/i.test(id)) continue;
+        let found = false;
+        for (const dir of dirs) {
+            const p = path.join(dir, id);
+            if (p.startsWith(dir) && fs.existsSync(p)) {
+                found = true;
+                break;
+            }
+        }
+        // Mirror the GET handler's CLOUD_DIR fallback (chunks stored under
+        // the NVMe users tree when CHUNKS_DIR points elsewhere).
+        if (!found && CHUNKS_DIR) {
+            for (const key of allKeys) {
+                if (!key || key === 'unknown') continue;
+                const p = path.join(CLOUD_DIR, 'users', key, 'chunks', id);
+                if (fs.existsSync(p)) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (found) existing.push(id);
+    }
+    return res.json({ existing });
+});
+
 // Download encrypted chunk blob
 app.get('/api/cloud/chunks/:chunkId', authenticateToken, blockDeletedSubscription, (req, res) => {
     const chunkId = (req.params.chunkId || '').toLowerCase();
