@@ -609,9 +609,11 @@ test('resolve projection preserves trial rows and clears grace only with an acti
     await runOn(conn, `INSERT INTO user_plans (user_id,status,expires_at,grace_until,updated_at) VALUES (1,'grace',?,?,?)`, [t0 - DAY_MS, t0 - 1000, t0]);
     const acct2 = await svc.ensureAccount('photolynk', '1', {});
     await svc.resolveIdentity('photolynk', '1', { at: t0, project: true });
-    const g = await getOn(conn, `SELECT status, expires_at, grace_until FROM user_plans WHERE user_id = 1`);
-    assert.equal(g.status, 'expired');
+    const g = await getOn(conn, `SELECT status, expires_at, grace_until, deleted_at FROM user_plans WHERE user_id = 1`);
+    assert.equal(g.status, 'grace', 'projection never drives status - the CAS state machine owns grace/expired/deleted_at');
     assert.equal(Number(g.expires_at), t0 - DAY_MS, 'last finite expiry is retained for runtime grace');
+    assert.equal(Number(g.grace_until), t0 - 1000, 'grace_until untouched by projection');
+    assert.equal(g.deleted_at, null, 'deleted_at untouched by projection');
     await svc.transaction((tx) => svc.applyPhotolynkInTransaction(tx, plPayment({ tierGb: 400, paidAt: t0, signature: 'sigRecover' })));
     const g2 = await getOn(conn, `SELECT status, grace_until, deleted_at FROM user_plans WHERE user_id = 1`);
     assert.equal(g2.status, 'active');
@@ -1687,5 +1689,94 @@ test('F1 absorb: legacy-mode bindable plan expiry feeds the shared floor', async
     const res = await svc.resolveAccount(acct, { at: t0 });
     assert.equal(res.sharedUntil, planExp, 'bindable plan expiry feeds the shared floor');
     assert.equal(res.apps.paceseeker.expiresAt, planExp);
+    await closeDb(conn);
+});
+
+// ---- project:'auto' - reads take the writer gate only on staleness ---------
+test("auto mode: fresh projection means a read performs NO write; 10min staleness projects once", async () => {
+    const { svc, conn, clock } = await mk();
+    await svc.initialize();
+    await runOn(conn, `INSERT INTO users (id,email) VALUES (1,'a@b.c')`);
+    await svc.ensureAccount('photolynk', '1', {});
+    // First projection stamps revision + updated_at.
+    await svc.resolveIdentity('photolynk', '1', { project: true });
+    const stamped = await getOn(conn,
+        `SELECT revision, updated_at FROM ecosystem_projection_state WHERE app='photolynk' AND identity='1'`);
+    assert.ok(stamped, 'projection row exists after the first projection');
+    clock.t += 1000; // still inside the 10-minute freshness window
+    await svc.resolveIdentity('photolynk', '1', { project: 'auto' });
+    const after = await getOn(conn,
+        `SELECT revision, updated_at FROM ecosystem_projection_state WHERE app='photolynk' AND identity='1'`);
+    assert.equal(Number(after.updated_at), Number(stamped.updated_at),
+        'a fresh, revision-matching auto read never takes the write path');
+    assert.equal(Number(after.revision), Number(stamped.revision));
+    // Past the freshness window one projection runs and re-stamps.
+    clock.t += 10 * 60 * 1000 + 1;
+    await svc.resolveIdentity('photolynk', '1', { project: 'auto' });
+    const stale = await getOn(conn,
+        `SELECT updated_at FROM ecosystem_projection_state WHERE app='photolynk' AND identity='1'`);
+    assert.ok(Number(stale.updated_at) > Number(after.updated_at), 'staleness forces one projection');
+    // ... and the next read is again write-free.
+    clock.t += 500;
+    await svc.resolveIdentity('photolynk', '1', { project: 'auto' });
+    const quiet = await getOn(conn,
+        `SELECT updated_at FROM ecosystem_projection_state WHERE app='photolynk' AND identity='1'`);
+    assert.equal(Number(quiet.updated_at), Number(stale.updated_at), 'refreshed projection quiets auto mode again');
+    await closeDb(conn);
+});
+
+test('auto mode: a payment bump projects once on read, then reads stay read-only', async () => {
+    const { svc, conn, clock } = await mk();
+    await svc.initialize();
+    await runOn(conn, `INSERT INTO users (id,email) VALUES (1,'a@b.c')`);
+    const acct = await svc.ensureAccount('photolynk', '1', {});
+    await svc.resolveIdentity('photolynk', '1', { project: true });
+    const before = await getOn(conn,
+        `SELECT revision, updated_at FROM ecosystem_projection_state WHERE app='photolynk' AND identity='1'`);
+    // A payment bumps the account revision - auto mode must project once.
+    await svc.transaction((tx) => svc.applyPhotolynkInTransaction(tx, plPayment({ tierGb: 400, paidAt: clock.t, signature: 'sigAutoPay' })));
+    const r = await svc.resolveIdentity('photolynk', '1', { project: 'auto' });
+    assert.equal(r.entitlement.planGb, 400, 'auto read sees the post-payment projection');
+    const mid = await getOn(conn,
+        `SELECT revision, updated_at FROM ecosystem_projection_state WHERE app='photolynk' AND identity='1'`);
+    assert.ok(Number(mid.revision) > Number(before.revision), 'projection row stamped to the post-payment revision');
+    // Second auto read: revision matches, fresh - no write.
+    await svc.resolveIdentity('photolynk', '1', { project: 'auto' });
+    const quiet = await getOn(conn,
+        `SELECT updated_at FROM ecosystem_projection_state WHERE app='photolynk' AND identity='1'`);
+    assert.equal(Number(quiet.updated_at), Number(mid.updated_at), 'no second projection');
+    // A non-projecting bump (wallet/proof change) also un-stales exactly once:
+    // projectAccountTx stamps the final revision even when nothing changed.
+    const acct2 = await svc.ensureAccount('photolynk', '1', { wallet: W2, proofKind: 'bind', proofRef: 'w2' });
+    assert.equal(acct2, acct);
+    await svc.resolveIdentity('photolynk', '1', { project: 'auto' });   // projects once
+    await svc.resolveIdentity('photolynk', '1', { project: 'auto' });   // read-only again
+    const fin = await getOn(conn,
+        `SELECT revision, updated_at FROM ecosystem_projection_state WHERE app='photolynk' AND identity='1'`);
+    const revRow = await getOn(conn, `SELECT revision FROM ecosystem_revisions WHERE account_id = ?`, [acct]);
+    assert.equal(Number(fin.revision), Number(revRow.revision), 'non-projecting bump is stamped, not re-projected forever');
+    await closeDb(conn);
+});
+
+test("auto mode: absorbLegacyLedgerPage makes a legacy-mode write visible to the next auto read", async () => {
+    const { svc, conn, clock } = await mk();
+    await svc.initialize();
+    await runOn(conn, `INSERT INTO users (id,email) VALUES (1,'a@b.c')`);
+    const acct = await svc.ensureAccount('photolynk', '1', {});
+    await svc.resolveIdentity('photolynk', '1', { project: true }); // fresh baseline projection
+    const t0 = clock.t;
+    const legacyExp = t0 + 30 * DAY_MS;
+    // Core "down": the legacy path writes its ledger rows directly.
+    await runOn(conn, `INSERT INTO solana_payments (user_id,tx_signature,tier_gb,duration,payment_token,created_at,verified_at) VALUES (1,'sigAutoLeg',400,'monthly','SOL',?,?)`, [t0, t0]);
+    await runOn(conn, `INSERT INTO solana_subscription_credits (tx_signature,user_id,source,payment_at,expires_before,expires_after,detail,created_at) VALUES ('sigAutoLeg',1,'solana',?,0,?,NULL,?)`, [t0, legacyExp, t0]);
+    await runOn(conn, `INSERT INTO user_plans (user_id,plan_gb,status,expires_at,payment_at,updated_at) VALUES (1,400,'active',?,?,?)`, [legacyExp, t0, t0]);
+    // The worker sweep absorbs and bumps - the NEXT auto read re-projects.
+    const n = await svc.absorbLegacyLedgerPage({ limit: 50 });
+    assert.ok(n > 0);
+    const r = await svc.resolveIdentity('photolynk', '1', { project: 'auto' });
+    assert.equal(r.entitlement.planGb, 400);
+    assert.equal(r.entitlement.expiresAt, legacyExp, 'auto read reflects the absorbed legacy write');
+    const plan = await getOn(conn, `SELECT expires_at, status FROM user_plans WHERE user_id = 1`);
+    assert.equal(Number(plan.expires_at), legacyExp);
     await closeDb(conn);
 });

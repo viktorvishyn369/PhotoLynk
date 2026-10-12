@@ -1500,14 +1500,17 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
                             compatChanged = true;
                         }
                     } else if (cur) {
+                        // Projection mirrors the resolved expiry ONLY - the
+                        // grace/retention state machine (resolveSubscriptionState)
+                        // owns status/grace_until/deleted_at. A projection-written
+                        // 'expired' would satisfy that machine's CAS guard with
+                        // deleted_at never set, so retention would never start.
                         const lastFin = lastFiniteMemberExpiry(m, benefits, actions);
                         const nextExp = lastFin != null ? lastFin : (cur.expires_at == null ? null : Number(cur.expires_at));
-                        const trialActive = cur.status === 'trial' && Number(cur.trial_until) > at;
-                        const nextStatus = trialActive ? 'trial' : (cur.deleted_at != null || cur.status === 'trial' || cur.status === 'none' ? cur.status : 'expired');
-                        if ((cur.expires_at == null ? null : Number(cur.expires_at)) !== (nextExp == null ? null : Number(nextExp)) || cur.status !== nextStatus) {
+                        if ((cur.expires_at == null ? null : Number(cur.expires_at)) !== (nextExp == null ? null : Number(nextExp))) {
                             await tx.run(
-                                `UPDATE user_plans SET status = ?, expires_at = ?, updated_at = ? WHERE user_id = ?`,
-                                [nextStatus, nextExp, now(), uid]);
+                                `UPDATE user_plans SET expires_at = ?, updated_at = ? WHERE user_id = ?`,
+                                [nextExp, now(), uid]);
                             compatChanged = true;
                         }
                     }
@@ -1562,14 +1565,38 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
         }
         const revision = changed ? await bumpGlobal(tx, accountId)
             : Number((await tx.get(`SELECT revision FROM ecosystem_revisions WHERE account_id = ?`, [accountId]))?.revision || 0);
-        if (changed) {
-            for (const m of members) {
-                if (!supportedApp(m.app)) continue;
-                await tx.run(`UPDATE ecosystem_projection_state SET revision = ? WHERE app = ? AND identity = ?`,
-                    [revision, m.app, String(m.identity)]);
-            }
+        // Every projection pass stamps the FINAL revision and refreshes
+        // updated_at - a non-projecting bump (e.g. ensureAccount wallet
+        // change) must not leave auto-mode reads projecting forever, and a
+        // stable account re-projects at most once per freshness window.
+        for (const m of members) {
+            if (!supportedApp(m.app)) continue;
+            await tx.run(
+                `UPDATE ecosystem_projection_state SET revision = ?, updated_at = ?
+                 WHERE app = ? AND identity = ? AND (revision IS NOT ? OR updated_at IS NOT ?)`,
+                [revision, now(), m.app, String(m.identity), revision, now()]);
         }
         return revision;
+    };
+
+    // Auto mode: a read takes the writer gate only when the stored projection
+    // is behind the account revision or older than the freshness window;
+    // otherwise the read-only snapshot is returned without a write.
+    const PROJECTION_STALE_MS = 10 * 60 * 1000;
+    const autoProjectionNeeded = async (tx, accountId) => {
+        const canonical = await canonicalAccount(tx, accountId);
+        const rev = await tx.get(`SELECT revision FROM ecosystem_revisions WHERE account_id = ?`, [canonical]);
+        const R = rev ? Number(rev.revision) : 0;
+        const members = await loadAccountMembers(tx, canonical);
+        const staleBefore = now() - PROJECTION_STALE_MS;
+        for (const m of members) {
+            if (!supportedApp(m.app)) continue;
+            const p = await tx.get(
+                `SELECT revision, updated_at FROM ecosystem_projection_state WHERE app = ? AND identity = ?`,
+                [m.app, String(m.identity)]);
+            if (!p || Number(p.revision || 0) !== R || Number(p.updated_at || 0) < staleBefore) return true;
+        }
+        return false;
     };
 
     const resolveIdentity = async (app, identity, { at = now(), project = true } = {}) => {
@@ -1582,9 +1609,20 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
             res.linkConflict = await readLinkConflict(tx, res.accountId, app, id);
             return res;
         };
+        if (project === 'auto') {
+            const needed = await readTransaction(async (tx) => {
+                const id = await validateIdentity(tx, app, identity);
+                const member = await tx.get(`SELECT account_id FROM ecosystem_members WHERE app = ? AND identity = ?`, [app, id]);
+                return member ? autoProjectionNeeded(tx, member.account_id) : false;
+            });
+            project = needed;
+        }
         return project ? await transaction(work) : await readTransaction(work);
     };
     const resolveAccount = async (accountId, { at = now(), project = false } = {}) => {
+        if (project === 'auto') {
+            project = await readTransaction((tx) => autoProjectionNeeded(tx, accountId));
+        }
         const work = (tx) => resolveAccountTx(tx, accountId, { at, project });
         return project ? await transaction(work) : await readTransaction(work);
     };

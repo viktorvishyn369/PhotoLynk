@@ -2170,6 +2170,49 @@ test('resolveSubscriptionState (real code): lazy transitions write once; readOnl
     await h.close();
 });
 
+test('projection never drives the grace/retention machine: lapsed benefit -> grace -> expired+deleted_at', async () => {
+    // A projection-written 'expired' would satisfy the CAS guard
+    // (`row.status !== 'expired'`) without deleted_at ever being set - the
+    // retention clock would never start. Projection may only mirror
+    // expires_at; resolveSubscriptionState owns the status transitions.
+    const { h, dbPath } = await mkEcoAdminDb();
+    const now = Date.now();
+    const clock = { t: now };
+    const svc = createEcosystemService({ sqlite3, dbPath, now: () => clock.t });
+    await svc.initialize();
+    await h.run(`INSERT INTO users (id,email) VALUES (1,'a@x')`);
+    // Lapsed paid plan still marked 'active' - exactly what a real row looks
+    // like before the lazy state machine has touched it.
+    const lapsedExp = now - 864e5;
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,status,expires_at,updated_at) VALUES (1,400,'active',?,?)`, [lapsedExp, now]);
+    const acct = await svc.ensureAccount('photolynk', '1', {});
+    // Projection absorbs the lapsed plan as a member-local benefit, mirrors
+    // the expiry, and must NOT touch status/grace_until/deleted_at.
+    await svc.resolveIdentity('photolynk', '1', { project: true });
+    const proj = await h.get(`SELECT status, expires_at, grace_until, deleted_at FROM user_plans WHERE user_id = 1`);
+    assert.equal(proj.status, 'active', 'projection must NOT write expired - status is the state machine\'s');
+    assert.equal(Number(proj.expires_at), lapsedExp, 'projection mirrors the resolved expiry');
+    assert.equal(proj.grace_until, null);
+    assert.equal(proj.deleted_at, null, 'no tombstone from projection');
+
+    // The real CAS state machine then transitions exactly as before the core.
+    const { resolveSubscriptionState } = loadPlanState(h);
+    const r1 = await resolveSubscriptionState(1);
+    assert.equal(r1.status, 'grace');
+    const g = await h.get(`SELECT status, grace_until, deleted_at FROM user_plans WHERE user_id = 1`);
+    assert.equal(g.status, 'grace');
+    assert.ok(Number(g.grace_until) > now, 'grace window written');
+    assert.equal(g.deleted_at, null);
+    // Grace lapses -> expired + deleted_at (retention clock starts).
+    await h.run(`UPDATE user_plans SET grace_until = ? WHERE user_id = 1`, [now - 1]);
+    const r2 = await resolveSubscriptionState(1);
+    assert.equal(r2.status, 'expired');
+    const fin = await h.get(`SELECT status, deleted_at FROM user_plans WHERE user_id = 1`);
+    assert.equal(fin.status, 'expired');
+    assert.ok(Number(fin.deleted_at) > 0, 'deleted_at set by the state machine, not projection');
+    await h.close();
+});
+
 // --- autopurge interlock -----------------------------------------------------
 const loadPurge = (h, dbPath, fakeFs) => vm.runInNewContext(
     `${extractMarked('USER_PURGE')}\n;({ purgeUserEverywhere })`,
@@ -3881,4 +3924,74 @@ test('admin eco-jobs: counts + rows with parsed subjects; legacy mode short-circ
     assert.equal(Object.keys(res2.body.counts).length, 0);
     assert.equal(res2.body.jobs.length, 0);
     await h.close();
+});
+
+// ===========================================================================
+// ecosystem-migration-dryrun.js - the production deploy-safety tool itself
+// ===========================================================================
+const { spawnSync } = require('child_process');
+const DRYRUN_SCRIPT = path.join(__dirname, 'scripts', 'ecosystem-migration-dryrun.js');
+
+// Legacy fixture shaped like a real prod DB: paid users, an ad-stacked plan,
+// trial/grace/premium-only rows, a PS device + verified revenue, shared and
+// revoke subs rows - everything the baseline must preserve.
+const mkDryrunFixture = async () => {
+    const { h, dbPath } = await mkEcoAdminDb();
+    const t0 = Date.now();
+    const DAY = 864e5;
+    const DEV = 'dev_' + 'a'.repeat(20);
+    const DEV2 = 'dev_' + 'b'.repeat(20);
+    await h.run(`INSERT INTO users (id,email) VALUES (1,'u1@x'),(2,'u2@x'),(3,'u3@x'),(4,'u4@x'),(5,'u5@x')`);
+    // user 1: active 400GB solana payment with an ad week stacked on top
+    const paid1 = t0 - 23 * DAY;
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,status,expires_at,payment_type,payment_at,updated_at) VALUES (1,400,'active',?,'ad_claim',?,?)`, [paid1 + 37 * DAY, paid1, t0]);
+    await h.run(`INSERT INTO solana_payments (user_id,tx_signature,tier_gb,duration,created_at,verified_at) VALUES (1,'sigU1',400,'monthly',?,?)`, [paid1, paid1]);
+    await h.run(`INSERT INTO solana_subscription_credits (tx_signature,user_id,source,payment_at,expires_before,expires_after,created_at) VALUES ('sigU1',1,'solana',?,NULL,?,?)`, [paid1, paid1 + 30 * DAY, paid1]);
+    // user 2: active 1TB solana
+    const paid2 = t0 - 10 * DAY;
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,status,expires_at,payment_type,payment_at,updated_at) VALUES (2,1000,'active',?,'solana',?,?)`, [paid2 + 30 * DAY, paid2, t0]);
+    await h.run(`INSERT INTO solana_payments (user_id,tx_signature,tier_gb,duration,created_at,verified_at) VALUES (2,'sigU2',1000,'monthly',?,?)`, [paid2, paid2]);
+    // user 3: live trial; user 4: lapsed into grace; user 5: premium-only
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,status,trial_until,updated_at) VALUES (3,50,'trial',?,?)`, [t0 + 5 * DAY, t0]);
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,status,expires_at,grace_until,updated_at) VALUES (4,400,'grace',?,?,?)`, [t0 - DAY, t0 + 6 * DAY, t0]);
+    await h.run(`INSERT INTO user_plans (user_id,plan_gb,status,expires_at,premium_gb,premium_expires_at,updated_at) VALUES (5,0,'expired',?,500,?,?)`, [t0 - 40 * DAY, t0 + 60 * DAY, t0]);
+    // accounts + members
+    await h.run(`INSERT INTO ecosystem_accounts (account_id,created_at) VALUES ('acctP1',?),('acctP2',?),('acctT',?),('acctG',?),('acctPrem',?),('acctPS',?),('acctShared',?),('acctRev',?)`,
+        [t0, t0, t0, t0, t0, t0, t0, t0]);
+    await h.run(`INSERT INTO ecosystem_members (account_id,app,identity,linked_at) VALUES
+        ('acctP1','photolynk','1',?),('acctP2','photolynk','2',?),('acctT','photolynk','3',?),
+        ('acctG','photolynk','4',?),('acctPrem','photolynk','5',?),('acctPS','paceseeker',?,?),
+        ('acctShared','paceseeker',?,?),('acctRev','paceseeker',?,?)`,
+        [t0, t0, t0, t0, t0, DEV, t0, DEV2, t0, 'dev_' + 'c'.repeat(20), t0]);
+    // PS device: sub_until covered by the account's shared floor + a verified
+    // revenue row; ad_until seeds the local ad benefit.
+    await h.run(`INSERT INTO paceseeker_devices (device_hash,sub_until,ad_until) VALUES (?,?,?)`, [DEV, t0 + 10 * DAY, t0 + 2 * DAY]);
+    await h.run(`INSERT INTO paceseeker_revenue (signature,device_hash,paid_at,paid_with,plan,reported_at,eco_verified) VALUES ('sigDEV',?,?,'SOL','monthly',?,1)`, [DEV, t0 - 20 * DAY, t0]);
+    await h.run(`INSERT INTO stealthlynk_subs (account_id,sub_until,source_app,source_kind,provenance,updated_at) VALUES
+        ('acctPS',?,'paceseeker','payment','sigDEV',?),
+        ('acctShared',?,'photolynk','payment','sigU2',?),
+        ('acctRev',?,'photolynk','revoke',NULL,?)`,
+        [t0 + 10 * DAY, t0, t0 + 15 * DAY, t0, t0 + 30 * DAY, t0]);
+    await h.close();
+    return dbPath;
+};
+
+test('migration dry-run on a legacy fixture: exit 0, zero regressions, copy-only', async () => {
+    const dbPath = await mkDryrunFixture();
+    const jsonOut = path.join(path.dirname(dbPath), 'report.json');
+    const r = spawnSync(process.execPath, [DRYRUN_SCRIPT, dbPath, '--json', jsonOut], { encoding: 'utf8' });
+    assert.equal(r.status, 0, `stdout:\n${r.stdout}\nstderr:\n${r.stderr}`);
+    const report = JSON.parse(fs.readFileSync(jsonOut, 'utf8'));
+    assert.equal(report.regressions.length, 0);
+    assert.equal(report.init.migrated, true);
+    assert.ok(report.membersResolved >= 8, 'every member resolved');
+    assert.ok(fs.existsSync(report.copy) && report.copy !== dbPath, 'operated on a copy');
+});
+
+test('migration dry-run detector fires: --inject-regression exits 1', async () => {
+    const dbPath = await mkDryrunFixture();
+    const r = spawnSync(process.execPath, [DRYRUN_SCRIPT, dbPath, '--inject-regression'], { encoding: 'utf8' });
+    assert.equal(r.status, 1, `expected exit 1, got ${r.status}\nstdout:\n${r.stdout}\nstderr:\n${r.stderr}`);
+    assert.ok(/REGRESSIONS \([1-9]/.test(r.stdout), 'human summary reports the planted regression');
+    assert.ok(r.stdout.includes('expires_at'), 'the planted expires_at regression is named');
 });

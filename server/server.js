@@ -4887,6 +4887,9 @@ const ecoPsMemberProof = async (deviceHash, wallet) => {
 // Repair + read the current projection for a user/device after a duplicate or
 // mirror path. Deduped per key so concurrent reads share one projection write.
 const _ecoProjectInFlight = new Map();
+// Every caller of this funnel is a read path or a post-mutation repair —
+// 'auto' projects only when the stored projection is behind the account
+// revision or stale (>10min); steady-state reads stay on the read gate.
 const _ecoProject = (app, identity) => {
     if (!ecosystemReady) return Promise.resolve(null);
     const key = `${app}:${identity}`;
@@ -4894,7 +4897,7 @@ const _ecoProject = (app, identity) => {
     if (held) return held;
     const p = (async () => {
         try {
-            return await ecosystem.resolveIdentity(app, String(identity), { project: true });
+            return await ecosystem.resolveIdentity(app, String(identity), { project: 'auto' });
         } catch (e) {
             console.warn('[Eco] projection failed for', key, e.message);
             return null;
@@ -7193,7 +7196,7 @@ async function _psTrialRespond(res, row, id, wallet) {
             // effective grant for this device (local ads, direct payment,
             // shared timeline). The pre-projection device row's ad_until is
             // stale - it must never re-inflate a revoked/current core result.
-            snap = await ecosystem.resolveIdentity('paceseeker', String(id), { project: true }).catch(() => null);
+            snap = await ecosystem.resolveIdentity('paceseeker', String(id), { project: 'auto' }).catch(() => null);
             if (snap && snap.entitlement && snap.entitlement.expiresAt != null) {
                 subUntil = Number(snap.entitlement.expiresAt) || 0;
             }
