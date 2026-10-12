@@ -4205,6 +4205,23 @@ app.get('/photolynk-remote-config.json', (req, res) => {
     res.status(404).json({ error: 'Remote config not found' });
 });
 
+// Lane remote config — signed { payload, signature } verified by the app
+// (same Ed25519 key as PaceSeeker). Extracted from unified remote-config.json.
+app.get('/lane-remote-config.json', (req, res) => {
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Cache-Control', 'public, max-age=300');
+    const cfgPath = path.join(__dirname, 'remote-config.json');
+    if (fs.existsSync(cfgPath)) {
+        try {
+            const raw = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+            if (raw.lane) return res.json(raw.lane);
+        } catch (e) {
+            return res.status(500).json({ error: 'Invalid config format' });
+        }
+    }
+    res.status(404).json({ error: 'Lane remote config not found' });
+});
+
 
 // ─── PaceSeeker AI Federation: crowd-sourced learning data ───
 // Users' DCA AI engines learn from real LIVE trade outcomes. This endpoint
@@ -14697,6 +14714,30 @@ const collectUserNftCids = async (user) => {
 // Helper functions for wallet-scoped filtering
 const normalizeWalletAddress = (wallet) => wallet ? String(wallet).trim() : '';
 const normalizeWalletMint = (m) => m ? String(m).replace(/^cnft_/, '') : '';
+
+// Parsed-JSON cache keyed by path + file mtime. Wallet-global scans run on
+// every client poll (album list, certificates) and used to re-read and
+// re-parse every user's album file each time — a synchronous O(total album
+// data) burst per request. Only this process writes these files, so mtime
+// is an exact staleness signal and the scan degenerates to cheap statSync
+// calls. Callers must not mutate returned objects — clone before writing.
+const _nftJsonFileCache = new Map(); // absPath -> {mtimeMs, parsed}
+const NFT_JSON_CACHE_MAX = 5000;
+const readJsonFileCached = (filePath) => {
+    try {
+        const mtimeMs = fs.statSync(filePath).mtimeMs;
+        const hit = _nftJsonFileCache.get(filePath);
+        if (hit && hit.mtimeMs === mtimeMs) return hit.parsed;
+        const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
+        if (_nftJsonFileCache.size >= NFT_JSON_CACHE_MAX) _nftJsonFileCache.clear();
+        _nftJsonFileCache.set(filePath, { mtimeMs, parsed });
+        return parsed;
+    } catch (_) {
+        _nftJsonFileCache.delete(filePath);
+        return undefined;
+    }
+};
+
 const nftMatchesWalletScope = (nft, walletAddress) => {
     const targetWallet = normalizeWalletAddress(walletAddress);
     if (!targetWallet || !nft) return false;
@@ -14961,25 +15002,24 @@ const readNftsForWalletGlobal = (walletAddress) => {
         const dirs = fs.readdirSync(NFT_DIR, { withFileTypes: true });
         for (const d of dirs) {
             if (!d.isDirectory()) continue;
-            const metaPath = path.join(NFT_DIR, d.name, 'nft-album.json');
-            if (!fs.existsSync(metaPath)) continue;
-            try {
-                const data = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-                for (const nft of (data.nfts || [])) {
-                    if (normalizeWalletAddress(nft.ownerAddress) !== targetWallet) continue;
-                    const key = normalizeWalletMint(nft.mintAddress);
-                    if (!key) continue;
-                    if (nft.imageUrl && nft.imageUrl.startsWith('data:') && nft.imageUrl.length > 5000) nft.imageUrl = undefined;
-                    if (nft.arweaveUrl && nft.arweaveUrl.startsWith('data:') && nft.arweaveUrl.length > 5000) nft.arweaveUrl = undefined;
-                    if (seenIdx[key] !== undefined) {
-                        const existing = merged[seenIdx[key]];
-                        mergeStoredNft(existing, nft);
-                        continue;
-                    }
-                    seenIdx[key] = merged.length;
-                    merged.push(nft);
+            const data = readJsonFileCached(path.join(NFT_DIR, d.name, 'nft-album.json'));
+            if (!data) continue;
+            for (const nft of (data.nfts || [])) {
+                if (normalizeWalletAddress(nft.ownerAddress) !== targetWallet) continue;
+                const key = normalizeWalletMint(nft.mintAddress);
+                if (!key) continue;
+                // Clone: cached parsed objects are shared — never mutate them.
+                const out = { ...nft };
+                if (out.imageUrl && out.imageUrl.startsWith('data:') && out.imageUrl.length > 5000) out.imageUrl = undefined;
+                if (out.arweaveUrl && out.arweaveUrl.startsWith('data:') && out.arweaveUrl.length > 5000) out.arweaveUrl = undefined;
+                if (seenIdx[key] !== undefined) {
+                    const existing = merged[seenIdx[key]];
+                    mergeStoredNft(existing, out);
+                    continue;
                 }
-            } catch (_) { }
+                seenIdx[key] = merged.length;
+                merged.push(out);
+            }
         }
     } catch (e) { console.error('[NFT] readNftsForWalletGlobal error:', e.message); }
     return merged;
@@ -15571,10 +15611,9 @@ const readCertsForWalletGlobal = (walletAddress) => {
         const dirs = fs.readdirSync(NFT_DIR, { withFileTypes: true });
         for (const d of dirs) {
             if (!d.isDirectory()) continue;
-            const cp = path.join(NFT_DIR, d.name, 'certificates.json');
-            if (!fs.existsSync(cp)) continue;
+            const parsed = readJsonFileCached(path.join(NFT_DIR, d.name, 'certificates.json'));
+            if (!parsed) continue;
             try {
-                const parsed = JSON.parse(fs.readFileSync(cp, 'utf8'));
                 for (const c of (Array.isArray(parsed) ? parsed : [])) {
                     // Match by ownerAddress primarily; creatorWallet only if ownerAddress absent
                     // After transfer, ownerAddress = newOwner so sender must NOT see it via creatorWallet
