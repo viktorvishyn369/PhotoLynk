@@ -376,6 +376,46 @@ test('extractTreasuryTransfer: unsafe raw amount rejected', () => {
     assert.throws(() => extractTreasuryTransfer(tx, TREASURY_OPTS), (e) => e.code === 'UNSAFE_AMOUNT');
 });
 
+test('extractTreasuryTransfer: treasury SOL self-payment uses the signed instruction amount', () => {
+    // treasury -> treasury: net gain is just the burned fee, but only the
+    // treasury keyholder can sign such a transfer - the ix amount is the proof.
+    const tx = solTx({ payer: TREASURY, lamports: '500000000' });
+    tx.transaction.message.accountKeys = [{ pubkey: TREASURY, signer: true, writable: true }];
+    tx.meta.preBalances = [2_000_000_000];
+    tx.meta.postBalances = [2_000_000_000 - 5000];
+    const r = extractTreasuryTransfer(tx, TREASURY_OPTS);
+    assert.equal(r.token, 'SOL');
+    assert.equal(r.rawAmount, '500000000');
+    assert.ok(Math.abs(r.amount - 0.5) < 1e-9);
+    assert.equal(r.senderWallet, TREASURY);
+    assert.equal(r.selfPayment, true);
+});
+
+test('extractTreasuryTransfer: treasury SKR self-payment to its own ATA is accepted', () => {
+    const tx = skrTx({ authority: TREASURY });
+    tx.transaction.message.instructions[0].parsed.info.destination = SRC_ATA;
+    tx.transaction.message.accountKeys = [
+        { pubkey: TREASURY, signer: true, writable: true },
+        { pubkey: SRC_ATA, signer: false, writable: true },
+    ];
+    tx.meta.preTokenBalances = [
+        { accountIndex: 1, mint: SKR_MINT, owner: TREASURY, uiTokenAmount: { amount: '1000000000', decimals: SKR_DECIMALS } },
+    ];
+    tx.meta.postTokenBalances = [
+        { accountIndex: 1, mint: SKR_MINT, owner: TREASURY, uiTokenAmount: { amount: '1000000000', decimals: SKR_DECIMALS } },
+    ];
+    const r = extractTreasuryTransfer(tx, TREASURY_OPTS);
+    assert.equal(r.token, 'SKR');
+    assert.equal(r.rawAmount, '106207279');
+    assert.equal(r.senderWallet, TREASURY);
+    assert.equal(r.selfPayment, true);
+});
+
+test('extractTreasuryTransfer: normal payments are not flagged as selfPayment', () => {
+    const r = extractTreasuryTransfer(solTx({ lamports: '500000000' }), TREASURY_OPTS);
+    assert.equal(r.selfPayment, false);
+});
+
 // ===========================================================================
 // createSubscriptionCreditor - atomicity
 // ===========================================================================

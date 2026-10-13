@@ -332,7 +332,8 @@ function extractTreasuryTransfer(tx, { wallet, mint, decimals }) {
         if (programId === TOKEN_PROGRAM_ID && (parsed?.type === 'transfer' || parsed?.type === 'transferChecked')) {
             const info = parsed.info || {};
             if (!info.authority || !signers.has(info.authority)) continue;
-            if (info.authority === wallet) continue; // treasury -> treasury move is not a payment
+            // Treasury -> treasury transfers are collected as selfPayments: only
+            // the treasury can sign them, and the signed amount is the proof.
             const destIdx = accountKeys.indexOf(info.destination);
             const srcIdx = accountKeys.indexOf(info.source);
             if (destIdx < 0 || srcIdx < 0) continue;
@@ -364,17 +365,23 @@ function extractTreasuryTransfer(tx, { wallet, mint, decimals }) {
     if (solTransfers.length) {
         const payers = new Set(solTransfers.map((t) => t.source));
         if (payers.size !== 1) throw codedError('AMBIGUOUS_PAYMENT', 'multiple SOL payers');
+        // Treasury self-payment: source AND destination are the treasury, so the
+        // net balance gain is zero/negative. Only the treasury keyholder can sign
+        // such a transfer (source must be a signer), so the signed instruction
+        // amount itself is the proof of payment.
+        const selfPay = solTransfers[0].source === wallet;
         const walletIdx = accountKeys.indexOf(wallet);
         const netGain = walletIdx >= 0 ? toBig(postBalances[walletIdx]) - toBig(preBalances[walletIdx]) : 0n;
         const ixSum = solTransfers.reduce((acc, t) => acc + t.raw, 0n);
         if (ixSum > MAX_SAFE_BIG) throw codedError('UNSAFE_AMOUNT', 'summed lamports exceed safe range');
-        const amount = ixSum < netGain ? ixSum : netGain;
+        const amount = selfPay ? ixSum : (ixSum < netGain ? ixSum : netGain);
         if (amount <= 0n) throw codedError('NO_INFLOW', 'no positive net SOL gain for treasury');
         return {
             token: 'SOL',
             amount: Number(amount) / LAMPORTS_PER_SOL,
             rawAmount: amount.toString(),
             senderWallet: solTransfers[0].source,
+            selfPayment: selfPay,
             blockTime: tx.blockTime ?? null,
             slot: tx.slot ?? null,
         };
@@ -383,21 +390,29 @@ function extractTreasuryTransfer(tx, { wallet, mint, decimals }) {
     if (skrTransfers.length) {
         const payers = new Set(skrTransfers.map((t) => t.authority));
         if (payers.size !== 1) throw codedError('AMBIGUOUS_PAYMENT', 'multiple SKR payers');
-        // Per receiving account: cap instruction sum by that account's net gain.
-        const byDest = new Map();
-        for (const t of skrTransfers) byDest.set(t.destIdx, (byDest.get(t.destIdx) || 0n) + t.raw);
-        let total = 0n;
-        for (const [destIdx, sum] of byDest) {
-            const pre = preTokenBalances.find((b) => b.accountIndex === destIdx && b.mint === mint);
-            const post = postTokenBalances.find((b) => b.accountIndex === destIdx && b.mint === mint);
-            const preRaw = toBigStrict(pre?.uiTokenAmount?.amount);
-            const postRaw = toBigStrict(post?.uiTokenAmount?.amount);
-            if (preRaw === 'unsafe' || postRaw === 'unsafe') {
-                throw codedError('UNSAFE_AMOUNT', 'unsafe token balance in transaction meta');
+        const selfPay = skrTransfers[0].authority === wallet;
+        let total;
+        if (selfPay) {
+            // Self-payment: source and destination share the treasury balance,
+            // net gain is zero - the signed instruction amount is the proof.
+            total = skrTransfers.reduce((acc, t) => acc + t.raw, 0n);
+        } else {
+            // Per receiving account: cap instruction sum by that account's net gain.
+            const byDest = new Map();
+            for (const t of skrTransfers) byDest.set(t.destIdx, (byDest.get(t.destIdx) || 0n) + t.raw);
+            total = 0n;
+            for (const [destIdx, sum] of byDest) {
+                const pre = preTokenBalances.find((b) => b.accountIndex === destIdx && b.mint === mint);
+                const post = postTokenBalances.find((b) => b.accountIndex === destIdx && b.mint === mint);
+                const preRaw = toBigStrict(pre?.uiTokenAmount?.amount);
+                const postRaw = toBigStrict(post?.uiTokenAmount?.amount);
+                if (preRaw === 'unsafe' || postRaw === 'unsafe') {
+                    throw codedError('UNSAFE_AMOUNT', 'unsafe token balance in transaction meta');
+                }
+                let net = postRaw - preRaw;
+                if (net < 0n) net = 0n;
+                total += sum < net ? sum : net;
             }
-            let net = postRaw - preRaw;
-            if (net < 0n) net = 0n;
-            total += sum < net ? sum : net;
         }
         if (total > MAX_SAFE_BIG) throw codedError('UNSAFE_AMOUNT', 'summed token amount exceeds safe range');
         if (total <= 0n) throw codedError('NO_INFLOW', 'no positive net SKR gain for treasury');
@@ -406,6 +421,7 @@ function extractTreasuryTransfer(tx, { wallet, mint, decimals }) {
             amount: Number(total) / Math.pow(10, Number(decimals)),
             rawAmount: total.toString(),
             senderWallet: skrTransfers[0].authority,
+            selfPayment: selfPay,
             blockTime: tx.blockTime ?? null,
             slot: tx.slot ?? null,
         };
