@@ -418,6 +418,20 @@ app.get('/.well-known/assetlinks.json', (req, res) => {
     res.status(404).json({ error: 'assetlinks.json not found' });
 });
 
+// Real client IP behind nginx/cloudflared. Proxy headers are trusted ONLY
+// when the socket itself is loopback (i.e. the request genuinely arrived via
+// the local proxy chain); a direct LAN/socket hit keeps its real source —
+// otherwise anyone could spoof X-Forwarded-For / CF-Connecting-IP to bypass
+// rate limits and the admin allowlist.
+const getClientIp = (req) => {
+    const sock = String(req.ip || req.socket?.remoteAddress || req.connection?.remoteAddress || '').replace('::ffff:', '');
+    if (sock !== '127.0.0.1' && sock !== '::1') return sock;
+    const cf = String(req.headers['cf-connecting-ip'] || '').trim();
+    if (cf) return cf;
+    const xff = String(req.headers['x-forwarded-for'] || '').split(',')[0].trim();
+    return xff || sock;
+};
+
 // Basic IP allowlist helper
 const isIpAllowed = (ip) => {
     if (!ADMIN_IP_ALLOWLIST.length) return true;
@@ -431,7 +445,7 @@ const adminAuth = async (req, res, next) => {
         if (!ADMIN_USER || !ADMIN_PASSWORD_BCRYPT) {
             return res.status(403).send('Admin access not configured');
         }
-        if (!isIpAllowed(req.ip)) {
+        if (!isIpAllowed(getClientIp(req))) {
             return res.status(403).send('IP not allowed');
         }
         const header = req.headers['authorization'] || '';
@@ -2037,6 +2051,40 @@ app.post('/admin/api/user/delete', adminAuth, async (req, res) => {
     }
 });
 
+// Release a device_uuid binding — support tool for users locked out by
+// "Device identifier conflict" (a uuid bound to a second live user row:
+// migrated/paired devices, duplicate accounts). Pass keepUserId to release
+// only OTHER users' bindings, or omit it to free the uuid entirely.
+app.post('/admin/api/user/release-device', adminAuth, async (req, res) => {
+    try {
+        const { deviceUuid, keepUserId } = req.body || {};
+        const uuid = String(deviceUuid || '').trim();
+        if (!uuid) {
+            return res.status(400).json({ error: 'deviceUuid required' });
+        }
+        const bound = await dbAllAsync(
+            `SELECT d.user_id, u.email FROM devices d LEFT JOIN users u ON u.id = d.user_id WHERE d.device_uuid = ?`,
+            [uuid]);
+        if (!bound || bound.length === 0) {
+            return res.json({ ok: true, released: 0, boundTo: [] });
+        }
+        const keep = keepUserId != null ? Number(keepUserId) : null;
+        let result;
+        if (Number.isFinite(keep)) {
+            result = await dbRunAsync(
+                `DELETE FROM devices WHERE device_uuid = ? AND (user_id IS NULL OR user_id != ?)`,
+                [uuid, keep]);
+        } else {
+            result = await dbRunAsync(`DELETE FROM devices WHERE device_uuid = ?`, [uuid]);
+        }
+        console.warn(`[Admin] Released device_uuid binding (${uuid.slice(0, 13)}…), was bound to ${JSON.stringify(bound.map(b => b.user_id))}, keep=${keep}`);
+        return res.json({ ok: true, released: result?.changes ?? 0, boundTo: bound });
+    } catch (e) {
+        console.error('[Admin] release-device error', e);
+        return res.status(500).json({ error: 'Server error', details: e?.message });
+    }
+});
+
 // Prevent stale caching (e.g., 304 Not Modified) for API responses like StealthCloud manifest listing
 app.set('etag', false);
 
@@ -2048,7 +2096,7 @@ const createRateLimiter = ({ windowMs, max }) => {
 
     return (req, res, next) => {
         const now = Date.now();
-        const key = `${req.ip}:${req.path}`;
+        const key = `${getClientIp(req)}:${req.path}`;
         const entry = hits.get(key) || { count: 0, resetAt: now + windowMsNum };
 
         if (now > entry.resetAt) {
@@ -2076,6 +2124,11 @@ const createRateLimiter = ({ windowMs, max }) => {
 const AUTH_RATE_LIMIT_WINDOW_MS = Number.parseInt(process.env.AUTH_RATE_LIMIT_WINDOW_MS || String(15 * 60 * 1000), 10);
 const AUTH_RATE_LIMIT_MAX = Number.parseInt(process.env.AUTH_RATE_LIMIT_MAX || '25', 10);
 const authRateLimiter = createRateLimiter({ windowMs: AUTH_RATE_LIMIT_WINDOW_MS, max: AUTH_RATE_LIMIT_MAX });
+// Ecosystem endpoints identify callers by bearer device_hash, not credentials —
+// a generous per-IP cap stops account enumeration/scraping without affecting
+// normal app polling (120/15min ≈ one call every 7.5s sustained).
+const ECO_RATE_LIMIT_MAX = Number.parseInt(process.env.ECO_RATE_LIMIT_MAX || '120', 10);
+const ecoRateLimiter = createRateLimiter({ windowMs: AUTH_RATE_LIMIT_WINDOW_MS, max: ECO_RATE_LIMIT_MAX });
 
 // ============================================================================
 // SECURITY CONFIGURATION
@@ -6196,7 +6249,7 @@ function ecoMaybeAuth(req, res, next) {
 }
 
 // Status: linked apps + shared sub + this week's ad claim state.
-app.get('/api/ecosystem/status', ecoMaybeAuth, async (req, res) => {
+app.get('/api/ecosystem/status', ecoRateLimiter, ecoMaybeAuth, async (req, res) => {
     try {
         const who = await ecoCallerAccount(req);
         if (who.error) return res.status(403).json({ error: who.error });
@@ -6269,7 +6322,7 @@ app.get('/api/ecosystem/status', ecoMaybeAuth, async (req, res) => {
 // bound automatically by a verified X post; this endpoint is for accounts that
 // only post elsewhere. Once set, the handle is pinned - it can't be changed
 // (prevents farming: same social identity required every week).
-app.post('/api/ecosystem/bind-social', ecoMaybeAuth, async (req, res) => {
+app.post('/api/ecosystem/bind-social', ecoRateLimiter, ecoMaybeAuth, async (req, res) => {
     try {
         const who = await ecoCallerAccount(req);
         if (who.error) return res.status(403).json({ error: who.error });
@@ -6313,7 +6366,7 @@ app.post('/api/ecosystem/bind-social', ecoMaybeAuth, async (req, res) => {
 });
 
 // Issues a t.me/<bot>?start=TG-XXXXXX deep link for TG membership verification.
-app.post('/api/ecosystem/tg-link', ecoMaybeAuth, async (req, res) => {
+app.post('/api/ecosystem/tg-link', ecoRateLimiter, ecoMaybeAuth, async (req, res) => {
     try {
         if (!ECO_TG_BOT_TOKEN) return res.status(503).json({ error: 'Telegram verification not configured' });
         const who = await ecoCallerAccount(req);
@@ -6326,11 +6379,11 @@ app.post('/api/ecosystem/tg-link', ecoMaybeAuth, async (req, res) => {
 
 // Link codes removed — replaced by signature-verified wallet binding below.
 // Stubs return 410 so older app builds get a clean error instead of a merge.
-app.post('/api/ecosystem/link-code', ecoMaybeAuth, async (req, res) => {
+app.post('/api/ecosystem/link-code', ecoRateLimiter, ecoMaybeAuth, async (req, res) => {
     res.status(410).json({ error: 'Link codes removed — apps link automatically once the wallet is verified.' });
 });
 
-app.post('/api/ecosystem/link', ecoMaybeAuth, async (req, res) => {
+app.post('/api/ecosystem/link', ecoRateLimiter, ecoMaybeAuth, async (req, res) => {
     res.status(410).json({ error: 'Link codes removed — apps link automatically once the wallet is verified.' });
 });
 
@@ -6366,7 +6419,7 @@ const _ecoVerifyWalletSig = (message, sigB64, pubB64, expectedAddr) => {
     return null;
 };
 
-app.get('/api/ecosystem/bind-challenge', ecoMaybeAuth, async (req, res) => {
+app.get('/api/ecosystem/bind-challenge', ecoRateLimiter, ecoMaybeAuth, async (req, res) => {
     try {
         const who = await ecoCallerAccount(req);
         if (who.error) return res.status(403).json({ error: who.error });
@@ -6405,7 +6458,7 @@ app.get('/api/ecosystem/bind-challenge', ecoMaybeAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Challenge failed' }); }
 });
 
-app.post('/api/ecosystem/bind-wallet', ecoMaybeAuth, async (req, res) => {
+app.post('/api/ecosystem/bind-wallet', ecoRateLimiter, ecoMaybeAuth, async (req, res) => {
     try {
         const who = await ecoCallerAccount(req);
         if (who.error) return res.status(403).json({ error: who.error });
@@ -6553,7 +6606,7 @@ app.post('/api/ecosystem/bind-wallet', ecoMaybeAuth, async (req, res) => {
 // Weekly ad kit: the unique code + ready-to-paste copies. Deterministic code
 // so re-opening the kit shows the same one all week. `platform` is this week's
 // required network — the claim verifier rejects posts on any other.
-app.get('/api/ecosystem/ad-kit', ecoMaybeAuth, async (req, res) => {
+app.get('/api/ecosystem/ad-kit', ecoRateLimiter, ecoMaybeAuth, async (req, res) => {
     try {
         const who = await ecoCallerAccount(req);
         if (who.error) return res.status(403).json({ error: who.error });
@@ -6570,7 +6623,7 @@ app.get('/api/ecosystem/ad-kit', ecoMaybeAuth, async (req, res) => {
     } catch (e) { res.status(500).json({ error: 'Ad kit failed' }); }
 });
 
-app.post('/api/ecosystem/ad-claim', ecoMaybeAuth, async (req, res) => {
+app.post('/api/ecosystem/ad-claim', ecoRateLimiter, ecoMaybeAuth, async (req, res) => {
     try {
         const who = await ecoCallerAccount(req);
         if (who.error) return res.status(403).json({ error: who.error });
@@ -7814,18 +7867,17 @@ const getUserPremiumGb = async (userId) => {
     return Number.isFinite(premiumGb) && premiumGb > 0 ? premiumGb : 0;
 };
 
-const getDirectorySizeRecursive = (dirPath) => {
+const getDirectorySizeRecursive = async (dirPath) => {
     let total = 0;
     try {
-        if (!fs.existsSync(dirPath)) return 0;
-        const entries = fs.readdirSync(dirPath, { withFileTypes: true });
+        const entries = await fs.promises.readdir(dirPath, { withFileTypes: true });
         for (const entry of entries) {
             const fullPath = path.join(dirPath, entry.name);
             try {
                 if (entry.isDirectory()) {
-                    total += getDirectorySizeRecursive(fullPath);
+                    total += await getDirectorySizeRecursive(fullPath);
                 } else if (entry.isFile()) {
-                    const stat = fs.statSync(fullPath);
+                    const stat = await fs.promises.stat(fullPath);
                     if (stat.isFile()) total += stat.size;
                 }
             } catch (e) { }
@@ -7869,30 +7921,35 @@ const getUserUsedBytes = async (userId, userOrNull) => {
             for (const key of allKeys) {
                 if (!key || key === 'unknown') continue;
 
-                // Encrypted chunks on disk (fallback if cloud_chunks table is stale/empty)
-                try {
-                    const chunksDir = CHUNKS_DIR
-                        ? path.join(CHUNKS_DIR, 'users', key, 'chunks')
-                        : path.join(CLOUD_DIR, 'users', key, 'chunks');
-                    if (fs.existsSync(chunksDir)) {
-                        fsChunkBytes += getDirectorySizeRecursive(chunksDir);
-                    }
-                } catch (e) { }
-
                 // Raw files (unencrypted backups)
                 try {
                     const rawDir = CHUNKS_DIR
                         ? path.join(CHUNKS_DIR, 'users', key, 'raw')
                         : path.join(CLOUD_DIR, 'users', key, 'raw');
                     if (fs.existsSync(rawDir)) {
-                        rawBytes += getDirectorySizeRecursive(rawDir);
+                        rawBytes += await getDirectorySizeRecursive(rawDir);
                     }
                 } catch (e) { }
             }
 
-            // If cloud_chunks table is empty or missing rows, use the actual filesystem chunk size
-            if (encryptedBytes <= 0 && fsChunkBytes > 0) {
-                encryptedBytes = fsChunkBytes;
+            // If cloud_chunks table is empty or missing rows, fall back to the
+            // actual filesystem chunk size. The walk is expensive on HDD-backed
+            // storage, so it only runs when the DB has nothing — before this it
+            // ran on EVERY call and its result was discarded whenever the DB
+            // was populated, freezing the event loop per request.
+            if (encryptedBytes <= 0) {
+                for (const key of allKeys) {
+                    if (!key || key === 'unknown') continue;
+                    try {
+                        const chunksDir = CHUNKS_DIR
+                            ? path.join(CHUNKS_DIR, 'users', key, 'chunks')
+                            : path.join(CLOUD_DIR, 'users', key, 'chunks');
+                        if (fs.existsSync(chunksDir)) {
+                            fsChunkBytes += await getDirectorySizeRecursive(chunksDir);
+                        }
+                    } catch (e) { }
+                }
+                if (fsChunkBytes > 0) encryptedBytes = fsChunkBytes;
             }
         } catch (e) { }
     }
@@ -18996,14 +19053,14 @@ const startExifBackfill = async () => {
         // Collect all uploaded files across all device directories (UUID folders)
         let allFiles = [];
         try {
-            const deviceDirs = fs.readdirSync(UPLOAD_DIR).filter(d => {
-                if (d.startsWith('.')) return false;
-                try { return fs.statSync(path.join(UPLOAD_DIR, d)).isDirectory(); } catch (_) { return false; }
-            });
+            const deviceEntries = await fs.promises.readdir(UPLOAD_DIR, { withFileTypes: true });
+            const deviceDirs = deviceEntries
+                .filter(e => e.isDirectory() && !e.name.startsWith('.'))
+                .map(e => e.name);
             for (const dd of deviceDirs) {
                 const dirPath = path.join(UPLOAD_DIR, dd);
                 try {
-                    const files = fs.readdirSync(dirPath).filter(f => EXIF_BACKFILL_IMAGE_EXTS.test(f));
+                    const files = (await fs.promises.readdir(dirPath)).filter(f => EXIF_BACKFILL_IMAGE_EXTS.test(f));
                     for (const f of files) {
                         allFiles.push({ dir: dirPath, filename: f, key: `${dd}/${f}` });
                     }
@@ -19154,19 +19211,17 @@ const startExifBackfill = async () => {
                 // Check if EXIF sidecar exists and whether it's "short" (incomplete)
                 let existingCount = 0;
                 let exifExists = false;
-                if (fs.existsSync(exifPath)) {
+                try {
+                    const existing = JSON.parse(await fs.promises.readFile(exifPath, 'utf8'));
                     exifExists = true;
-                    try {
-                        const existing = JSON.parse(fs.readFileSync(exifPath, 'utf8'));
-                        existingCount = countMeaningfulFields(existing?.exif);
-                    } catch (_) { existingCount = 0; /* corrupt file — rewrite */ exifExists = false; }
+                    existingCount = countMeaningfulFields(existing?.exif);
                     if (existingCount >= EXIF_SHORT_THRESHOLD) {
                         // Already rich — skip
                         skipped++;
                         processedSet.add(key);
                         continue;
                     }
-                }
+                } catch (_) { /* missing or corrupt sidecar — (re)extract below */ }
 
                 // Extract EXIF using sharp
                 let meta;
@@ -19259,61 +19314,53 @@ const startExifBackfill = async () => {
         const cloudUsersRoot = path.join(CLOUD_DIR, 'users');
         let manifestStored = 0, manifestSkipped = 0, manifestErrors = 0;
         try {
-            if (fs.existsSync(cloudUsersRoot)) {
-                const userDirs = fs.readdirSync(cloudUsersRoot).filter(d => {
-                    if (d.startsWith('.')) return false;
-                    try { return fs.statSync(path.join(cloudUsersRoot, d)).isDirectory(); } catch (_) { return false; }
-                });
-                for (const ud of userDirs) {
-                    const manifestsDir = path.join(cloudUsersRoot, ud, 'manifests');
-                    if (!fs.existsSync(manifestsDir)) continue;
-                    let manifestFiles;
-                    try { manifestFiles = fs.readdirSync(manifestsDir).filter(f => f.endsWith('.json') && !f.startsWith('.')); } catch (_) { continue; }
+            const cloudEntries = await fs.promises.readdir(cloudUsersRoot, { withFileTypes: true }).catch(() => []);
+            for (const e of cloudEntries) {
+                if (!e.isDirectory() || e.name.startsWith('.')) continue;
+                const ud = e.name;
+                const manifestsDir = path.join(cloudUsersRoot, ud, 'manifests');
+                let manifestFiles;
+                try { manifestFiles = (await fs.promises.readdir(manifestsDir)).filter(f => f.endsWith('.json') && !f.startsWith('.')); } catch (_) { continue; }
 
-                    for (const mf of manifestFiles) {
+                for (const mf of manifestFiles) {
+                    try {
+                        const content = JSON.parse(await fs.promises.readFile(path.join(manifestsDir, mf), 'utf8'));
+                        const meta = content?.meta;
+                        if (!meta?.fileHash) continue; // no fileHash → can't create sidecar
+
+                        const exifPath = getExifPath(meta.fileHash);
+                        if (!exifPath) continue;
+                        if (await fs.promises.stat(exifPath).then(() => true, () => false)) { manifestSkipped++; continue; } // already has sidecar
+
+                        // Build minimal EXIF from manifest metadata
+                        const exif = {};
+                        if (meta.exifCaptureTime) exif.captureTime = String(meta.exifCaptureTime).slice(0, 30);
+                        if (meta.exifMake) exif.make = String(meta.exifMake).replace(/\0/g, '').trim().toLowerCase() || null;
+                        if (meta.exifModel) exif.model = String(meta.exifModel).replace(/\0/g, '').trim().toLowerCase() || null;
+                        if (meta.originalSize) exif.originalSize = meta.originalSize;
+
+                        if (!exif.captureTime && !exif.make) continue; // no meaningful data
+
+                        const exifData = {
+                            fileHash: meta.fileHash.slice(0, 64),
+                            platform: 'manifest-backfill',
+                            storedAt: new Date().toISOString(),
+                            userId: ud,
+                            exif,
+                        };
+
+                        // Use O_EXCL to not race with client-side backfill
                         try {
-                            const content = JSON.parse(fs.readFileSync(path.join(manifestsDir, mf), 'utf8'));
-                            const meta = content?.meta;
-                            if (!meta?.fileHash) continue; // no fileHash → can't create sidecar
+                            await fs.promises.writeFile(exifPath, JSON.stringify(exifData, null, 2), { flag: 'wx' });
+                            manifestStored++;
+                        } catch (excl) {
+                            if (excl.code === 'EEXIST') { manifestSkipped++; continue; }
+                            throw excl;
+                        }
+                    } catch (_) { manifestErrors++; }
 
-                            const exifPath = getExifPath(meta.fileHash);
-                            if (!exifPath) continue;
-                            if (fs.existsSync(exifPath)) { manifestSkipped++; continue; } // already has sidecar
-
-                            // Build minimal EXIF from manifest metadata
-                            const exif = {};
-                            if (meta.exifCaptureTime) exif.captureTime = String(meta.exifCaptureTime).slice(0, 30);
-                            if (meta.exifMake) exif.make = String(meta.exifMake).replace(/\0/g, '').trim().toLowerCase() || null;
-                            if (meta.exifModel) exif.model = String(meta.exifModel).replace(/\0/g, '').trim().toLowerCase() || null;
-                            if (meta.originalSize) exif.originalSize = meta.originalSize;
-
-                            if (!exif.captureTime && !exif.make) continue; // no meaningful data
-
-                            const exifData = {
-                                fileHash: meta.fileHash.slice(0, 64),
-                                platform: 'manifest-backfill',
-                                storedAt: new Date().toISOString(),
-                                userId: ud,
-                                exif,
-                            };
-
-                            // Use O_EXCL to not race with client-side backfill
-                            let fd;
-                            try {
-                                fd = fs.openSync(exifPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL);
-                                fs.writeSync(fd, JSON.stringify(exifData, null, 2), 0, 'utf8');
-                                manifestStored++;
-                            } catch (excl) {
-                                if (excl.code === 'EEXIST') { manifestSkipped++; continue; }
-                                throw excl;
-                            } finally {
-                                if (fd !== undefined) try { fs.closeSync(fd); } catch (_) { }
-                            }
-                        } catch (_) { manifestErrors++; }
-
-                        // Yield every file
-                        await new Promise(r => setImmediate(r));
-                    }
+                    // Yield every file
+                    await new Promise(r => setImmediate(r));
                 }
             }
         } catch (e) {
