@@ -3344,12 +3344,13 @@ function touchDeviceLastSeen(user, deviceUuid) {
         // check-then-insert gap and end up sharing a folder key.
         db.run(`INSERT INTO devices (user_id, device_uuid, last_seen)
                  SELECT ?, ?, ?
-                 WHERE NOT EXISTS (
-                     SELECT 1 FROM devices
-                     WHERE device_uuid = ? AND user_id IS NOT NULL AND user_id != ?
-                 )
+                 WHERE EXISTS (SELECT 1 FROM users WHERE id = ?)
+                     AND NOT EXISTS (
+                         SELECT 1 FROM devices
+                         WHERE device_uuid = ? AND user_id IS NOT NULL AND user_id != ?
+                     )
                  ON CONFLICT(user_id, device_uuid) DO UPDATE SET last_seen = ?`,
-            [uid, safeDu, now, safeDu, uid, now], () => { });
+            [uid, safeDu, now, uid, safeDu, uid, now], () => { });
     } catch (e) { }
 }
 
@@ -3365,10 +3366,28 @@ const deviceUuidOwnedByOther = async (deviceUuid, userId) => {
         // Read ALL rows for the uuid and decide in JS: SQL `user_id != ?`
         // never matches NULL rows, so an orphaned row would let a second
         // account claim a uuid that is already somebody's folder key.
+        const uuid = String(deviceUuid || '');
         const rows = await dbAllAsync(
-            `SELECT user_id FROM devices WHERE device_uuid = ?`,
-            [String(deviceUuid || '')]);
-        return (rows || []).some(r => r && r.user_id != null && String(r.user_id) !== String(userId));
+            `SELECT user_id FROM devices WHERE device_uuid = ?`, [uuid]);
+        const ids = [...new Set((rows || []).map(r => r && r.user_id).filter(id => id != null))];
+        if (ids.length === 0) return false;
+        // Rows whose user_id no longer exists are orphans left by account
+        // deletion (a post-delete token call can re-insert them via
+        // touchDeviceLastSeen). A dead user owns no folder - drop the rows
+        // and treat the uuid as free so re-registration is never blocked
+        // by a tombstone.
+        const live = await dbAllAsync(
+            `SELECT id FROM users WHERE id IN (${ids.map(() => '?').join(',')})`, ids);
+        const liveIds = new Set((live || []).map(r => String(r.id)));
+        const deadIds = ids.filter(id => !liveIds.has(String(id)));
+        if (deadIds.length > 0) {
+            db.run(
+                `DELETE FROM devices WHERE device_uuid = ? AND user_id IN (${deadIds.map(() => '?').join(',')})`,
+                [uuid, ...deadIds],
+                (e) => { if (e) console.warn('[DeviceUuidGuard] orphan sweep failed:', e.message); }
+            );
+        }
+        return ids.some(id => liveIds.has(String(id)) && String(id) !== String(userId));
     } catch (_) {
         // Fail closed: a broken DB must never let a cross-account claim
         // through - the same DB write would fail anyway.
