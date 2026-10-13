@@ -843,6 +843,7 @@ function renderEcoTable(){
     html+='<td style="font-size:11px;min-width:220px">'+ecoEntitlementLines(a)+'</td>';
     html+='<td><span class="date-cell">'+claimsTxt+'</span></td>';
     html+='<td><button class="btn btn-primary" style="padding:3px 8px;font-size:11px" onclick="ecoSubAction(&apos;'+a.account_id+'&apos;,&apos;extend&apos;)" title="Add 7 days to the shared sub">+7d</button> '
+      +'<button class="btn btn-primary" style="padding:3px 8px;font-size:11px" onclick="ecoSubAction(&apos;'+a.account_id+'&apos;,&apos;set-until&apos;)" title="Set the shared sub to an absolute date">Set&hellip;</button> '
       +(a.subscribed?'<button class="btn btn-red" style="padding:3px 8px;font-size:11px" onclick="ecoSubAction(&apos;'+a.account_id+'&apos;,&apos;revoke&apos;)" title="Revoke the shared sub now">Revoke</button>':'<span class="date-cell">-</span>')
       +'</td>';
     html+='</tr>';
@@ -926,8 +927,15 @@ function ecoSubAction(accountId,action){
   if(action==='revoke'&&!confirm('Revoke this account\\'s shared subscription now? Member entitlements written by the ecosystem will be stripped immediately.'))return;
   var body={accountId:accountId,action:action};
   if(action==='extend')body.days=7;
+  if(action==='set-until'){
+    var inp=prompt('Set shared sub until (YYYY-MM-DD or epoch ms):');if(inp==null)return;
+    var until=Number(inp);
+    if(!(until>0)){var t=Date.parse(String(inp).trim());if(!isFinite(t)){toast('Invalid date','error');return}until=t;}
+    if(until<=Date.now()){toast('Date must be in the future','error');return}
+    body.until=until;
+  }
   fetch('/admin/api/eco-account/sub',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})
-    .then(function(r){return r.json().then(function(d){if(!r.ok)throw new Error(d.error||'Failed');toast(action==='revoke'?'Sub revoked':'Sub extended','success');ecoLoaded=false;loadEcoAccounts()})})
+    .then(function(r){return r.json().then(function(d){if(!r.ok)throw new Error(d.error||'Failed');toast(action==='revoke'?'Sub revoked':action==='set-until'?'Sub set':'Sub extended','success');ecoLoaded=false;loadEcoAccounts()})})
     .catch(function(e){toast(e.message||'Action failed','error')});
 }
 
