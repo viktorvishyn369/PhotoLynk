@@ -2203,7 +2203,14 @@ const getUserDeviceUuids = async (user) => {
         }
     }
 
-    const uuids = [current, ...(rows || []).map(r => (r && r.device_uuid) ? String(r.device_uuid) : '')].filter(Boolean);
+    const uuids = [current, ...(rows || []).map(r => (r && r.device_uuid) ? String(r.device_uuid) : '')]
+        .filter(u => {
+            if (!u) return false;
+            // Drop any uuid that wouldn't survive sanitization (a planted or
+            // corrupt row like '../victim' must never reach a disk path).
+            const s = sanitizeUserKey(u);
+            return s && s === u;
+        });
 
     return Array.from(new Set(uuids));
 };
@@ -3324,13 +3331,25 @@ function touchDeviceLastSeen(user, deviceUuid) {
         const uid = user && user.id;
         const du = deviceUuid || (user && user.device_uuid);
         if (!uid || !du) return;
-        const key = uid + '|' + du;
+        // Never let a caller plant a foreign/foreign-shaped uuid into this
+        // account's device rows — the devices table gates folder ownership.
+        const safeDu = sanitizeUserKey(du);
+        if (!safeDu || safeDu !== String(du)) return;
+        const key = uid + '|' + safeDu;
         const now = Date.now();
         if (now - (deviceSeenAt.get(key) || 0) < 5 * 60 * 1000) return;
         deviceSeenAt.set(key, now);
-        db.run(`INSERT INTO devices (user_id, device_uuid, last_seen) VALUES (?, ?, ?)
+        // Single atomic statement: the INSERT itself carries the ownership
+        // condition, so two accounts racing the same uuid can't both win the
+        // check-then-insert gap and end up sharing a folder key.
+        db.run(`INSERT INTO devices (user_id, device_uuid, last_seen)
+                 SELECT ?, ?, ?
+                 WHERE NOT EXISTS (
+                     SELECT 1 FROM devices
+                     WHERE device_uuid = ? AND user_id IS NOT NULL AND user_id != ?
+                 )
                  ON CONFLICT(user_id, device_uuid) DO UPDATE SET last_seen = ?`,
-            [uid, du, now, now], () => { });
+            [uid, safeDu, now, safeDu, uid, now], () => { });
     } catch (e) { }
 }
 
@@ -3343,12 +3362,17 @@ function touchDeviceLastSeen(user, deviceUuid) {
 // come from a forgery attempt.
 const deviceUuidOwnedByOther = async (deviceUuid, userId) => {
     try {
-        const row = await dbGetAsync(
-            `SELECT user_id FROM devices WHERE device_uuid = ? AND user_id != ? LIMIT 1`,
-            [String(deviceUuid || ''), userId]);
-        return !!row;
+        // Read ALL rows for the uuid and decide in JS: SQL `user_id != ?`
+        // never matches NULL rows, so an orphaned row would let a second
+        // account claim a uuid that is already somebody's folder key.
+        const rows = await dbAllAsync(
+            `SELECT user_id FROM devices WHERE device_uuid = ?`,
+            [String(deviceUuid || '')]);
+        return (rows || []).some(r => r && r.user_id != null && String(r.user_id) !== String(userId));
     } catch (_) {
-        return false;
+        // Fail closed: a broken DB must never let a cross-account claim
+        // through - the same DB write would fail anyway.
+        return true;
     }
 };
 // === DEVICE_UUID_GUARD_END ===
@@ -3365,8 +3389,21 @@ const authenticateToken = (req, res, next) => {
             // Cross-server fallback: if client is on local/private network,
             // decode token without signature verification so NFT/cert sync
             // works against local desktop servers that share the same user DB.
+            // HARD RULE: a request that came through any proxy or tunnel
+            // (X-Forwarded-For / CF headers — Cloudflare Tunnel always sets
+            // them and forwards as 127.0.0.1) must never take this path —
+            // an unsigned forged token is indistinguishable from a
+            // foreign-signed one. Set STEALTHLYNX_DISABLE_LAN_TOKEN_FALLBACK=1
+            // to disable the fallback entirely.
             const clientIp = req.ip || req.connection.remoteAddress || '';
-            if (isPrivateIp(clientIp)) {
+            const proxied = !!(
+                req.headers['x-forwarded-for'] || req.headers['x-real-ip'] ||
+                req.headers['cf-connecting-ip'] || req.headers['cf-ray'] ||
+                req.headers['forwarded'] || req.headers['via']
+            );
+            const fallbackAllowed = process.env.STEALTHLYNX_DISABLE_LAN_TOKEN_FALLBACK !== '1'
+                && isPrivateIp(clientIp) && !proxied;
+            if (fallbackAllowed) {
                 try {
                     const decoded = jwt.decode(token);
                     if (decoded && decoded.email) {
@@ -3387,7 +3424,26 @@ const authenticateToken = (req, res, next) => {
             return res.status(403).json({ error: 'Device mismatch. Token not valid for this device.' });
         }
 
+        // Token claims become filesystem paths (upload dirs, chunk folders).
+        // Reject any claim whose value wouldn't survive sanitization — a uuid
+        // containing '/', '..' or '.' is always forged or corrupted.
+        for (const claimKey of ['device_uuid', 'user_uuid', 'storage_uuid']) {
+            const v = user[claimKey];
+            if (v != null && v !== '') {
+                const sv = sanitizeUserKey(v);
+                if (!sv || sv !== String(v)) {
+                    return res.status(403).json({ error: 'Invalid token claims' });
+                }
+            }
+        }
+
         req.user = user;
+
+        // A signature-VERIFIED token whose email resolves to no local user is
+        // a dead account's token - it must not keep working for its remaining
+        // 30d life against preserved data. The unsigned LAN fallback is
+        // exempt: foreign-server tokens legitimately resolve to nobody here.
+        const signatureVerified = !err;
 
         // Cross-server token resolution: if the token's user_id doesn't exist in
         // this server's DB (e.g. StealthCloud token used against local desktop server),
@@ -3406,6 +3462,11 @@ const authenticateToken = (req, res, next) => {
                         merged._originalTokenId = user.id;
                     }
                     req.user = merged;
+                } else if (!dbErr && !localUser && signatureVerified) {
+                    // Verified signature but no local account: the user was
+                    // deleted. Reject instead of letting a 30d token keep
+                    // reading preserved data.
+                    return res.status(403).json({ error: 'Account no longer exists' });
                 } else if (!user.storage_uuid && user.email) {
                     const computed = computeStorageUuidFromEmail(user.email);
                     if (computed) req.user = { ...user, storage_uuid: computed };
@@ -4141,11 +4202,20 @@ const ensureStealthCloudUserDirs = (user) => {
     return { userDir, chunksDir, manifestsDir, rawDir, rawMetaDir };
 };
 
+// Sanitize a client-supplied upload filename into a safe single-path
+// component — '..'/'/' and control chars must never reach disk.
+const sanitizeUploadFilename = (name) => {
+    const base = path.basename(String(name || '')).replace(/[^\w.\-() ]/g, '_');
+    return base && base !== '.' && base !== '..' ? base : `upload_${Date.now()}`;
+};
+
 // File Storage Config
 const storage = multer.diskStorage({
     destination: (req, file, cb) => {
         // Use device UUID for folder name (scalable for future cloud service)
-        const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
+        const safeDu = sanitizeUserKey(req.user && req.user.device_uuid);
+        if (!safeDu) return cb(new Error('Invalid device uuid'), null);
+        const deviceDir = path.join(UPLOAD_DIR, safeDu);
         if (!fs.existsSync(deviceDir)) {
             fs.mkdirSync(deviceDir, { recursive: true });
         }
@@ -4155,7 +4225,7 @@ const storage = multer.diskStorage({
         // Use original name but sanitize or prepend timestamp to avoid collisions if needed.
         // For sync, we often want to keep the exact filename or a hash.
         // Here we assume the client sends a unique filename (e.g. UUID or timestamped name)
-        cb(null, file.originalname);
+        cb(null, sanitizeUploadFilename(file.originalname));
     }
 });
 
@@ -7502,7 +7572,7 @@ app.get('/api/downloads/file/:filename', (req, res) => {
 const downloadUpload = multer({
     storage: multer.diskStorage({
         destination: (req, file, cb) => cb(null, DOWNLOADS_DIR),
-        filename: (req, file, cb) => cb(null, file.originalname),
+        filename: (req, file, cb) => cb(null, sanitizeUploadFilename(file.originalname)),
     }),
     limits: { fileSize: 500 * 1024 * 1024 }, // 500MB max
     fileFilter: (req, file, cb) => {
@@ -7814,7 +7884,7 @@ app.get('/api/capacity', (req, res) => {
 // Public well-known capacity JSON routes are registered before the
 // /.well-known static mount (see serveCapacityJson above).
 
-app.get('/api/cloud/usage', authenticateToken, async (req, res) => {
+app.get('/api/cloud/usage', authenticateToken, blockDeletedSubscription, async (req, res) => {
     try {
         const row = await ensurePlanRow(req.user.id);
         const quotaProfile = getUserQuotaProfileFromRow(row, Date.now());
@@ -8595,6 +8665,20 @@ app.post('/api/migrate-credentials', authenticateToken, async (req, res) => {
             return res.status(409).json({ error: 'Email already in use by another account' });
         }
 
+        // The new folder key is validated BEFORE any credential change — a
+        // rejected uuid must not leave the account already rotated.
+        const requestedDeviceUuid = device_uuid || req.user.device_uuid;
+        const safeEffectiveUuid = requestedDeviceUuid ? sanitizeUserKey(requestedDeviceUuid) : '';
+        if (requestedDeviceUuid && (!safeEffectiveUuid || safeEffectiveUuid !== String(requestedDeviceUuid))) {
+            return res.status(400).json({ error: 'Invalid device identifier' });
+        }
+        // Same cross-account guard as login: the new folder key must not
+        // already belong to a different user.
+        if (safeEffectiveUuid && await deviceUuidOwnedByOther(safeEffectiveUuid, userId)) {
+            console.warn(`[Migrate] Rejected device_uuid claimed by another account: user=${userId}`);
+            return res.status(403).json({ error: 'Device identifier conflict' });
+        }
+
         // Hash new password
         const hashedPassword = await bcrypt.hash(new_password, BCRYPT_ROUNDS);
         const newStorageUuid = computeStorageUuidFromEmail(normalizedNewEmail);
@@ -8619,14 +8703,9 @@ app.post('/api/migrate-credentials', authenticateToken, async (req, res) => {
             );
         }
 
-        // Update device_uuid in devices table if provided
-        const effectiveDeviceUuid = device_uuid || req.user.device_uuid;
-        // Same cross-account guard as login: the new folder key must not
-        // already belong to a different user.
-        if (effectiveDeviceUuid && await deviceUuidOwnedByOther(effectiveDeviceUuid, userId)) {
-            console.warn(`[Migrate] Rejected device_uuid claimed by another account: user=${userId}`);
-            return res.status(403).json({ error: 'Device identifier conflict' });
-        }
+        // Update device_uuid in devices table if provided (already
+        // sanitized + ownership-checked above, before the credential write).
+        const effectiveDeviceUuid = safeEffectiveUuid || null;
         if (effectiveDeviceUuid) {
             // Insert or update device record
             db.run(
@@ -11347,7 +11426,7 @@ app.post('/api/upload/raw', authenticateToken, (req, res) => {
 });
 
 // List Files (for Sync) - includes hash metadata for cross-device dedup
-app.get('/api/files', authenticateToken, async (req, res) => {
+app.get('/api/files', authenticateToken, blockDeletedSubscription, async (req, res) => {
     const rawOffset = req.query && req.query.offset ? req.query.offset : null;
     const rawLimit = req.query && req.query.limit ? req.query.limit : null;
     const includeMeta = req.query && req.query.meta === 'true';
@@ -11462,7 +11541,7 @@ app.get('/api/files', authenticateToken, async (req, res) => {
 });
 
 // Migrate existing files to compute missing hashes
-app.post('/api/files/migrate-hashes', authenticateToken, async (req, res) => {
+app.post('/api/files/migrate-hashes', authenticateToken, blockDeletedSubscription, async (req, res) => {
     const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
     if (!fs.existsSync(deviceDir)) {
         return res.json({ migrated: 0, message: 'No files to migrate' });
@@ -11521,7 +11600,7 @@ app.post('/api/files/migrate-hashes', authenticateToken, async (req, res) => {
 
 // Submit platform-specific hash for a file (for cross-platform dedup fallback)
 // Called by clients after syncing a file to store their platform's computed hash
-app.post('/api/files/platform-hash', authenticateToken, (req, res) => {
+app.post('/api/files/platform-hash', authenticateToken, blockDeletedSubscription, (req, res) => {
     const { filename, platform, perceptualHash, fileHash } = req.body || {};
 
     if (!filename || !platform) {
@@ -11552,7 +11631,7 @@ app.post('/api/files/platform-hash', authenticateToken, (req, res) => {
 });
 
 // Batch submit platform hashes (more efficient for sync)
-app.post('/api/files/platform-hashes', authenticateToken, (req, res) => {
+app.post('/api/files/platform-hashes', authenticateToken, blockDeletedSubscription, (req, res) => {
     const { platform, hashes } = req.body || {};
 
     if (!platform || !Array.isArray(hashes) || hashes.length === 0) {
@@ -11589,7 +11668,7 @@ app.post('/api/files/platform-hashes', authenticateToken, (req, res) => {
 
 // Register synced file metadata (called by desktop sync after downloading from StealthCloud)
 // This enables mobile sync to get fileHash for EXIF lookup
-app.post('/api/files/register', authenticateToken, (req, res) => {
+app.post('/api/files/register', authenticateToken, blockDeletedSubscription, (req, res) => {
     const { filename, fileHash, perceptualHash, size, mimeType } = req.body || {};
 
     if (!filename) {
@@ -11748,7 +11827,7 @@ app.post('/api/files/purge', authenticateToken, async (req, res) => {
 });
 
 // Thumbnail endpoint - returns resized image (150px) or video frame
-app.get('/api/files/:filename/thumb', authenticateToken, async (req, res) => {
+app.get('/api/files/:filename/thumb', authenticateToken, blockDeletedSubscription, async (req, res) => {
     const filename = req.params.filename;
     const resolved = await resolveClassicFileForUser(req.user, filename);
     if (!resolved) return res.status(404).json({ error: 'File not found' });
@@ -11976,7 +12055,7 @@ app.get('/api/debug/state', (req, res) => {
 });
 
 // Download File
-app.get('/api/files/:filename', authenticateToken, async (req, res) => {
+app.get('/api/files/:filename', authenticateToken, blockDeletedSubscription, async (req, res) => {
     const filename = req.params.filename;
     console.log('[DOWNLOAD] Request for:', filename, 'user.id:', req.user && req.user.id, 'user.email:', req.user && req.user.email, 'device_uuid:', req.user && req.user.device_uuid);
     try {
@@ -12609,7 +12688,7 @@ app.put('/api/cloud/device-state', authenticateToken, requireUploadSubscription,
 // Orphaned chunk cleanup: finds and deletes chunks on disk that are not referenced
 // by any manifest across ALL UUID directories for the user.
 // This reclaims space from duplicate uploads caused by UUID changes.
-app.post('/api/cloud/cleanup-orphans', authenticateToken, async (req, res) => {
+app.post('/api/cloud/cleanup-orphans', authenticateToken, blockDeletedSubscription, async (req, res) => {
     try {
         const allKeys = getStealthCloudAllPossibleUserKeys(req.user);
         const cloudUsersRoot = path.join(CLOUD_DIR, 'users');
@@ -12703,7 +12782,7 @@ app.post('/api/cloud/cleanup-orphans', authenticateToken, async (req, res) => {
 
 // Chunk reconciliation: client sends list of chunk IDs it needs (from decrypted manifests),
 // server deletes all other chunks for this user. Reclaims space from orphaned/duplicate uploads.
-app.post('/api/cloud/reconcile-chunks', authenticateToken, async (req, res) => {
+app.post('/api/cloud/reconcile-chunks', authenticateToken, blockDeletedSubscription, async (req, res) => {
     try {
         const neededIds = req.body.neededChunkIds;
         if (!Array.isArray(neededIds)) {
@@ -12806,6 +12885,48 @@ app.post('/api/cloud/reconcile-chunks', authenticateToken, async (req, res) => {
     }
 });
 
+// Streaming sha256 check for content-addressed chunks. A partial/aborted
+// write can leave bytes on disk under a valid id — existsSync alone is not
+// proof of content. Mismatched files are deleted so the client re-uploads.
+const chunkFileMatchesId = (filePath, expectedHex) => {
+    try {
+        const hash = crypto.createHash('sha256');
+        const fd = fs.openSync(filePath, 'r');
+        try {
+            const buf = Buffer.allocUnsafe(1 << 20);
+            let n;
+            while ((n = fs.readSync(fd, buf, 0, buf.length, null)) > 0) {
+                hash.update(buf.subarray(0, n));
+            }
+        } finally { fs.closeSync(fd); }
+        return hash.digest('hex') === String(expectedHex).toLowerCase();
+    } catch (e) { return false; }
+};
+
+// True when the file exists AND verifies against its content id. A file that
+// fails the check but was modified within the last minute is likely an
+// in-flight write by another request — deleting it mid-write corrupts that
+// upload, so callers must leave it alone (an aborted write ages out and is
+// deleted by the next check).
+const CHUNK_INFLIGHT_WINDOW_MS = 60 * 1000;
+const chunkFileVerified = (filePath, expectedHex) => {
+    if (chunkFileMatchesId(filePath, expectedHex)) return true;
+    try {
+        const mtime = fs.statSync(filePath).mtimeMs;
+        if (Date.now() - mtime < CHUNK_INFLIGHT_WINDOW_MS) return 'inflight';
+    } catch (e) { }
+    try { fs.unlinkSync(filePath); } catch (e) { }
+    return false;
+};
+
+// Report a chunk as stored only when the file exists and is non-empty — a
+// zero-byte leftover must look "missing" so upload resume sends it again.
+const chunkFilePresent = (filePath) => {
+    try {
+        return fs.existsSync(filePath) && fs.statSync(filePath).size > 0;
+    } catch (e) { return false; }
+};
+
 // Upload encrypted chunk blob
 app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req, res, next) => {
     const ct = (req.headers['content-type'] || '').toString().toLowerCase();
@@ -12837,7 +12958,13 @@ app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req
         }
 
         if (fs.existsSync(target)) {
-            return res.json({ chunkId: requestedId, stored: true });
+            const v = chunkFileVerified(target, requestedId);
+            // 'inflight' = another request is writing it right now — treat as
+            // stored; its own post-write hash check finishes the job.
+            if (v === true || v === 'inflight') {
+                return res.json({ chunkId: requestedId, stored: true });
+            }
+            // false = corrupt old file already deleted — store real bytes below.
         }
 
         // Cross-UUID: check if chunk exists under another UUID dir
@@ -12846,7 +12973,7 @@ app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req
         for (const key of allKeys) {
             if (!key || key === 'unknown') continue;
             const altPath = path.join(chunksUsersRoot, key, 'chunks', requestedId);
-            if (fs.existsSync(altPath)) {
+            if (fs.existsSync(altPath) && chunkFileVerified(altPath, requestedId) === true) {
                 // Chunk exists under another UUID — symlink or copy to primary dir
                 try {
                     fs.copyFileSync(altPath, target);
@@ -12905,8 +13032,13 @@ app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req
         const { chunksDir } = ensureStealthCloudUserDirs(req.user);
         const existing = path.join(chunksDir, requestedId);
         if (fs.existsSync(existing)) {
-            try { fs.unlinkSync(tmpPath); } catch (e) { }
-            return res.json({ chunkId: requestedId, stored: true });
+            const v = chunkFileVerified(existing, requestedId);
+            if (v === true || v === 'inflight') {
+                try { fs.unlinkSync(tmpPath); } catch (e) { }
+                return res.json({ chunkId: requestedId, stored: true });
+            }
+            // false = corrupt old file already deleted — store the fresh
+            // (hash-verified below) upload instead.
         }
         // Cross-UUID: check if chunk exists under another UUID dir
         const allKeys = getStealthCloudAllPossibleUserKeys(req.user);
@@ -12915,7 +13047,7 @@ app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req
         for (const key of allKeys) {
             if (!key || key === 'unknown') continue;
             const altPath = path.join(chunksUsersRoot, key, 'chunks', requestedId);
-            if (fs.existsSync(altPath)) {
+            if (fs.existsSync(altPath) && chunkFileVerified(altPath, requestedId) === true) {
                 try {
                     fs.copyFileSync(altPath, existing);
                     const altStat = fs.statSync(existing);
@@ -13023,7 +13155,10 @@ app.post('/api/cloud/chunks/exists-batch', authenticateToken, blockDeletedSubscr
         let found = false;
         for (const dir of dirs) {
             const p = path.join(dir, id);
-            if (p.startsWith(dir) && fs.existsSync(p)) {
+            // Verified, not merely present: a truncated/poisoned blob under a
+            // valid chunkId must report missing so resume/repair re-uploads
+            // it. 'inflight' counts as existing (a live write in progress).
+            if (p.startsWith(dir) && chunkFileVerified(p, id) !== false) {
                 found = true;
                 break;
             }
@@ -13034,7 +13169,7 @@ app.post('/api/cloud/chunks/exists-batch', authenticateToken, blockDeletedSubscr
             for (const key of allKeys) {
                 if (!key || key === 'unknown') continue;
                 const p = path.join(CLOUD_DIR, 'users', key, 'chunks', id);
-                if (fs.existsSync(p)) {
+                if (chunkFileVerified(p, id) !== false) {
                     found = true;
                     break;
                 }
@@ -13052,33 +13187,37 @@ app.get('/api/cloud/chunks/:chunkId', authenticateToken, blockDeletedSubscriptio
         return res.status(400).json({ error: 'Invalid chunk id' });
     }
     const { chunksDir: chunksRoot } = ensureStealthCloudUserDirs(req.user);
-    let chunkPath = path.join(chunksRoot, chunkId);
-    if (!chunkPath.startsWith(chunksRoot)) {
+    const primary = path.join(chunksRoot, chunkId);
+    if (!primary.startsWith(chunksRoot)) {
         return res.status(403).json({ error: 'Access denied' });
     }
 
-    // Search across all UUID dirs if not found in primary dir
-    if (!fs.existsSync(chunkPath)) {
+    // Candidate locations: primary dir first, then every alternate UUID dir
+    // (and the CLOUD_DIR users tree when CHUNKS_DIR points elsewhere).
+    const candidates = [primary];
+    {
         const allKeys = getStealthCloudAllPossibleUserKeys(req.user);
         const chunksUsersRoot = CHUNKS_DIR ? path.join(CHUNKS_DIR, 'users') : path.join(CLOUD_DIR, 'users');
         for (const key of allKeys) {
             if (!key || key === 'unknown') continue;
-            const altPath = path.join(chunksUsersRoot, key, 'chunks', chunkId);
-            if (fs.existsSync(altPath)) {
-                chunkPath = altPath;
-                break;
-            }
-            // Also check CLOUD_DIR (some chunks may be stored there)
-            const altPath2 = path.join(CLOUD_DIR, 'users', key, 'chunks', chunkId);
-            if (fs.existsSync(altPath2)) {
-                chunkPath = altPath2;
-                break;
-            }
+            candidates.push(path.join(chunksUsersRoot, key, 'chunks', chunkId));
+            candidates.push(path.join(CLOUD_DIR, 'users', key, 'chunks', chunkId));
         }
     }
 
-    if (fs.existsSync(chunkPath)) {
-        return res.download(chunkPath);
+    // Serve the first file that actually hashes to the requested id. A file
+    // that exists but fails the check is a partial write — delete it so the
+    // client's missing-chunk machinery (resume / integrity sweep) re-uploads
+    // the real content, then keep looking in the alternate dirs. A file
+    // modified <60s ago is an in-flight write by another request — skip it
+    // without deleting so the concurrent upload isn't corrupted.
+    for (const p of candidates) {
+        if (!fs.existsSync(p)) continue;
+        const v = chunkFileVerified(p, chunkId);
+        if (v === true) {
+            return res.download(p);
+        }
+        // false → corrupt file deleted; 'inflight' → left alone, look elsewhere
     }
 
     return res.status(404).json({ error: 'Chunk not found' });
@@ -13128,6 +13267,10 @@ function buildServerDedupSets(manifestsDir) {
         exifFull: new Set(),
         exifTimeModel: new Set(),
         exifTimeMake: new Set(),
+        // hash -> manifestId reverse lookups so hash-based skips can name the
+        // REAL existing manifest instead of the (nonexistent) requested id.
+        fileHashManifestIds: new Map(),
+        perceptualHashManifestIds: new Map(),
     };
 
     if (!fs.existsSync(manifestsDir)) {
@@ -13163,8 +13306,18 @@ function buildServerDedupSets(manifestsDir) {
                             const normalized = normalizeFilenameForCompare(content.meta.filename);
                             if (normalized) cacheEntry.sets.filenames.add(normalized);
                         }
-                        if (content.meta.fileHash) cacheEntry.sets.fileHashes.add(content.meta.fileHash);
-                        if (content.meta.perceptualHash) cacheEntry.sets.perceptualHashes.add(content.meta.perceptualHash);
+                        if (content.meta.fileHash) {
+                            cacheEntry.sets.fileHashes.add(content.meta.fileHash);
+                            if (!cacheEntry.sets.fileHashManifestIds.has(content.meta.fileHash)) {
+                                cacheEntry.sets.fileHashManifestIds.set(content.meta.fileHash, manifestId);
+                            }
+                        }
+                        if (content.meta.perceptualHash) {
+                            cacheEntry.sets.perceptualHashes.add(content.meta.perceptualHash);
+                            if (!cacheEntry.sets.perceptualHashManifestIds.has(content.meta.perceptualHash)) {
+                                cacheEntry.sets.perceptualHashManifestIds.set(content.meta.perceptualHash, manifestId);
+                            }
+                        }
 
                         // EXIF-based dedup keys
                         const ct = content.meta.exifCaptureTime;
@@ -13199,6 +13352,8 @@ function buildCrossUuidDedupSets(user) {
         exifFull: new Set(),
         exifTimeModel: new Set(),
         exifTimeMake: new Set(),
+        fileHashManifestIds: new Map(),
+        perceptualHashManifestIds: new Map(),
     };
     for (const key of allKeys) {
         if (!key || key === 'unknown') continue;
@@ -13209,6 +13364,12 @@ function buildCrossUuidDedupSets(user) {
         for (const fn of sets.filenames) merged.filenames.add(fn);
         for (const fh of sets.fileHashes) merged.fileHashes.add(fh);
         for (const ph of sets.perceptualHashes) merged.perceptualHashes.add(ph);
+        for (const [fh, mid] of (sets.fileHashManifestIds || new Map()).entries()) {
+            if (!merged.fileHashManifestIds.has(fh)) merged.fileHashManifestIds.set(fh, mid);
+        }
+        for (const [ph, mid] of (sets.perceptualHashManifestIds || new Map()).entries()) {
+            if (!merged.perceptualHashManifestIds.has(ph)) merged.perceptualHashManifestIds.set(ph, mid);
+        }
         for (const e of sets.exifFull) merged.exifFull.add(e);
         for (const e of sets.exifTimeModel) merged.exifTimeModel.add(e);
         for (const e of sets.exifTimeMake) merged.exifTimeMake.add(e);
@@ -13219,17 +13380,31 @@ function buildCrossUuidDedupSets(user) {
 // Check if perceptual hash matches any existing hash (fuzzy matching)
 function findPerceptualHashMatchServer(hash, hashSet) {
     if (!hash || hash.length !== 16 || !hashSet || hashSet.size === 0) return { match: false };
-    if (hashSet.has(hash)) return { match: true, reason: 'exact' };
+    if (hashSet.has(hash)) return { match: true, reason: 'exact', existingHash: hash };
     for (const existing of hashSet) {
         if (existing && existing.length === 16) {
             const dist = hammingDistance64(hash, existing);
             if (dist <= SERVER_DHASH_THRESHOLD) {
-                return { match: true, reason: 'fuzzy', distance: dist };
+                return { match: true, reason: 'fuzzy', distance: dist, existingHash: existing };
             }
         }
     }
     return { match: false };
 }
+
+// Locate the stored manifest payload for an id across this user's uuid dirs
+// (rare path — only consulted on a dedup collision, so no cache needed).
+const findStoredManifestPayload = (user, manifestId) => {
+    try {
+        const allKeys = getStealthCloudAllPossibleUserKeys(user);
+        for (const key of allKeys) {
+            if (!key || key === 'unknown') continue;
+            const p = path.join(CLOUD_DIR, 'users', key, 'manifests', `${manifestId}.json`);
+            if (fs.existsSync(p)) return JSON.parse(fs.readFileSync(p, 'utf8'));
+        }
+    } catch (_) { }
+    return null;
+};
 
 // Upload encrypted manifest JSON
 // Now includes comprehensive server-side deduplication as extra precaution
@@ -13261,8 +13436,8 @@ app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (
     if (!manifestId || typeof manifestId !== 'string') return res.status(400).json({ error: 'manifestId required' });
     if (!encryptedManifest || typeof encryptedManifest !== 'string') return res.status(400).json({ error: 'encryptedManifest required' });
 
-    if (typeof chunkCount === 'number' && chunkCount <= 0) {
-        return res.status(400).json({ error: 'Invalid manifest: chunkCount must be > 0' });
+    if (typeof chunkCount === 'number' && chunkCount < 0) {
+        return res.status(400).json({ error: 'Invalid manifest: chunkCount must be >= 0' });
     }
 
     const safeId = manifestId.replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
@@ -13276,24 +13451,37 @@ app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (
     const dedupSets = buildCrossUuidDedupSets(req.user);
     console.log(`[SC-Dedup] Checking ${safeId}: ${dedupSets.manifestIds.size} manifestIds, ${dedupSets.fileHashes.size} fHashes, ${dedupSets.perceptualHashes.size} pHashes (cross-UUID)`);
 
-    // Check 1: ManifestId (filename + size hash) - exact match only
+    // Check 1: ManifestId (filename + size hash) - exact match only.
+    // A same-name/same-size replacement is a DIFFERENT file: when both sides
+    // carry a fileHash and they differ, report a conflict so the client can
+    // re-post under a content-scoped manifestId instead of losing the file.
     if (dedupSets.manifestIds.has(safeId)) {
+        const stored = findStoredManifestPayload(req.user, safeId);
+        const storedHash = stored && stored.meta && stored.meta.fileHash ? String(stored.meta.fileHash) : '';
+        if (storedHash && fileHash && storedHash !== String(fileHash)) {
+            console.log(`[SC-Dedup] manifestId collision with different bytes: ${safeId}`);
+            return res.json({ ok: true, conflict: true, manifestId: safeId, reason: 'manifestId-hash-mismatch' });
+        }
         console.log(`[SC-Dedup] Skipping ${safeId} - manifestId already exists`);
         return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'manifestId' });
     }
 
-    // Check 2: Exact file hash match (byte-identical files)
+    // Check 2: Exact file hash match (byte-identical files). Return the REAL
+    // existing manifestId - the requested id doesn't exist server-side, so
+    // marking the asset against it only earned a phantom mark.
     if (fileHash && dedupSets.fileHashes.has(fileHash)) {
-        console.log(`[SC-Dedup] Skipping ${safeId} - fileHash already exists`);
-        return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'fileHash' });
+        const existingId = dedupSets.fileHashManifestIds.get(fileHash) || safeId;
+        console.log(`[SC-Dedup] Skipping ${safeId} - fileHash already exists as ${existingId}`);
+        return res.json({ ok: true, manifestId: existingId, skipped: true, reason: 'fileHash' });
     }
 
     // Check 3: Perceptual hash match (images - 1-bit tolerance for identical)
     if (perceptualHash) {
         const phashMatch = findPerceptualHashMatchServer(perceptualHash, dedupSets.perceptualHashes);
         if (phashMatch.match) {
+            const existingId = (phashMatch.existingHash && dedupSets.perceptualHashManifestIds.get(phashMatch.existingHash)) || safeId;
             console.log(`[SC-Dedup] Skipping ${safeId} - perceptualHash match (${phashMatch.reason}${phashMatch.distance !== undefined ? ', dist=' + phashMatch.distance : ''})`);
-            return res.json({ ok: true, manifestId: safeId, skipped: true, reason: 'perceptualHash' });
+            return res.json({ ok: true, manifestId: existingId, skipped: true, reason: 'perceptualHash' });
         }
     }
 
@@ -13346,7 +13534,10 @@ app.get('/api/cloud/manifests', authenticateToken, blockDeletedSubscription, (re
     // manifests committed mid-scan can't shift a numeric offset window.
     const afterId = req.query && req.query.after ? String(req.query.after) : null;
     const offset = rawOffset !== null ? Math.max(0, parseInt(String(rawOffset), 10) || 0) : 0;
-    const limit = rawLimit !== null ? Math.max(0, parseInt(String(rawLimit), 10) || 0) : 0;
+    let limit = rawLimit !== null ? Math.max(0, parseInt(String(rawLimit), 10) || 0) : 0;
+    // full=1 responses carry every manifest's encrypted blob — cap the page
+    // so a limit=0/absent request can't stream the entire account in one go.
+    if (includeFull && (limit <= 0 || limit > 500)) limit = 500;
 
     res.setHeader('Cache-Control', 'no-store');
     res.setHeader('Pragma', 'no-cache');
@@ -13359,6 +13550,7 @@ app.get('/api/cloud/manifests', authenticateToken, blockDeletedSubscription, (re
     const allKeys = getStealthCloudAllPossibleUserKeys(req.user);
     const seenManifestIds = new Set();
     let list = [];
+    let scanError = false;
 
     for (const key of allKeys) {
         if (!key || key === 'unknown') continue;
@@ -13367,7 +13559,7 @@ app.get('/api/cloud/manifests', authenticateToken, blockDeletedSubscription, (re
         let files;
         try {
             files = fs.readdirSync(dir).filter(f => f.endsWith('.json') && !f.startsWith('.'));
-        } catch (e) { continue; }
+        } catch (e) { scanError = true; continue; }
 
         for (const f of files) {
             const manifestId = f.replace(/\.json$/, '');
@@ -13416,7 +13608,10 @@ app.get('/api/cloud/manifests', authenticateToken, blockDeletedSubscription, (re
         list = list.slice(offset, offset + limit);
     }
 
-    res.json({ manifests: list, total });
+    // scanError tells sweep-style consumers (integrity repair) that at least
+    // one storage dir failed to read, so this page may be incomplete and must
+    // not be treated as verified. Normal callers ignore it.
+    res.json({ manifests: list, total, ...(scanError ? { scanError: true } : {}) });
 });
 
 // Download encrypted manifest
@@ -13446,7 +13641,7 @@ app.get('/api/cloud/manifests/:manifestId', authenticateToken, blockDeletedSubsc
 });
 
 // Update manifest metadata (backfill for old manifests missing metadata)
-app.patch('/api/cloud/manifests/:manifestId', authenticateToken, (req, res) => {
+app.patch('/api/cloud/manifests/:manifestId', authenticateToken, blockDeletedSubscription, (req, res) => {
     const safeId = (req.params.manifestId || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128);
     if (!safeId) return res.status(400).json({ error: 'Invalid manifest id' });
 
@@ -13593,7 +13788,7 @@ app.post('/api/cloud/raw', authenticateToken, requireUploadSubscription, express
 });
 
 // Upload metadata (thumbnail, EXIF) for a raw file
-app.post('/api/cloud/raw/:filename/meta', authenticateToken, express.json({ limit: '10mb' }), (req, res) => {
+app.post('/api/cloud/raw/:filename/meta', authenticateToken, blockDeletedSubscription, express.json({ limit: '10mb' }), (req, res) => {
     const filename = req.params.filename;
     const safeName = path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 255);
     if (!safeName) return res.status(400).json({ error: 'Invalid filename' });
@@ -13618,7 +13813,7 @@ app.post('/api/cloud/raw/:filename/meta', authenticateToken, express.json({ limi
 });
 
 // List raw files
-app.get('/api/cloud/raw', authenticateToken, (req, res) => {
+app.get('/api/cloud/raw', authenticateToken, blockDeletedSubscription, (req, res) => {
     const { rawDir, rawMetaDir } = ensureStealthCloudUserDirs(req.user);
     const includeMeta = req.query.meta === 'true';
 
@@ -13664,7 +13859,7 @@ app.get('/api/cloud/raw', authenticateToken, (req, res) => {
 });
 
 // Download raw file
-app.get('/api/cloud/raw/:filename', authenticateToken, (req, res) => {
+app.get('/api/cloud/raw/:filename', authenticateToken, blockDeletedSubscription, (req, res) => {
     const filename = req.params.filename;
     const safeName = path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 255);
     if (!safeName) return res.status(400).json({ error: 'Invalid filename' });
@@ -13684,7 +13879,7 @@ app.get('/api/cloud/raw/:filename', authenticateToken, (req, res) => {
 });
 
 // Get thumbnail for raw file
-app.get('/api/cloud/raw/:filename/thumb', authenticateToken, async (req, res) => {
+app.get('/api/cloud/raw/:filename/thumb', authenticateToken, blockDeletedSubscription, async (req, res) => {
     const filename = req.params.filename;
     const safeName = path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 255);
     if (!safeName) return res.status(400).json({ error: 'Invalid filename' });
@@ -13750,7 +13945,7 @@ app.get('/api/cloud/raw/:filename/thumb', authenticateToken, async (req, res) =>
 });
 
 // Delete raw file
-app.delete('/api/cloud/raw/:filename', authenticateToken, (req, res) => {
+app.delete('/api/cloud/raw/:filename', authenticateToken, blockDeletedSubscription, (req, res) => {
     const filename = req.params.filename;
     const safeName = path.basename(filename).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 255);
     if (!safeName) return res.status(400).json({ error: 'Invalid filename' });
@@ -13775,7 +13970,7 @@ app.delete('/api/cloud/raw/:filename', authenticateToken, (req, res) => {
 });
 
 // Unified list: Get both encrypted manifests and raw files
-app.get('/api/cloud/files', authenticateToken, (req, res) => {
+app.get('/api/cloud/files', authenticateToken, blockDeletedSubscription, (req, res) => {
     const { manifestsDir, rawDir, rawMetaDir } = ensureStealthCloudUserDirs(req.user);
     const includeMeta = req.query.meta === 'true';
 
@@ -14108,7 +14303,7 @@ const getLinkedDeviceUuids = (deviceUuid, userId) => {
 // Link two devices — POST /api/device/link
 // Body: { target_device_uuid, label? }
 // The caller's device_uuid comes from their JWT token.
-app.post('/api/device/link', authenticateToken, async (req, res) => {
+app.post('/api/device/link', authenticateToken, blockDeletedSubscription, async (req, res) => {
     try {
         const myUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
         const targetUuid = sanitizeUserKey(req.body.target_device_uuid);
@@ -14170,7 +14365,7 @@ app.post('/api/device/link', authenticateToken, async (req, res) => {
 });
 
 // List linked devices — GET /api/device/links
-app.get('/api/device/links', authenticateToken, async (req, res) => {
+app.get('/api/device/links', authenticateToken, blockDeletedSubscription, async (req, res) => {
     try {
         const myUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
         if (!myUuid) return res.json({ links: [] });
@@ -14197,7 +14392,7 @@ app.get('/api/device/links', authenticateToken, async (req, res) => {
 
 // Unlink a device — DELETE /api/device/link
 // Body: { target_device_uuid }
-app.delete('/api/device/link', authenticateToken, async (req, res) => {
+app.delete('/api/device/link', authenticateToken, blockDeletedSubscription, async (req, res) => {
     try {
         const myUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
         const targetUuid = sanitizeUserKey(req.body.target_device_uuid);
@@ -14354,7 +14549,7 @@ const nftUpload = multer({
     },
 });
 
-app.post('/api/nft/upload', authenticateToken, (req, res, next) => {
+app.post('/api/nft/upload', authenticateToken, blockDeletedSubscription, (req, res, next) => {
     nftUpload.single('image')(req, res, (err) => {
         if (err) {
             console.error('[NFT] Upload multer error:', err.message);
@@ -14442,7 +14637,7 @@ const buildPinataMultipart = (fileBuffer, filename, contentType) => {
 // client's shouldTryPinataFallback status list.
 const shouldRotatePinataJwt = (status) => [401, 402, 403, 429].includes(Number(status));
 
-app.post('/api/nft/ipfs-pin', authenticateToken, async (req, res) => {
+app.post('/api/nft/ipfs-pin', authenticateToken, blockDeletedSubscription, async (req, res) => {
     try {
         const fileBuffer = Buffer.isBuffer(req.body) ? req.body : null;
         if (!fileBuffer || fileBuffer.length === 0) {
@@ -14515,7 +14710,7 @@ app.post('/api/nft/ipfs-pin', authenticateToken, async (req, res) => {
 
 // Check NFT storage eligibility (for UI to show/hide option)
 // GET /api/nft/eligibility?size=<bytes>
-app.get('/api/nft/eligibility', authenticateToken, async (req, res) => {
+app.get('/api/nft/eligibility', authenticateToken, blockDeletedSubscription, async (req, res) => {
     try {
         const userId = req.user.id;
         const fileSize = parseInt(req.query.size) || 5 * 1024 * 1024; // Default 5MB estimate
@@ -14530,7 +14725,7 @@ app.get('/api/nft/eligibility', authenticateToken, async (req, res) => {
 
 // List user's NFT images
 // GET /api/nft/images
-app.get('/api/nft/images', authenticateToken, async (req, res) => {
+app.get('/api/nft/images', authenticateToken, blockDeletedSubscription, async (req, res) => {
     try {
         const userId = req.user.id;
         const userKey = resolveNftStorageKeyFromUser(req.user);
@@ -14621,8 +14816,10 @@ const serveNftImage = async (req, res) => {
                     }
                 } catch (e) { /* ignore */ }
             }
-            // Last resort: search all user folders for this filename (handles credential migration)
-            if (!fs.existsSync(filePath)) {
+            // Last resort: search all user folders for this filename (handles
+            // credential migration). Encrypted .bin blobs are excluded — they
+            // must only ever come from the resolved user's own folder.
+            if (!fs.existsSync(filePath) && requestedExt !== '.bin') {
                 try {
                     const dirs = fs.readdirSync(NFT_DIR, { withFileTypes: true });
                     for (const d of dirs) {
@@ -14638,6 +14835,7 @@ const serveNftImage = async (req, res) => {
                         }
                         if (!hasExtension) {
                             for (const ext of extensionsToTry) {
+                                if (ext === '.bin') continue; // encrypted blobs stay owner-scoped
                                 const testPathWithExt = path.join(NFT_DIR, d.name, safeFilename + ext);
                                 if (fs.existsSync(testPathWithExt)) {
                                     filePath = testPathWithExt;
@@ -14704,7 +14902,7 @@ app.get('/:userId/:filename', (req, res, next) => {
 });
 
 // Delete NFT image (authenticated, owner only)
-app.delete('/api/nft/image/:imageId', authenticateToken, async (req, res) => {
+app.delete('/api/nft/image/:imageId', authenticateToken, blockDeletedSubscription, async (req, res) => {
     try {
         const userId = req.user.id;
         const userKey = resolveNftStorageKeyFromUser(req.user);
@@ -15333,7 +15531,7 @@ const readMergedNftsForDevice = async (deviceUuid, userId, includeKeys = []) => 
     return merged;
 };
 
-app.get('/api/nft/weekly-discount', authenticateToken, async (req, res) => {
+app.get('/api/nft/weekly-discount', authenticateToken, blockDeletedSubscription, async (req, res) => {
     try {
         const quote = await buildWeeklyNftDiscountQuote({
             user: req.user,
@@ -15348,13 +15546,18 @@ app.get('/api/nft/weekly-discount', authenticateToken, async (req, res) => {
 
 // Get user's NFT album (list of minted NFTs) — merges linked device folders
 // GET /api/nft/list
-app.get('/api/nft/list', authenticateToken, async (req, res) => {
+app.get('/api/nft/list', authenticateToken, blockDeletedSubscription, async (req, res) => {
     try {
         const userId = req.user.id;
         const userKey = resolveNftStorageKeyFromUser(req.user);
         const deviceUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
         const walletAddress = req.query.walletAddress || '';
 
+        // A wallet-scoped global scan returns transfer key material — the
+        // wallet must be signature-bound to the caller's account.
+        if (walletAddress && !(await walletBoundToUser(normalizeWalletAddress(walletAddress), userId))) {
+            return res.status(403).json({ error: 'Wallet not bound to this account' });
+        }
         const nfts = walletAddress
             ? readNftsForWalletGlobal(walletAddress)
             : await readMergedNftsForDevice(deviceUuid || userKey, userId);
@@ -15368,7 +15571,7 @@ app.get('/api/nft/list', authenticateToken, async (req, res) => {
 
 // POST /api/nft/sync
 // Body: { action: 'add'|'remove'|'backup', nft?: {}, mintAddress?: '', nfts?: [] }
-app.post('/api/nft/sync', authenticateToken, async (req, res) => {
+app.post('/api/nft/sync', authenticateToken, blockDeletedSubscription, async (req, res) => {
     try {
         const userId = req.user.id;
         const userKey = resolveNftStorageKeyFromUser(req.user);
@@ -15528,6 +15731,9 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
         } else if (action === 'list-mints') {
             // Lightweight: return only mint addresses for a wallet (used to detect transferred-out NFTs)
             const deviceUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
+            if (walletAddress && !(await walletBoundToUser(normalizeWalletAddress(walletAddress), userId))) {
+                return res.status(403).json({ error: 'Wallet not bound to this account' });
+            }
             const allNfts = walletAddress
                 ? readNftsForWalletGlobal(walletAddress)
                 : await readMergedNftsForDevice(deviceUuid || userKey, userId);
@@ -15535,6 +15741,9 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
             return res.json({ success: true, mints, total: mints.length });
         } else if (action === 'get') {
             const deviceUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
+            if (walletAddress && !(await walletBoundToUser(normalizeWalletAddress(walletAddress), userId))) {
+                return res.status(403).json({ error: 'Wallet not bound to this account' });
+            }
             const allNfts = walletAddress
                 ? readNftsForWalletGlobal(walletAddress)
                 : await readMergedNftsForDevice(deviceUuid || userKey, userId);
@@ -15569,7 +15778,7 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
 // Body: { deleteAssets?: boolean, unpinIpfs?: boolean }
 //   deleteAssets = true  → also delete all image/thumbnail files from StealthCloud
 //   unpinIpfs    = true  → also unpin every IPFS CID found in album metadata from Pinata
-app.post('/api/nft/clear-all', authenticateToken, async (req, res) => {
+app.post('/api/nft/clear-all', authenticateToken, blockDeletedSubscription, async (req, res) => {
     try {
         const userKey = resolveNftStorageKeyFromUser(req.user);
         const deleteAssets = !!(req.body && req.body.deleteAssets);
@@ -15801,7 +16010,7 @@ const walletBoundToUser = async (walletAddressNorm, userId) => {
 // bound to the caller (transferNftKey = decryption keys must never be public).
 // Used by DecryptedNFTImage to fetch transferNftKey for transferred encrypted NFTs.
 // GET /api/nft/certificates/wallet/:walletAddress
-app.get('/api/nft/certificates/wallet/:walletAddress', authenticateToken, async (req, res) => {
+app.get('/api/nft/certificates/wallet/:walletAddress', authenticateToken, blockDeletedSubscription, async (req, res) => {
     try {
         const walletAddress = req.params.walletAddress;
         if (!walletAddress || walletAddress.length < 32) {
@@ -15830,7 +16039,7 @@ app.get('/api/nft/certificates/wallet/:walletAddress', authenticateToken, async 
 // Get/sync NFT certificates (Limited Edition CoA)
 // GET /api/nft/certificates - returns all certificates for the user
 // POST /api/nft/certificates - sync certificates { action: 'add'|'backup', certificate?: {}, certificates?: [] }
-app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
+app.get('/api/nft/certificates', authenticateToken, blockDeletedSubscription, async (req, res) => {
     try {
         const userKey = resolveNftStorageKeyFromUser(req.user);
         const deviceUuid = sanitizeUserKey(req.user.device_uuid || req.user.deviceUuid);
@@ -15917,7 +16126,7 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
     }
 });
 
-app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
+app.post('/api/nft/certificates', authenticateToken, blockDeletedSubscription, async (req, res) => {
     try {
         const userKey = resolveNftStorageKeyFromUser(req.user);
         const userNftDir = path.join(NFT_DIR, String(userKey));
@@ -16010,6 +16219,16 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
                 || (certificate.mintAddress && c.mintAddress === certificate.mintAddress));
             if (!senderOwned) {
                 return res.status(403).json({ error: 'Certificate not owned by this account' });
+            }
+            // The sending wallet must be signature-bound to the caller —
+            // otherwise a fabricated cert claiming a foreign ownerAddress can
+            // plant attacker-chosen transferNftKey material into a victim's
+            // inbox. Certs with no wallet fields predate this check and fall
+            // back to the in-file ownership gate above.
+            const senderWalletOfCert = normalizeWalletAddress(
+                certificate.ownerAddress || certificate.creatorWallet || certificate.transferredFrom || '');
+            if (senderWalletOfCert && !(await walletBoundToUser(senderWalletOfCert, userId))) {
+                return res.status(403).json({ error: 'Transfer wallet not bound to this account' });
             }
             const newOwner = String(req.body.newOwnerAddress).trim();
             if (!newOwner) return res.status(400).json({ error: 'newOwnerAddress required' });
