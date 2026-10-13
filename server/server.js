@@ -13338,6 +13338,13 @@ app.get('/api/cloud/manifests', authenticateToken, blockDeletedSubscription, (re
     const rawOffset = req.query && req.query.offset ? req.query.offset : null;
     const rawLimit = req.query && req.query.limit ? req.query.limit : null;
     const includeMeta = req.query && req.query.meta === 'true'; // ?meta=true to include hash metadata
+    // ?full=1 additionally returns each manifest's encryptedManifest blob so a
+    // client-side integrity sweep can decrypt it and diff its chunk ids
+    // against the chunk store without one GET per manifest.
+    const includeFull = req.query && req.query.full === '1';
+    // ?after=<manifestId> gives stable keyset pagination for long sweeps:
+    // manifests committed mid-scan can't shift a numeric offset window.
+    const afterId = req.query && req.query.after ? String(req.query.after) : null;
     const offset = rawOffset !== null ? Math.max(0, parseInt(String(rawOffset), 10) || 0) : 0;
     const limit = rawLimit !== null ? Math.max(0, parseInt(String(rawLimit), 10) || 0) : 0;
 
@@ -13368,11 +13375,14 @@ app.get('/api/cloud/manifests', authenticateToken, blockDeletedSubscription, (re
             seenManifestIds.add(manifestId);
             const entry = { manifestId };
 
-            if (includeMeta) {
+            if (includeMeta || includeFull) {
                 try {
                     const manifestPath = path.join(dir, f);
                     const content = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-                    if (content.meta) {
+                    if (includeFull && content && content.encryptedManifest !== undefined) {
+                        entry.encryptedManifest = content.encryptedManifest;
+                    }
+                    if (includeMeta && content.meta) {
                         entry.filename = content.meta.filename || null;
                         entry.mediaType = content.meta.mediaType || null;
                         entry.originalSize = content.meta.originalSize || null;
@@ -13399,6 +13409,9 @@ app.get('/api/cloud/manifests', authenticateToken, blockDeletedSubscription, (re
 
     list.sort((a, b) => String(a.manifestId || '').localeCompare(String(b.manifestId || '')));
     const total = list.length;
+    if (afterId) {
+        list = list.filter(e => String(e.manifestId || '').localeCompare(afterId) > 0);
+    }
     if (limit > 0) {
         list = list.slice(offset, offset + limit);
     }
