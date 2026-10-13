@@ -1408,6 +1408,8 @@ const runWalletLogin = async (h, body) => {
         extractMarked('FIND_USER_BY_WALLET') + '\n;findUserByWalletAddress', sandbox);
     sandbox.validateWalletLoginMessage = vm.runInNewContext(
         extractMarked('WALLET_MSG_VALIDATOR') + '\n;validateWalletLoginMessage', sandbox);
+    sandbox.deviceUuidOwnedByOther = vm.runInNewContext(
+        extractMarked('DEVICE_UUID_GUARD') + '\n;deviceUuidOwnedByOther', sandbox);
     vm.runInNewContext(extractMarked('WALLET_LOGIN_ROUTE'), sandbox);
     const res = resStub();
     await captured.handler({ body }, res);

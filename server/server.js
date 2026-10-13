@@ -3334,6 +3334,25 @@ function touchDeviceLastSeen(user, deviceUuid) {
     } catch (e) { }
 }
 
+// === DEVICE_UUID_GUARD_BEGIN ===
+// A device_uuid is the storage-folder key — it must never be claimed by a
+// second account. Returns true when `deviceUuid` is registered under a
+// DIFFERENT user_id. Legitimate uuids are deterministic per account
+// (uuidv5(email:password) / wallet-derived), and device pairing LINKS
+// separate uuids rather than sharing one, so cross-account rows can only
+// come from a forgery attempt.
+const deviceUuidOwnedByOther = async (deviceUuid, userId) => {
+    try {
+        const row = await dbGetAsync(
+            `SELECT user_id FROM devices WHERE device_uuid = ? AND user_id != ? LIMIT 1`,
+            [String(deviceUuid || ''), userId]);
+        return !!row;
+    } catch (_) {
+        return false;
+    }
+};
+// === DEVICE_UUID_GUARD_END ===
+
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const deviceUuid = req.headers['x-device-uuid']; // Critical for security binding
@@ -4156,7 +4175,7 @@ const cloudStorage = multer.diskStorage({
         cb(null, safeId);
     }
 });
-const uploadCloudChunk = multer({ storage: cloudStorage });
+const uploadCloudChunk = multer({ storage: cloudStorage, limits: { fileSize: 250 * 1024 * 1024 } });
 
 // Raw encrypted chunk uploads (application/octet-stream)
 const rawCloudChunk = express.raw({ type: '*/*', limit: '250mb' });
@@ -7836,6 +7855,13 @@ app.post('/api/register', authRateLimiter, async (req, res) => {
 
     try {
         const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
+        // The device_uuid keys the storage folder — refuse to register an
+        // account that claims a uuid already bound to another user.
+        const claimedUuid = req.body.device_uuid || req.body.deviceUuid;
+        if (claimedUuid && await deviceUuidOwnedByOther(claimedUuid, -1)) {
+            console.warn(`[Register] Rejected device_uuid claimed by another account: ${String(claimedUuid).slice(0, 13)}…`);
+            return res.status(403).json({ error: 'Device identifier conflict' });
+        }
         const u = (crypto.randomUUID ? crypto.randomUUID() : crypto.randomBytes(16).toString('hex'));
         const storageUuid = computeStorageUuidFromEmail(normalizedEmail);
         const now = Date.now();
@@ -8009,6 +8035,13 @@ app.post('/api/login', authRateLimiter, async (req, res) => {
                     needsFolderMigration = true;
                 }
             }
+        }
+
+        // The device_uuid keys the storage folder — a login must never mint a
+        // token carrying a uuid registered to a different account.
+        if (await deviceUuidOwnedByOther(device_uuid, user.id)) {
+            console.warn(`[Login] Rejected device_uuid claimed by another account: user=${user.id} uuid=${String(device_uuid).slice(0, 13)}…`);
+            return res.status(403).json({ error: 'Device identifier conflict' });
         }
 
         // Register/Update Device (update last_seen on every login)
@@ -8263,6 +8296,13 @@ app.post('/api/wallet-login', authRateLimiter, async (req, res) => {
 
         // Proven wallet ownership -> durable payment-attribution binding.
         await dbRunAsync(paymentRecovery.UPSERT_WALLET_BINDING_SQL, [walletAddressNorm, user.id, Date.now()]);
+
+        // The device_uuid keys the storage folder — refuse to mint a token
+        // that claims another account's folder key.
+        if (await deviceUuidOwnedByOther(device_uuid, user.id)) {
+            console.warn(`[WalletLogin] Rejected device_uuid claimed by another account: user=${user.id}`);
+            return res.status(403).json({ error: 'Device identifier conflict' });
+        }
 
         // Register/Update device.
         await dbRunAsync(
@@ -8581,6 +8621,12 @@ app.post('/api/migrate-credentials', authenticateToken, async (req, res) => {
 
         // Update device_uuid in devices table if provided
         const effectiveDeviceUuid = device_uuid || req.user.device_uuid;
+        // Same cross-account guard as login: the new folder key must not
+        // already belong to a different user.
+        if (effectiveDeviceUuid && await deviceUuidOwnedByOther(effectiveDeviceUuid, userId)) {
+            console.warn(`[Migrate] Rejected device_uuid claimed by another account: user=${userId}`);
+            return res.status(403).json({ error: 'Device identifier conflict' });
+        }
         if (effectiveDeviceUuid) {
             // Insert or update device record
             db.run(
@@ -12663,6 +12709,15 @@ app.post('/api/cloud/reconcile-chunks', authenticateToken, async (req, res) => {
         if (!Array.isArray(neededIds)) {
             return res.status(400).json({ error: 'neededChunkIds must be an array' });
         }
+        // Purge safety: every chunk NOT in the list is deleted. An empty list
+        // would wipe the entire store — a client bug (failed manifest fetch
+        // returning []) must never translate into mass deletion. Require the
+        // caller to opt in explicitly for a real purge.
+        if (neededIds.length === 0 || req.body.confirmPurge !== true) {
+            return res.status(400).json({
+                error: 'Refusing purge without non-empty neededChunkIds and confirmPurge:true',
+            });
+        }
 
         const neededSet = new Set(neededIds.map(id => String(id).toLowerCase()));
         const allKeys = getStealthCloudAllPossibleUserKeys(req.user);
@@ -13272,7 +13327,7 @@ app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (
             thumbMime: typeof thumbMime === 'string' ? thumbMime : null,
         }
     };
-    fs.writeFileSync(manifestPath, JSON.stringify(payload));
+    writeJsonAtomic(manifestPath, payload);
 
     console.log(`[SC] Stored manifest ${safeId} for user ${req.user.id}`);
     res.json({ ok: true, manifestId: safeId });
@@ -13438,7 +13493,7 @@ app.patch('/api/cloud/manifests/:manifestId', authenticateToken, (req, res) => {
         if (typeof thumbH === 'number' && !content.meta.thumbH) content.meta.thumbH = thumbH;
         if (thumbMime && !content.meta.thumbMime) content.meta.thumbMime = thumbMime;
 
-        fs.writeFileSync(manifestPath, JSON.stringify(content));
+        writeJsonAtomic(manifestPath, content);
         // Invalidate dedup cache so backfilled hashes are picked up immediately
         try { serverDedupCache.delete(manifestsDir); } catch (e) { }
         console.log(`[SC] Updated metadata for manifest ${safeId}`);
@@ -14053,6 +14108,32 @@ app.post('/api/device/link', authenticateToken, async (req, res) => {
             return res.status(400).json({ error: 'Cannot link device to itself' });
         }
 
+        // Ownership proof: linking merges NFT/certificate data across folders,
+        // so the caller must demonstrate control of the TARGET account. Device
+        // pairing already transports the target account's credentials inside
+        // the QR blob — verify them server-side. Alternatively accept a JWT
+        // minted for the target device uuid.
+        const targetEmail = String(req.body.target_email || '').toLowerCase().trim();
+        const targetPassword = String(req.body.target_password || '');
+        let targetOk = false;
+        if (targetEmail && targetPassword) {
+            const targetUser = await dbGetAsync(
+                `SELECT id, password FROM users WHERE email = ? OR alias_email = ?`,
+                [targetEmail, targetEmail]);
+            targetOk = !!(targetUser && targetUser.password
+                && await bcrypt.compare(targetPassword, targetUser.password));
+        }
+        if (!targetOk && req.body.target_auth_token) {
+            try {
+                const decoded = jwt.verify(String(req.body.target_auth_token), JWT_SECRET);
+                targetOk = sanitizeUserKey(decoded && decoded.device_uuid) === targetUuid;
+            } catch (_) { targetOk = false; }
+        }
+        if (!targetOk) {
+            console.warn(`[DeviceLink] Rejected link without target-account proof: user=${req.user.id}`);
+            return res.status(403).json({ error: 'Target account credentials required' });
+        }
+
         // Sort UUIDs to ensure consistent ordering (avoids duplicate pairs)
         const [uuidA, uuidB] = [myUuid, targetUuid].sort();
 
@@ -14446,7 +14527,8 @@ app.get('/api/nft/images', authenticateToken, async (req, res) => {
             return res.json({ images: [] });
         }
 
-        const files = fs.readdirSync(userNftDir);
+        const files = fs.readdirSync(userNftDir)
+            .filter(f => NFT_SERVE_EXTENSIONS.has(path.extname(f).toLowerCase()));
         const images = files.map(f => {
             const filePath = path.join(userNftDir, f);
             const stats = fs.statSync(filePath);
@@ -14470,6 +14552,11 @@ app.get('/api/nft/images', authenticateToken, async (req, res) => {
 // PUBLIC: Serve NFT image (no authentication required)
 // GET /api/nft/image/:userId/:filename OR /:userId/:filename (for nft.stealthlynk.io subdomain)
 // This endpoint is publicly accessible so NFT wallets/marketplaces can display images
+const NFT_SERVE_EXTENSIONS = new Set([
+    '.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif', '.tiff', '.tif',
+    '.avif', '.dng', '.cr2', '.cr3', '.nef', '.arw', '.raf', '.orf', '.rw2',
+    '.pef', '.srw', '.bin',
+]);
 const serveNftImage = async (req, res) => {
     try {
         const { userId, filename } = req.params;
@@ -14478,6 +14565,14 @@ const serveNftImage = async (req, res) => {
 
         if (!safeKey || !safeFilename) {
             return res.status(400).json({ error: 'Invalid request' });
+        }
+
+        // Hard extension whitelist BEFORE any disk access: the folder also
+        // holds nft-album.json / certificates.json (which contain decryption
+        // keys) — a public route must never serve them.
+        const requestedExt = path.extname(safeFilename).toLowerCase();
+        if (requestedExt && !NFT_SERVE_EXTENSIONS.has(requestedExt)) {
+            return res.status(400).json({ error: 'Invalid file type' });
         }
 
         let filePath = path.join(NFT_DIR, safeKey, safeFilename);
@@ -14519,6 +14614,9 @@ const serveNftImage = async (req, res) => {
                     const dirs = fs.readdirSync(NFT_DIR, { withFileTypes: true });
                     for (const d of dirs) {
                         if (!d.isDirectory()) continue;
+                        // Transfer inboxes hold certificates.json with key material —
+                        // never serve files from them via this public route.
+                        if (d.name.startsWith('_transfer_inbox_')) continue;
                         const testPath = path.join(NFT_DIR, d.name, safeFilename);
                         if (fs.existsSync(testPath)) {
                             filePath = testPath;
@@ -14599,14 +14697,23 @@ app.delete('/api/nft/image/:imageId', authenticateToken, async (req, res) => {
         const userKey = resolveNftStorageKeyFromUser(req.user);
         const { imageId } = req.params;
 
+        // Uploads are named `${32-hex}.${image-ext}` — require that shape so a
+        // prefix like "nft" can never match nft-album.json/certificates.json.
+        if (!/^[a-f0-9]{16,64}$/i.test(String(imageId))) {
+            return res.status(400).json({ error: 'Invalid image id' });
+        }
+
         const userNftDir = path.join(NFT_DIR, String(userKey));
         if (!fs.existsSync(userNftDir)) {
             return res.status(404).json({ error: 'Image not found' });
         }
 
-        // Find file with this imageId
+        // Find file with this imageId — dot boundary + image-ext whitelist
+        // means only real uploads match, never metadata JSON.
         const files = fs.readdirSync(userNftDir);
-        const file = files.find(f => f.startsWith(imageId));
+        const file = files.find(f =>
+            f.startsWith(`${imageId}.`)
+            && NFT_SERVE_EXTENSIONS.has(path.extname(f).toLowerCase()));
 
         if (!file) {
             return res.status(404).json({ error: 'Image not found' });
@@ -14721,21 +14828,30 @@ const normalizeWalletMint = (m) => m ? String(m).replace(/^cnft_/, '') : '';
 // data) burst per request. Only this process writes these files, so mtime
 // is an exact staleness signal and the scan degenerates to cheap statSync
 // calls. Callers must not mutate returned objects — clone before writing.
-const _nftJsonFileCache = new Map(); // absPath -> {mtimeMs, parsed}
+const _nftJsonFileCache = new Map(); // absPath -> {mtimeMs, size, parsed}
 const NFT_JSON_CACHE_MAX = 5000;
 const readJsonFileCached = (filePath) => {
     try {
-        const mtimeMs = fs.statSync(filePath).mtimeMs;
+        const st = fs.statSync(filePath);
         const hit = _nftJsonFileCache.get(filePath);
-        if (hit && hit.mtimeMs === mtimeMs) return hit.parsed;
+        if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.parsed;
         const parsed = JSON.parse(fs.readFileSync(filePath, 'utf8'));
         if (_nftJsonFileCache.size >= NFT_JSON_CACHE_MAX) _nftJsonFileCache.clear();
-        _nftJsonFileCache.set(filePath, { mtimeMs, parsed });
+        _nftJsonFileCache.set(filePath, { mtimeMs: st.mtimeMs, size: st.size, parsed });
         return parsed;
     } catch (_) {
         _nftJsonFileCache.delete(filePath);
         return undefined;
     }
+};
+
+// Crash-safe JSON persistence: write to a sibling temp file then rename, so a
+// killed process never leaves a truncated nft-album.json / certificates.json
+// (which the read paths would otherwise treat as "empty" and clobber).
+const writeJsonAtomic = (filePath, obj) => {
+    const tmp = `${filePath}.tmp-${process.pid}-${Date.now()}`;
+    fs.writeFileSync(tmp, JSON.stringify(obj, null, 2));
+    fs.renameSync(tmp, filePath);
 };
 
 const nftMatchesWalletScope = (nft, walletAddress) => {
@@ -15257,8 +15373,14 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
         if (fs.existsSync(metadataPath)) {
             try {
                 data = JSON.parse(fs.readFileSync(metadataPath, 'utf8'));
+                // Legacy files may be a bare array — normalize to {nfts:[...]}.
+                if (Array.isArray(data)) data = { nfts: data };
+                if (!data || !Array.isArray(data.nfts)) data = { nfts: [] };
             } catch (e) {
-                data = { nfts: [] };
+                // A corrupt album must never be silently overwritten — the
+                // write below would permanently destroy every entry.
+                console.error(`[NFT] Refusing sync on corrupt album file: ${metadataPath}`);
+                return res.status(500).json({ error: 'Stored album unreadable — refusing to overwrite' });
             }
         }
 
@@ -15298,7 +15420,7 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
                         rememberRemovedNftCids(userId, (linkedData.nfts || []).filter(mintMatchFn));
                         linkedData.nfts = (linkedData.nfts || []).filter(n => !mintMatchFn(n));
                         if (linkedData.nfts.length < linkedBefore) {
-                            fs.writeFileSync(linkedPath, JSON.stringify(linkedData, null, 2));
+                            writeJsonAtomic(linkedPath, linkedData);
                             console.log(`[NFT] Album remove (linked ${uuid}): mint=${mintAddress} removed=${linkedBefore - linkedData.nfts.length}`);
                         }
                     } catch (_) { }
@@ -15328,7 +15450,7 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
                             });
                             const removedHere = globalBefore - globalData.nfts.length;
                             if (removedHere > 0) {
-                                fs.writeFileSync(globalPath, JSON.stringify(globalData, null, 2));
+                                writeJsonAtomic(globalPath, globalData);
                                 globalRemoved += removedHere;
                             }
                         } catch (_) { }
@@ -15354,9 +15476,9 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
             for (const n of nfts) {
                 const normMint = normalizeWalletMint(n.mintAddress);
                 if (!normMint) continue;
-                if (n.mintAddress.startsWith('tx_') && n.metadataUrl && existingMetaMap[n.metadataUrl] !== undefined) {
+                if (typeof n.mintAddress === 'string' && n.mintAddress.startsWith('tx_') && n.metadataUrl && existingMetaMap[n.metadataUrl] !== undefined) {
                     const realIdx = existingMetaMap[n.metadataUrl];
-                    if (data.nfts[realIdx] && !data.nfts[realIdx].mintAddress.startsWith('tx_')) {
+                    if (data.nfts[realIdx] && typeof data.nfts[realIdx].mintAddress === 'string' && !data.nfts[realIdx].mintAddress.startsWith('tx_')) {
                         const real = data.nfts[realIdx];
                         updated += mergeStoredNft(real, n);
                         deduped++;
@@ -15365,9 +15487,9 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
                 }
                 const idx = existingMap[normMint];
                 if (idx === undefined) {
-                    if (n.metadataUrl && !n.mintAddress.startsWith('tx_') && existingMetaMap[n.metadataUrl] !== undefined) {
+                    if (n.metadataUrl && typeof n.mintAddress === 'string' && !n.mintAddress.startsWith('tx_') && existingMetaMap[n.metadataUrl] !== undefined) {
                         const oldIdx = existingMetaMap[n.metadataUrl];
-                        if (data.nfts[oldIdx] && data.nfts[oldIdx].mintAddress.startsWith('tx_')) {
+                        if (data.nfts[oldIdx] && typeof data.nfts[oldIdx].mintAddress === 'string' && data.nfts[oldIdx].mintAddress.startsWith('tx_')) {
                             const old = data.nfts[oldIdx];
                             const mergedNft = { ...old, mintAddress: n.mintAddress };
                             if (n.assetId) mergedNft.assetId = n.assetId;
@@ -15421,7 +15543,7 @@ app.post('/api/nft/sync', authenticateToken, async (req, res) => {
             if (n.imageUrl && n.imageUrl.startsWith('data:') && n.imageUrl.length > 5000) n.imageUrl = undefined;
             if (n.arweaveUrl && n.arweaveUrl.startsWith('data:') && n.arweaveUrl.length > 5000) n.arweaveUrl = undefined;
         }
-        fs.writeFileSync(metadataPath, JSON.stringify(data, null, 2));
+        writeJsonAtomic(metadataPath, data);
         const weeklyDiscountQuote = await buildWeeklyNftDiscountQuote({ user: req.user }).catch(() => null);
         res.json({ success: true, count: data.nfts.length, weeklyDiscountQuote });
     } catch (error) {
@@ -15513,7 +15635,7 @@ app.post('/api/nft/clear-all', authenticateToken, async (req, res) => {
                             }
                             const remainingNfts = currentNfts.filter(nft => !nftMatchesWalletScope(nft, targetWallet));
                             if (remainingNfts.length > 0) {
-                                fs.writeFileSync(metadataPath, JSON.stringify(Array.isArray(raw) ? remainingNfts : { ...raw, nfts: remainingNfts }, null, 2));
+                                writeJsonAtomic(metadataPath, Array.isArray(raw) ? remainingNfts : { ...raw, nfts: remainingNfts });
                             } else {
                                 fs.unlinkSync(metadataPath);
                             }
@@ -15531,7 +15653,7 @@ app.post('/api/nft/clear-all', authenticateToken, async (req, res) => {
                         certsCleared += matchingCerts.length;
                         const remainingCerts = currentCerts.filter(cert => !certificateMatchesWalletScope(cert, targetWallet));
                         if (remainingCerts.length > 0) {
-                            fs.writeFileSync(certsPath, JSON.stringify(remainingCerts, null, 2));
+                            writeJsonAtomic(certsPath, remainingCerts);
                         } else {
                             fs.unlinkSync(certsPath);
                         }
@@ -15544,6 +15666,13 @@ app.post('/api/nft/clear-all', authenticateToken, async (req, res) => {
         if (deleteAssets) {
             for (const filePath of matchedFilePaths) {
                 try {
+                    // Record URLs resolve to NFT_DIR/<folderKey>/<file> — the
+                    // folder must be one this account actually owns, otherwise
+                    // a crafted URL in the caller's own album could unlink
+                    // another user's images.
+                    const rel = path.relative(NFT_DIR, filePath);
+                    const folderKey = rel.split(path.sep)[0];
+                    if (!folderKey || !ownedFolderKeys.has(folderKey)) continue;
                     if (fs.existsSync(filePath)) {
                         fs.unlinkSync(filePath);
                         filesDeleted++;
@@ -15636,14 +15765,37 @@ const readCertsForWalletGlobal = (walletAddress) => {
     return merged;
 };
 
-// Public: Get certificates for a wallet address (no auth required)
-// Used by DecryptedNFTImage to fetch transferNftKey for decryption of transferred encrypted NFTs
+// Wallet-ownership gate: a wallet address is PUBLIC on-chain data, so any
+// endpoint that returns transferNftKey (the decryption material for
+// transferred NFTs) must only serve a wallet that is cryptographically bound
+// to the calling account. Only solana_wallet_bindings counts — it is written
+// exclusively by ed25519-verified wallet logins and the ecosystem bind flow.
+// users.wallet_address is NOT trusted here: /api/save-wallet lets any
+// authenticated user set it to an arbitrary string.
+const walletBoundToUser = async (walletAddressNorm, userId) => {
+    if (!walletAddressNorm || !userId) return false;
+    try {
+        const bound = await dbGetAsync(
+            `SELECT wallet FROM solana_wallet_bindings WHERE wallet = ? AND user_id = ?`,
+            [walletAddressNorm, userId]);
+        return !!bound;
+    } catch (_) {
+        return false;
+    }
+};
+
+// Get certificates for a wallet address — AUTHENTICATED + wallet must be
+// bound to the caller (transferNftKey = decryption keys must never be public).
+// Used by DecryptedNFTImage to fetch transferNftKey for transferred encrypted NFTs.
 // GET /api/nft/certificates/wallet/:walletAddress
-app.get('/api/nft/certificates/wallet/:walletAddress', async (req, res) => {
+app.get('/api/nft/certificates/wallet/:walletAddress', authenticateToken, async (req, res) => {
     try {
         const walletAddress = req.params.walletAddress;
         if (!walletAddress || walletAddress.length < 32) {
             return res.status(400).json({ error: 'Invalid wallet address' });
+        }
+        if (!(await walletBoundToUser(normalizeWalletAddress(walletAddress), req.user.id))) {
+            return res.status(403).json({ error: 'Wallet not bound to this account' });
         }
         const certs = readCertsForWalletGlobal(walletAddress);
         // Only return fields needed for decryption — don't leak full cert data publicly
@@ -15673,9 +15825,15 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
         const certsPath = path.join(NFT_DIR, String(userKey), 'certificates.json');
 
         // When walletAddress is provided, scan ALL folders globally (same wallet = same certs)
-        // Otherwise fall back to linked device folders for the current user
+        // Otherwise fall back to linked device folders for the current user.
+        // The wallet must be bound to this account — the global scan returns
+        // transferNftKey fields, so an arbitrary wallet parameter would leak
+        // decryption keys for anyone's transferred NFTs.
         let certs = [];
         if (walletAddress) {
+            if (!(await walletBoundToUser(normalizeWalletAddress(walletAddress), req.user.id))) {
+                return res.status(403).json({ error: 'Wallet not bound to this account' });
+            }
             certs = readCertsForWalletGlobal(walletAddress);
         } else {
             const linkedUuids = await getLinkedDeviceUuids(deviceUuid || userKey, req.user.id);
@@ -15734,20 +15892,11 @@ app.get('/api/nft/certificates', authenticateToken, async (req, res) => {
             return res.json({ success: true, certificate: null });
         }
 
-        let needsRewrite = false;
-        const apiSlim = certs.map(c => {
-            if (c.metadata || c.encryptionData || c.imageData
-                || (c.imageUrl && c.imageUrl.startsWith('data:') && c.imageUrl.length > 5000)) needsRewrite = true;
-            return slimForApi(c);
-        });
-        // Compact on-disk file: strip junk fields but PRESERVE rfc3161Token + c2paManifest
-        if (needsRewrite) {
-            try {
-                const diskSlim = certs.map(slimForDisk);
-                fs.writeFileSync(certsPath, JSON.stringify(diskSlim, null, 2));
-                console.log(`[NFT] Compacted certificates.json on disk for user=${userKey} (${certs.length} certs, tokens preserved)`);
-            } catch (e) { console.warn('[NFT] Failed to compact certificates.json:', e.message); }
-        }
+        // A GET must never write: when walletAddress is supplied `certs` is a
+        // cross-folder MERGED set — rewriting it into the caller's own file
+        // would drop other wallets' certs and import foreign ones. Slim the
+        // response only.
+        const apiSlim = certs.map(c => slimForApi(c));
         res.json({ success: true, certificates: apiSlim });
     } catch (error) {
         console.error('[NFT] Certificates fetch error:', error);
@@ -15764,7 +15913,15 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
 
         let certs = [];
         if (fs.existsSync(certsPath)) {
-            try { certs = JSON.parse(fs.readFileSync(certsPath, 'utf8')); } catch (_) { }
+            try {
+                certs = JSON.parse(fs.readFileSync(certsPath, 'utf8'));
+                if (!Array.isArray(certs)) certs = [];
+            } catch (_) {
+                // A corrupt certificates file must never be treated as empty —
+                // the write below would permanently destroy every cert.
+                console.error(`[NFT] Refusing cert write on corrupt file: ${certsPath}`);
+                return res.status(500).json({ error: 'Stored certificates unreadable — refusing to overwrite' });
+            }
         }
 
         const { action, certificate, certificates, certId, mintAddress } = req.body;
@@ -15831,6 +15988,16 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
         } else if (action === 'transfer' && certificate && req.body.newOwnerAddress) {
             // Transfer cert to new owner: write full cert (with heavy fields) into a wallet-keyed
             // transfer-inbox folder so readCertsForWalletGlobal picks it up for the recipient.
+            // Ownership gate: the cert (by id or mintAddress) must exist in the
+            // CALLER's own certificates.json — otherwise any authenticated user
+            // could inject a fabricated cert (with attacker-chosen keys) into a
+            // victim's inbox, or "transfer" a cert they never owned.
+            const senderOwned = certs.some(c =>
+                (certificate.id && c.id === certificate.id)
+                || (certificate.mintAddress && c.mintAddress === certificate.mintAddress));
+            if (!senderOwned) {
+                return res.status(403).json({ error: 'Certificate not owned by this account' });
+            }
             const newOwner = String(req.body.newOwnerAddress).trim();
             if (!newOwner) return res.status(400).json({ error: 'newOwnerAddress required' });
             const requestedNewMintAddress = req.body.newMintAddress ? String(req.body.newMintAddress).trim() : '';
@@ -15865,7 +16032,7 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
                 const idx = inboxCerts.findIndex(c => c.id === transferredCert.id);
                 if (idx >= 0) inboxCerts[idx] = transferredCert;
             }
-            fs.writeFileSync(inboxCertsPath, JSON.stringify(inboxCerts, null, 2));
+            writeJsonAtomic(inboxCertsPath, inboxCerts);
             console.log(`[NFT] Certificate transferred: id=${certificate.id} from=${certificate.ownerAddress || 'unknown'} to=${newOwner}`);
 
             // Also copy the NFT album entry to the inbox so readNftsForWalletGlobal finds it for new owner
@@ -15945,7 +16112,7 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
                         const idx = inboxAlbum.nfts.findIndex(n => normalizeWalletMint(n.mintAddress) === recipientMint);
                         if (idx >= 0) inboxAlbum.nfts[idx] = transferredNft;
                     }
-                    fs.writeFileSync(inboxAlbumPath, JSON.stringify(inboxAlbum, null, 2));
+                    writeJsonAtomic(inboxAlbumPath, inboxAlbum);
                     console.log(`[NFT] Album entry transferred to inbox: oldMint=${certificate.mintAddress} newMint=${recipientMintAddress} to=${newOwner}`);
                 }
             } catch (albumErr) { console.warn('[NFT] Album entry transfer failed (non-critical):', albumErr.message); }
@@ -15961,7 +16128,7 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
             });
             if (certs.length < before) {
                 const cleanCertsForDisk = certs.map(c => slimCert(c));
-                fs.writeFileSync(certsPath, JSON.stringify(cleanCertsForDisk, null, 2));
+                writeJsonAtomic(certsPath, cleanCertsForDisk);
             }
 
             // Remove the NFT from sender's album so it doesn't reappear on sync
@@ -15972,7 +16139,7 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
                     const beforeNfts = (senderData.nfts || []).length;
                     senderData.nfts = (senderData.nfts || []).filter(n => normalizeWalletMint(n.mintAddress) !== targetMint);
                     if (senderData.nfts.length < beforeNfts) {
-                        fs.writeFileSync(senderMetaPath, JSON.stringify(senderData, null, 2));
+                        writeJsonAtomic(senderMetaPath, senderData);
                         console.log(`[NFT] Removed transferred NFT from sender's album: mint=${certificate.mintAddress}`);
                     }
                 }
@@ -15996,7 +16163,7 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
                                     return true;
                                 });
                                 if (linkedCerts.length < lb) {
-                                    fs.writeFileSync(linkedCp, JSON.stringify(linkedCerts.map(c => slimCert(c)), null, 2));
+                                    writeJsonAtomic(linkedCp, linkedCerts.map(c => slimCert(c)));
                                     console.log(`[NFT] Cert transfer remove (linked ${uuid}): mint=${certificate.mintAddress}`);
                                 }
                             }
@@ -16010,7 +16177,7 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
                             const beforeNfts = (linkedAlbum.nfts || []).length;
                             linkedAlbum.nfts = (linkedAlbum.nfts || []).filter(n => normalizeWalletMint(n.mintAddress) !== targetMint);
                             if (linkedAlbum.nfts.length < beforeNfts) {
-                                fs.writeFileSync(linkedAlbumPath, JSON.stringify(linkedAlbum, null, 2));
+                                writeJsonAtomic(linkedAlbumPath, linkedAlbum);
                                 console.log(`[NFT] NFT transfer remove (linked ${uuid}): mint=${certificate.mintAddress}`);
                             }
                         } catch (_) { }
@@ -16024,7 +16191,7 @@ app.post('/api/nft/certificates', authenticateToken, async (req, res) => {
 
         // Ensure only whitelisted fields persist on disk
         const cleanCerts = certs.map(c => slimCert(c));
-        fs.writeFileSync(certsPath, JSON.stringify(cleanCerts, null, 2));
+        writeJsonAtomic(certsPath, cleanCerts);
         res.json({ success: true, count: certs.length });
     } catch (error) {
         console.error('[NFT] Certificates sync error:', error);
