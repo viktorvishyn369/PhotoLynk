@@ -11089,7 +11089,7 @@ db.serialize(() => {
 });
 
 // Upload File
-app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => {
+app.post('/api/upload', authenticateToken, blockDeletedSubscription, upload.single('file'), (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
     const { filename, path: filePath, originalname, mimetype, size } = req.file;
@@ -11138,7 +11138,7 @@ app.post('/api/upload', authenticateToken, upload.single('file'), (req, res) => 
 });
 
 // Raw Upload File (no multipart)
-app.post('/api/upload/raw', authenticateToken, (req, res) => {
+app.post('/api/upload/raw', authenticateToken, blockDeletedSubscription, (req, res) => {
     const originalname = (req.headers['x-filename'] || req.headers['x-file-name'] || '').toString();
     if (!originalname) return res.status(400).json({ error: 'Missing x-filename header' });
 
@@ -11990,7 +11990,16 @@ app.get('/api/files/:filename/thumb', authenticateToken, blockDeletedSubscriptio
 });
 
 // Diagnostic: test download without auth (remove after debugging)
-app.get('/api/debug/download-test', (req, res) => {
+// Debug endpoints disclose other users' files/state — admin-only. The JWT
+// carries no role claim; user id 1 is the first (operator) account.
+const requireAdminDebug = (req, res, next) => {
+    if (!req.user || Number(req.user.id) !== 1) {
+        return res.status(403).json({ error: 'Admin only' });
+    }
+    next();
+};
+
+app.get('/api/debug/download-test', authenticateToken, requireAdminDebug, (req, res) => {
     try {
         const dirs = fs.readdirSync(UPLOAD_DIR);
         let testFile = null;
@@ -12027,7 +12036,7 @@ app.get('/api/debug/download-test', (req, res) => {
 });
 
 // Diagnostic: show server state (remove after debugging)
-app.get('/api/debug/state', (req, res) => {
+app.get('/api/debug/state', authenticateToken, requireAdminDebug, (req, res) => {
     try {
         const dirs = fs.readdirSync(UPLOAD_DIR);
         const info = { UPLOAD_DIR, cwd: process.cwd(), execPath: process.execPath, nodeVersion: process.version, dirs: [] };
@@ -13031,7 +13040,13 @@ app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req
     if (requestedId && requestedId.match(/^[a-f0-9]{64}$/i)) {
         const { chunksDir } = ensureStealthCloudUserDirs(req.user);
         const existing = path.join(chunksDir, requestedId);
-        if (fs.existsSync(existing)) {
+        // cloudStorage.filename names the multer output <x-chunk-id>, so
+        // tmpPath === existing means the file at `existing` IS this upload —
+        // not a pre-existing chunk. Dedup/copying over it (or unlinking it
+        // as "tmp") would report stored:true while deleting the bytes.
+        // Fall through to the hash verification below instead.
+        const samePath = path.resolve(tmpPath) === path.resolve(existing);
+        if (!samePath && fs.existsSync(existing)) {
             const v = chunkFileVerified(existing, requestedId);
             if (v === true || v === 'inflight') {
                 try { fs.unlinkSync(tmpPath); } catch (e) { }
@@ -13040,6 +13055,7 @@ app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req
             // false = corrupt old file already deleted — store the fresh
             // (hash-verified below) upload instead.
         }
+        if (!samePath) {
         // Cross-UUID: check if chunk exists under another UUID dir
         const allKeys = getStealthCloudAllPossibleUserKeys(req.user);
         const chunksUsersRoot = CHUNKS_DIR ? path.join(CHUNKS_DIR, 'users') : path.join(CLOUD_DIR, 'users');
@@ -13063,6 +13079,7 @@ app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req
         }
         if (foundAlt) {
             return res.json({ chunkId: requestedId, stored: true });
+        }
         }
     }
 
@@ -14171,7 +14188,11 @@ app.get('/api/exif/:fileHash', authenticateToken, async (req, res) => {
         }
 
         const exifData = JSON.parse(fs.readFileSync(exifPath, 'utf8'));
-        return res.json(exifData);
+        // Strip the server-side envelope: userId/storedAt/upgradedFrom would
+        // disclose which account originally uploaded this content hash. The
+        // caller only needs the EXIF payload itself.
+        const { userId: _uid, storedAt: _sa, upgradedFrom: _up, ...safe } = exifData || {};
+        return res.json(safe);
     } catch (e) {
         console.error('[EXIF] Retrieve error:', e.message);
         return res.status(500).json({ error: 'Failed to retrieve EXIF' });
@@ -14199,7 +14220,11 @@ app.post('/api/exif/batch', authenticateToken, async (req, res) => {
 
             if (fs.existsSync(exifPath)) {
                 try {
-                    results[hash] = JSON.parse(fs.readFileSync(exifPath, 'utf8'));
+                    const raw = JSON.parse(fs.readFileSync(exifPath, 'utf8'));
+                    // Same envelope strip as the single GET — never leak the
+                    // uploader's account id to a different user.
+                    const { userId: _uid, storedAt: _sa, upgradedFrom: _up, ...safe } = raw || {};
+                    results[hash] = safe;
                 } catch (e) {
                     // Skip invalid files
                 }
@@ -14326,10 +14351,24 @@ app.post('/api/device/link', authenticateToken, blockDeletedSubscription, async 
         let targetOk = false;
         if (targetEmail && targetPassword) {
             const targetUser = await dbGetAsync(
-                `SELECT id, password FROM users WHERE email = ? OR alias_email = ?`,
+                `SELECT id, password, user_uuid, storage_uuid FROM users WHERE email = ? OR alias_email = ?`,
                 [targetEmail, targetEmail]);
-            targetOk = !!(targetUser && targetUser.password
+            const credsOk = !!(targetUser && targetUser.password
                 && await bcrypt.compare(targetPassword, targetUser.password));
+            if (credsOk) {
+                // Credentials alone don't prove the target DEVICE: without
+                // this check anyone could link a victim's device_uuid by
+                // authenticating with their own email/password, merging
+                // folder access across accounts.
+                targetOk = sanitizeUserKey(targetUser.user_uuid) === targetUuid
+                    || sanitizeUserKey(targetUser.storage_uuid) === targetUuid;
+                if (!targetOk) {
+                    const devRow = await dbGetAsync(
+                        `SELECT 1 FROM devices WHERE user_id = ? AND device_uuid = ? LIMIT 1`,
+                        [targetUser.id, targetUuid]);
+                    targetOk = !!devRow;
+                }
+            }
         }
         if (!targetOk && req.body.target_auth_token) {
             try {
@@ -16940,7 +16979,15 @@ try {
 }
 
 // Solana RPC proxy - avoids CORS issues when calling from browser
-app.post('/solana-rpc', async (req, res) => {
+// Open JSON-RPC proxy used by the NFT payment page. Per-IP limit keeps the
+// shared upstream quota from being burned by arbitrary third-party callers
+// while staying generous enough for a real mint/transfer session.
+const solanaRpcLimiter = createRateLimiter({
+    windowMs: Number.parseInt(process.env.SOLANA_RPC_RATE_WINDOW_MS || '60000', 10),
+    max: Number.parseInt(process.env.SOLANA_RPC_RATE_MAX || '120', 10),
+});
+
+app.post('/solana-rpc', solanaRpcLimiter, async (req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
@@ -16984,6 +17031,15 @@ app.options('/solana-rpc', (req, res) => {
 
 // Serve local images via HTTP (for Electron renderer which can't access file:// directly)
 app.get('/local-image', (req, res) => {
+    // Loopback-only — this route exists for the local Electron renderer.
+    // Without it any remote (or DNS-rebinding web) caller could read
+    // arbitrary files via ?path=/etc/passwd.
+    const remote = (req.socket && req.socket.remoteAddress) || '';
+    const isLoopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1' || remote === 'localhost';
+    if (!isLoopback) {
+        return res.status(403).json({ error: 'Local access only' });
+    }
+
     const imagePath = req.query.path;
     if (!imagePath) {
         return res.status(400).json({ error: 'No path provided' });
@@ -16991,12 +17047,12 @@ app.get('/local-image', (req, res) => {
 
     const resolvedPath = path.resolve(imagePath);
 
-    // Allow any path for now (desktop app is trusted)
     if (!fs.existsSync(resolvedPath)) {
         return res.status(404).json({ error: 'File not found' });
     }
 
-    // Determine content type
+    // Determine content type — and confine the route to image extensions.
+    // Arbitrary extensions (e.g. .pem, .sqlite) are refused outright.
     const ext = path.extname(resolvedPath).toLowerCase();
     const mimeTypes = {
         '.jpg': 'image/jpeg',
@@ -17006,13 +17062,27 @@ app.get('/local-image', (req, res) => {
         '.webp': 'image/webp',
         '.heic': 'image/heic',
         '.heif': 'image/heif',
+        '.bmp': 'image/bmp',
+        '.tiff': 'image/tiff',
+        '.tif': 'image/tiff',
+        '.avif': 'image/avif',
+        '.dng': 'image/x-adobe-dng',
+        '.cr2': 'image/x-canon-cr2',
+        '.cr3': 'image/x-canon-cr3',
+        '.nef': 'image/x-nikon-nef',
+        '.arw': 'image/x-sony-arw',
+        '.orf': 'image/x-olympus-orf',
+        '.rw2': 'image/x-panasonic-rw2',
     };
+    if (!mimeTypes[ext]) {
+        return res.status(403).json({ error: 'Only image files are served' });
+    }
 
     // Add CORS headers for Electron renderer
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET');
     res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
-    res.setHeader('Content-Type', mimeTypes[ext] || 'image/jpeg');
+    res.setHeader('Content-Type', mimeTypes[ext]);
     res.setHeader('Cache-Control', 'public, max-age=3600');
     fs.createReadStream(resolvedPath).pipe(res);
 });
@@ -17209,7 +17279,12 @@ app.get('/nft-image-token/:token', (req, res) => {
 });
 
 // NFT Payment page - served via HTTP so Phantom extension can interact with it
+// One-time nonce binding the browser page render to the mint callbacks —
+// without it any caller can inject a forged global.nftMintSuccess.
+let nftPaymentNonce = null;
+
 app.get('/nft-payment', (req, res) => {
+    nftPaymentNonce = crypto.randomBytes(16).toString('hex');
     // Set permissive CSP to allow Solana CDN and IPFS gateways
     res.setHeader('Content-Security-Policy', "default-src 'self' 'unsafe-inline' 'unsafe-eval'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https://cdn.jsdelivr.net https://unpkg.com https://bundle.run; img-src 'self' data: blob: https: http:; connect-src 'self' https: wss:; style-src 'self' 'unsafe-inline';");
     res.send(`<!DOCTYPE html>
@@ -17286,6 +17361,7 @@ app.get('/nft-payment', (req, res) => {
   </div>
   <script>
     const params = new URLSearchParams(window.location.search);
+    const MINT_NONCE = ${JSON.stringify(nftPaymentNonce)};
     const recipient = params.get('recipient') || '';
     let amount = parseFloat(params.get('amount')) || 0;
     const feeUsd = parseFloat(params.get('feeUsd')) || 0;
@@ -17537,6 +17613,7 @@ app.get('/nft-payment', (req, res) => {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({
+            nonce: MINT_NONCE,
             paymentSignature: paymentSig,
             recipient: recipient,
             metadataUrl: metadataUrl,
@@ -17871,6 +17948,7 @@ app.get('/nft-payment', (req, res) => {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
+              nonce: MINT_NONCE,
               paymentTx: paymentSig,
               mintTx: mintSig,
               name: qsStd.get('name') || '',
@@ -18065,6 +18143,7 @@ app.get('/nft-payment', (req, res) => {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
+            nonce: MINT_NONCE,
             paymentTx: paymentSig,
             mintTx: mintSig,
             name: qs.get('name') || '',
@@ -18113,7 +18192,7 @@ app.get('/nft-payment', (req, res) => {
         fetch('/nft-mint-failed', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ error: errMsg, stage: stage })
+          body: JSON.stringify({ error: errMsg, stage: stage, nonce: MINT_NONCE })
         }).catch(e => console.log('Failed to notify app of failure:', e));
       }
     }
@@ -18137,6 +18216,10 @@ app.get('/nft-payment', (req, res) => {
 
 // NFT mint success callback - receives mint details from browser to show in app
 app.post('/nft-mint-success', (req, res) => {
+    const { nonce } = req.body || {};
+    if (!nftPaymentNonce || nonce !== nftPaymentNonce) {
+        return res.status(403).json({ error: 'Invalid mint nonce' });
+    }
     const { paymentTx, mintTx, name, imageUrl, imageToken, amount, estimatedTotalSol, estimatedTotalUsd, solPrice, nftType, mintAddress, metadataUrl, wallet, edition, license, watermark, encrypt, storageOption, contentHash, exifHash, exifRawHash, exifBindingHash, certificationMode } = req.body;
     console.log('[NFT] Mint success received:', { paymentTx, mintTx, amount, estimatedTotalSol, estimatedTotalUsd, nftType, edition, contentHash: contentHash?.substring(0, 16) });
     // Resolve imageToken server-side so album always gets the real image URL for onchain NFTs
@@ -18187,7 +18270,10 @@ app.get('/nft-mint-success', (req, res) => {
 
 // NFT mint failure callback - receives mint failure from browser to notify app
 app.post('/nft-mint-failed', (req, res) => {
-    const { error, stage } = req.body;
+    const { error, stage, nonce } = req.body || {};
+    if (!nftPaymentNonce || nonce !== nftPaymentNonce) {
+        return res.status(403).json({ error: 'Invalid mint nonce' });
+    }
     console.log('[NFT] Mint failed:', { error, stage });
     global.nftMintFailure = {
         error: error || 'Mint failed',
@@ -18210,7 +18296,10 @@ app.get('/nft-mint-failed', (req, res) => {
 
 // NFT mint after QR payment - called when QR payment is detected via polling
 app.post('/api/nft/mint-after-payment', async (req, res) => {
-    const { paymentSignature, recipient, metadataUrl, nftType, name } = req.body;
+    const { paymentSignature, recipient, metadataUrl, nftType, name, nonce } = req.body || {};
+    if (!nftPaymentNonce || nonce !== nftPaymentNonce) {
+        return res.status(403).json({ error: 'Invalid mint nonce' });
+    }
     console.log('[NFT] Mint after QR payment:', { paymentSignature, nftType, name });
 
     try {
@@ -18236,10 +18325,14 @@ app.post('/api/nft/mint-after-payment', async (req, res) => {
 
 // Wallet connected callback - receives address from browser and broadcasts to Electron app
 app.post('/wallet-connected', (req, res) => {
-    const { address } = req.body;
+    const { address, nonce } = req.body || {};
+    if (!walletConnectNonce || nonce !== walletConnectNonce) {
+        return res.status(403).json({ success: false, error: 'Invalid wallet nonce' });
+    }
     if (!address) {
         return res.status(400).json({ success: false, error: 'No address provided' });
     }
+    walletConnectNonce = null;
     console.log('[Wallet] Connected from browser:', address);
     // Store in memory for the app to poll
     global.connectedWalletAddress = address;
@@ -18270,8 +18363,12 @@ app.get('/wallet-address', (req, res) => {
     }
 });
 
+// One-time nonce binding the wallet-connect page to /wallet-connected.
+let walletConnectNonce = null;
+
 // Wallet connect page - for connecting Phantom in browser
 app.get('/wallet-connect', (req, res) => {
+    walletConnectNonce = crypto.randomBytes(16).toString('hex');
     // Headers to help Phantom extension work properly
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Content-Security-Policy', "default-src 'self' 'unsafe-inline' 'unsafe-eval'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; img-src 'self' data: blob: https: http:; connect-src 'self' https: wss:; style-src 'self' 'unsafe-inline';");
@@ -18352,13 +18449,15 @@ app.get('/wallet-connect', (req, res) => {
       hideWaiting();
     }
     
+    const WALLET_NONCE = ${JSON.stringify(walletConnectNonce)};
+
     // Send address back to desktop app automatically
     async function sendAddressToApp(address) {
       try {
         await fetch('/wallet-connected', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ address })
+          body: JSON.stringify({ address, nonce: WALLET_NONCE })
         });
         return true;
       } catch (e) {
@@ -18534,6 +18633,7 @@ app.get('/wallet-connect', (req, res) => {
 
 // NFT Transfer state
 let nftTransferStatus = { completed: false, success: false, signature: null, error: null };
+let nftTransferNonce = null;
 
 // NFT Transfer status endpoint - polled by desktop app
 app.get('/nft-transfer-status', (req, res) => {
@@ -18542,7 +18642,13 @@ app.get('/nft-transfer-status', (req, res) => {
 
 // NFT Transfer completed callback - receives result from browser
 app.post('/nft-transfer-complete', (req, res) => {
-    const { success, signature, error } = req.body;
+    const { success, signature, error, nonce } = req.body || {};
+    // Require the one-time nonce embedded in the signing page — otherwise any
+    // caller can spoof a completion for whichever user happens to be polling.
+    if (!nftTransferNonce || nonce !== nftTransferNonce) {
+        return res.status(403).json({ error: 'Invalid transfer nonce' });
+    }
+    nftTransferNonce = null;
     nftTransferStatus = { completed: true, success: !!success, signature: signature || null, error: error || null };
     // Reset after 30 seconds
     setTimeout(() => { nftTransferStatus = { completed: false, success: false, signature: null, error: null }; }, 30000);
@@ -18555,7 +18661,17 @@ app.get('/nft-transfer-sign', (req, res) => {
     if (!tx || !mint || !to) {
         return res.status(400).send('Missing parameters');
     }
+    // Strict charset validation: these values are interpolated into HTML/JS.
+    // base64 for the transaction, base58 for addresses — anything else is
+    // either malformed input or an injection attempt.
+    if (!/^[A-Za-z0-9+/=_-]+$/.test(String(tx)) || !/^[1-9A-HJ-NP-Za-km-z]{32,64}$/.test(String(mint)) || !/^[1-9A-HJ-NP-Za-km-z]{32,64}$/.test(String(to))) {
+        return res.status(400).send('Invalid parameters');
+    }
     const isVersioned = versioned === '1';
+    // One-time nonce binds the completion callback to THIS page render.
+    nftTransferNonce = crypto.randomBytes(16).toString('hex');
+    const safeMint = `${String(mint).slice(0, 8)}...${String(mint).slice(-8)}`;
+    const safeTo = `${String(to).slice(0, 8)}...${String(to).slice(-8)}`;
 
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.send(`<!DOCTYPE html>
@@ -18598,11 +18714,11 @@ app.get('/nft-transfer-sign', (req, res) => {
     <div class="info-box">
       <div class="info-row">
         <span class="info-label">NFT Mint</span>
-        <span class="info-value">${mint.slice(0, 8)}...${mint.slice(-8)}</span>
+        <span class="info-value">${safeMint}</span>
       </div>
       <div class="info-row">
         <span class="info-label">Recipient</span>
-        <span class="info-value">${to.slice(0, 8)}...${to.slice(-8)}</span>
+        <span class="info-value">${safeTo}</span>
       </div>
     </div>
     
@@ -18612,8 +18728,9 @@ app.get('/nft-transfer-sign', (req, res) => {
   </div>
   
   <script>
-    const txBase64 = '${tx}';
+    const txBase64 = ${JSON.stringify(String(tx))};
     const isVersioned = ${isVersioned};
+    const transferNonce = ${JSON.stringify(nftTransferNonce)};
     
     function showStatus(msg, type) { 
       const el = document.getElementById('status'); 
@@ -18633,7 +18750,7 @@ app.get('/nft-transfer-sign', (req, res) => {
         await fetch('/nft-transfer-complete', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ success, signature, error })
+          body: JSON.stringify({ success, signature, error, nonce: transferNonce })
         });
       } catch (e) {
         console.error('Failed to notify app:', e);
