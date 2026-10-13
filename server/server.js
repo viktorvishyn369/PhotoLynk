@@ -14,6 +14,7 @@ const crypto = require('crypto');
 const axios = require('axios');
 const nacl = require('tweetnacl');
 const naclUtil = require('tweetnacl-util');
+const { v5: uuidv5 } = require('uuid');
 const updater = require('./updater');
 const paymentRecovery = require('./paymentRecovery');
 const { ensurePaceSeekerSchema, createSubscriptionReadiness } = require('./subscriptionSchema');
@@ -3361,7 +3362,30 @@ function touchDeviceLastSeen(user, deviceUuid) {
 // (uuidv5(email:password) / wallet-derived), and device pairing LINKS
 // separate uuids rather than sharing one, so cross-account rows can only
 // come from a forgery attempt.
-const deviceUuidOwnedByOther = async (deviceUuid, userId) => {
+// Derivation must match the app exactly: uuidv5(email:password) under the
+// standard DNS namespace. Wallet emails always derive from the legacy
+// address-derived password (the submitted login password may be the
+// rotated v2 one), regular emails use the submitted password.
+const DEVICE_UUID_V5_NAMESPACE = '6ba7b810-9dad-11d1-80b4-00c04fd430c8';
+const WALLET_UUID_EMAIL_DOMAIN = '@seeker.photolynk.local';
+const WALLET_LEGACY_PASSWORD_SALT = 'PhotoLynk-Seeker-WalletAuth-v1';
+
+const canonicalDeviceUuid = (email, submittedPassword) => {
+    const e = String(email || '').trim().toLowerCase();
+    if (!e) return null;
+    let pw = submittedPassword;
+    if (e.endsWith(WALLET_UUID_EMAIL_DOMAIN)) {
+        const addr = e.slice(0, -WALLET_UUID_EMAIL_DOMAIN.length);
+        try {
+            const h = nacl.hash(naclUtil.decodeUTF8(`${addr}:${WALLET_LEGACY_PASSWORD_SALT}`));
+            pw = naclUtil.encodeBase64(h.slice(0, 32));
+        } catch (_) { return null; }
+    }
+    if (!pw) return null;
+    try { return uuidv5(`${e}:${pw}`, DEVICE_UUID_V5_NAMESPACE); } catch (_) { return null; }
+};
+
+const deviceUuidOwnedByOther = async (deviceUuid, userId, credProof = null) => {
     try {
         // Read ALL rows for the uuid and decide in JS: SQL `user_id != ?`
         // never matches NULL rows, so an orphaned row would let a second
@@ -3387,7 +3411,25 @@ const deviceUuidOwnedByOther = async (deviceUuid, userId) => {
                 (e) => { if (e) console.warn('[DeviceUuidGuard] orphan sweep failed:', e.message); }
             );
         }
-        return ids.some(id => liveIds.has(String(id)) && String(id) !== String(userId));
+        const conflict = ids.some(id => liveIds.has(String(id)) && String(id) !== String(userId));
+        if (!conflict) return false;
+        // Canonical-owner reclaim: the uuid is derived from the claimant's
+        // own credentials, so proving those credentials proves ownership of
+        // the folder key. A conflicting LIVE binding could only ever have
+        // been written by someone holding these credentials (unguarded
+        // pre-guard inserts, cross-server token merges, header propagation)
+        // — release it instead of locking out the credential holder.
+        // A claimant who does NOT hold the deriving credentials can never
+        // pass canonicalDeviceUuid, so foreign claims still hard-block.
+        const keepId = Number.isFinite(Number(userId)) ? Number(userId) : -1;
+        if (credProof && canonicalDeviceUuid(credProof.email, credProof.password) === uuid) {
+            await dbRunAsync(
+                `DELETE FROM devices WHERE device_uuid = ? AND (user_id IS NULL OR user_id != ?)`,
+                [uuid, keepId]);
+            console.warn(`[DeviceUuidGuard] Released foreign binding on canonically-owned uuid for ${credProof.email}`);
+            return false;
+        }
+        return true;
     } catch (_) {
         // Fail closed: a broken DB must never let a cross-account claim
         // through - the same DB write would fail anyway.
@@ -7980,7 +8022,7 @@ app.post('/api/register', authRateLimiter, async (req, res) => {
         // The device_uuid keys the storage folder — refuse to register an
         // account that claims a uuid already bound to another user.
         const claimedUuid = req.body.device_uuid || req.body.deviceUuid;
-        if (claimedUuid && await deviceUuidOwnedByOther(claimedUuid, -1)) {
+        if (claimedUuid && await deviceUuidOwnedByOther(claimedUuid, -1, { email: normalizedEmail, password })) {
             console.warn(`[Register] Rejected device_uuid claimed by another account: ${String(claimedUuid).slice(0, 13)}…`);
             return res.status(403).json({ error: 'Device identifier conflict' });
         }
@@ -8161,7 +8203,7 @@ app.post('/api/login', authRateLimiter, async (req, res) => {
 
         // The device_uuid keys the storage folder — a login must never mint a
         // token carrying a uuid registered to a different account.
-        if (await deviceUuidOwnedByOther(device_uuid, user.id)) {
+        if (await deviceUuidOwnedByOther(device_uuid, user.id, { email: user.email, password })) {
             console.warn(`[Login] Rejected device_uuid claimed by another account: user=${user.id} uuid=${String(device_uuid).slice(0, 13)}…`);
             return res.status(403).json({ error: 'Device identifier conflict' });
         }
@@ -8421,7 +8463,7 @@ app.post('/api/wallet-login', authRateLimiter, async (req, res) => {
 
         // The device_uuid keys the storage folder — refuse to mint a token
         // that claims another account's folder key.
-        if (await deviceUuidOwnedByOther(device_uuid, user.id)) {
+        if (await deviceUuidOwnedByOther(device_uuid, user.id, { email: user.email })) {
             console.warn(`[WalletLogin] Rejected device_uuid claimed by another account: user=${user.id}`);
             return res.status(403).json({ error: 'Device identifier conflict' });
         }
@@ -8726,7 +8768,7 @@ app.post('/api/migrate-credentials', authenticateToken, async (req, res) => {
         }
         // Same cross-account guard as login: the new folder key must not
         // already belong to a different user.
-        if (safeEffectiveUuid && await deviceUuidOwnedByOther(safeEffectiveUuid, userId)) {
+        if (safeEffectiveUuid && await deviceUuidOwnedByOther(safeEffectiveUuid, userId, { email: normalizedNewEmail, password: new_password })) {
             console.warn(`[Migrate] Rejected device_uuid claimed by another account: user=${userId}`);
             return res.status(403).json({ error: 'Device identifier conflict' });
         }
