@@ -2160,7 +2160,7 @@ db.serialize(() => {
 // in prod: SQLITE_BUSY during the boot window crash-looped the service).
 // Give every callback-less call an error sink so contention degrades to a
 // log line instead of a restart.
-for (const m of ['run', 'get', 'all', 'each', 'exec']) {
+for (const m of ['run', 'get', 'all', 'exec']) {
     const orig = db[m].bind(db);
     db[m] = function (...args) {
         if (typeof args[args.length - 1] !== 'function') {
@@ -2169,6 +2169,15 @@ for (const m of ['run', 'get', 'all', 'each', 'exec']) {
         return orig(...args);
     };
 }
+// db.each takes TWO callbacks (row + complete); a lone row callback still
+// leaves iteration errors emitting 'error' on the internal statement.
+const origEach = db.each.bind(db);
+db.each = function (...args) {
+    if (args.filter(a => typeof a === 'function').length < 2) {
+        args.push((e) => { if (e) console.error('[DB] background each failed:', e.message); });
+    }
+    return origEach(...args);
+};
 
 const dbGetAsync = (sql, params) => new Promise((resolve, reject) => {
     db.get(sql, params, (err, row) => {
