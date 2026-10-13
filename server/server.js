@@ -4242,13 +4242,46 @@ const cloudStorage = multer.diskStorage({
         const safeId = typeof requestedId === 'string' && requestedId.match(/^[a-f0-9]{64}$/i)
             ? requestedId.toLowerCase()
             : crypto.randomBytes(32).toString('hex');
-        cb(null, safeId);
+        // For content-addressed uploads write under a temp name so the final
+        // <chunkId> path only ever appears via atomic rename AFTER hash
+        // verification — a concurrent GET must never read a partial file.
+        // Uploads without a valid chunk id keep the plain name (they are not
+        // content-addressed anyway).
+        const hasValidId = typeof requestedId === 'string' && requestedId.match(/^[a-f0-9]{64}$/i);
+        cb(null, hasValidId
+            ? `${safeId}.part-${crypto.randomBytes(8).toString('hex')}`
+            : safeId);
     }
 });
 const uploadCloudChunk = multer({ storage: cloudStorage, limits: { fileSize: 250 * 1024 * 1024 } });
 
 // Raw encrypted chunk uploads (application/octet-stream)
 const rawCloudChunk = express.raw({ type: '*/*', limit: '250mb' });
+
+// Orphaned multer .part-* files: a process crash mid-write leaves a partial
+// chunk under a temp name that no route will ever finalize. Sweep hourly —
+// files younger than 1h may still be streaming and are left alone.
+const sweepStaleChunkParts = () => {
+    try {
+        const chunksUsersRoot = CHUNKS_DIR ? path.join(CHUNKS_DIR, 'users') : null;
+        if (!chunksUsersRoot || !fs.existsSync(chunksUsersRoot)) return;
+        const cutoff = Date.now() - 60 * 60 * 1000;
+        for (const userDir of fs.readdirSync(chunksUsersRoot)) {
+            const chunksSub = path.join(chunksUsersRoot, userDir, 'chunks');
+            let names;
+            try { names = fs.readdirSync(chunksSub); } catch (e) { continue; }
+            for (const name of names) {
+                if (!name.includes('.part-')) continue;
+                const p = path.join(chunksSub, name);
+                try {
+                    const st = fs.statSync(p);
+                    if (st.isFile() && st.mtimeMs < cutoff) fs.unlinkSync(p);
+                } catch (e) { }
+            }
+        }
+    } catch (e) { }
+};
+setInterval(sweepStaleChunkParts, 60 * 60 * 1000).unref?.();
 
 // --- ROUTES ---
 
@@ -13110,7 +13143,16 @@ app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req
                 const dir = path.dirname(req.file.path);
                 const target = path.join(dir, requestedId);
                 if (fs.existsSync(target)) {
-                    fs.unlinkSync(req.file.path);
+                    // A concurrent upload may have finalized first, or a stale
+                    // corrupt file may sit there — verify before deciding.
+                    const tv = chunkFileVerified(target, requestedId);
+                    if (tv === true || tv === 'inflight') {
+                        fs.unlinkSync(req.file.path);
+                    } else {
+                        // Stale corrupt file removed by the verifier — keep
+                        // our freshly-verified bytes.
+                        fs.renameSync(req.file.path, target);
+                    }
                 } else {
                     fs.renameSync(req.file.path, target);
                 }
