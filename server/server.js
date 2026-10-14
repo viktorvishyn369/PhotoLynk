@@ -11612,26 +11612,31 @@ app.get('/api/files', authenticateToken, blockDeletedSubscription, async (req, r
         const byName = new Map();
         for (const uuid of deviceUuids) {
             const deviceDir = path.join(UPLOAD_DIR, uuid);
-            if (!fs.existsSync(deviceDir)) continue;
             let dirItems = [];
             try {
-                dirItems = fs.readdirSync(deviceDir);
+                dirItems = await fs.promises.readdir(deviceDir);
             } catch (e) {
                 continue;
             }
-            for (const filename of dirItems) {
-                if (!filename || filename.startsWith('.')) continue;
-                const filePath = path.join(deviceDir, filename);
-                if (!filePath.startsWith(deviceDir)) continue;
-                try {
-                    const st = fs.statSync(filePath);
-                    if (!st.isFile()) continue;
-                    const existing = byName.get(filename);
-                    const next = { filename, size: st.size, created_at: st.mtime };
+            // stat in bounded batches — thousands of statSync calls would
+            // freeze the event loop for the whole request.
+            const STAT_BATCH = 16;
+            for (let i = 0; i < dirItems.length; i += STAT_BATCH) {
+                const batch = dirItems.slice(i, i + STAT_BATCH);
+                const stats = await Promise.all(batch.map(filename => {
+                    if (!filename || filename.startsWith('.')) return null;
+                    const filePath = path.join(deviceDir, filename);
+                    if (!filePath.startsWith(deviceDir)) return null;
+                    return fs.promises.stat(filePath).then(st => ({ filename, st })).catch(() => null);
+                }));
+                for (const r of stats) {
+                    if (!r || !r.st.isFile()) continue;
+                    const existing = byName.get(r.filename);
+                    const next = { filename: r.filename, size: r.st.size, created_at: r.st.mtime };
                     if (!existing || (existing.created_at && next.created_at && next.created_at > existing.created_at)) {
-                        byName.set(filename, next);
+                        byName.set(r.filename, next);
                     }
-                } catch (e) { }
+                }
             }
         }
 
@@ -13722,7 +13727,7 @@ app.post('/api/cloud/manifests', authenticateToken, requireUploadSubscription, (
 });
 
 // List manifests - now includes metadata for fast client-side deduplication
-app.get('/api/cloud/manifests', authenticateToken, blockDeletedSubscription, (req, res) => {
+app.get('/api/cloud/manifests', authenticateToken, blockDeletedSubscription, async (req, res) => {
     const rawOffset = req.query && req.query.offset ? req.query.offset : null;
     const rawLimit = req.query && req.query.limit ? req.query.limit : null;
     const includeMeta = req.query && req.query.meta === 'true'; // ?meta=true to include hash metadata
@@ -13755,23 +13760,38 @@ app.get('/api/cloud/manifests', authenticateToken, blockDeletedSubscription, (re
     for (const key of allKeys) {
         if (!key || key === 'unknown') continue;
         const dir = path.join(CLOUD_DIR, 'users', key, 'manifests');
-        if (!fs.existsSync(dir)) continue;
         let files;
         try {
-            files = fs.readdirSync(dir).filter(f => f.endsWith('.json') && !f.startsWith('.'));
-        } catch (e) { scanError = true; continue; }
+            files = (await fs.promises.readdir(dir)).filter(f => f.endsWith('.json') && !f.startsWith('.'));
+        } catch (e) {
+            if (e.code === 'ENOENT') continue; // key dir simply absent — not a scan failure
+            scanError = true; continue;
+        }
 
+        const pending = [];
         for (const f of files) {
             const manifestId = f.replace(/\.json$/, '');
             if (seenManifestIds.has(manifestId)) continue; // Skip duplicates across UUIDs
             seenManifestIds.add(manifestId);
-            const entry = { manifestId };
+            pending.push(manifestId);
+        }
 
-            if (includeMeta || includeFull) {
-                try {
-                    const manifestPath = path.join(dir, f);
-                    const content = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-                    if (includeFull && content && content.encryptedManifest !== undefined) {
+        // meta reads are async in bounded batches — thousands of synchronous
+        // reads on the HDD would freeze the event loop for the whole request.
+        const READ_BATCH = 16;
+        for (let i = 0; i < pending.length; i += READ_BATCH) {
+            const batchIds = pending.slice(i, i + READ_BATCH);
+            const contents = (includeMeta || includeFull)
+                ? await Promise.all(batchIds.map(id =>
+                    fs.promises.readFile(path.join(dir, `${id}.json`), 'utf8')
+                        .then(t => { try { return JSON.parse(t); } catch (_) { return null; } })
+                        .catch(() => null)))
+                : batchIds.map(() => null);
+            for (let j = 0; j < batchIds.length; j++) {
+                const entry = { manifestId: batchIds[j] };
+                const content = contents[j];
+                if (content) {
+                    if (includeFull && content.encryptedManifest !== undefined) {
                         entry.encryptedManifest = content.encryptedManifest;
                     }
                     if (includeMeta && content.meta) {
@@ -13791,11 +13811,9 @@ app.get('/api/cloud/manifests', authenticateToken, blockDeletedSubscription, (re
                         entry.thumbH = content.meta.thumbH || null;
                         entry.thumbMime = content.meta.thumbMime || null;
                     }
-                } catch (e) {
-                    // Ignore read errors, just return manifestId
                 }
+                list.push(entry);
             }
-            list.push(entry);
         }
     }
 
@@ -14170,70 +14188,65 @@ app.delete('/api/cloud/raw/:filename', authenticateToken, blockDeletedSubscripti
 });
 
 // Unified list: Get both encrypted manifests and raw files
-app.get('/api/cloud/files', authenticateToken, blockDeletedSubscription, (req, res) => {
+app.get('/api/cloud/files', authenticateToken, blockDeletedSubscription, async (req, res) => {
     const { manifestsDir, rawDir, rawMetaDir } = ensureStealthCloudUserDirs(req.user);
     const includeMeta = req.query.meta === 'true';
 
     const files = [];
+    const IO_BATCH = 16; // bounded parallelism — sync per-file I/O here froze the event loop
 
     // Get encrypted files from manifests
-    if (fs.existsSync(manifestsDir)) {
-        try {
-            const manifests = fs.readdirSync(manifestsDir)
-                .filter(f => f.endsWith('.json'))
-                .map(f => {
-                    try {
-                        const manifestPath = path.join(manifestsDir, f);
-                        const content = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-                        return {
-                            type: 'encrypted',
-                            manifestId: f.replace('.json', ''),
-                            filename: content.filename || f,
-                            size: content.size || 0,
-                            createdAt: content.createdAt || null,
-                            mediaType: content.mediaType || null,
-                        };
-                    } catch (e) {
-                        return null;
-                    }
-                })
-                .filter(Boolean);
-            files.push(...manifests);
-        } catch (e) { }
-    }
+    try {
+        const manifestNames = (await fs.promises.readdir(manifestsDir)).filter(f => f.endsWith('.json'));
+        for (let i = 0; i < manifestNames.length; i += IO_BATCH) {
+            const batch = manifestNames.slice(i, i + IO_BATCH);
+            const parsed = await Promise.all(batch.map(f =>
+                fs.promises.readFile(path.join(manifestsDir, f), 'utf8')
+                    .then(t => ({ f, content: (() => { try { return JSON.parse(t); } catch (_) { return null; } })() }))
+                    .catch(() => ({ f, content: null }))));
+            for (const { f, content } of parsed) {
+                if (!content) continue;
+                files.push({
+                    type: 'encrypted',
+                    manifestId: f.replace('.json', ''),
+                    filename: content.filename || f,
+                    size: content.size || 0,
+                    createdAt: content.createdAt || null,
+                    mediaType: content.mediaType || null,
+                });
+            }
+        }
+    } catch (e) { }
 
     // Get raw files
-    if (fs.existsSync(rawDir)) {
-        try {
-            const rawFiles = fs.readdirSync(rawDir)
-                .filter(f => !f.startsWith('.'))
-                .map(filename => {
-                    const filePath = path.join(rawDir, filename);
-                    const stats = fs.statSync(filePath);
-                    if (!stats.isFile()) return null;
+    try {
+        const rawNames = (await fs.promises.readdir(rawDir)).filter(f => !f.startsWith('.'));
+        for (let i = 0; i < rawNames.length; i += IO_BATCH) {
+            const batch = rawNames.slice(i, i + IO_BATCH);
+            const rows = await Promise.all(batch.map(async filename => {
+                const filePath = path.join(rawDir, filename);
+                const stats = await fs.promises.stat(filePath).catch(() => null);
+                if (!stats || !stats.isFile()) return null;
 
-                    const file = {
-                        type: 'raw',
-                        filename,
-                        size: stats.size,
-                        createdAt: stats.mtime.toISOString(),
-                    };
+                const file = {
+                    type: 'raw',
+                    filename,
+                    size: stats.size,
+                    createdAt: stats.mtime.toISOString(),
+                };
 
-                    if (includeMeta) {
-                        const metaPath = path.join(rawMetaDir, `${filename}.json`);
-                        if (fs.existsSync(metaPath)) {
-                            try {
-                                file.meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-                            } catch (e) { }
-                        }
-                    }
+                if (includeMeta) {
+                    const metaPath = path.join(rawMetaDir, `${filename}.json`);
+                    try {
+                        file.meta = JSON.parse(await fs.promises.readFile(metaPath, 'utf8'));
+                    } catch (e) { }
+                }
 
-                    return file;
-                })
-                .filter(Boolean);
-            files.push(...rawFiles);
-        } catch (e) { }
-    }
+                return file;
+            }));
+            for (const r of rows) if (r) files.push(r);
+        }
+    } catch (e) { }
 
     res.json({ files, total: files.length });
 });
