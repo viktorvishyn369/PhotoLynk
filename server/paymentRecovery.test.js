@@ -1441,6 +1441,8 @@ const runWalletLogin = async (h, body) => {
         ecoEnsureAccount: async () => 'acct',
         ecoSyncMemberEntitlement: async () => { },
         crypto: require('crypto'),
+        // Same regex as server.js sanitizeUserKey — the handler gates on it.
+        sanitizeUserKey: (v) => String(v || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128),
         console, Date,
     };
     // REAL implementations evaluated in the same sandbox (temp-db dbAllAsync).

@@ -257,6 +257,75 @@ const reserveStealthCloudIncomingBytes = async ({ userId, incomingBytes }) => {
     }
 };
 
+// Classic (non-StealthCloud) uploads historically had no size limit and no
+// quota accounting: any registered account could stream unbounded bytes to
+// UPLOAD_DIR and fill the server disk. Old clients keep working, but bytes
+// now count toward the user's quota — the plan quota when one exists, else
+// the same 5 GB default the trial/NFT paths assume — plus a per-file
+// backstop and an in-flight reservation that serializes the
+// check-then-write decision per account.
+const CLASSIC_UPLOAD_MAX_BYTES = 10 * 1024 * 1024 * 1024; // 10 GB per file
+const CLASSIC_FREE_QUOTA_BYTES = 5 * 1000 * 1000 * 1000;  // 5 GB default
+
+const reserveClassicUploadBytes = async ({ userId, incomingBytes }) => {
+    const inc = typeof incomingBytes === 'number' && Number.isFinite(incomingBytes) ? Math.max(0, incomingBytes) : 0;
+    const releaseLock = await acquireCloudUploadLock(userId);
+    try {
+        const planQuota = await getUserQuotaBytes(userId);
+        const quotaBytes = planQuota > 0 ? planQuota : CLASSIC_FREE_QUOTA_BYTES;
+        const usedBytes = await getUserUsedBytes(userId);
+        const key = String(userId);
+        const reservedBytes = Number(cloudUploadReservedBytes.get(key) || 0) || 0;
+        const remainingBytes = Math.max(0, quotaBytes - (usedBytes + reservedBytes));
+        const allowed = inc <= CLASSIC_UPLOAD_MAX_BYTES && inc <= remainingBytes;
+
+        if (!allowed) {
+            return {
+                allowed: false,
+                quotaBytes,
+                usedBytes,
+                reservedBytes,
+                remainingBytes,
+                release: () => { },
+            };
+        }
+
+        cloudUploadReservedBytes.set(key, reservedBytes + inc);
+        let released = false;
+        const releaseReservation = () => {
+            if (released) return;
+            released = true;
+            const cur = Number(cloudUploadReservedBytes.get(key) || 0) || 0;
+            const next = Math.max(0, cur - inc);
+            if (next <= 0) cloudUploadReservedBytes.delete(key);
+            else cloudUploadReservedBytes.set(key, next);
+        };
+
+        return {
+            allowed: true,
+            quotaBytes,
+            usedBytes,
+            reservedBytes: reservedBytes + inc,
+            remainingBytes,
+            release: releaseReservation,
+        };
+    } finally {
+        releaseLock();
+    }
+};
+
+const streamSha256 = (filePath) => new Promise((resolve, reject) => {
+    const h = crypto.createHash('sha256');
+    const s = fs.createReadStream(filePath);
+    s.on('data', (d) => h.update(d));
+    s.on('end', () => resolve(h.digest('hex')));
+    s.on('error', reject);
+});
+
+// Thumbnail generation buffers the whole source file — cap the input so a
+// giant upload can't OOM the process on a per-request basis.
+const THUMB_MAX_INPUT_BYTES = 300 * 1024 * 1024; // 300 MB
+
 const resolveDataDir = () => {
     if (process.env.PHOTOSYNC_DATA_DIR) return process.env.PHOTOSYNC_DATA_DIR;
     if (process.env.UPLOAD_DIR) return path.dirname(process.env.UPLOAD_DIR);
@@ -3336,8 +3405,12 @@ db.serialize(() => {
 
             let cleaned = 0;
             rows.forEach(row => {
-                // Files are stored by device_uuid, not user_id
-                const deviceDir = path.join(UPLOAD_DIR, row.device_uuid);
+                // Files are stored by device_uuid, not user_id. Skip rows whose
+                // uuid wouldn't survive sanitization — a planted/legacy dirty
+                // value must never become a disk path.
+                const safeDu = sanitizeUserKey(row.device_uuid);
+                if (!safeDu || safeDu !== String(row.device_uuid)) return;
+                const deviceDir = path.join(UPLOAD_DIR, safeDu);
                 const filePath = path.join(deviceDir, row.filename);
 
                 if (!fs.existsSync(filePath)) {
@@ -3791,7 +3864,11 @@ const purgeUserEverywhereUnlocked = async (userId, options = {}) => {
 
         for (const device of devices) {
             if (!device || !device.device_uuid) continue;
-            const deviceDir = path.join(UPLOAD_DIR, device.device_uuid);
+            // A planted or legacy-corrupt uuid must never escape UPLOAD_DIR —
+            // these dirs are passed to recursive rm.
+            const safeDu = sanitizeUserKey(device.device_uuid);
+            if (!safeDu || safeDu !== String(device.device_uuid)) continue;
+            const deviceDir = path.join(UPLOAD_DIR, safeDu);
             if (fs.existsSync(deviceDir)) dirsToDelete.add(deviceDir);
         }
 
@@ -4366,7 +4443,7 @@ const storage = multer.diskStorage({
     }
 });
 
-const upload = multer({ storage: storage });
+const upload = multer({ storage: storage, limits: { fileSize: CLASSIC_UPLOAD_MAX_BYTES } });
 
 // Cloud chunk storage (encrypted blobs): keep server blind
 const cloudStorage = multer.diskStorage({
@@ -7915,6 +7992,7 @@ const getUserUsedBytes = async (userId, userOrNull) => {
     // Get raw files + encrypted chunks from filesystem for all possible user keys
     let rawBytes = 0;
     let fsChunkBytes = 0;
+    let classicBytes = 0;
     if (user) {
         try {
             const allKeys = getStealthCloudAllPossibleUserKeys(user);
@@ -7928,6 +8006,15 @@ const getUserUsedBytes = async (userId, userOrNull) => {
                         : path.join(CLOUD_DIR, 'users', key, 'raw');
                     if (fs.existsSync(rawDir)) {
                         rawBytes += await getDirectorySizeRecursive(rawDir);
+                    }
+                } catch (e) { }
+
+                // Classic uploads under UPLOAD_DIR/<key> — historically uncounted,
+                // so a free account could fill the disk at zero recorded usage.
+                try {
+                    const classicDir = path.join(UPLOAD_DIR, key);
+                    if (fs.existsSync(classicDir)) {
+                        classicBytes += await getDirectorySizeRecursive(classicDir);
                     }
                 } catch (e) { }
             }
@@ -7954,7 +8041,7 @@ const getUserUsedBytes = async (userId, userOrNull) => {
         } catch (e) { }
     }
 
-    const total = encryptedBytes + rawBytes;
+    const total = encryptedBytes + rawBytes + classicBytes;
     return Number.isFinite(total) ? total : 0;
 };
 
@@ -8102,6 +8189,15 @@ app.post('/api/register', authRateLimiter, async (req, res) => {
         // The device_uuid keys the storage folder — refuse to register an
         // account that claims a uuid already bound to another user.
         const claimedUuid = req.body.device_uuid || req.body.deviceUuid;
+        // Format gate — the uuid becomes a filesystem path segment and is
+        // signed into the JWT, so anything that wouldn't survive sanitization
+        // (e.g. '../x') must never be minted or stored.
+        if (claimedUuid) {
+            const safeClaim = sanitizeUserKey(claimedUuid);
+            if (!safeClaim || safeClaim !== String(claimedUuid)) {
+                return res.status(400).json({ error: 'Invalid device identifier' });
+            }
+        }
         if (claimedUuid && await deviceUuidOwnedByOther(claimedUuid, -1, { email: normalizedEmail, password })) {
             console.warn(`[Register] Rejected device_uuid claimed by another account: ${String(claimedUuid).slice(0, 13)}…`);
             return res.status(403).json({ error: 'Device identifier conflict' });
@@ -8140,6 +8236,14 @@ app.post('/api/register', authRateLimiter, async (req, res) => {
 app.post('/api/login', authRateLimiter, async (req, res) => {
     const { email, password, device_uuid, device_name, country_verification_code, wallet_domain } = req.body;
     if (!email || !password || !device_uuid) return res.status(400).json({ error: 'Missing credentials or device ID' });
+    // Format gate — the uuid is signed into the JWT and becomes a filesystem
+    // path segment; a value that wouldn't survive sanitization is forged.
+    {
+        const safeDu = sanitizeUserKey(device_uuid);
+        if (!safeDu || safeDu !== String(device_uuid)) {
+            return res.status(400).json({ error: 'Invalid device identifier' });
+        }
+    }
     const normalizedEmail = String(email).toLowerCase().trim();
     const walletDomain = wallet_domain ? String(wallet_domain).toLowerCase().trim() : null;
 
@@ -8474,6 +8578,13 @@ app.post('/api/wallet-login', authRateLimiter, async (req, res) => {
     const { wallet_address, signed_message, signature, public_key_b64, device_uuid, device_name, wallet_domain } = req.body;
     if (!wallet_address || !signed_message || !signature || !public_key_b64 || !device_uuid) {
         return res.status(400).json({ error: 'Missing wallet login parameters' });
+    }
+    // Format gate — signed into the JWT and used as a filesystem path segment.
+    {
+        const safeDu = sanitizeUserKey(device_uuid);
+        if (!safeDu || safeDu !== String(device_uuid)) {
+            return res.status(400).json({ error: 'Invalid device identifier' });
+        }
     }
 
     try {
@@ -11263,60 +11374,126 @@ db.serialize(() => {
 });
 
 // Upload File
-app.post('/api/upload', authenticateToken, blockDeletedSubscription, upload.single('file'), (req, res) => {
+app.post('/api/upload', authenticateToken, blockDeletedSubscription, (req, res, next) => {
+    // Early reject when the declared length already exceeds the per-file cap —
+    // avoids writing a multi-GB body we would only delete afterwards.
+    const declared = Number(req.headers['content-length']);
+    if (Number.isFinite(declared) && declared > CLASSIC_UPLOAD_MAX_BYTES * 1.1) {
+        return res.status(413).json({ error: 'File too large', code: 'UPLOAD_TOO_LARGE' });
+    }
+    upload.single('file')(req, res, (err) => {
+        if (err) {
+            const tooBig = err && err.code === 'LIMIT_FILE_SIZE';
+            return res.status(tooBig ? 413 : 400).json({
+                error: tooBig ? 'File too large' : (err.message || 'Upload failed'),
+                code: tooBig ? 'UPLOAD_TOO_LARGE' : 'UPLOAD_FAILED',
+            });
+        }
+        next();
+    });
+}, async (req, res) => {
     if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
     const { filename, path: filePath, originalname, mimetype, size } = req.file;
+    const cleanupFile = () => { try { fs.unlinkSync(filePath); } catch (e) { } };
 
-    // Calculate file hash to detect duplicates
-    const fileBuffer = fs.readFileSync(filePath);
-    const fileHash = crypto.createHash('sha256').update(fileBuffer).digest('hex');
-
-    // Check if this exact file already exists for this user (by hash only - same content = duplicate)
-    db.get(`SELECT filename, file_hash FROM files WHERE user_id = ? AND file_hash = ?`,
-        [req.user.id, fileHash],
-        (err, row) => {
-            if (row) {
-                // Check if the file actually exists on disk
-                const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
-                const existingFilePath = path.join(deviceDir, row.filename);
-
-                if (fs.existsSync(existingFilePath)) {
-                    // Duplicate file exists - delete the uploaded file and return existing filename
-                    fs.unlinkSync(filePath);
-                    console.log(`Duplicate file detected: ${originalname} (matches ${row.filename})`);
-                    return res.json({ message: 'File already exists (duplicate)', filename: row.filename, duplicate: true });
-                } else {
-                    // File in DB but not on disk - remove from DB and continue with upload
-                    console.log(`File ${row.filename} in DB but missing from disk - cleaning up DB`);
-                    db.run(`DELETE FROM files WHERE user_id = ? AND file_hash = ?`, [req.user.id, fileHash]);
-                    // Continue to save the new file below
-                }
-            }
-
-            // Not a duplicate - save to DB
-            db.run(`INSERT OR REPLACE INTO files (user_id, filename, original_name, mime_type, size, file_hash) VALUES (?, ?, ?, ?, ?, ?)`,
-                [req.user.id, originalname, originalname, mimetype, size, fileHash],
-                (err) => {
-                    if (err) {
-                        console.error('Metadata save error:', err);
-                        // If DB save fails, try to clean up the file
-                        fs.unlinkSync(filePath);
-                        return res.status(500).json({ error: 'Failed to save file metadata' });
-                    }
-                    res.json({ message: 'File uploaded', filename: originalname });
-                }
-            );
+    let reservation = null;
+    try {
+        // Quota gate — classic uploads were previously unbounded and uncounted,
+        // letting any registered account fill the server disk.
+        reservation = await reserveClassicUploadBytes({ userId: req.user.id, incomingBytes: size });
+        if (!reservation.allowed) {
+            cleanupFile();
+            return res.status(413).json({
+                error: 'Storage limit reached',
+                code: 'QUOTA_EXCEEDED',
+                quotaBytes: reservation.quotaBytes,
+                usedBytes: reservation.usedBytes,
+                remainingBytes: reservation.remainingBytes,
+            });
         }
-    );
+
+        // Stream the hash — readFileSync buffered whole multi-GB uploads into memory.
+        const fileHash = await streamSha256(filePath);
+
+        // Check if this exact file already exists for this user (by hash only - same content = duplicate)
+        const row = await dbGetAsync(
+            `SELECT filename, file_hash FROM files WHERE user_id = ? AND file_hash = ?`,
+            [req.user.id, fileHash]
+        );
+        if (row) {
+            const deviceDir = path.join(UPLOAD_DIR, sanitizeUserKey(req.user.device_uuid) || 'unknown');
+            const existingFilePath = path.join(deviceDir, path.basename(String(row.filename)));
+
+            if (fs.existsSync(existingFilePath)) {
+                cleanupFile();
+                console.log(`Duplicate file detected: ${originalname} (matches ${row.filename})`);
+                return res.json({ message: 'File already exists (duplicate)', filename: row.filename, duplicate: true });
+            }
+            // File in DB but not on disk - remove from DB and continue with upload
+            console.log(`File ${row.filename} in DB but missing from disk - cleaning up DB`);
+            db.run(`DELETE FROM files WHERE user_id = ? AND file_hash = ?`, [req.user.id, fileHash]);
+        }
+
+        // Not a duplicate - save to DB
+        db.run(`INSERT OR REPLACE INTO files (user_id, filename, original_name, mime_type, size, file_hash) VALUES (?, ?, ?, ?, ?, ?)`,
+            [req.user.id, originalname, originalname, mimetype, size, fileHash],
+            (err) => {
+                if (err) {
+                    console.error('Metadata save error:', err);
+                    cleanupFile();
+                    return res.status(500).json({ error: 'Failed to save file metadata' });
+                }
+                res.json({ message: 'File uploaded', filename: originalname });
+            }
+        );
+    } catch (e) {
+        cleanupFile();
+        console.error('Upload error:', e);
+        return res.status(500).json({ error: 'Upload failed' });
+    } finally {
+        if (reservation) reservation.release();
+    }
 });
 
 // Raw Upload File (no multipart)
-app.post('/api/upload/raw', authenticateToken, blockDeletedSubscription, (req, res) => {
+app.post('/api/upload/raw', authenticateToken, blockDeletedSubscription, async (req, res) => {
     const originalname = (req.headers['x-filename'] || req.headers['x-file-name'] || '').toString();
     if (!originalname) return res.status(400).json({ error: 'Missing x-filename header' });
 
-    const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
+    // Reject declared bodies over the per-file cap before any bytes hit disk.
+    const declaredBytes = Number(req.headers['content-length']);
+    if (Number.isFinite(declaredBytes) && declaredBytes > CLASSIC_UPLOAD_MAX_BYTES) {
+        return res.status(413).json({ error: 'File too large', code: 'UPLOAD_TOO_LARGE' });
+    }
+
+    // Reserve quota up front when the length is known so concurrent uploads for
+    // the same account serialize the check-then-write decision.
+    let reservation = null;
+    try {
+        if (Number.isFinite(declaredBytes) && declaredBytes > 0) {
+            reservation = await reserveClassicUploadBytes({ userId: req.user.id, incomingBytes: declaredBytes });
+            if (!reservation.allowed) {
+                return res.status(413).json({
+                    error: 'Storage limit reached',
+                    code: 'QUOTA_EXCEEDED',
+                    quotaBytes: reservation.quotaBytes,
+                    usedBytes: reservation.usedBytes,
+                    remainingBytes: reservation.remainingBytes,
+                });
+            }
+        }
+    } catch (e) {
+        console.error('[Upload] Quota check failed:', e.message);
+        return res.status(500).json({ error: 'Upload unavailable' });
+    }
+    const releaseReservation = () => {
+        if (reservation) { try { reservation.release(); } catch (e) { } reservation = null; }
+    };
+
+    const safeDu = sanitizeUserKey(req.user.device_uuid);
+    if (!safeDu) return res.status(400).json({ error: 'Invalid device identifier' });
+    const deviceDir = path.join(UPLOAD_DIR, safeDu);
     try { fs.mkdirSync(deviceDir, { recursive: true }); } catch (e) { }
 
     const safeName = path.basename(originalname);
@@ -11387,23 +11564,40 @@ app.post('/api/upload/raw', authenticateToken, blockDeletedSubscription, (req, r
 
     req.on('aborted', () => {
         console.log(`[Upload] Request aborted for ${safeName}`);
+        releaseReservation();
         closeStreamAndCleanup();
     });
 
     req.on('error', (e) => {
         console.log(`[Upload] Request error for ${safeName}: ${e.message}`);
+        releaseReservation();
         closeStreamAndCleanup();
     });
 
     out.on('error', (e) => {
         console.error(`[Upload] Write stream error for ${safeName}: ${e.message}`);
+        releaseReservation();
         closeStreamAndCleanup();
-        return res.status(500).json({ error: 'Failed to write upload' });
+        if (!res.headersSent) return res.status(500).json({ error: 'Failed to write upload' });
     });
 
+    let uploadTooLarge = false;
     req.on('data', (chunk) => {
         try {
             writtenBytes += chunk.length;
+            // Hard cap mid-stream: a client that sends more than it declared (or
+            // nothing at all) still cannot write past the per-file limit.
+            if (writtenBytes > CLASSIC_UPLOAD_MAX_BYTES) {
+                if (!uploadTooLarge) {
+                    uploadTooLarge = true;
+                    console.warn(`[Upload] ${safeName} exceeded per-file cap - aborting`);
+                    releaseReservation();
+                    closeStreamAndCleanup();
+                    try { req.destroy(); } catch (e) { }
+                    if (!res.headersSent) res.status(413).json({ error: 'File too large', code: 'UPLOAD_TOO_LARGE' });
+                }
+                return;
+            }
             hasher.update(chunk);
         } catch (e) {
             // ignore
@@ -11429,9 +11623,35 @@ app.post('/api/upload/raw', authenticateToken, blockDeletedSubscription, (req, r
             else doClean();
         };
 
+        if (uploadTooLarge) return;
+
         const fileHash = hasher.digest('hex');
         const mimetype = (req.headers['content-type'] || 'application/octet-stream').toString();
         const size = writtenBytes;
+
+        // No declared length meant no upfront reservation — verify the actual
+        // bytes against quota now and drop the file if it does not fit.
+        try {
+            if (!reservation) {
+                const postCheck = await reserveClassicUploadBytes({ userId: req.user.id, incomingBytes: size });
+                if (!postCheck.allowed) {
+                    cleanupTmp(200);
+                    return res.status(413).json({
+                        error: 'Storage limit reached',
+                        code: 'QUOTA_EXCEEDED',
+                        quotaBytes: postCheck.quotaBytes,
+                        usedBytes: postCheck.usedBytes,
+                        remainingBytes: postCheck.remainingBytes,
+                    });
+                }
+                reservation = postCheck;
+            }
+        } catch (e) {
+            console.error('[Upload] Post-write quota check failed:', e.message);
+            cleanupTmp(200);
+            releaseReservation();
+            return res.status(500).json({ error: 'Upload unavailable' });
+        }
 
         // Detect real file format from magic bytes and fix extension if mismatched
         // Android sometimes reports screenshots as .jpg when they're actually PNG
@@ -11538,9 +11758,10 @@ app.post('/api/upload/raw', authenticateToken, blockDeletedSubscription, (req, r
             // Check file hash first (exact match)
             const fileHashMatch = await checkFileHash();
             if (fileHashMatch) {
-                const existingFilePath = path.join(deviceDir, fileHashMatch.filename);
+                const existingFilePath = path.join(deviceDir, path.basename(String(fileHashMatch.filename)));
                 if (fs.existsSync(existingFilePath)) {
                     cleanupTmp(200);
+                    releaseReservation();
                     console.log(`Duplicate raw upload detected: ${safeName} (fileHash matches ${fileHashMatch.filename})`);
                     return res.json({ message: 'File already exists (duplicate)', filename: fileHashMatch.filename, duplicate: true });
                 }
@@ -11551,9 +11772,10 @@ app.post('/api/upload/raw', authenticateToken, blockDeletedSubscription, (req, r
             // Check perceptual hash (fuzzy match for images)
             const phashMatch = await checkPerceptualHash();
             if (phashMatch) {
-                const existingFilePath = path.join(deviceDir, phashMatch.filename);
+                const existingFilePath = path.join(deviceDir, path.basename(String(phashMatch.filename)));
                 if (fs.existsSync(existingFilePath)) {
                     cleanupTmp(200);
+                    releaseReservation();
                     console.log(`Duplicate raw upload detected: ${safeName} (perceptualHash matches ${phashMatch.filename}, dist=${phashMatch.distance})`);
                     return res.json({ message: 'File already exists (duplicate)', filename: phashMatch.filename, duplicate: true });
                 }
@@ -11573,6 +11795,7 @@ app.post('/api/upload/raw', authenticateToken, blockDeletedSubscription, (req, r
             } catch (e) {
                 console.error(`[Upload] Failed to rename ${tmpPath} -> ${correctedFinalPath}: ${e.message}`);
                 cleanupTmp(200);
+                releaseReservation();
                 return res.status(500).json({ error: 'Failed to finalize upload' });
             }
 
@@ -11581,6 +11804,7 @@ app.post('/api/upload/raw', authenticateToken, blockDeletedSubscription, (req, r
                 `INSERT OR REPLACE INTO files (user_id, filename, original_name, mime_type, size, file_hash, perceptual_hash) VALUES (?, ?, ?, ?, ?, ?, ?)`,
                 [req.user.id, correctedSafeName, safeName, mimetype, size, fileHash, perceptualHash],
                 (err2) => {
+                    releaseReservation();
                     if (err2) {
                         console.error('Metadata save error:', err2);
                         try { fs.unlinkSync(correctedFinalPath); } catch (e) { }
@@ -11591,6 +11815,7 @@ app.post('/api/upload/raw', authenticateToken, blockDeletedSubscription, (req, r
             );
         } catch (err) {
             cleanupTmp();
+            releaseReservation();
             console.error('Dedup check error:', err);
             return res.status(500).json({ error: 'Database error' });
         }
@@ -11721,7 +11946,7 @@ app.get('/api/files', authenticateToken, blockDeletedSubscription, async (req, r
 
 // Migrate existing files to compute missing hashes
 app.post('/api/files/migrate-hashes', authenticateToken, blockDeletedSubscription, async (req, res) => {
-    const deviceDir = path.join(UPLOAD_DIR, req.user.device_uuid);
+    const deviceDir = path.join(UPLOAD_DIR, sanitizeUserKey(req.user.device_uuid) || 'unknown');
     if (!fs.existsSync(deviceDir)) {
         return res.json({ migrated: 0, message: 'No files to migrate' });
     }
@@ -11741,7 +11966,7 @@ app.post('/api/files/migrate-hashes', authenticateToken, blockDeletedSubscriptio
         let errors = 0;
 
         for (const row of rows) {
-            const filePath = path.join(deviceDir, row.filename);
+            const filePath = path.join(deviceDir, path.basename(String(row.filename)));
             if (!fs.existsSync(filePath)) {
                 errors++;
                 continue;
@@ -11820,6 +12045,12 @@ app.post('/api/files/platform-hashes', authenticateToken, blockDeletedSubscripti
     const validPlatforms = ['ios', 'android'];
     if (!validPlatforms.includes(platform)) {
         return res.status(400).json({ error: 'Invalid platform' });
+    }
+
+    // A 25 MB JSON body could carry millions of entries — each one is a DB
+    // statement. Bound the batch so a single request cannot pin the writer.
+    if (hashes.length > 5000) {
+        return res.status(400).json({ error: 'Too many hashes in one request (max 5000)' });
     }
 
     let saved = 0;
@@ -12099,6 +12330,7 @@ app.get('/api/files/:filename/thumb', authenticateToken, blockDeletedSubscriptio
         if (isHeicFile && heicConvert) {
             try {
                 console.log(`[THUMB] Converting HEIC: ${filename}`);
+                if (fs.statSync(filePath).size > THUMB_MAX_INPUT_BYTES) throw new Error('source too large for thumbnail');
                 const heicBuffer = fs.readFileSync(filePath);
                 const jpegBuffer = await heicConvert({
                     buffer: heicBuffer,
@@ -12114,6 +12346,7 @@ app.get('/api/files/:filename/thumb', authenticateToken, blockDeletedSubscriptio
 
         try {
             // Read file into buffer to avoid Sharp holding file handle open on Windows
+            if (!inputBuffer && fs.statSync(filePath).size > THUMB_MAX_INPUT_BYTES) throw new Error('source too large for thumbnail');
             const sharpInput = inputBuffer || fs.readFileSync(filePath);
             const thumbBuffer = await sharp(sharpInput, { failOn: 'none', pages: 1 })
                 .rotate()
@@ -13274,11 +13507,11 @@ app.post('/api/cloud/chunks', authenticateToken, requireUploadSubscription, (req
         });
     }
 
-    // Optional integrity check: if client provided a sha256 id, verify it
+    // Optional integrity check: if client provided a sha256 id, verify it.
+    // Streamed — a sync read buffered the whole 250 MB chunk per request.
     if (requestedId && requestedId.match(/^[a-f0-9]{64}$/i)) {
         try {
-            const buf = fs.readFileSync(req.file.path);
-            const actual = crypto.createHash('sha256').update(buf).digest('hex');
+            const actual = await streamSha256(req.file.path);
             if (actual !== requestedId) {
                 fs.unlinkSync(req.file.path);
                 return res.status(400).json({ error: 'Chunk hash mismatch' });
@@ -13966,12 +14199,16 @@ app.post('/api/cloud/raw', authenticateToken, requireUploadSubscription, express
         // Compute file hash for deduplication
         const fileHash = crypto.createHash('sha256').update(req.body).digest('hex');
 
-        // Check if file already exists (by hash)
+        // Check if file already exists (by hash). Only same-size candidates can
+        // match, and the compare is streamed — syncing the whole directory into
+        // memory per upload stalled the event loop and risked OOM on big files.
         const existingFiles = fs.readdirSync(rawDir);
         for (const existing of existingFiles) {
             const existingPath = path.join(rawDir, existing);
-            if (fs.statSync(existingPath).isFile()) {
-                const existingHash = crypto.createHash('sha256').update(fs.readFileSync(existingPath)).digest('hex');
+            try {
+                const st = fs.statSync(existingPath);
+                if (!st.isFile() || st.size !== fileSize) continue;
+                const existingHash = await streamSha256(existingPath);
                 if (existingHash === fileHash) {
                     reservation.release();
                     return res.json({
@@ -13982,7 +14219,7 @@ app.post('/api/cloud/raw', authenticateToken, requireUploadSubscription, express
                         message: 'File already exists (duplicate)'
                     });
                 }
-            }
+            } catch (e) { }
         }
 
         // Write file
@@ -14130,6 +14367,7 @@ app.get('/api/cloud/raw/:filename/thumb', authenticateToken, blockDeletedSubscri
     if (isImage && sharp) {
         try {
             // Read file into buffer first to avoid Sharp holding file handle open on Windows
+            if (fs.statSync(filePath).size > THUMB_MAX_INPUT_BYTES) throw new Error('source too large for thumbnail');
             const fileBuffer = fs.readFileSync(filePath);
             const thumbBuffer = await sharp(fileBuffer, { pages: 1 })
                 .resize(220, 220, { fit: 'inside', withoutEnlargement: true })
@@ -14804,7 +15042,17 @@ app.post('/api/nft/upload', authenticateToken, blockDeletedSubscription, (req, r
 
         // NFT uploads are allowed for all authenticated users without subscription check
         // NFT images/thumbnails are essential for NFT functionality and users pay commission per mint
-        // No quota check - NFT storage is separate from backup storage
+        // No plan quota - NFT storage is separate from backup storage - but the
+        // directory must still be bounded or a free account could fill the disk
+        // one 50 MB image at a time.
+        const userNftDir = ensureUserNftDir(userKey);
+        const NFT_USER_MAX_FILES = 5000;
+        try {
+            const nftFiles = fs.readdirSync(userNftDir).filter(f => !f.startsWith('.'));
+            if (nftFiles.length >= NFT_USER_MAX_FILES) {
+                return res.status(413).json({ error: 'NFT storage limit reached for this account' });
+            }
+        } catch (e) { }
 
         // Generate unique image ID
         const imageId = crypto.randomBytes(16).toString('hex');
@@ -14819,8 +15067,7 @@ app.post('/api/nft/upload', authenticateToken, blockDeletedSubscription, (req, r
         const ext = mimeToExt[req.file.mimetype] || 'jpg';
         const filename = `${imageId}.${ext}`;
 
-        // Save to user's NFT directory
-        const userNftDir = ensureUserNftDir(userKey);
+        // Save to user's NFT directory (dir ensured above)
         const filePath = path.join(userNftDir, filename);
         fs.writeFileSync(filePath, req.file.buffer);
 
@@ -17456,16 +17703,26 @@ app.get('/skr-price', async (req, res) => {
 
 // Temporary image token store - holds large data URIs (e.g. on-chain SVG) for the payment page
 // Avoids URL length limits when passing data: URIs as query params
+const NFT_IMAGE_TOKEN_MAX_DATAURI = 4 * 1024 * 1024; // 4 MB — on-chain SVGs are far smaller
+const NFT_IMAGE_TOKEN_MAX_ENTRIES = 100;
 const nftImageTokens = {};
 app.post('/nft-image-token', (req, res) => {
     const { dataUri } = req.body;
     if (!dataUri) return res.status(400).json({ error: 'No dataUri' });
-    const token = require('crypto').randomBytes(12).toString('hex');
-    nftImageTokens[token] = { dataUri, expires: Date.now() + 10 * 60 * 1000 }; // 10 min TTL
-    // Clean up expired tokens
-    for (const k of Object.keys(nftImageTokens)) {
-        if (nftImageTokens[k].expires < Date.now()) delete nftImageTokens[k];
+    if (typeof dataUri !== 'string' || dataUri.length > NFT_IMAGE_TOKEN_MAX_DATAURI) {
+        return res.status(413).json({ error: 'dataUri too large' });
     }
+    // Clean up expired tokens, then bound the map — it's an unauthenticated
+    // store, so without a cap an attacker could grow it without limit.
+    const now = Date.now();
+    for (const k of Object.keys(nftImageTokens)) {
+        if (nftImageTokens[k].expires < now) delete nftImageTokens[k];
+    }
+    if (Object.keys(nftImageTokens).length >= NFT_IMAGE_TOKEN_MAX_ENTRIES) {
+        return res.status(429).json({ error: 'Too many pending image tokens' });
+    }
+    const token = require('crypto').randomBytes(12).toString('hex');
+    nftImageTokens[token] = { dataUri, expires: now + 10 * 60 * 1000 }; // 10 min TTL
     res.json({ token });
 });
 app.get('/nft-image-token/:token', (req, res) => {
