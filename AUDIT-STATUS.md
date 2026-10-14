@@ -45,8 +45,21 @@ Date: 2026-10-13. All commits are local unless marked PUSHED. No production depl
 - `test-execution-reliability.js`: 53/53 (3 new ledger tests)
 - `test-subscription-scan.js`: 39/39
 - `test-pipeline-wiring.js`: 28/28
-- `test-candle-merge.js`: 18/18, `test-market-context.js`: 8/8, `test-sim-planner.js`: 163/163, `test-pullback-scan.js`: 28/28, `test-indicator-recovery.js`: 23/23, `test-phase0-fixes.js`: 163/163
+- `test-candle-merge.js`: 18/18, `test-market-context.js`: 8/8, `test-sim-planner.js`: 3/3, `test-pullback-scan.js`: 28/28, `test-indicator-recovery.js`: 23/23, `test-phase0-fixes.js`: 163/163
 - `node --check` clean on all 12 edited .js files
+
+### PaceSeeker — fresh megaplan pass (post-7ffa922, findings: 0)
+
+Full re-read of `dcaBot.js` (5,947 lines, end-to-end: constructor → start/stop → warmup → collection loop → fast-stop/armed-entry watchdogs → tick → _executeBuy/_executeSell → _resolvePendingTxs → _buildAndSendTransaction → _sendTx → _remitFee) plus dcaAI.js ledger surface (recordEntry, recordSell, resetPositionExternal, adoptTokensExternal, _slotMetrics, _persist/_persistSnapshot/_persistDebounced, loadState ~580 lines incl. legacy migrations, _recordPattern eviction cap) and supporting files (pendingTx.js 151, subscriptionService.js head, walletService.sendSignedTransaction 1086–1212).
+
+Verified clean this pass (no change):
+- **Send/confirm ambiguity**: `sendSignedTransaction` persists the derived signature via `onPrepared` BEFORE `sendRawTransaction`; `onSubmitted` records lastValidBlockHeight; blockhash-expiry proof requires an absent signature past lastValidBlockHeight; ambiguous timeout throws `definitive:false` and leaves the pending row. `_sendTx` clears pendings only on `definitive===true`. `_resolvePendingTxs` reconciles confirmed-but-unreconciled fills via receipt diffing (token-balance deltas incl. WSOL native-path), keeps unresolved rows blocking new orders, clears only failed/expired-absent.
+- **Order serialization**: `_orderInFlight`/`_fastStopInFlight`/`_armedEntryInFlight`/`_stateResetting` + `_stateRevision` invalidation; tick, both watchdogs, settings updates, sim resets, and stop() all drain or defer through the same gates. Emergency sell allowed over pending buys only when every unresolved row is a buy.
+- **Jupiter/tx integrity**: `assertTransactionSafe` pre-sign, MWA/session blockhash refresh rebuilds re-validated (fall back to the already-validated tx), `assertPayerSignerSafe` + `assertPostSignInstructionSafety` + `assertSignedMatchesUnsigned` + `assertFeeInstructionPresent` post-sign.
+- **Fee remit**: `pendingRemit` persisted pre-broadcast, `markRemitError` leaves pending intact, `_maybeAutoRemitFee` resolves stale pendings first; 150s confirm window vs 180s wallet-lock stale release.
+- **Memory/DoS**: pattern memory hard-truncates at 1.5×cap; `_appliedFills` capped 1000; pendingTx quarantines >4MB files and salvages partial rows; loadState validates slot ids/nextSlotId collisions; `_loaded` gate prevents pre-load persist clobbering; SecureStore 2KB-safe queue in subscriptionService.
+- **Subscription/payment**: peppered checksums on owner+device records, server chain recovery uses pinned-endpoint 429-retry (never races nodes with a cursor), ECO2 envelopes require Ed25519 verify + monotonic revision, promo/invite codes checksummed.
+- `node --check` clean; suites re-run green: execution-reliability 55/55, subscription-scan 39/39, candle-merge 18/18, market-context 8/8, sim-planner 3/3, pullback-scan 28/28, indicator-recovery 23/23, pipeline-wiring 28/28, phase0-fixes 163/163. `pretrain.js` regression backtest launched (full 420K-candle run, background).
 
 ---
 
@@ -102,8 +115,11 @@ Client tests: purchase **83/83**, auto-upload yield **23/23**.
 ## DONE — nft-service (branch master)
 
 | fd014b8 | PUSHED | Premium flat-fee charge aligned to advertised $0.01 (was charging $0.02); `PREMIUM_MAX_NO_FEE_MINTS` 10,000 cap enforced (past cap falls through to normal discount math); non-premium `photoLynkFeeFree` keeps $0.02 |
+| de7a5fa | LOCAL | Fresh full pass (all 8 modules + scripts): `sendTransactionResilient` resolves broadcast ambiguity against the ledger (poll signature until blockhash expiry) — a confirm timeout/send error after a landed tx no longer reports failure, so mint refunds + free-mint releases can't fire for NFTs that exist on-chain. Applied to mint, re-mint transfer, burn, and profit paths. Per-user `/mint` mutex (client retry/double-tap could burn two paid/free mints). `/das-proxy` bounded: 60/min per-user, 64KB params, 4KB cache keys. `/unpin` metadata fetch capped at 4MB. `/history`+`/payments` limit clamped 1–1000. `computeContentHash` streams (250MB uploads no longer whole-buffered). Temp names get crypto-random suffix (Date.now() collided across concurrent users in shared tmpdir). Resend alert fetch 10s timeout. **Two live Pinata JWTs removed from source** (config.js + pinataAccounts.js) → env-only; tokens remain in git history and must be rotated + redeployed as PINATA_JWT_FALLBACK/PINATA_JWT_EXTRA2. |
 
 Verified working end-to-end: 100 free mints via atomic `UPDATE ... WHERE mint_count < 100` reservation; `releaseFreeMint` on pre-land failure; `recordReservedFreeMint` audit; premium only granted by verified server-side paths (`/upgrade-premium` closed by default); estimate/mint routes share `getPremiumStatus` counters.
+
+Confirmed by design (no change): `/credit` + `/upgrade-premium` trust client receipts (TODO: real IAP verification) but are closed at the main-server mount unless `NFT_SERVICE_ALLOW_UNVERIFIED_IAP=1` — keep fail-closed until receipt verification is implemented. `/unpin` mount guard limits CIDs to the caller's own NFT records and metadata fetches to approved IPFS gateways. Standalone mode fails closed without `NFT_SERVICE_STANDALONE_TOKEN` ≥32 chars. `balance.js` transactions atomic (receipt dedup, premium activate, deduct/refund). Wallet keypair + `.env` gitignored; no other secrets in tracked files.
 
 ---
 
@@ -739,3 +755,51 @@ First zero-findings pass. Per-pass findings:
 
 Device-only verification remains the open item (live keys, native
 PCM, iOS, real-network censorship).
+
+## Ecosystem integration pass — Phase 4/5/6/7 re-verification (2026)
+
+### solana-seeker (Phase 4)
+- Fresh re-reads of the money/security surface at baseline `a3611ba`
+  (clean tree, no drift): `solanaPurchases.js` (pre-broadcast durable
+  receipts, derived-signature authority, SLQ1 quote binding, ambiguity
+  never terminal), `DevicePairing.js` (secretbox + PBKDF2 30k, attempt
+  caps, TTL/skew), `walletAuth.js` (SecureStore→file fallback,
+  domain-separated derivations), `remoteConfig.js` (Ed25519-signed
+  endpoint rotation only, anti-replay stamps, persisted payload
+  re-verify, bounded fetches, axios failover dedup),
+  `subscriptionStatusCache.js` (scoped v2 envelopes, owner alias,
+  expiry normalization), `hashCache.js` (chunked LRU + atomic writes +
+  resumable v2→v3 migration), `headlessTask.js` (lane leases, UI yield,
+  eligibility gates, auth-expiry surfacing), `uploadOperations.js` +
+  `backgroundTask.js` (50MB base64 gates, chunked position/length reads,
+  bounded JSON parses).
+- Suites: 111/111 (purchase 83 + auto-upload 23 + hashcache 1 +
+  remote-config 4 earlier + re-run). Findings: 0.
+
+### Companion (Phase 5)
+- Drift re-verify at `006cb2b`: tree clean (only stray untracked marker
+  files), `tsc --noEmit` clean. Pass 16 was already zero-findings;
+  no code changed since → result stands. Findings: 0.
+
+### mobile-v2/scripts (Phase 6)
+- `photolynk-sync.sh` fully read: flock, two-phase rsync (live bulk →
+  stopped-source snapshots), sqlite `.backup` + `quick_check` both
+  sides, mount guards, empty-source guard, user-count sanity, deletion
+  preview + confirm, auto service recovery, 10-DB-backup retention,
+  opt-in JWT/wallet sync. Compat shims + embedder correct. Findings: 0.
+
+### Ecosystem integration (Phase 7)
+- `ecosystemRoutes.js` + `ecosystemPayments.js` + `ecosystemEntitlements.js`
+  re-read on the binding paths: server-authoritative pricing, signed
+  SLQ2 quotes (single-use promo reservations, payer-proof binding for
+  PS, subjectId-as-telemetry), durable verification queue, ambiguity→
+  pending/conflict never silent-credit, receipt conflict matrix, alias
+  merge + revision-monotone projection.
+- Suites: 94/94 (entitlements + integration + 10K-account scale test,
+  P95 read 22ms under 100 concurrent credits).
+- Cross-app chain verified end-to-end: server `signEntitlement` emits
+  shared benefits only at ≥399¢ equivalence (PS↔PL400GB symmetric);
+  PS client verifies ECO2 Ed25519 envelopes fail-closed with device-hash
+  subject pinning, ±7d skew, 30d-bounded null expiry, revision-authoritative
+  reductions; PL consumes server-projected `user_plans` (payment_type
+  'ecosystem') — no client-side trust decision. Findings: 0.
