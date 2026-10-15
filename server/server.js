@@ -17,7 +17,7 @@ const naclUtil = require('tweetnacl-util');
 const { v5: uuidv5 } = require('uuid');
 const updater = require('./updater');
 const paymentRecovery = require('./paymentRecovery');
-const { ensurePaceSeekerSchema, createSubscriptionReadiness } = require('./subscriptionSchema');
+const { ensurePaceSeekerSchema, ensureLaneSchema, createSubscriptionReadiness } = require('./subscriptionSchema');
 const { createEcosystemService, DEFAULT_REGISTRY } = require('./ecosystemEntitlements');
 const { createEcosystemPaymentService, USDC_MINT, USDT_MINT } = require('./ecosystemPayments');
 const { mountEcosystemRoutes } = require('./ecosystemRoutes');
@@ -433,7 +433,7 @@ app.use('/api/nft/ipfs-pin', express.raw({ type: '*/*', limit: '40mb' }));
 app.use(express.json({ limit: '25mb' }));
 
 const subscriptionReadiness = createSubscriptionReadiness();
-for (const prefix of ['/api/ecosystem', '/api/paceseeker', '/api/solana', '/api/subscription', '/api/premium', '/api/cloud', '/admin/api']) {
+for (const prefix of ['/api/ecosystem', '/api/paceseeker', '/api/lane', '/api/solana', '/api/subscription', '/api/premium', '/api/cloud', '/admin/api']) {
     app.use(prefix, subscriptionReadiness.middleware);
 }
 
@@ -5226,16 +5226,17 @@ const ecoPlBindingProof = async (userId, wallet) => {
 
 // Existing member proof for a PS device wallet - the only acceptable proof
 // source for verified:true callers on the PaceSeeker path.
-const ecoPsMemberProof = async (deviceHash, wallet) => {
+const ecoDeviceMemberProof = async (app, deviceHash, wallet) => {
     if (!deviceHash || !wallet || !ecosystemReady) return { proofKind: null, proofRef: null };
     try {
         const row = await ecosystem.readTransaction((tx) => tx.get(
-            `SELECT kind, reference FROM ecosystem_member_proofs WHERE app = 'paceseeker' AND identity = ? AND wallet = ?`,
-            [String(deviceHash), String(wallet)]));
+            `SELECT kind, reference FROM ecosystem_member_proofs WHERE app = ? AND identity = ? AND wallet = ?`,
+            [String(app), String(deviceHash), String(wallet)]));
         if (!row) return { proofKind: null, proofRef: null };
         return { proofKind: row.kind || 'bind', proofRef: row.reference || `proof:${deviceHash}` };
     } catch (e) { return { proofKind: null, proofRef: null }; }
 };
+const ecoPsMemberProof = async (deviceHash, wallet) => ecoDeviceMemberProof('paceseeker', deviceHash, wallet);
 
 // Repair + read the current projection for a user/device after a duplicate or
 // mirror path. Deduped per key so concurrent reads share one projection write.
@@ -5335,7 +5336,7 @@ async function ecoEnsureAccount(app, identity, wallet, { verified = false, proof
         // upgrade via durable solana_wallet_bindings evidence; PaceSeeker only
         // via an existing member proof row.
         const p = app === 'photolynk' ? await ecoPlBindingProof(identity, wallet)
-            : app === 'paceseeker' ? await ecoPsMemberProof(identity, wallet)
+            : (app === 'paceseeker' || app === 'lane') ? await ecoDeviceMemberProof(app, identity, wallet)
                 : { proofKind: null, proofRef: null };
         proofKind = p.proofKind;
         proofRef = p.proofRef;
@@ -6289,13 +6290,14 @@ const ecoMemberProvenWallet = async (app, identity) => {
 
 async function ecoCallerAccount(req) {
     const app = String(req.query.app || req.body?.app || '').toLowerCase();
-    if (app === 'ps' || app === 'paceseeker') {
+    if (app === 'ps' || app === 'paceseeker' || app === 'ln' || app === 'lane') {
+        const appName = (app === 'ln' || app === 'lane') ? 'lane' : 'paceseeker';
         const id = String(req.query.id || req.body?.id || '').trim();
         if (!/^[A-Za-z0-9_-]{16,128}$/.test(id)) return { error: 'Invalid device id' };
-        const row = await dbGetAsync(`SELECT account_id, wallet, wallet_verified FROM ecosystem_members WHERE app = 'paceseeker' AND identity = ?`, [id]);
-        if (!row) return { error: 'Device not registered yet — open PaceSeeker once first' };
-        const provenWallet = await ecoMemberProvenWallet('paceseeker', id);
-        return { accountId: row.account_id, app: 'paceseeker', identity: id, wallet: row.wallet, walletVerified: !!row.wallet_verified, provenWallet };
+        const row = await dbGetAsync(`SELECT account_id, wallet, wallet_verified FROM ecosystem_members WHERE app = ? AND identity = ?`, [appName, id]);
+        if (!row) return { error: `Device not registered yet — open ${appName === 'lane' ? 'Lane' : 'PaceSeeker'} once first` };
+        const provenWallet = await ecoMemberProvenWallet(appName, id);
+        return { accountId: row.account_id, app: appName, identity: id, wallet: row.wallet, walletVerified: !!row.wallet_verified, provenWallet };
     }
     if (app === 'pl' || app === 'photolynk') {
         // authenticateToken already ran: req.user.id is the PhotoLynk user.
@@ -7360,12 +7362,13 @@ app.get('/api/paceseeker/trial', (req, res) => {
     });
 });
 
-// On-chain verification for a PaceSeeker subscription payment before it is
-// allowed to mint a cross-app entitlement. The memo HMAC pepper lives in the
-// app's native binary so the server can't validate it - instead we require a
-// real tx: PS1| memo + a transfer into the shared treasury worth >=
-// PS_ECO_MIN_PAYMENT_USD (below the $3.99 sub price after quote tolerance,
-// high enough that faking the heartbeat costs nearly as much as paying).
+// On-chain verification for a PaceSeeker/Lane subscription payment before it
+// is allowed to mint a cross-app entitlement. The memo HMAC pepper lives in
+// the app's native binary so the server can't validate it - instead we
+// require a real tx: an app-prefixed memo (PS1| / LN1|) + a transfer into the
+// shared treasury worth >= PS_ECO_MIN_PAYMENT_USD (below the $3.99 sub price
+// after quote tolerance, high enough that faking the heartbeat costs nearly
+// as much as paying).
 // Same shared treasury as SOLANA_PAYMENT_WALLET (duplicated literally - that
 // const is declared later in this file and would hit the TDZ).
 const PS_TREASURY_WALLET = 'HttTZkUG8xn5A1uJPjRDJqqufdwvHmNQroEGmST8iimU';
@@ -7381,7 +7384,7 @@ const PS_VERIFY_NEG_TTL_MS = 10 * 60 * 1000;
 // A verified payment can only legitimately extend the shared sub by one plan
 // period — never trust client-reported expiry/plan strings.
 const PS_ECO_PLAN_MS = 30 * 24 * 60 * 60 * 1000;
-async function verifyPsPaymentTx(signature) {
+async function verifyDevicePaymentTx(signature, memoPrefix) {
     const cached = _psPayVerifyCache.get(signature);
     if (cached) {
         if (cached.ok || Date.now() - cached.at < PS_VERIFY_NEG_TTL_MS) return cached;
@@ -7411,7 +7414,8 @@ async function verifyPsPaymentTx(signature) {
     };
     if (!tx || (tx.meta && tx.meta.err)) return fail();
 
-    // Must carry a PS1| memo (format check only - the HMAC pepper is client-side)
+    // Must carry the app's product memo (format check only - the HMAC pepper
+    // is client-side). PS1| = PaceSeeker, LN1| = Lane.
     const msg = tx.transaction?.message || {};
     const ixs = [...(msg.instructions || []), ...((tx.meta?.innerInstructions || []).flatMap(i => i.instructions || []))];
     const hasMemo = ixs.some(ix => {
@@ -7422,7 +7426,7 @@ async function verifyPsPaymentTx(signature) {
             const decoded = paymentRecovery.base58Decode(String(ix.data));
             if (decoded) data = Buffer.from(decoded).toString('utf8');
         }
-        return (pid === 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr' || pid === 'Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo') && data.startsWith('PS1|');
+        return (pid === 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr' || pid === 'Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo') && data.startsWith(memoPrefix);
     });
     if (!hasMemo) return fail();
 
@@ -7474,9 +7478,11 @@ async function verifyPsPaymentTx(signature) {
     // roll the shared sub forward forever.
     const rec = { ok, payer, usd, paidAt: tx.blockTime ? tx.blockTime * 1000 : null, at: Date.now() };
     _psPayVerifyCache.set(signature, rec);
-    console.log(`[Eco] PS payment verify ${signature.slice(0, 16)}… memo=${hasMemo} usd≈${usd.toFixed(2)} payer=${(payer || '').slice(0, 8)} -> ${ok}`);
+    console.log(`[Eco] ${memoPrefix.replace('|', '')} payment verify ${signature.slice(0, 16)}… memo=${hasMemo} usd≈${usd.toFixed(2)} payer=${(payer || '').slice(0, 8)} -> ${ok}`);
     return rec;
 }
+const verifyPsPaymentTx = (signature) => verifyDevicePaymentTx(signature, 'PS1|');
+const verifyLanePaymentTx = (signature) => verifyDevicePaymentTx(signature, 'LN1|');
 
 // Verify (or confirm previously-verified) a reported PS payment, then mirror
 // it onto the ecosystem account. Deduped by the revenue ledger's sig UNIQUE.
@@ -7534,6 +7540,174 @@ function enqueuePsVerification(deviceHash, sig) {
         .then(() => { try { wakeEcoWorker(); } catch (e) { } })
         .catch(() => { });
 }
+function enqueueLaneVerification(deviceHash, sig) {
+    if (!ecosystemReady || !sig) return;
+    ecosystem.enqueueVerification({ signature: sig, app: 'lane', identity: String(deviceHash) })
+        .then(() => { try { wakeEcoWorker(); } catch (e) { } })
+        .catch(() => { });
+}
+
+// Lane counterpart of ecoMirrorPsPayment — same bindings (verified-wallet
+// payer match, fixed server-side grant duration), minus ad weeks (Lane has
+// none). The ecosystem worker path owns verification when ready.
+async function ecoMirrorLanePayment(deviceHash, wallet, sig) {
+    if (!sig) return;
+    await ecoEnsureAccount('lane', deviceHash, wallet || null);
+    if (ecosystemReady) {
+        enqueueLaneVerification(deviceHash, sig);
+        return;
+    }
+    const v = await verifyLanePaymentTx(sig);
+    if (!v.ok) {
+        console.warn(`[Eco] unverified payment sig ${sig.slice(0, 16)}… from ${deviceHash.slice(0, 10)} - NOT mirrored`);
+        return;
+    }
+    const member = await dbGetAsync(
+        `SELECT account_id, wallet, wallet_verified FROM ecosystem_members WHERE app = 'lane' AND identity = ?`, [String(deviceHash)]);
+    if (!member?.wallet_verified || !member.wallet || member.wallet !== v.payer) {
+        console.warn(`[Eco] payment sig ${sig.slice(0, 16)}… payer ${String(v.payer || '').slice(0, 8)} not bound-verified on device ${deviceHash.slice(0, 10)} - NOT mirrored`);
+        return;
+    }
+    db.run(`UPDATE lane_revenue SET eco_verified = 1 WHERE signature = ?`, [sig], () => { });
+    const sub = await ecoGetSub(member.account_id);
+    const base = Math.max(v.paidAt || Date.now(), Number(sub?.sub_until) || 0);
+    const until = base + PS_ECO_PLAN_MS + 12 * 60 * 60 * 1000;
+    await ecoFloorSub(member.account_id, until, { sourceApp: 'lane', kind: 'payment', provenance: sig, allowRevoked: true });
+}
+
+// Lane heartbeat response: device fields + a signed ECO1 grant (and the ECO2
+// snapshot envelope) when the device's ecosystem account carries an active
+// shared sub — the same signed-grant contract PaceSeeker clients consume.
+async function _laneTrialRespond(res, row, id, wallet) {
+    const out = { ok: true, firstSeen: row.first_seen || null };
+    try {
+        const accountId = await ecoEnsureAccount('lane', id, wallet || null);
+        let snap = null;
+        let subUntil = 0;
+        if (ecosystemReady) {
+            snap = await ecosystem.resolveIdentity('lane', String(id), { project: 'auto' }).catch(() => null);
+            if (snap && snap.entitlement && snap.entitlement.expiresAt != null) {
+                subUntil = Number(snap.entitlement.expiresAt) || 0;
+            }
+        } else {
+            await ecoSyncMemberEntitlement(accountId);
+            const sub = await ecoGetSub(accountId);
+            const localApp = ecoLocalAdApp(sub);
+            // Lane has no ad weeks — only the shared sub applies.
+            subUntil = (!localApp || localApp === 'lane') ? (Number(sub?.sub_until) || 0) : 0;
+        }
+        const g = subUntil > Date.now() ? ecoSignGrant(accountId, subUntil) : null;
+        out.eco = { account: accountId, subUntil, grant: g ? g.grant : null, sig: g ? g.sig : null };
+        if (paymentProtocol && ecosystemReady && snap) {
+            try {
+                const env = paymentProtocol.signEntitlement(snap, { app: 'lane', identity: String(id) });
+                if (env) out.eco.v2 = env;
+            } catch (e) { /* unsigned snapshot — ECO1 above still applies */ }
+        }
+    } catch (e) {
+        // Eco layer failure must never break the core response.
+    }
+    res.json(out);
+}
+
+// Lane device heartbeat — mirrors /api/paceseeker/trial semantics: rate
+// limits, immutable revenue ledger, ecosystem mirror on a reported payment
+// sig, signed-grant response. Lane has no time-boxed trial: free usage is a
+// client-side 7-day-per-month ledger (reported via um/ud as telemetry).
+const laneTrialBuckets = new Map();
+const laneDeviceBuckets = new Map();
+app.get('/api/lane/trial', (req, res) => {
+    const id = String(req.query.id || '').trim();
+    if (!/^[A-Za-z0-9_-]{16,128}$/.test(id)) {
+        return res.status(400).json({ error: 'Invalid device id' });
+    }
+    const ip = String((req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.ip || '').replace(/[^0-9a-zA-Z:.\-]/g, '').slice(0, 45);
+    const ipCheck = psRateCheck(laneTrialBuckets, ip || 'unknown', PS_TRIAL_RATE_LIMIT);
+    if (ipCheck === 'limited') return res.status(429).json({ error: 'Rate limited' });
+    if (ipCheck === 'overflow') return res.status(503).json({ error: 'Rate limiter unavailable', code: 'RATE_LIMIT_UNAVAILABLE' });
+    const devCheck = psRateCheck(laneDeviceBuckets, id, PS_DEVICE_RATE_LIMIT);
+    if (devCheck === 'limited') return res.status(429).json({ error: 'Rate limited' });
+    if (devCheck === 'overflow') return res.status(503).json({ error: 'Rate limiter unavailable', code: 'RATE_LIMIT_UNAVAILABLE' });
+
+    const now = Date.now();
+    const vcRaw = String(req.query.vc || '');
+    const vc = /^\d+$/.test(vcRaw) ? Math.floor(Number(vcRaw)) : null;
+    const stRaw = String(req.query.st || '');
+    const st = /^(none|paid)$/.test(stRaw) ? stRaw : null;
+    const seRaw = String(req.query.se || '');
+    const se = /^\d+$/.test(seRaw) ? Math.floor(Number(seRaw)) : null;
+    const sigRaw = String(req.query.sig || '');
+    const paySig = /^[1-9A-HJ-NP-Za-km-z]{32,128}$/.test(sigRaw) ? sigRaw : null;
+    const patRaw = String(req.query.pat || '');
+    const payAt = /^\d+$/.test(patRaw) ? Math.floor(Number(patRaw)) : null;
+    const pwRaw = String(req.query.pw || '');
+    const payWith = /^[A-Za-z0-9]{1,16}$/.test(pwRaw) ? pwRaw.toUpperCase() : null;
+    const plRaw = String(req.query.pl || '');
+    const payPlan = /^[A-Za-z0-9_-]{1,24}$/.test(plRaw) ? plRaw : null;
+    const usdRaw = String(req.query.usd || '');
+    const payUsd = /^\d+(\.\d+)?$/.test(usdRaw) ? Number(usdRaw) : null;
+    const amtRaw = String(req.query.amt || '');
+    const payAmt = /^\d+$/.test(amtRaw) ? Math.floor(Number(amtRaw)) : null;
+    const wRaw = String(req.query.w || '');
+    const wallet = /^[1-9A-HJ-NP-Za-km-z]{32,64}$/.test(wRaw) ? wRaw : null;
+    // Free-tier telemetry: um=YYYY-MM, ud=days used (clamped 0..31).
+    const umRaw = String(req.query.um || '');
+    const usageMonth = /^\d{4}-\d{2}$/.test(umRaw) ? umRaw : null;
+    const udRaw = String(req.query.ud || '');
+    const usageDays = /^\d+$/.test(udRaw) ? Math.min(31, Math.floor(Number(udRaw))) : null;
+    if (paySig) {
+        db.run('INSERT OR IGNORE INTO lane_revenue (signature, device_hash, paid_at, paid_with, plan, usd_at_checkout, amount_atomic, reported_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            [paySig, id, payAt, payWith, payPlan, payUsd, payAmt, now],
+            function () {
+                try {
+                    if (this.changes > 0 || ecosystemReady) {
+                        ecoMirrorLanePayment(id, wallet, paySig).catch(() => { });
+                    }
+                } catch (e) { }
+            });
+    }
+
+    db.get('SELECT * FROM lane_devices WHERE device_hash = ?', [id], (err, row) => {
+        if (err) {
+            console.error('[Lane] trial lookup error:', err.message);
+            return res.status(500).json({ error: 'Database error' });
+        }
+        if (!row) {
+            db.run(
+                'INSERT OR IGNORE INTO lane_devices (device_hash, first_seen, last_seen, trial_started_at, version_code, last_ip, sub_status, reported_sub_until, sub_signature, sub_paid_at, sub_paid_with, sub_plan, sub_usd, sub_amount_atomic, wallet_address, usage_month, usage_days) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                [id, now, now, now, vc, ip, st || 'none', se, paySig, payAt, payWith, payPlan, payUsd, payAmt, wallet, usageMonth, usageDays],
+                () => {
+                    db.get('SELECT * FROM lane_devices WHERE device_hash = ?', [id], (e2, r2) => {
+                        if (e2 || !r2) return res.status(500).json({ error: 'Database error' });
+                        _laneTrialRespond(res, r2, id, wallet);
+                    });
+                }
+            );
+            return;
+        }
+        db.run(
+            'UPDATE lane_devices SET last_seen = ?, version_code = COALESCE(?, version_code), last_ip = ?, sub_status = COALESCE(?, sub_status), reported_sub_until = COALESCE(?, reported_sub_until), sub_signature = COALESCE(?, sub_signature), sub_paid_at = COALESCE(?, sub_paid_at), sub_paid_with = COALESCE(?, sub_paid_with), sub_plan = COALESCE(?, sub_plan), sub_usd = COALESCE(?, sub_usd), sub_amount_atomic = COALESCE(?, sub_amount_atomic), wallet_address = COALESCE(?, wallet_address), usage_month = COALESCE(?, usage_month), usage_days = COALESCE(?, usage_days) WHERE device_hash = ?',
+            [now, vc, ip, st, se, paySig, payAt, payWith, payPlan, payUsd, payAmt, wallet, usageMonth, usageDays, id]
+        );
+        if (st === 'paid' && se && se > now && row.sub_signature) {
+            if (ecosystemReady) {
+                enqueueLaneVerification(id, row.sub_signature);
+            } else {
+                (async () => {
+                    const v = await verifyLanePaymentTx(row.sub_signature);
+                    if (!v.ok) return;
+                    const member = await dbGetAsync(
+                        `SELECT account_id, wallet, wallet_verified FROM ecosystem_members WHERE app = 'lane' AND identity = ?`, [String(id)]);
+                    if (!member?.wallet_verified || !member.wallet || member.wallet !== v.payer) return;
+                    const capBase = v.paidAt || Date.now();
+                    const cappedUntil = Math.min(Number(se) || 0, capBase + PS_ECO_PLAN_MS + 12 * 60 * 60 * 1000);
+                    await ecoFloorSub(member.account_id, cappedUntil, { sourceApp: 'lane', kind: 'payment', provenance: row.sub_signature });
+                })().catch(() => { });
+            }
+        }
+        _laneTrialRespond(res, row, id, wallet);
+    });
+});
 
 // Respond to a PaceSeeker heartbeat: trial fields plus, when the device's
 // ecosystem account holds an active shared sub, an Ed25519-signed grant the
@@ -19699,12 +19873,18 @@ const startHttps = () => {
     }
 };
 
-// Promo policy for PS quotes: only the signed remote-config payload's
-// subPromo fields - never client-supplied config.
-const ecoGetPromoPolicy = async () => {
+// Promo policy for device-app quotes: only the signed remote-config payload's
+// subPromo fields - never client-supplied config. PaceSeeker reads the
+// top-level payload; Lane reads its own signed `lane` section of the same
+// shared file so each app's promo rollout is independently controlled.
+const ecoGetPromoPolicy = async (app = 'paceseeker') => {
     try {
         const cfg = JSON.parse(fs.readFileSync(path.join(__dirname, 'remote-config.json'), 'utf8'));
-        const payload = cfg && cfg.payload ? JSON.parse(cfg.payload) : {};
+        let section = cfg && cfg.payload ? cfg.payload : null;
+        if (app === 'lane') {
+            section = cfg && cfg.lane && typeof cfg.lane.payload === 'string' ? cfg.lane.payload : null;
+        }
+        const payload = section ? JSON.parse(section) : {};
         return {
             enabled: !!payload.subPromoEnabled,
             discountPct: Number(payload.subPromoDiscountPct) || 0,
@@ -19884,6 +20064,7 @@ const ecoTryInitialize = async () => {
 
 userPlansMigrationDone
     .then(() => ensurePaceSeekerSchema(db))
+    .then(() => ensureLaneSchema(db))
     // Ecosystem init must never reject readiness: it catches its own
     // failures and drops into legacy compatibility mode with retries.
     .then(() => ecoTryInitialize().catch(() => { }))

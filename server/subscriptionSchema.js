@@ -28,6 +28,28 @@ const PS_REVENUE_COLUMNS = {
     eco_verified: 'INTEGER DEFAULT 0',
 };
 
+const LN_DEVICE_COLUMNS = {
+    sub_status: 'TEXT',
+    sub_until: 'INTEGER',
+    sub_signature: 'TEXT',
+    sub_paid_at: 'INTEGER',
+    sub_paid_with: 'TEXT',
+    sub_plan: 'TEXT',
+    sub_usd: 'REAL',
+    sub_amount_atomic: 'INTEGER',
+    wallet_address: 'TEXT',
+    reported_sub_until: 'INTEGER',
+    // Server-mirrored free-tier ledger: calendar month key + used-day count
+    // reported by the client (telemetry - the device ledger is authoritative
+    // for gating; this copy exists for abuse review and future enforcement).
+    usage_month: 'TEXT',
+    usage_days: 'INTEGER DEFAULT 0',
+};
+
+const LN_REVENUE_COLUMNS = {
+    eco_verified: 'INTEGER DEFAULT 0',
+};
+
 const REQUIRED_COLUMNS = {
     ecosystem_members: ['account_id', 'app', 'identity', 'wallet', 'wallet_verified', 'wallet_changed_at'],
     ecosystem_accounts: ['account_id'],
@@ -89,6 +111,30 @@ const ensurePaceSeekerSchema = async (db) => {
     }
 };
 
+const ensureLaneSchema = async (db) => {
+    await runAsync(db, `CREATE TABLE IF NOT EXISTS lane_devices (
+        device_hash TEXT PRIMARY KEY,
+        first_seen INTEGER,
+        last_seen INTEGER,
+        trial_started_at INTEGER,
+        version_code INTEGER,
+        last_ip TEXT
+    )`);
+    await runAsync(db, `CREATE TABLE IF NOT EXISTS lane_revenue (
+        signature TEXT PRIMARY KEY,
+        device_hash TEXT,
+        paid_at INTEGER,
+        paid_with TEXT,
+        plan TEXT,
+        usd_at_checkout REAL,
+        amount_atomic INTEGER,
+        reported_at INTEGER,
+        eco_verified INTEGER DEFAULT 0
+    )`);
+    await ensureColumns(db, 'lane_devices', LN_DEVICE_COLUMNS);
+    await ensureColumns(db, 'lane_revenue', LN_REVENUE_COLUMNS);
+};
+
 const createSubscriptionReadiness = () => {
     let settled = false;
     let resolveWait;
@@ -108,4 +154,4 @@ const createSubscriptionReadiness = () => {
     return { wait, finish, middleware };
 };
 
-module.exports = { ensurePaceSeekerSchema, createSubscriptionReadiness };
+module.exports = { ensurePaceSeekerSchema, ensureLaneSchema, createSubscriptionReadiness };

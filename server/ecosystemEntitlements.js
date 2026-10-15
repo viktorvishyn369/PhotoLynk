@@ -15,6 +15,7 @@ const TIMELINE_EVENT_PREFIX = 'sharedtl:';
 const TOKEN_ENUM = {
     paceseeker: new Set(['SOL', 'USDC', 'USDT', 'SKR']),
     photolynk: new Set(['SOL', 'SKR']),
+    lane: new Set(['SOL', 'USDC', 'USDT', 'SKR']),
 };
 const SHARED_VALUE_CENTS = 399;
 // A user_plans row may stack non-payment time on top of paid expiry (ad week,
@@ -31,9 +32,11 @@ const DEFAULT_REGISTRY = {
     apps: {
         paceseeker: { monthlyValueCents: 399, benefit: 'features' },
         photolynk: { monthlyValueCents: 399, benefit: 'storage', tierGb: 400 },
+        lane: { monthlyValueCents: 399, benefit: 'features' },
     },
     products: {
         'paceseeker.monthly': { app: 'paceseeker', monthlyValueCents: 399, tierGb: 0, ecosystem: true, durations: { monthly: 30 * DAY_MS } },
+        'lane.monthly': { app: 'lane', monthlyValueCents: 399, tierGb: 0, ecosystem: true, durations: { monthly: 30 * DAY_MS } },
         'photolynk.storage_100': { app: 'photolynk', monthlyValueCents: 175, tierGb: 100, ecosystem: false, durations: { monthly: 30 * DAY_MS, yearly: 365 * DAY_MS } },
         'photolynk.storage_200': { app: 'photolynk', monthlyValueCents: 245, tierGb: 200, ecosystem: false, durations: { monthly: 30 * DAY_MS, yearly: 365 * DAY_MS } },
         'photolynk.storage_400': { app: 'photolynk', monthlyValueCents: 399, tierGb: 400, ecosystem: true, durations: { monthly: 30 * DAY_MS, yearly: 365 * DAY_MS } },
@@ -199,8 +202,8 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
             if (!/^[0-9]+$/.test(id)) throw codedError('IDENTITY_INVALID', 'photolynk identity must be a numeric user id');
             const u = await tx.get(`SELECT id FROM users WHERE id = ?`, [Number(id)]);
             if (!u) throw codedError('IDENTITY_UNKNOWN', `photolynk user does not exist: ${id}`);
-        } else if (app === 'paceseeker') {
-            if (!PS_IDENTITY_RE.test(id)) throw codedError('IDENTITY_INVALID', 'paceseeker identity must be a device hash');
+        } else if (app === 'paceseeker' || app === 'lane') {
+            if (!PS_IDENTITY_RE.test(id)) throw codedError('IDENTITY_INVALID', `${app} identity must be a device hash`);
         }
         return id;
     };
@@ -237,11 +240,11 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
         return true;
     };
 
-    const provenPsMembersForWallet = async (tx, wallet) => {
+    const provenMembersForWallet = async (tx, wallet, app) => {
         const rows = await tx.all(
             `SELECT m.account_id, m.identity FROM ecosystem_member_proofs p
              JOIN ecosystem_members m ON m.app = p.app AND m.identity = p.identity AND m.wallet = p.wallet
-             WHERE p.wallet = ? AND p.app = 'paceseeker'`, [wallet]);
+             WHERE p.wallet = ? AND p.app = ?`, [wallet, String(app)]);
         const seen = new Map();
         for (const r of rows) {
             const c = await canonicalAccount(tx, r.account_id);
@@ -554,7 +557,7 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
             const product = own(registry.products, r.product_id);
             if (!product || !product.ecosystem) continue;
             if (!(Number(r.verified_at) > 0)) continue;
-            if (r.app === 'paceseeker') {
+            if (r.app === 'paceseeker' || r.app === 'lane') {
                 if (!isNonBlank(r.payer_wallet) || !isNonBlank(r.amount_atomic)) continue;
                 const allowed = TOKEN_ENUM[r.app];
                 if (!isNonBlank(r.token) || !allowed || !allowed.has(String(r.token))) continue;
@@ -742,7 +745,7 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
                     [now(), `rcpt:${r.signature}`, app, id]);
                 continue;
             }
-            if (app === 'paceseeker') {
+            if (app === 'paceseeker' || app === 'lane') {
                 const sharedBefore = await foldSharedEnd(tx, canonical, { beforeTs: paidAt });
                 end = Math.max(end, paidAt, sharedBefore);
             } else {
@@ -944,7 +947,7 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
         const old = await tx.get(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [signature]);
         if (!old) return null;
         const oldPremium = old.duration === 'premium' || old.duration === 'premium_skr' || Number(old.tier_gb) === 0;
-        if (app === 'paceseeker') {
+        if (app === 'paceseeker' || app === 'lane') {
             await recordConflict(tx, signature, app, deviceHash || '', 'signature recorded in solana_payments ledger');
             return { conflict: { app: 'photolynk', productId: 'solana_payments', originIdentity: String(old.user_id) } };
         }
@@ -1284,29 +1287,33 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
             return { ok: true, applied: true, signature: sig, appliedAt: now() };
         });
 
-    const applyPaceSeekerPayment = async (receipt, { deviceHash } = {}) =>
+    // PaceSeeker and Lane share the same payment contract: a device-hash
+    // identity, wallet-proven account binding, one 'monthly' product, and
+    // identical dedup/stack semantics. The function below is parameterized
+    // by app — both exported wrappers pin it.
+    const applyDevicePayment = async (receipt, { deviceHash, app } = {}) =>
         transaction(async (tx) => {
             const r = receipt || {};
             const sig = validatePaymentCore(r);
-            const token = validateToken('paceseeker', r.token);
+            const token = validateToken(app, r.token);
             if (token === 'SKR' && !isNonBlank(r.mint)) throw codedError('MINT_REQUIRED', 'mint is required for SKR receipts');
             if (r.verifiedAt != null && !isFiniteMs(r.verifiedAt)) throw codedError('VERIFIED_AT_INVALID');
-            const productId = 'paceseeker.monthly';
+            const productId = `${app}.monthly`;
             const product = productFor(productId);
             const durationMs = durationFor(product, productId, 'monthly');
             const wallet = isNonBlank(r.payerWallet) ? String(r.payerWallet) : null;
             const deviceId = deviceHash == null ? null : String(deviceHash);
-            if (deviceId != null) await validateIdentity(tx, 'paceseeker', deviceId);
+            if (deviceId != null) await validateIdentity(tx, app, deviceId);
             let member = null;
             let accountId = null;
             if (deviceId) {
                 member = await tx.get(
-                    `SELECT account_id, identity FROM ecosystem_members WHERE app = 'paceseeker' AND identity = ?`, [deviceId]);
-                if (member && wallet && await hasProof(tx, 'paceseeker', deviceId, wallet)) {
+                    `SELECT account_id, identity FROM ecosystem_members WHERE app = ? AND identity = ?`, [app, deviceId]);
+                if (member && wallet && await hasProof(tx, app, deviceId, wallet)) {
                     accountId = member.account_id;
                 }
             } else if (wallet) {
-                const holders = await provenPsMembersForWallet(tx, wallet);
+                const holders = await provenMembersForWallet(tx, wallet, app);
                 const memberCount = holders.reduce((n, h) => n + h.members.length, 0);
                 if (holders.length > 1 || memberCount > 1) {
                     return { ok: false, code: 'AMBIGUOUS_WALLET', accounts: holders.map((h) => h.accountId) };
@@ -1319,14 +1326,14 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
             if (!member || !accountId) {
                 await enqueueJobTx(tx, {
                     signature: sig,
-                    subjects: [{ app: 'paceseeker', identity: deviceId || null, wallet }],
+                    subjects: [{ app, identity: deviceId || null, wallet }],
                     errorCode: 'PAYMENT_ACCOUNT_UNVERIFIED',
                 });
-                return { ok: false, code: 'PAYMENT_ACCOUNT_UNVERIFIED', retryable: true, awaitingRegistration: !deviceId && !wallet ? 'paceseeker' : 'paceseeker' };
+                return { ok: false, code: 'PAYMENT_ACCOUNT_UNVERIFIED', retryable: true, awaitingRegistration: app };
             }
             const originIdentity = String(member.identity);
             const prior = await receiptCheck(tx, {
-                signature: sig, app: 'paceseeker', productId, duration: 'monthly', originIdentity,
+                signature: sig, app, productId, duration: 'monthly', originIdentity,
                 token, payerWallet: wallet, amountAtomic: r.amountAtomic, quoteId: r.quoteId,
                 mint: r.mint, paidAt: r.paidAt, verifiedAt: r.verifiedAt,
             });
@@ -1334,7 +1341,7 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
             const canonical = await canonicalAccount(tx, accountId);
             const snapshot = async () => {
                 const snap = await resolveAccountTx(tx, canonical, { at: now(), project: true });
-                const psM = snap.members.find((m) => m.app === 'paceseeker' && String(m.identity) === originIdentity) || {};
+                const psM = snap.members.find((m) => m.app === app && String(m.identity) === originIdentity) || {};
                 return {
                     ok: true, alreadyApplied: true, accountId: canonical,
                     sharedUntil: snap.sharedUntil,
@@ -1346,46 +1353,46 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
                 const rec = prior.receipt || {};
                 const epAcct = rec.account_id || accountId;
                 await refoldEpoch(tx, (await epochForPaidAt(tx, epAcct, Number(rec.paid_at) || r.paidAt)).timeline_id);
-                await refoldLocalMember(tx, accountId, 'paceseeker', originIdentity);
+                await refoldLocalMember(tx, accountId, app, originIdentity);
                 return await snapshot();
             }
-            const ledger = await checkSolanaLedger(tx, { signature: sig, app: 'paceseeker', deviceHash: deviceId });
+            const ledger = await checkSolanaLedger(tx, { signature: sig, app, deviceHash: deviceId });
             if (ledger && ledger.conflict) return conflictResult(ledger.conflict);
             if (ledger && ledger.accounted) {
                 const lin = await lineageForReceipt(tx, accountId, r.paidAt);
                 await insertReceipt(tx, {
-                    signature: sig, accountId: lin, app: 'paceseeker', productId, duration: 'monthly', originIdentity,
+                    signature: sig, accountId: lin, app, productId, duration: 'monthly', originIdentity,
                     payerWallet: wallet, token, mint: r.mint, amountAtomic: r.amountAtomic,
                     paidAt: r.paidAt, verifiedAt: r.verifiedAt, quoteId: r.quoteId, evidence: r.evidence,
                     appliedAt: now(), legacyAccounted: true,
                 });
-                await refoldLocalMember(tx, accountId, 'paceseeker', originIdentity);
+                await refoldLocalMember(tx, accountId, app, originIdentity);
                 await refoldEpoch(tx, (await epochForPaidAt(tx, lin, r.paidAt)).timeline_id);
                 return await snapshot();
             }
             const eventId = `rcpt:${sig}`;
             await insertEvent(tx, {
-                eventId, accountId, sourceKind: 'payment', sourceApp: 'paceseeker', sourceRef: sig,
+                eventId, accountId, sourceKind: 'payment', sourceApp: app, sourceRef: sig,
                 payload: { productId, token, deviceHash: deviceId, quoteId: r.quoteId || null },
             });
             if (deviceId) {
                 await insertBenefit(tx, {
-                    eventId, accountId, app: 'paceseeker', identity: deviceId, benefit: 'features',
+                    eventId, accountId, app, identity: deviceId, benefit: 'features',
                     startsAt: r.paidAt, expiresAt: r.paidAt + durationMs, tierGb: 0,
                     monthlyValueCents: 0, scope: 'local', value: { source: 'payment' },
                 });
             }
             const lin = await lineageForReceipt(tx, accountId, r.paidAt);
             await insertReceipt(tx, {
-                signature: sig, accountId: lin, app: 'paceseeker', productId, duration: 'monthly', originIdentity,
+                signature: sig, accountId: lin, app, productId, duration: 'monthly', originIdentity,
                 payerWallet: wallet, token, mint: r.mint, amountAtomic: r.amountAtomic,
                 paidAt: r.paidAt, verifiedAt: r.verifiedAt, quoteId: r.quoteId, evidence: r.evidence, appliedAt: now(),
             });
-            if (deviceId) await refoldLocalMember(tx, accountId, 'paceseeker', deviceId);
+            if (deviceId) await refoldLocalMember(tx, accountId, app, deviceId);
             await refoldEpoch(tx, (await epochForPaidAt(tx, lin, r.paidAt)).timeline_id);
             await bumpGlobal(tx, canonical);
             const snap = await resolveAccountTx(tx, canonical, { at: now(), project: true });
-            const psMember = snap.members.find((m) => m.app === 'paceseeker' && String(m.identity) === originIdentity) || {};
+            const psMember = snap.members.find((m) => m.app === app && String(m.identity) === originIdentity) || {};
             return {
                 ok: true,
                 alreadyApplied: false, accountId: canonical, sharedUntil: snap.sharedUntil,
@@ -1393,6 +1400,11 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
                 revision: snap.revision,
             };
         });
+
+    const applyPaceSeekerPayment = async (receipt, { deviceHash } = {}) =>
+        applyDevicePayment(receipt, { deviceHash, app: 'paceseeker' });
+    const applyLanePayment = async (receipt, { deviceHash } = {}) =>
+        applyDevicePayment(receipt, { deviceHash, app: 'lane' });
 
     const resolveAccountTx = async (tx, accountId, { at = now(), project = false } = {}) => {
         const canonical = await canonicalAccount(tx, accountId);
@@ -1521,6 +1533,14 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
                 const dev = await tx.get(`SELECT sub_until FROM paceseeker_devices WHERE device_hash = ?`, [String(m.identity)]);
                 if (dev && Number(dev.sub_until || 0) !== next) {
                     await tx.run(`UPDATE paceseeker_devices SET sub_until = ? WHERE device_hash = ?`, [next, String(m.identity)]);
+                    compatChanged = true;
+                }
+            } else if (m.app === 'lane' && (await tableExists(tx, 'lane_devices'))) {
+                const lastFin = st.active ? st.expiresAt : lastFiniteMemberExpiry(m, benefits, actions);
+                const next = lastFin == null ? 0 : Number(lastFin);
+                const dev = await tx.get(`SELECT sub_until FROM lane_devices WHERE device_hash = ?`, [String(m.identity)]);
+                if (dev && Number(dev.sub_until || 0) !== next) {
+                    await tx.run(`UPDATE lane_devices SET sub_until = ? WHERE device_hash = ?`, [next, String(m.identity)]);
                     compatChanged = true;
                 }
             }
@@ -2390,6 +2410,9 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
             if (await tableExists(tx, 'paceseeker_devices')) {
                 await tx.run(`CREATE INDEX IF NOT EXISTS idx_paceseeker_devices_last_seen ON paceseeker_devices(last_seen)`);
             }
+            if (await tableExists(tx, 'lane_devices')) {
+                await tx.run(`CREATE INDEX IF NOT EXISTS idx_lane_devices_last_seen ON lane_devices(last_seen)`);
+            }
             const meta = await tx.get(`SELECT value FROM ecosystem_meta WHERE key = 'baseline_v2'`);
             if (meta) return { initialized: true, migrated: false };
             await migrateBaseline(tx);
@@ -2499,6 +2522,7 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
         ensureAccountInTransaction: ensureAccountTx,
         markPremiumApplied,
         applyPaceSeekerPayment,
+        applyLanePayment,
         resolveIdentity,
         resolveAccount,
         grantAdClaim,

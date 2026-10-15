@@ -77,12 +77,13 @@ function mountEcosystemRoutes(app, deps = {}) {
             const { productId, duration, token, payerWallet, promoCode } = req.body || {};
             const payer = String(payerWallet || '').trim();
             if (!payer) return res.status(400).json({ error: 'payerWallet required', code: 'PAYER_REQUIRED' });
-            if (who.app === 'paceseeker') {
-                // A PS quote only credits its own member: the payer must be
-                // the wallet this device actually proved by signature.
+            if (who.app === 'paceseeker' || who.app === 'lane') {
+                // A device-app quote only credits its own member: the payer
+                // must be the wallet this device actually proved by
+                // signature.
                 const proven = await ecosystem.readTransaction((tx) => tx.all(
-                    `SELECT wallet FROM ecosystem_member_proofs WHERE app = 'paceseeker' AND identity = ?`,
-                    [String(who.identity)])).catch(() => []);
+                    `SELECT wallet FROM ecosystem_member_proofs WHERE app = ? AND identity = ?`,
+                    [who.app, String(who.identity)])).catch(() => []);
                 if (!proven.some((p) => p.wallet === payer)) {
                     return res.status(403).json({ error: 'payerWallet is not the proven wallet for this device', code: 'PAYER_UNPROVEN' });
                 }

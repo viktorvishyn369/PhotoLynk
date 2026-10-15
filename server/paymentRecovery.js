@@ -120,6 +120,10 @@ function base58Decode(str) {
 // timestamp is client-reported telemetry; on-chain blockTime stays
 // authoritative for paidAt.
 const PS_MEMO_RE = /^PS1\|monthly\|(\d+)\|([0-9a-fA-F]{8})(?:\|promo:(PS[A-Z0-9]{12}))?$/;
+// Lane sub memo: LN1|monthly|<milliseconds>|<8-hex checksum>[|promo:<14-char
+// LN code>] — same contract as PS1 (checksum is shape-only, timestamp is
+// telemetry; on-chain blockTime stays authoritative for paidAt).
+const LN_MEMO_RE = /^LN1\|monthly\|(\d+)\|([0-9a-fA-F]{8})(?:\|promo:(LN[A-Z0-9]{12}))?$/;
 // ECO2 quote-reference memo: SLQ1|<32-lower-hex quote id>. Optional, carries
 // no product intent of its own - it only accompanies a primary product memo.
 const QUOTE_MEMO_RE = /^SLQ1\|([0-9a-f]{32})$/;
@@ -127,6 +131,15 @@ const QUOTE_MEMO_RE = /^SLQ1\|([0-9a-f]{32})$/;
 function parsePaceSeekerMemo(memo) {
     if (typeof memo !== 'string') return null;
     const m = memo.match(PS_MEMO_RE);
+    if (!m) return null;
+    const timestamp = Number(m[1]);
+    if (!Number.isSafeInteger(timestamp) || timestamp <= 0) return null;
+    return { duration: 'monthly', reportedPaidAt: timestamp, checksum: m[2].toLowerCase(), promo: m[3] || null };
+}
+
+function parseLaneMemo(memo) {
+    if (typeof memo !== 'string') return null;
+    const m = memo.match(LN_MEMO_RE);
     if (!m) return null;
     const timestamp = Number(m[1]);
     if (!Number.isSafeInteger(timestamp) || timestamp <= 0) return null;
@@ -217,21 +230,36 @@ function extractEcosystemMemo(tx) {
             quoteId,
         };
     }
+    if (cls.ln.length) {
+        const memo = cls.ln[0];
+        const parsed = parseLaneMemo(memo);
+        if (!parsed) throw codedError('MEMO_MISMATCH', 'invalid product memo');
+        return {
+            app: 'lane', memo,
+            tierGb: null, duration: 'monthly',
+            productId: 'lane.monthly',
+            code: null,
+            promo: parsed.promo,
+            reportedPaidAt: parsed.reportedPaidAt,
+            quoteId,
+        };
+    }
     return null;
 }
 
 function _classifyMemos(tx) {
-    const pl = [], ps = [], other = [];
+    const pl = [], ps = [], ln = [], other = [];
     for (const t of _memoTexts(tx)) {
         if (t.startsWith('PhotoLynk:')) pl.push(t);
         else if (t.startsWith('PS1|')) ps.push(t);
+        else if (t.startsWith('LN1|')) ln.push(t);
         else other.push(t);
     }
-    const total = pl.length + ps.length;
+    const total = pl.length + ps.length + ln.length;
     if (total > 1) {
         throw codedError('MEMO_MISMATCH', `conflicting product memos (${total})`);
     }
-    return { pl, ps, other };
+    return { pl, ps, ln, other };
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,7 +1049,9 @@ module.exports = {
     parseSubscriptionMemo,
     parsePremiumMemo,
     parsePaceSeekerMemo,
+    parseLaneMemo,
     PS_MEMO_RE,
+    LN_MEMO_RE,
     QUOTE_MEMO_RE,
     extractPaymentMemo,
     extractEcosystemMemo,

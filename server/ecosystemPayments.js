@@ -16,17 +16,13 @@ const USDT_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
 // Exact published product prices in USD cents. Yearly = monthly x 12.
 const PLAN_PRICES_CENTS = {
     'paceseeker.monthly': { app: 'paceseeker', usdCents: 399, tierGb: 0, durations: ['monthly'] },
+    'lane.monthly': { app: 'lane', usdCents: 399, tierGb: 0, durations: ['monthly'] },
     'photolynk.storage_100': { app: 'photolynk', usdCents: 175, tierGb: 100, durations: ['monthly', 'yearly'] },
     'photolynk.storage_200': { app: 'photolynk', usdCents: 245, tierGb: 200, durations: ['monthly', 'yearly'] },
     'photolynk.storage_400': { app: 'photolynk', usdCents: 399, tierGb: 400, durations: ['monthly', 'yearly'] },
     'photolynk.storage_1000': { app: 'photolynk', usdCents: 799, tierGb: 1000, durations: ['monthly', 'yearly'] },
     'photolynk.premium': { app: 'photolynk', usdCents: 4999, tierGb: 0, durations: ['premium'] },
 };
-
-// Legacy PS promo: the memo's trailing 8-hex field marks a discounted payment.
-// Its checksum is native-side (not server-verifiable); presence alone accepts
-// the historical 50% discount, rounded to a whole-cent expectation.
-const PS_LEGACY_PROMO_CENTS = Math.round(399 * 0.5);
 
 const codedError = (code, message, extra) => {
     const e = new Error(message || code);
@@ -40,6 +36,7 @@ const BASE58_SIG_RE = /^[1-9A-HJ-NP-Za-km-z]{32,90}$/;
 // Same promo checksum the native client computes (fnv1a32 over code+pepper).
 // The checksum is shape verification only - no claim it is cryptographic.
 const PROMO_PEPPER = 'PS_PROMO_V1_PEPPER';
+const LN_PROMO_PEPPER = 'LN_PROMO_V1_PEPPER';
 function _fnv1a32(input) {
     let hash = 0x811c9dc5;
     for (let i = 0; i < input.length; i++) {
@@ -53,6 +50,18 @@ function promoCodeValid(code) {
     const c = String(code || '').trim().toUpperCase();
     if (c.length !== 14 || !c.startsWith('PS')) return false;
     return c.slice(10, 14) === _fnv1a32(c.slice(0, 10) + PROMO_PEPPER).slice(0, 4).toUpperCase();
+}
+// Lane promo codes share the same 14-char shape (prefix + 8 + 4-char fnv1a32
+// checksum) but live in their own codespace: LN prefix + LN pepper, so a PS
+// code is never accepted for a Lane product (and vice versa).
+function promoCodeValidFor(app, code) {
+    const c = String(code || '').trim().toUpperCase();
+    if (c.length !== 14) return false;
+    if (app === 'lane') {
+        if (!c.startsWith('LN')) return false;
+        return c.slice(10, 14) === _fnv1a32(c.slice(0, 10) + LN_PROMO_PEPPER).slice(0, 4).toUpperCase();
+    }
+    return promoCodeValid(code);
 }
 
 function createEcosystemPaymentService({
@@ -130,9 +139,9 @@ function createEcosystemPaymentService({
         return rows.map((r) => r.user_id);
     };
 
-    const promoPolicy = async () => {
+    const promoPolicy = async (app) => {
         try {
-            const p = typeof getPromoPolicy === 'function' ? await getPromoPolicy() : null;
+            const p = typeof getPromoPolicy === 'function' ? await getPromoPolicy(app) : null;
             return { enabled: p && p.enabled !== false, discountPct: Math.max(0, Math.min(100, Number(p && p.discountPct) || 0)), mode: p && p.mode || 'code' };
         } catch (_) { return { enabled: false, discountPct: 0, mode: 'code' }; }
     };
@@ -170,12 +179,14 @@ function createEcosystemPaymentService({
         const months = dur === 'yearly' ? 12 : 1;
         let usdCents = prod.usdCents * months;
         let promo = null;
-        // Promo policy is PaceSeeker-only; PhotoLynk (incl. premium) never
-        // receives a discount, and a supplied PL promo is rejected outright.
-        const policy = prod.app === 'paceseeker'
-            ? await promoPolicy() : { enabled: false, discountPct: 0, mode: 'code' };
+        // Promo policy covers the device-hash apps (PaceSeeker + Lane, each
+        // with its own signed remote-config section); PhotoLynk (incl.
+        // premium) never receives a discount - a supplied PL promo is
+        // rejected outright.
+        const policy = prod.app === 'paceseeker' || prod.app === 'lane'
+            ? await promoPolicy(prod.app) : { enabled: false, discountPct: 0, mode: 'code' };
         if (isNonBlank(promoCode)) {
-            if (!policy.enabled || !promoCodeValid(promoCode)) throw codedError('PROMO_INVALID', 'promo code is not valid');
+            if (!policy.enabled || !promoCodeValidFor(prod.app, promoCode)) throw codedError('PROMO_INVALID', 'promo code is not valid');
             usdCents = Math.round(usdCents * (100 - policy.discountPct) / 100);
             promo = String(promoCode).trim().toUpperCase();
         } else if (policy.enabled && (policy.mode === 'auto' || policy.mode === 'hidden')) {
@@ -341,17 +352,19 @@ function createEcosystemPaymentService({
         const months = duration === 'yearly' ? 12 : 1;
         let expectedUsd = (prod.usdCents * months) / 100;
         let flagged = null;
-        if (prod.app === 'paceseeker') {
+        if (prod.app === 'paceseeker' || prod.app === 'lane') {
             // Discount only for an actual validated promo: suffix - the
             // memo's always-present checksum field is not a promo marker
-            // and an unverifiable promo claims no discount.
-            if (promo && promoCodeValid(promo)) expectedUsd = PS_LEGACY_PROMO_CENTS / 100;
+            // and an unverifiable promo claims no discount. Lane's unquoted
+            // fallback uses the same historical half-price contract.
+            const promoCents = Math.round(prod.usdCents * 0.5);
+            if (promo && promoCodeValidFor(prod.app, promo)) expectedUsd = promoCents / 100;
             else if (STABLES.has(token)) {
                 // Ambiguous legacy discount: a ~half-price payment with no
                 // promo marker could not be distinguished from a promo-mode
                 // charge - keep the grant and expose the evidence gap.
                 const cents = Number(rawAmount) / Math.pow(10, TOKENS[token].decimals - 2);
-                if (cents < prod.usdCents && cents >= PS_LEGACY_PROMO_CENTS) flagged = 'PRICE_EVIDENCE_UNAVAILABLE';
+                if (cents < prod.usdCents && cents >= promoCents) flagged = 'PRICE_EVIDENCE_UNAVAILABLE';
             }
         }
         if (STABLES.has(token)) {
@@ -441,13 +454,15 @@ function createEcosystemPaymentService({
         }
 
         const payer = insp.transfer.senderWallet;
-        if (insp.app === 'paceseeker') {
+        if (insp.app === 'paceseeker' || insp.app === 'lane') {
             // Quoted payments bind to the quote subject; unquoted payments are
-            // attributed by the core across ALL proven PS holders of the payer
-            // wallet - reported subjects are telemetry, never attribution, and
-            // cannot conceal a globally ambiguous wallet.
+            // attributed by the core across ALL proven holders of the payer
+            // wallet - reported subjects are telemetry, never attribution,
+            // and cannot conceal a globally ambiguous wallet. Lane shares
+            // this exact contract.
             const deviceHash = quoteSubjectId;
-            const r = await ecosystem.applyPaceSeekerPayment({
+            const apply = insp.app === 'lane' ? ecosystem.applyLanePayment : ecosystem.applyPaceSeekerPayment;
+            const r = await apply({
                 signature: sig, payerWallet: payer, token: insp.transfer.token, mint: insp.transfer.mint,
                 amountAtomic: String(insp.transfer.rawAmount), paidAt: insp.paidAt, verifiedAt: _now(),
                 quoteId,
@@ -459,7 +474,7 @@ function createEcosystemPaymentService({
             const appliedIdentity = deviceHash || await ecosystem.readTransaction((tx) =>
                 tx.get(`SELECT origin_identity FROM ecosystem_receipts WHERE signature = ?`, [sig])
                     .then((row) => (row && row.origin_identity) || null)).catch(() => null);
-            return { status: 'applied', app: 'paceseeker', identity: appliedIdentity, result: r, flagged: price.flagged || null };
+            return { status: 'applied', app: insp.app, identity: appliedIdentity, result: r, flagged: price.flagged || null };
         }
 
         if (insp.app === 'photolynk') {
@@ -650,4 +665,4 @@ function createEcosystemPaymentService({
     };
 }
 
-module.exports = { createEcosystemPaymentService, USDC_MINT, USDT_MINT, promoCodeValid, BASE58_SIG_RE };
+module.exports = { createEcosystemPaymentService, USDC_MINT, USDT_MINT, promoCodeValid, promoCodeValidFor, BASE58_SIG_RE };
