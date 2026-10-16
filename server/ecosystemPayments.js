@@ -15,8 +15,8 @@ const USDT_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
 
 // Exact published product prices in USD cents. Yearly = monthly x 12.
 const PLAN_PRICES_CENTS = {
-    'paceseeker.monthly': { app: 'paceseeker', usdCents: 399, tierGb: 0, durations: ['monthly'] },
-    'lane.monthly': { app: 'lane', usdCents: 399, tierGb: 0, durations: ['monthly'] },
+    'paceseeker.monthly': { app: 'paceseeker', usdCents: 175, tierGb: 0, durations: ['monthly'] },
+    'lane.monthly': { app: 'lane', usdCents: 175, tierGb: 0, durations: ['monthly'] },
     'photolynk.storage_100': { app: 'photolynk', usdCents: 175, tierGb: 100, durations: ['monthly', 'yearly'] },
     'photolynk.storage_200': { app: 'photolynk', usdCents: 245, tierGb: 200, durations: ['monthly', 'yearly'] },
     'photolynk.storage_400': { app: 'photolynk', usdCents: 399, tierGb: 400, durations: ['monthly', 'yearly'] },
@@ -62,6 +62,22 @@ function promoCodeValidFor(app, code) {
         return c.slice(10, 14) === _fnv1a32(c.slice(0, 10) + LN_PROMO_PEPPER).slice(0, 4).toUpperCase();
     }
     return promoCodeValid(code);
+}
+// Free-month grant codes live in a separate codespace (PF = PaceSeeker Free,
+// LF = Lane Free) with their own peppers — a discount code can never be
+// redeemed as a free grant and vice versa. Single-use is enforced by the
+// redeem event itself (event id = `promo:<code>`).
+const PS_FREE_PROMO_PEPPER = 'PF_PROMO_V1_PEPPER';
+const LN_FREE_PROMO_PEPPER = 'LF_PROMO_V1_PEPPER';
+function promoFreeCodeValidFor(app, code) {
+    const c = String(code || '').trim().toUpperCase();
+    if (c.length !== 14) return false;
+    if (app === 'lane') {
+        if (!c.startsWith('LF')) return false;
+        return c.slice(10, 14) === _fnv1a32(c.slice(0, 10) + LN_FREE_PROMO_PEPPER).slice(0, 4).toUpperCase();
+    }
+    if (!c.startsWith('PF')) return false;
+    return c.slice(10, 14) === _fnv1a32(c.slice(0, 10) + PS_FREE_PROMO_PEPPER).slice(0, 4).toUpperCase();
 }
 
 function createEcosystemPaymentService({
@@ -142,8 +158,25 @@ function createEcosystemPaymentService({
     const promoPolicy = async (app) => {
         try {
             const p = typeof getPromoPolicy === 'function' ? await getPromoPolicy(app) : null;
-            return { enabled: p && p.enabled !== false, discountPct: Math.max(0, Math.min(100, Number(p && p.discountPct) || 0)), mode: p && p.mode || 'code' };
-        } catch (_) { return { enabled: false, discountPct: 0, mode: 'code' }; }
+            return {
+                enabled: p && p.enabled !== false,
+                discountPct: Math.max(0, Math.min(100, Number(p && p.discountPct) || 0)),
+                // Fixed final price (USD). When > 0 it wins over discountPct —
+                // "charge exactly $X" instead of a percentage. Free grants are
+                // a separate redeem path; this floors at $0.01 so a quote can
+                // never demand a zero atomic amount.
+                priceUsd: Math.max(0, Number(p && p.priceUsd) || 0),
+                mode: p && p.mode || 'code',
+            };
+        } catch (_) { return { enabled: false, discountPct: 0, priceUsd: 0, mode: 'code' }; }
+    };
+
+    // Effective monthly charge in cents under a promo policy. priceUsd wins
+    // over discountPct and never prices above list or at/under zero.
+    const promoPriceCents = (prod, policy) => {
+        const list = Number(prod.usdCents) || 0;
+        if (policy.priceUsd > 0) return Math.max(1, Math.min(list, Math.round(policy.priceUsd * 100)));
+        return Math.round(list * (100 - policy.discountPct) / 100);
     };
 
     const tokenPriceUsd = async (token) => {
@@ -184,13 +217,13 @@ function createEcosystemPaymentService({
         // premium) never receives a discount - a supplied PL promo is
         // rejected outright.
         const policy = prod.app === 'paceseeker' || prod.app === 'lane'
-            ? await promoPolicy(prod.app) : { enabled: false, discountPct: 0, mode: 'code' };
+            ? await promoPolicy(prod.app) : { enabled: false, discountPct: 0, priceUsd: 0, mode: 'code' };
         if (isNonBlank(promoCode)) {
             if (!policy.enabled || !promoCodeValidFor(prod.app, promoCode)) throw codedError('PROMO_INVALID', 'promo code is not valid');
-            usdCents = Math.round(usdCents * (100 - policy.discountPct) / 100);
+            usdCents = promoPriceCents(prod, policy) * months;
             promo = String(promoCode).trim().toUpperCase();
         } else if (policy.enabled && (policy.mode === 'auto' || policy.mode === 'hidden')) {
-            usdCents = Math.round(usdCents * (100 - policy.discountPct) / 100);
+            usdCents = promoPriceCents(prod, policy) * months;
         }
 
         const priceUsd = await tokenPriceUsd(tok);
@@ -357,7 +390,16 @@ function createEcosystemPaymentService({
             // memo's always-present checksum field is not a promo marker
             // and an unverifiable promo claims no discount. Lane's unquoted
             // fallback uses the same historical half-price contract.
-            const promoCents = Math.round(prod.usdCents * 0.5);
+            // Discount only for an actual validated promo: suffix - the
+            // memo's always-present checksum field is not a promo marker
+            // and an unverifiable promo claims no discount. The discounted
+            // expectation follows the live promo policy (priceUsd override
+            // or percent); when the policy can't be read it falls back to
+            // the historical half-price contract.
+            const policy = await promoPolicy(prod.app).catch(() => null);
+            const promoCents = policy && policy.enabled
+                ? promoPriceCents(prod, policy)
+                : Math.round(prod.usdCents * 0.5);
             if (promo && promoCodeValidFor(prod.app, promo)) expectedUsd = promoCents / 100;
             else if (STABLES.has(token)) {
                 // Ambiguous legacy discount: a ~half-price payment with no
@@ -665,4 +707,4 @@ function createEcosystemPaymentService({
     };
 }
 
-module.exports = { createEcosystemPaymentService, USDC_MINT, USDT_MINT, promoCodeValid, promoCodeValidFor, BASE58_SIG_RE };
+module.exports = { createEcosystemPaymentService, USDC_MINT, USDT_MINT, promoCodeValid, promoCodeValidFor, promoFreeCodeValidFor, BASE58_SIG_RE };

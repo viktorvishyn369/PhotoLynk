@@ -227,15 +227,18 @@ test('PL1000 + PS renewal: 1000GB until T1 then shared400 until T2', async () =>
     const atT1 = await svc.resolveIdentity('photolynk', '1', { at: t1 - 1 });
     assert.equal(atT1.apps.photolynk.planGb, 1000);
     const after = await svc.resolveIdentity('photolynk', '1', { at: t1 + 1 });
-    assert.equal(after.apps.photolynk.planGb, 400, 'PL1000 local expires at T1, shared400 remains');
+    // Cost-match: the account's max paid value is the 1TB plan (799¢) — the
+    // shared floor stamps it, so PL keeps 1000GB while the PS renewal
+    // extends the shared end past the local plan's expiry.
+    assert.equal(after.apps.photolynk.planGb, 1000, 'PL1000 local expires at T1, shared floor keeps the paid tier');
     assert.equal(after.apps.photolynk.expiresAt, t2);
     const plan = await getOn(conn, `SELECT plan_gb, expires_at FROM user_plans WHERE user_id = 1`);
-    assert.equal(Number(plan.plan_gb), 400, 'projection at t1+1 materializes shared400');
+    assert.equal(Number(plan.plan_gb), 1000, 'projection at t1+1 materializes the stamped tier');
     assert.equal(Number(plan.expires_at), t2);
     await closeDb(conn);
 });
 
-test('PL100 local with later expiry cannot suppress the shared400 tier', async () => {
+test('PL100 yearly feeds the shared floor at its own value tier', async () => {
     const { svc, conn, clock } = await mk();
     await svc.initialize();
     const t0 = clock.t;
@@ -247,12 +250,15 @@ test('PL100 local with later expiry cannot suppress the shared400 tier', async (
     await runOn(conn, `INSERT INTO ecosystem_member_proofs (app,identity,wallet,kind,verified_at) VALUES (?,?,?,?,?)`, ['paceseeker', DEV1, W1, 'bind', t0]);
     await svc.applyPaceSeekerPayment(psReceipt({ signature: 'sigPSy', paidAt: t0 }), { deviceHash: DEV1 });
     const res = await svc.resolveIdentity('photolynk', '1', { at: t0 + 5 * DAY_MS });
-    assert.equal(res.apps.photolynk.planGb, 400, 'shared400 outranks the longer-lived 100GB plan');
-    assert.equal(res.apps.photolynk.expiresAt, t0 + 30 * DAY_MS, 'expiry tracks only benefits supplying the chosen tier');
+    // PL100 (175¢/mo) is ecosystem-qualifying now: its receipt feeds the
+    // shared fold stamped at 175 → tier 100GB, chained with the PS month.
+    assert.equal(res.apps.photolynk.planGb, 100, 'cost-match: 175¢ value supplies the 100GB tier');
+    assert.equal(res.apps.photolynk.expiresAt, t0 + 365 * DAY_MS + 30 * DAY_MS,
+        'local year + shared chain both supply tier 100 — max expiry wins');
     await closeDb(conn);
 });
 
-test('low-tier purchase after a big legacy shared grant cannot extend shared', async () => {
+test('ecosystem purchase after a big legacy shared grant extends it further', async () => {
     const { svc, conn, clock } = await mk();
     const t0 = clock.t;
     await runOn(conn, `INSERT INTO users (id,email) VALUES (1,'a@b.c')`);
@@ -264,7 +270,9 @@ test('low-tier purchase after a big legacy shared grant cannot extend shared', a
     assert.equal(before, t0 + 90 * DAY_MS);
     await svc.transaction((tx) => svc.applyPhotolynkInTransaction(tx, plPayment({ tierGb: 200, paidAt: t0 })));
     const after = (await svc.resolveAccount('acct1', { at: t0 })).sharedUntil;
-    assert.equal(after, t0 + 90 * DAY_MS, 'a non-qualifying purchase adds no shared time');
+    // 200GB is ecosystem-qualifying now: its month chains on top of the
+    // legacy floor just like any paid subscription.
+    assert.equal(after, t0 + 120 * DAY_MS, 'a qualifying purchase extends the shared floor');
     await closeDb(conn);
 });
 
@@ -329,10 +337,12 @@ test('admin set-until/revoke cannot be backfilled; independent direct payment un
     await svc.transaction((tx) => svc.applyPhotolynkInTransaction(tx, plPayment({ tierGb: 100, paidAt: t0 + 2000, signature: 'sigLocal' })));
     res = await svc.resolveAccount(acct, { at: t0 + 2000 });
     assert.equal(res.apps.photolynk.active, true, 'an independent direct payment still works under revoke');
-    assert.equal(res.sharedUntil, 0);
+    // PL100 is ecosystem-qualifying now: paid after the revoke, it lifts the
+    // shared floor prospectively the same way a PS payment does.
+    assert.equal(res.sharedUntil, t0 + 2000 + 30 * DAY_MS);
     const r = await svc.applyPaceSeekerPayment(psReceipt({ signature: 'sigPSnew', paidAt: t0 + 3000 }), { deviceHash: DEV1 });
     res = await svc.resolveAccount(acct, { at: t0 + 3000 });
-    assert.equal(res.sharedUntil, t0 + 3000 + 30 * DAY_MS, 'a NEW qualifying payment lifts revoke prospectively');
+    assert.equal(res.sharedUntil, t0 + 2000 + 60 * DAY_MS, 'a NEW qualifying payment chains onto the lifted floor');
     await closeDb(conn);
 });
 
@@ -490,7 +500,7 @@ test('migration: legacy revoke subs row suppresses shared, ad subs stay local', 
 
 test('third registered app receives shared features via registry only', async () => {
     const registry = JSON.parse(JSON.stringify(require('./ecosystemEntitlements').DEFAULT_REGISTRY));
-    registry.apps.appx = { monthlyValueCents: 399, benefit: 'features' };
+    registry.apps.appx = { monthlyValueCents: 175, benefit: 'features' };
     const { svc, conn, clock } = await mk({ registry });
     await svc.initialize();
     const t0 = clock.t;
@@ -883,7 +893,7 @@ test('G: admin extend grants on an empty account; set-until is exact; shared_loc
     assert.equal(r2.entitlement.active, false, 'expired shared_local does not resurrect');
     const ex2 = await svc.adjustShared(acct2, { action: 'extend', days: 10, eventId: 'adm:e2', actor: 'admin' });
     const r3 = await svc.resolveIdentity('photolynk', '1', { at: t0 });
-    assert.equal(r3.entitlement.planGb, 400, 'extend yields the shared 400 tier, never the dead 1000');
+    assert.equal(r3.entitlement.planGb, 1000, 'extend yields the full-ecosystem (top) tier — fresh stamp, not the dead row');
     assert.equal(Number(r3.entitlement.expiresAt), t0 + 10 * DAY_MS);
     await closeDb(conn);
 });
@@ -1281,10 +1291,10 @@ test('6: collision checks cover members retained on aliased sources', async () =
     await closeDb(conn);
 });
 
-test('7: registry app value policy — <=399 supported, higher rejected explicitly', async () => {
+test('7: registry app value policy — <=registry-max supported, higher rejected explicitly', async () => {
     const registry = JSON.parse(JSON.stringify(require('./ecosystemEntitlements').DEFAULT_REGISTRY));
-    registry.apps.appLo = { monthlyValueCents: 199, benefit: 'features' };
-    registry.apps.appHi = { monthlyValueCents: 499, benefit: 'features' };
+    registry.apps.appLo = { monthlyValueCents: 175, benefit: 'features' };
+    registry.apps.appHi = { monthlyValueCents: 999, benefit: 'features' };
     const { svc, conn, clock } = await mk({ registry });
     await svc.initialize();
     const t0 = clock.t;

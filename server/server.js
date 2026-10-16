@@ -18,7 +18,7 @@ const { v5: uuidv5 } = require('uuid');
 const updater = require('./updater');
 const paymentRecovery = require('./paymentRecovery');
 const { ensurePaceSeekerSchema, ensureLaneSchema, createSubscriptionReadiness } = require('./subscriptionSchema');
-const { createEcosystemService, DEFAULT_REGISTRY } = require('./ecosystemEntitlements');
+const { createEcosystemService, DEFAULT_REGISTRY, storageTierForValue } = require('./ecosystemEntitlements');
 const { createEcosystemPaymentService, USDC_MINT, USDT_MINT } = require('./ecosystemPayments');
 const { mountEcosystemRoutes } = require('./ecosystemRoutes');
 let sharp;
@@ -903,9 +903,9 @@ function renderEcoTable(){
   var html='';
   ecoFiltered.forEach(function(a){
     var mems=(a.members||[]).map(function(m){
-      var lab=m.app==='paceseeker'?'PS':'PL';
+      var lab=m.app==='paceseeker'?'PS':(m.app==='lane'?'LN':'PL');
       var vTag=m.wallet_verified?'':' <span style="color:var(--warn)" title="wallet not signature-verified">&#9888;</span>';
-      return'<div style="margin-bottom:2px"><span class="mini-tag" style="color:'+(m.app==='paceseeker'?'var(--accent)':'var(--success)')+'">'+lab+'</span> <span class="uuid-cell" title="'+m.identity+'">'+String(m.identity||'').substring(0,12)+'</span>'+vTag+'</div>';
+      return'<div style="margin-bottom:2px"><span class="mini-tag" style="color:'+(m.app==='paceseeker'?'var(--accent)':(m.app==='lane'?'var(--info)':'var(--success)'))+'">'+lab+'</span> <span class="uuid-cell" title="'+m.identity+'">'+String(m.identity||'').substring(0,12)+'</span>'+vTag+'</div>';
     }).join('')||'<span class="date-cell">-</span>';
     var wals=(a.members||[]).filter(function(m){return m.wallet}).map(function(m){
       return'<div style="margin-bottom:2px"><span class="uuid-cell" style="cursor:pointer" title="'+m.wallet+' - click to copy" onclick="copyUuid(this,&apos;'+m.wallet+'&apos;)">'+String(m.wallet).substring(0,6)+'&hellip;'+String(m.wallet).slice(-4)+'</span></div>';
@@ -950,18 +950,31 @@ function ecoEntitlementLines(a){
   }
   var ent=a.entitlements;var out=[];
   (ent.members||[]).forEach(function(m){
-    var lab=m.app==='paceseeker'?'PS':'PL';
+    var lab=m.app==='paceseeker'?'PS':(m.app==='lane'?'LN':'PL');
     var idt=m.app==='photolynk'?('#'+m.identity):String(m.identity||'').substring(0,8)+'&hellip;';
     var bits=[];
     if(m.planGb)bits.push(m.planGb+'GB');
     if(m.expiresAt!=null)bits.push('until '+ecoUntil(m.expiresAt));
     if(m.sourceKind)bits.push(ecoKindLabel(m.sourceKind));
-    out.push('<div title="'+m.app+' '+m.identity+' &middot; '+(m.sourceKind||'')+'/'+(m.sourceScope||'')+'"><span class="mini-tag" style="color:'+(m.app==='paceseeker'?'var(--accent)':'var(--success)')+'">'+lab+'</span> '+idt+(m.active?'':' <s>expired</s>')+' &middot; '+(bits.join(' &middot; ')||'no grant')+'</div>');
+    // Provenance: which concrete source (receipt / promo / admin / PL plan)
+    // is granting this member right now — the source&rarr;app link the admin
+    // needs to answer "which payment activated this app?".
+    if(m.sourceEventId)bits.push('via '+String(m.sourceEventId).substring(0,24));
+    out.push('<div title="'+m.app+' '+m.identity+' &middot; '+(m.sourceKind||'')+'/'+(m.sourceScope||'')+' &middot; '+(m.sourceEventId||'')+(m.sourceValueCents?' &middot; '+m.sourceValueCents+'&cent;':'')+'"><span class="mini-tag" style="color:'+(m.app==='paceseeker'?'var(--accent)':(m.app==='lane'?'var(--info)':'var(--success)'))+'">'+lab+'</span> '+idt+(m.active?'':' <s>expired</s>')+' &middot; '+(bits.join(' &middot; ')||'no grant')+'</div>');
   });
   (ent.sources||[]).forEach(function(s){
     if(s.scope!=='shared')return;
     var kind=s.kind||'shared';
-    var label='shared &middot; '+(Number(s.monthlyValueCents)||0)+'&cent; &middot; '+(s.expiresAt!=null?'until '+ecoUntil(s.expiresAt):'open');
+    var cents=Number(s.monthlyValueCents)||0;
+    var label='shared &middot; '+cents+'&cent; &middot; '+(s.expiresAt!=null?'until '+ecoUntil(s.expiresAt):'open');
+    // Value&rarr;apps matrix: which apps this shared benefit activates.
+    if(s.activates){
+      var act=[];
+      if(s.activates.paceseeker)act.push('PS');
+      if(s.activates.lane)act.push('LN');
+      if(s.activates.photolynkGb>0)act.push('PL '+s.activates.photolynkGb+'GB');
+      if(act.length)label+=' &rarr; '+act.join(' &middot; ');
+    }
     var from=s.app&&s.app!=='*'?('from '+s.app+' '):'';
     var rev=s.revoked;
     out.push('<div title="'+(s.eventId||'')+'" style="'+(rev?'text-decoration:line-through;opacity:.6':'')+'"><span class="mini-tag" style="color:var(--muted)">'+from+ecoKindLabel(kind)+'</span> '+label+(rev?' <span style="color:var(--danger)">revoked</span>':'')+'</div>');
@@ -5161,11 +5174,15 @@ db.serialize(() => {
 
 const ECO_WEEK_MS = 7 * 24 * 60 * 60 * 1000;
 // Binding tier: a paid PhotoLynk plan at/above ECO_BIND_MIN_TIER_GB (and a
-// PaceSeeker sub at the same $3.99 price point) activates the shared
+// PaceSeeker/Lane sub at the same $1.75 price point) activates the shared
 // entitlement across every ecosystem app. Lower tiers and weekly ad claims
 // are app-local only — free access never binds.
-const ECO_BIND_MIN_TIER_GB = 400;
-const ECO_PL_TIER_GB = 400;            // ecosystem grant -> PhotoLynk 400GB tier ($3.99 = PaceSeeker price)
+const ECO_BIND_MIN_TIER_GB = 100;
+// Degraded-mode materialized tier: the shared row carries no value stamp, so
+// the mirror grants the floor tier (100 GB = the $1.75 cost match). Never
+// over-grants; when the core recovers, resolveAccount re-folds the receipts
+// and projects the true value-matched tier.
+const ECO_PL_TIER_GB = 100;
 const ECO_AD_MAX_TIER_GB = 200;        // ad-week grants materialize at most 200GB, app-local
 const ECO_AD_TIERS_GB = [100, 200];    // tiers a user may claim a free week on
 const ECO_LINK_CODE_TTL_MS = 10 * 60 * 1000;
@@ -7046,17 +7063,34 @@ app.get('/admin/api/eco-accounts', adminAuth, async (req, res) => {
                             expiresAt: m.expiresAt == null ? null : Number(m.expiresAt),
                             planGb: Number(m.planGb) || 0,
                             sourceKind: m.sourceKind || null, sourceScope: m.sourceScope || null,
+                            sourceEventId: m.sourceEventId || null,
+                            sourceApp: m.sourceApp || null,
+                            sourceValueCents: Number(m.sourceValueCents) || 0,
                         })),
-                        sources: (snap.sources || []).map(s => ({
-                            scope: s.scope, app: s.app,
-                            identity: s.identity == null ? null : String(s.identity),
-                            kind: s.kind || null, benefit: s.benefit || null,
-                            tierGb: Number(s.tierGb) || 0,
-                            monthlyValueCents: Number(s.monthlyValueCents) || 0,
-                            startsAt: s.startsAt == null ? null : Number(s.startsAt),
-                            expiresAt: s.expiresAt == null ? null : Number(s.expiresAt),
-                            eventId: s.eventId || null,
-                        })),
+                        sources: (snap.sources || []).map(s => {
+                            const cents = Number(s.monthlyValueCents) || 0;
+                            const appsReg = (DEFAULT_REGISTRY && DEFAULT_REGISTRY.apps) || {};
+                            // Same rule memberEligible applies: a shared
+                            // benefit covers an app when its value meets that
+                            // app's monthlyValueCents; PhotoLynk resolves to
+                            // the value-matched storage tier.
+                            const activates = s.scope === 'shared' ? {
+                                paceseeker: cents >= (Number(appsReg.paceseeker?.monthlyValueCents) || 0),
+                                lane: cents >= (Number(appsReg.lane?.monthlyValueCents) || 0),
+                                photolynkGb: storageTierForValue(DEFAULT_REGISTRY, cents),
+                            } : null;
+                            return {
+                                scope: s.scope, app: s.app,
+                                identity: s.identity == null ? null : String(s.identity),
+                                kind: s.kind || null, benefit: s.benefit || null,
+                                tierGb: Number(s.tierGb) || 0,
+                                monthlyValueCents: cents,
+                                activates,
+                                startsAt: s.startsAt == null ? null : Number(s.startsAt),
+                                expiresAt: s.expiresAt == null ? null : Number(s.expiresAt),
+                                eventId: s.eventId || null,
+                            };
+                        }),
                     } : { error: 'RESOLVE_EMPTY' };
                 } catch (e) {
                     entBy[a.account_id] = { error: (e && e.code) || 'RESOLVE_FAILED' };
@@ -7366,13 +7400,14 @@ app.get('/api/paceseeker/trial', (req, res) => {
 // is allowed to mint a cross-app entitlement. The memo HMAC pepper lives in
 // the app's native binary so the server can't validate it - instead we
 // require a real tx: an app-prefixed memo (PS1| / LN1|) + a transfer into the
-// shared treasury worth >= PS_ECO_MIN_PAYMENT_USD (below the $3.99 sub price
+// shared treasury worth >= PS_ECO_MIN_PAYMENT_USD (below the $1.75 sub price
 // after quote tolerance, high enough that faking the heartbeat costs nearly
-// as much as paying).
+// as much as paying). Promo-priced payments below the floor still grant the
+// app's own sub locally — they just don't feed the cross-app shared floor.
 // Same shared treasury as SOLANA_PAYMENT_WALLET (duplicated literally - that
 // const is declared later in this file and would hit the TDZ).
 const PS_TREASURY_WALLET = 'HttTZkUG8xn5A1uJPjRDJqqufdwvHmNQroEGmST8iimU';
-const PS_ECO_MIN_PAYMENT_USD = 3.5; // below the $3.99 sub price minus quote-drift tolerance
+const PS_ECO_MIN_PAYMENT_USD = 1.5; // below the $1.75 sub price minus quote-drift tolerance
 const PS_ECO_STABLE_MINTS = {
     'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v': 6, // USDC
     'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB': 6, // USDT
@@ -19888,6 +19923,7 @@ const ecoGetPromoPolicy = async (app = 'paceseeker') => {
         return {
             enabled: !!payload.subPromoEnabled,
             discountPct: Number(payload.subPromoDiscountPct) || 0,
+            priceUsd: Number(payload.subPromoPriceUsd) || 0,
             mode: String(payload.subPromoMode || 'code'),
         };
     } catch (e) {
@@ -19979,6 +20015,7 @@ mountEcosystemRoutes(app, {
     protocol: () => paymentProtocol,
     ecosystem,
     signKey: ECO_SIGNING_KEY,
+    signGrant: ecoSignGrant,
     registry: DEFAULT_REGISTRY,
     requestScan: ecoRequestScan,
     wakeWorker: wakeEcoWorker,

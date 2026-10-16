@@ -300,7 +300,7 @@ test('quote reuse requires same payer+promo; PL promo is rejected outright', asy
         'PL premium cannot take a PS promo');
     const q3 = await protocol.issueQuote({ app: 'paceseeker', identity: DEV1, productId: 'paceseeker.monthly', token: 'USDC', payerWallet: P1, promoCode: VALID_PROMO });
     const p3 = JSON.parse(q3.payload);
-    assert.equal(p3.usdCents, 200, 'PS promo applies the 50% discount, rounded');
+    assert.equal(p3.usdCents, 88, 'PS promo applies the 50% discount on the $1.75 list, rounded');
     const q4 = await protocol.issueQuote({ app: 'paceseeker', identity: DEV1, productId: 'paceseeker.monthly', token: 'USDC', payerWallet: P1, promoCode: VALID_PROMO });
     assert.equal(q4.quoteId, q3.quoteId, 'same promo request reuses');
     const q5 = await protocol.issueQuote({ app: 'paceseeker', identity: DEV1, productId: 'paceseeker.monthly', token: 'USDC', payerWallet: P1 });
@@ -665,5 +665,167 @@ test('unknown SLQ1 quote memo on a band-valid PL payment applies with no binding
     const rec = await getOn(conn, `SELECT quote_id, evidence_json FROM ecosystem_receipts WHERE signature = ?`, [sig]);
     assert.equal(rec.quote_id, null, 'no quote binding is stored');
     assert.equal(JSON.parse(rec.evidence_json || '{}').quoteIgnored, 'QUOTE_UNKNOWN');
+    await closeDb(conn);
+});
+
+// --- Cost-match promo/subscription regressions ($1.75 model) ---------------
+
+const FREE_PROMO = (() => {
+    const base = 'PFTESTCD12';
+    return base + _fnv1a32(base + 'PF_PROMO_V1_PEPPER').slice(0, 4).toUpperCase();
+})();
+const FREE_PROMO_2 = (() => {
+    const base = 'PFTESTCD22';
+    return base + _fnv1a32(base + 'PF_PROMO_V1_PEPPER').slice(0, 4).toUpperCase();
+})();
+const LN_FREE_PROMO = (() => {
+    const base = 'LFTESTCD12';
+    return base + _fnv1a32(base + 'LF_PROMO_V1_PEPPER').slice(0, 4).toUpperCase();
+})();
+const VALID_PROMO2 = (() => {
+    const base = 'PSTESTCD34';
+    return base + _fnv1a32(base + 'PS_PROMO_V1_PEPPER').slice(0, 4).toUpperCase();
+})();
+const LN_VALID_PROMO = (() => {
+    const base = 'LNTESTCD12';
+    return base + _fnv1a32(base + 'LN_PROMO_V1_PEPPER').slice(0, 4).toUpperCase();
+})();
+const DAY = 24 * 60 * 60 * 1000;
+
+test('fixed final price wins over percentage; disabled promo fails closed', async () => {
+    const { conn, ecosystem, protocol, state } = await mkStack();
+    await ecosystem.ensureAccount('paceseeker', DEV1, {});
+    // Percentage default: 50% off the $1.75 list -> 88c.
+    let q = await protocol.issueQuote({ app: 'paceseeker', identity: DEV1, productId: 'paceseeker.monthly', token: 'USDC', payerWallet: P1, promoCode: VALID_PROMO });
+    assert.equal(JSON.parse(q.payload).usdCents, 88);
+    // Fixed final price takes precedence and ignores the percentage.
+    // (Fresh code — a quote reserves its promo, reusing it throws PROMO_TAKEN.)
+    state.promo = { enabled: true, discountPct: 50, priceUsd: 1.19, mode: 'code' };
+    q = await protocol.issueQuote({ app: 'paceseeker', identity: DEV1, productId: 'paceseeker.monthly', token: 'USDC', payerWallet: P1, promoCode: VALID_PROMO2 });
+    assert.equal(JSON.parse(q.payload).usdCents, 119, 'subPromoPriceUsd overrides discountPct');
+    // Lane gets the same treatment.
+    q = await protocol.issueQuote({ app: 'lane', identity: 'ln-1', productId: 'lane.monthly', token: 'USDC', payerWallet: P1, promoCode: LN_VALID_PROMO });
+    assert.equal(JSON.parse(q.payload).usdCents, 119, 'lane.monthly honors the same fixed price');
+    // Disabled policy rejects even a structurally valid code.
+    state.promo = { enabled: false, discountPct: 50, priceUsd: 1.19, mode: 'code' };
+    await assert.rejects(
+        protocol.issueQuote({ app: 'paceseeker', identity: DEV1, productId: 'paceseeker.monthly', token: 'USDC', payerWallet: P1, promoCode: VALID_PROMO }),
+        (e) => e.code === 'PROMO_INVALID', 'disabled promo never discounts');
+    await closeDb(conn);
+});
+
+test('PS/Lane monthly price is 175c; old 399c overpayment still accepted', async () => {
+    const { conn, clock, txMap, ecosystem, protocol } = await mkStack();
+    await ecosystem.ensureAccount('paceseeker', DEV1, { wallet: P1, proofKind: 'bind', proofRef: 'p1' });
+    const q = await protocol.issueQuote({ app: 'paceseeker', identity: DEV1, productId: 'paceseeker.monthly', token: 'USDC', payerWallet: P1 });
+    assert.equal(JSON.parse(q.payload).usdCents, 175, 'PS list price is $1.75');
+    // Legacy $3.99 payment (old client): overpayment above the quote applies.
+    const lamports = 39_900_000; // $3.99 at the mocked $100 SOL band
+    const sig = SIG('old399');
+    txMap.set(sig, mkSolTx({
+        sig, payer: P1, lamports, blockTime: secsNow(clock),
+        memos: [`PS1|monthly|${clock.t}|deadbeef`, `SLQ1|${q.quoteId}`],
+    }));
+    const r = await protocol.processSignature(sig, { subjects: [] });
+    assert.equal(r.status, 'applied', 'old-app $3.99 payment remains valid');
+    await closeDb(conn);
+});
+
+test('free-month redeem: single-use globally, local-only grant, stacks, eco block activates instantly', async () => {
+    const { conn, clock, ecosystem, protocol, signingKey } = await mkStack();
+    const acct = await ecosystem.ensureAccount('paceseeker', DEV1, {});
+
+    // Route-level codespace check: LF belongs to lane, not paceseeker.
+    const app = express();
+    app.use(express.json());
+    mountEcosystemRoutes(app, {
+        caller: async (req) => ({ app: String(req.query.app || 'paceseeker'), identity: String(req.query.id || DEV1) }),
+        ready: () => true, protocol: () => protocol, ecosystem, signKey: signingKey, registry: DEFAULT_REGISTRY,
+        signGrant: (accountId, subUntil) => ({ grant: `ECO1|${accountId}|${subUntil}`, sig: 'testsig' }),
+    });
+    const server = app.listen(0);
+    await new Promise((res) => server.once('listening', res));
+    const port = server.address().port;
+    try {
+        // LF code on the paceseeker app: invalid codespace.
+        const bad = await (await fetch(`http://127.0.0.1:${port}/api/ecosystem/promo/redeem?app=paceseeker&id=${DEV1}`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: LN_FREE_PROMO }),
+        })).json();
+        assert.equal(bad.code, 'PROMO_INVALID', 'LF code rejected for paceseeker');
+        // Discount-shaped code is not a free code either.
+        const disc = await (await fetch(`http://127.0.0.1:${port}/api/ecosystem/promo/redeem?app=paceseeker&id=${DEV1}`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: VALID_PROMO }),
+        })).json();
+        assert.equal(disc.code, 'PROMO_INVALID', 'PS discount code is not a grant code');
+        // Valid PF code redeems and returns the signed eco block.
+        const ok = await (await fetch(`http://127.0.0.1:${port}/api/ecosystem/promo/redeem?app=paceseeker&id=${DEV1}`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: FREE_PROMO }),
+        })).json();
+        assert.equal(ok.success, true);
+        assert.equal(Number(ok.expiresAt), clock.t + 30 * DAY, 'one local month');
+        assert.equal(ok.eco.subUntil, clock.t + 30 * DAY, 'eco block carries the grant instantly');
+        assert.equal(ok.eco.grant, `ECO1|${acct}|${clock.t + 30 * DAY}`);
+        assert.ok(ok.eco.v2 && ok.eco.v2.signature, 'v2 envelope signed');
+        // Global single-use: another identity cannot burn the same code.
+        const dup = await (await fetch(`http://127.0.0.1:${port}/api/ecosystem/promo/redeem?app=paceseeker&id=${DEV2}`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: FREE_PROMO }),
+        }));
+        assert.equal(dup.status, 409);
+        const dupBody = await dup.json();
+        assert.equal(dupBody.code, 'PROMO_USED');
+    } finally {
+        server.close();
+    }
+
+    // The grant is local: resolved member is active with promo provenance,
+    // sharedUntil stays zero, and a lane member on the same account gets
+    // nothing — free codes never feed the shared floor.
+    const snap = await ecosystem.resolveAccount(acct, { at: clock.t });
+    const me = snap.members.find((m) => m.app === 'paceseeker' && m.identity === DEV1);
+    assert.equal(me.active, true);
+    assert.equal(me.sourceKind, 'promo');
+    assert.equal(me.sourceEventId, `promo:${FREE_PROMO}`);
+    assert.equal(Number(snap.sharedUntil) || 0, 0, 'no shared floor from a free code');
+    await runOn(conn, `INSERT INTO ecosystem_members (account_id,app,identity,linked_at) VALUES (?,?,?,?)`, [acct, 'lane', 'ln-9', clock.t]);
+    const snap2 = await ecosystem.resolveAccount(acct, { at: clock.t });
+    const ln = snap2.members.find((m) => m.app === 'lane');
+    assert.equal(ln.active, false, 'promo grant never crosses apps');
+
+    // A second distinct PF code stacks on the live expiry.
+    const r2 = await ecosystem.redeemPromoGrant({ app: 'paceseeker', identity: DEV1, code: FREE_PROMO_2 });
+    assert.equal(Number(r2.expiresAt), clock.t + 60 * DAY, 'renewal stacks on remaining time');
+
+    // PhotoLynk cannot take feature grants.
+    await assert.rejects(ecosystem.redeemPromoGrant({ app: 'photolynk', identity: '1', code: FREE_PROMO_2 }),
+        (e) => e.code === 'APP_UNSUPPORTED');
+    await closeDb(conn);
+});
+
+test('PhotoLynk 100GB binds the shared floor at 175c and activates PS/Lane; 1TB lifts all', async () => {
+    const { conn, clock, txMap, ecosystem, protocol } = await mkStack();
+    await runOn(conn, `INSERT INTO users (id,email) VALUES (1,'a@b.c')`);
+    const acct = await ecosystem.ensureAccount('photolynk', '1', {});
+    await runOn(conn, `INSERT INTO ecosystem_members (account_id,app,identity,linked_at) VALUES (?,?,?,?)`, [acct, 'paceseeker', DEV1, clock.t]);
+    await runOn(conn, `INSERT INTO ecosystem_members (account_id,app,identity,linked_at) VALUES (?,?,?,?)`, [acct, 'lane', 'ln-1', clock.t]);
+    // 100GB monthly: $1.75 — the exact cost match.
+    const q = await protocol.issueQuote({ app: 'photolynk', identity: '1', productId: 'photolynk.storage_100', token: 'SOL', payerWallet: P1 });
+    const p = JSON.parse(q.payload);
+    assert.equal(p.usdCents, 175, 'storage_100 prices at $1.75');
+    const sig = SIG('pl100');
+    txMap.set(sig, mkSolTx({
+        sig, payer: P1, lamports: Number(p.amountAtomic), blockTime: secsNow(clock),
+        memos: ['PhotoLynk:sub:100:monthly', `SLQ1|${q.quoteId}`],
+    }));
+    const r = await protocol.processSignature(sig, { subjects: [] });
+    assert.equal(r.status, 'applied', JSON.stringify(r));
+    const paidAtMs = secsNow(clock) * 1000;
+    const snap = await ecosystem.resolveAccount(acct, { at: paidAtMs + 1000 });
+    const ps = snap.members.find((m) => m.app === 'paceseeker');
+    const ln = snap.members.find((m) => m.app === 'lane');
+    const pl = snap.members.find((m) => m.app === 'photolynk');
+    assert.equal(ps.active, true, '100GB activates PaceSeeker');
+    assert.equal(ln.active, true, '100GB activates Lane');
+    assert.equal(pl.planGb, 100, 'PL member keeps its own 100GB tier');
+    assert.ok(Number(snap.sharedUntil) >= paidAtMs + 29 * DAY, 'shared floor lifted');
     await closeDb(conn);
 });

@@ -17,12 +17,18 @@ const TOKEN_ENUM = {
     photolynk: new Set(['SOL', 'SKR']),
     lane: new Set(['SOL', 'USDC', 'USDT', 'SKR']),
 };
-const SHARED_VALUE_CENTS = 399;
+// "Full ecosystem" stamp: admin/legacy generic grants carry this value so
+// they keep granting the top shared tier. It is also the validity cap for a
+// benefit's monthlyValueCents — so it must cover the most expensive product
+// in the registry (derived below, after DEFAULT_REGISTRY). Payment-derived
+// shared benefits stamp the product's own monthlyValueCents instead —
+// the shared floor is a VALUE floor: a $1.75 payment unlocks the 175¢ tier in
+// every app (PS/Lane features + PhotoLynk 100GB), a $7.99 one unlocks 1TB.
 // A user_plans row may stack non-payment time on top of paid expiry (ad week,
 // admin edit, store row). Only bindable payment types at the bind tier may
 // feed the shared floor — the same gate the pre-core mirror used.
 const BINDABLE_PLAN_PAYMENT_TYPES = new Set(['', 'solana', 'skr', 'ecosystem', 'apple', 'google']);
-const BIND_MIN_TIER_GB = 400;
+const BIND_MIN_TIER_GB = 100;
 const bindablePlan = (plan) => !!plan
     && Number(plan.plan_gb) >= BIND_MIN_TIER_GB
     && BINDABLE_PLAN_PAYMENT_TYPES.has(plan.payment_type == null ? '' : String(plan.payment_type));
@@ -30,19 +36,51 @@ const bindablePlan = (plan) => !!plan
 const DEFAULT_REGISTRY = {
     version: 2,
     apps: {
-        paceseeker: { monthlyValueCents: 399, benefit: 'features' },
-        photolynk: { monthlyValueCents: 399, benefit: 'storage', tierGb: 400 },
-        lane: { monthlyValueCents: 399, benefit: 'features' },
+        paceseeker: { monthlyValueCents: 175, benefit: 'features' },
+        photolynk: { monthlyValueCents: 175, benefit: 'storage', tierGb: 100 },
+        lane: { monthlyValueCents: 175, benefit: 'features' },
     },
     products: {
-        'paceseeker.monthly': { app: 'paceseeker', monthlyValueCents: 399, tierGb: 0, ecosystem: true, durations: { monthly: 30 * DAY_MS } },
-        'lane.monthly': { app: 'lane', monthlyValueCents: 399, tierGb: 0, ecosystem: true, durations: { monthly: 30 * DAY_MS } },
-        'photolynk.storage_100': { app: 'photolynk', monthlyValueCents: 175, tierGb: 100, ecosystem: false, durations: { monthly: 30 * DAY_MS, yearly: 365 * DAY_MS } },
-        'photolynk.storage_200': { app: 'photolynk', monthlyValueCents: 245, tierGb: 200, ecosystem: false, durations: { monthly: 30 * DAY_MS, yearly: 365 * DAY_MS } },
+        'paceseeker.monthly': { app: 'paceseeker', monthlyValueCents: 175, tierGb: 0, ecosystem: true, durations: { monthly: 30 * DAY_MS } },
+        'lane.monthly': { app: 'lane', monthlyValueCents: 175, tierGb: 0, ecosystem: true, durations: { monthly: 30 * DAY_MS } },
+        'photolynk.storage_100': { app: 'photolynk', monthlyValueCents: 175, tierGb: 100, ecosystem: true, durations: { monthly: 30 * DAY_MS, yearly: 365 * DAY_MS } },
+        'photolynk.storage_200': { app: 'photolynk', monthlyValueCents: 245, tierGb: 200, ecosystem: true, durations: { monthly: 30 * DAY_MS, yearly: 365 * DAY_MS } },
         'photolynk.storage_400': { app: 'photolynk', monthlyValueCents: 399, tierGb: 400, ecosystem: true, durations: { monthly: 30 * DAY_MS, yearly: 365 * DAY_MS } },
         'photolynk.storage_1000': { app: 'photolynk', monthlyValueCents: 799, tierGb: 1000, ecosystem: true, durations: { monthly: 30 * DAY_MS, yearly: 365 * DAY_MS } },
         'photolynk.premium': { app: 'photolynk', monthlyValueCents: 0, tierGb: 0, ecosystem: false, premium: true },
     },
+};
+
+// Registry-derived so adding a pricier product automatically raises both the
+// "full ecosystem" stamp and the value cap — a hardcoded cap here previously
+// would have rejected a 799¢ 1TB benefit row.
+const SHARED_VALUE_CENTS = Math.max(1, ...Object.values(DEFAULT_REGISTRY.products)
+    .map((p) => Number(p && p.monthlyValueCents) || 0));
+
+// Value→tier mapping for PhotoLynk storage grants: derived from the product
+// registry so a price change updates the mapping automatically. A shared
+// benefit stamped at V cents grants the most expensive PL tier whose monthly
+// value is <= V (175→100GB, 245→200, 399→400, 799→1000).
+const storageTierForValue = (registry, cents) => {
+    const v = Number(cents) || 0;
+    let best = 0;
+    for (const p of Object.values((registry && registry.products) || {})) {
+        if (!p || p.app !== 'photolynk' || p.premium || !(Number(p.tierGb) > 0)) continue;
+        const val = Number(p.monthlyValueCents) || 0;
+        if (val > 0 && val <= v) best = Math.max(best, Number(p.tierGb));
+    }
+    return best;
+};
+// Inverse: value stamp for a PL plan tier (used when the source row carries
+// planGb but no explicit price, e.g. legacy bindable plans).
+const planToValueCents = (registry, tierGb) => {
+    const t = Number(tierGb) || 0;
+    let best = 0;
+    for (const p of Object.values((registry && registry.products) || {})) {
+        if (!p || p.app !== 'photolynk' || p.premium || !(Number(p.tierGb) > 0)) continue;
+        if (Number(p.tierGb) <= t) best = Math.max(best, Number(p.monthlyValueCents) || 0);
+    }
+    return best;
 };
 
 const codedError = (code, message, extra) => {
@@ -318,6 +356,9 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
     const updateBenefitExpiry = (tx, { eventId, app, identity, benefit, expiresAt }) =>
         tx.run(`UPDATE ecosystem_benefits SET expires_at = ? WHERE event_id = ? AND app = ? AND identity = ? AND benefit = ?`,
             [expiresAt == null ? null : expiresAt, eventId, app, String(identity), benefit]);
+    const updateBenefitValue = (tx, { eventId, app, identity, benefit, monthlyValueCents }) =>
+        tx.run(`UPDATE ecosystem_benefits SET monthly_value_cents = ? WHERE event_id = ? AND app = ? AND identity = ? AND benefit = ?`,
+            [Number(monthlyValueCents) || 0, eventId, app, String(identity), benefit]);
 
     const recordConflict = (tx, signature, app, identity, detail) =>
         tx.run(`INSERT OR IGNORE INTO ecosystem_receipt_conflicts (signature,app,identity,detail,created_at) VALUES (?,?,?,?,?)`,
@@ -438,7 +479,9 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
     const tierSupplied = (b, app) => {
         if (b.scope === 'shared') {
             const appDef = own(registry.apps, app);
-            return appDef && appDef.benefit === 'storage' ? (Number(appDef.tierGb) || 0) : 0;
+            return appDef && appDef.benefit === 'storage'
+                ? storageTierForValue(registry, b.monthly_value_cents)
+                : 0;
         }
         return Number(b.tier_gb) || 0;
     };
@@ -475,6 +518,12 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
             planGb,
             sourceKind: winner ? (winner.event_kind || winner.scope) : null,
             sourceScope: winner ? winner.scope : null,
+            // Winner provenance for admin traceability: which concrete source
+            // (receipt sig / promo code / admin event / PL plan) is granting
+            // this member's entitlement right now.
+            sourceEventId: winner ? (winner.event_id || null) : null,
+            sourceApp: winner ? (winner.event_app || null) : null,
+            sourceValueCents: winner ? (Number(winner.monthly_value_cents) || 0) : 0,
             paymentType: winner && winner.value_json ? (() => { try { return JSON.parse(winner.value_json)?.paymentType || null; } catch (_) { return null; } })() : null,
             nextChangeAt: nextChangeAt === Infinity ? null : nextChangeAt,
             eligible,
@@ -530,7 +579,7 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
             if (!product || !product.ecosystem) continue;
             let dur = null;
             try { dur = durationFor(product, r.product_id, r.duration || 'monthly'); } catch (_) { continue; }
-            out.push({ ts: Number(r.paid_at), kind: 'receipt', dur, id: r.signature });
+            out.push({ ts: Number(r.paid_at), kind: 'receipt', dur, id: r.signature, valueCents: Number(product.monthlyValueCents) || 0 });
         }
         const actions = await readOverrideList(tx, lineageId);
         for (const a of actions) {
@@ -631,6 +680,28 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
             const evs = await sharedFoldEvents(tx, e.account_id, { w0, w1 });
             let originKind = 'legacy';
             if (evs.length) originKind = evs[evs.length - 1].kind === 'receipt' ? 'payment' : 'admin';
+            // Stamped value = the price the account actually paid monthly:
+            // cost-match means a $1.75 payment unlocks the 175¢ tier in every
+            // app, a $7.99 one the 799¢ tier. Admin/legacy contributors (no
+            // product price) stamp the full ecosystem value as before. When
+            // `end` was inherited from parent epochs / the legacy base, the
+            // paying receipts live outside this window — fall back to the
+            // lineage max so the stamp survives refolds.
+            let stampedValue = 0;
+            let sawNonReceipt = false;
+            for (const ev of evs) {
+                if (ev.kind === 'receipt') stampedValue = Math.max(stampedValue, Number(ev.valueCents) || 0);
+                else sawNonReceipt = true;
+            }
+            if (end > 0 && !stampedValue) {
+                const valRows = await tx.all(
+                    `SELECT product_id FROM ecosystem_receipts WHERE account_id = ?`, [e.account_id]);
+                for (const rv of valRows) {
+                    const prod = own(registry.products, rv.product_id);
+                    if (prod && prod.ecosystem) stampedValue = Math.max(stampedValue, Number(prod.monthlyValueCents) || 0);
+                }
+            }
+            if (sawNonReceipt || (end > 0 && !stampedValue)) stampedValue = Math.max(stampedValue, SHARED_VALUE_CENTS);
             await insertEvent(tx, {
                 eventId, accountId: e.account_id, sourceKind: 'timeline', sourceApp: 'ecosystem', sourceRef: e.account_id,
                 payload: { end },
@@ -639,10 +710,11 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
                 [end > 0 ? originKind : 'timeline', JSON.stringify({ end }), eventId]);
             await insertBenefit(tx, {
                 eventId, accountId: e.account_id, app: '*', identity: '*', benefit: 'subscription',
-                startsAt, expiresAt: end > 0 ? end : 0, tierGb: 0, monthlyValueCents: 399, scope: 'shared',
+                startsAt, expiresAt: end > 0 ? end : 0, tierGb: 0, monthlyValueCents: stampedValue, scope: 'shared',
                 value: { timeline: true },
             });
             await updateBenefitExpiry(tx, { eventId, app: '*', identity: '*', benefit: 'subscription', expiresAt: end > 0 ? end : 0 });
+            await updateBenefitValue(tx, { eventId, app: '*', identity: '*', benefit: 'subscription', monthlyValueCents: stampedValue });
         }
         const children = await tx.all(`SELECT child_id FROM ecosystem_timeline_parents WHERE parent_id = ?`, [eid]);
         for (const row of children) await refoldEpoch(tx, row.child_id, visited);
@@ -711,7 +783,7 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
              WHERE b.account_id IN (${placeholders(lineage.length)})
                AND b.scope = 'local' AND b.app = ? AND b.identity = ?
                AND b.revoked_at IS NULL
-               AND COALESCE(e.source_kind,'') IN ('legacy','admin','store')`, [...lineage, app, id]);
+               AND COALESCE(e.source_kind,'') IN ('legacy','admin','store','promo')`, [...lineage, app, id]);
         for (const r of legacyRows) {
             const x = Number(r.expires_at);
             if (Number.isFinite(x) && x > 0) end = Math.max(end, x);
@@ -1998,7 +2070,11 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
                             changed += await absorbBenefitExpiry(tx, {
                                 eventId: sharedEventId, accountId: acct, app: '*', identity: '*',
                                 benefit: 'subscription', startsAt: Number(plan.payment_at) || Number(plan.updated_at) || 0,
-                                expiresAt: sharedTarget, tierGb: 0, monthlyValueCents: SHARED_VALUE_CENTS,
+                                expiresAt: sharedTarget, tierGb: 0,
+                                // Value-stamp from the plan's tier so a legacy
+                                // 100GB plan grants the 175¢ tier, a 400GB plan
+                                // the 399¢ tier — same as a fresh payment.
+                                monthlyValueCents: planToValueCents(registry, plan.plan_gb),
                                 scope: 'shared', value: { legacy: true, floor: true },
                             });
                         }
@@ -2490,7 +2566,7 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
                     value: { source: srcKind, actor: actor || null },
                 });
             }
-            if (sharedEligible && srcKind === 'store' && planGb >= 400) {
+            if (sharedEligible && srcKind === 'store' && planGb >= BIND_MIN_TIER_GB) {
                 const shId = `localplan_shared:${String(eventId)}`;
                 await insertEvent(tx, {
                     eventId: shId, accountId, sourceKind: 'store', sourceApp: 'photolynk', sourceRef: String(eventId),
@@ -2498,7 +2574,7 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
                 });
                 await insertBenefit(tx, {
                     eventId: shId, accountId, app: 'photolynk', identity: String(uid), benefit: 'storage',
-                    startsAt, expiresAt, tierGb: planGb, monthlyValueCents: SHARED_VALUE_CENTS, scope: 'shared',
+                    startsAt, expiresAt, tierGb: planGb, monthlyValueCents: planToValueCents(registry, planGb), scope: 'shared',
                     value: { source: 'store', actor: actor || null },
                 });
             }
@@ -2507,6 +2583,50 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
         await refoldLocalMember(tx, accountId, 'photolynk', uid);
         const snap = await snapshotFor(tx, accountId, now(), { app: 'photolynk', identity: String(uid) });
         return { ...snap, alreadyRecorded: !!prior };
+    };
+
+    // Free-month promo redemption (PF/LF codespace). The checksum was already
+    // verified by the caller; the burn record is the event itself —
+    // `promo:<code>` is a PRIMARY-KEY insert, so one code redeems exactly
+    // once globally even across devices/accounts. Grants a LOCAL 'features'
+    // month only: free codes never feed the shared floor, so they unlock
+    // just the app they were issued for.
+    const PROMO_GRANT_MS = 30 * DAY_MS;
+    const redeemPromoGrant = async ({ app, identity, code }) => {
+        const appKey = String(app || '').toLowerCase();
+        const appDef = supportedApp(appKey);
+        if (!appDef || appDef.benefit !== 'features') {
+            throw codedError('APP_UNSUPPORTED', 'promo grants only apply to feature apps', { statusCode: 400 });
+        }
+        const id = String(identity || '');
+        const c = String(code || '').trim().toUpperCase();
+        if (!c) throw codedError('PROMO_INVALID', 'promo code required', { statusCode: 400 });
+        return await transaction(async (tx) => {
+            const accountId = await ensureAccountTx(tx, appKey, id, {});
+            const evtId = `promo:${c}`;
+            const ins = await insertEvent(tx, {
+                eventId: evtId, accountId, sourceKind: 'promo', sourceApp: appKey,
+                sourceRef: id, payload: { code: c },
+            });
+            if (!ins || !ins.changes) {
+                throw codedError('PROMO_USED', 'promo code already redeemed', { statusCode: 409 });
+            }
+            // Renewal semantics: stack on the current live local expiry.
+            const baseRow = await tx.get(
+                `SELECT MAX(COALESCE(expires_at,0)) AS m FROM ecosystem_benefits
+                 WHERE account_id = ? AND app = ? AND identity = ? AND benefit = 'features'
+                   AND scope = 'local' AND revoked_at IS NULL`, [accountId, appKey, id]);
+            const start = now();
+            const expiresAt = Math.max(start, Number(baseRow && baseRow.m) || 0) + PROMO_GRANT_MS;
+            await insertBenefit(tx, {
+                eventId: evtId, accountId, app: appKey, identity: id, benefit: 'features',
+                startsAt: start, expiresAt, tierGb: 0, monthlyValueCents: 0, scope: 'local',
+                value: { source: 'promo', code: c },
+            });
+            await refoldLocalMember(tx, accountId, appKey, id);
+            await bumpGlobal(tx, accountId);
+            return { ok: true, accountId, expiresAt };
+        });
     };
 
     return {
@@ -2526,6 +2646,7 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
         resolveIdentity,
         resolveAccount,
         grantAdClaim,
+        redeemPromoGrant,
         adjustShared,
         enqueueVerification,
         absorbLegacyLedgerPage,
@@ -2535,4 +2656,4 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
     };
 }
 
-module.exports = { createEcosystemService, DEFAULT_REGISTRY, DAY_MS };
+module.exports = { createEcosystemService, DEFAULT_REGISTRY, DAY_MS, storageTierForValue };

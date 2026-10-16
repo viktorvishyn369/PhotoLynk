@@ -11,7 +11,7 @@
 // resolves subject, product price and quote terms from server state, and
 // inspects the actual on-chain transfer.
 
-const { BASE58_SIG_RE } = require('./ecosystemPayments');
+const { BASE58_SIG_RE, promoFreeCodeValidFor } = require('./ecosystemPayments');
 
 const codedHttp = (status, code, message, extra) => ({
     status, code, error: message || code, ...(extra || {}),
@@ -26,6 +26,7 @@ function mountEcosystemRoutes(app, deps = {}) {
         protocol = () => null,
         ecosystem = null,
         signKey = null,
+        signGrant = null,
         registry = null,
         requestScan = null,
         wakeWorker = null,
@@ -219,6 +220,44 @@ function mountEcosystemRoutes(app, deps = {}) {
     };
     app.get('/api/ecosystem/v2/entitlement', auth, getEntitlement);
     app.get('/api/ecosystem/entitlement', auth, getEntitlement);
+
+    // Free-month promo redemption (PF/LF codespace — distinct peppers from
+    // the discount-code spaces). Burns the code once globally via the
+    // `promo:<code>` event PK and grants a LOCAL month on the caller's
+    // identity — never feeds the cross-app shared floor.
+    const redeemPromo = async (req, res) => {
+        try {
+            if (!ready()) return notReady(res);
+            const who = await caller(req);
+            if (who.error) return callerError(res, who);
+            const code = String((req.body || {}).code || '').trim().toUpperCase();
+            if (!promoFreeCodeValidFor(who.app, code)) {
+                return res.status(400).json({ success: false, error: 'invalid promo code', code: 'PROMO_INVALID' });
+            }
+            const r = await ecosystem.redeemPromoGrant({ app: who.app, identity: who.identity, code });
+            const out = { success: true, accountId: r.accountId, expiresAt: r.expiresAt };
+            try {
+                // Return the same signed eco block a heartbeat carries so the
+                // app activates immediately instead of waiting for the next
+                // trial ping. Failure is harmless — the grant is durable and
+                // the next heartbeat delivers it.
+                const snap = await ecosystem.resolveIdentity(who.app, String(who.identity), { project: false });
+                const subUntil = snap && snap.entitlement && snap.entitlement.expiresAt != null
+                    ? Number(snap.entitlement.expiresAt) : (Number(r.expiresAt) || 0);
+                const g = typeof signGrant === 'function' && subUntil > Date.now()
+                    ? signGrant(r.accountId, subUntil) : null;
+                const env = snap && protocol() ? protocol().signEntitlement(snap, { app: who.app, identity: String(who.identity) }) : null;
+                out.eco = { account: r.accountId, subUntil, grant: g ? g.grant : null, sig: g ? g.sig : null };
+                if (env) out.eco.v2 = env;
+            } catch (e) { /* durable grant — next heartbeat carries it */ }
+            res.json(out);
+        } catch (e) {
+            const status = (e && e.statusCode) || (e && e.code === 'PROMO_USED' ? 409 : 500);
+            res.status(status).json({ success: false, error: (e && e.message) || 'redeem failed', code: (e && e.code) || 'REDEEM_FAILED' });
+        }
+    };
+    app.post('/api/ecosystem/promo/redeem', auth, redeemPromo);
+    app.post('/api/ecosystem/v2/promo/redeem', auth, redeemPromo);
 }
 
 module.exports = { mountEcosystemRoutes };
