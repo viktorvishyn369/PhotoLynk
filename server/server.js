@@ -720,12 +720,10 @@ table{min-width:100%;width:auto}
   <table id="eco-table" style="display:none">
     <thead><tr>
       <th>Account</th>
-      <th>Members</th>
-      <th>Wallets</th>
-      <th>Socials</th>
-      <th>Sub Source</th>
-      <th>Shared until</th>
-      <th>Entitlements</th>
+      <th>First app</th>
+      <th>Signed up in</th>
+      <th>Active grants</th>
+      <th>Source</th>
       <th>Claims</th>
       <th>Actions</th>
     </tr></thead>
@@ -895,6 +893,11 @@ function ecoSourceBadge(a){
   return'<span class="mini-tag" style="color:'+s.c+'" title="'+(a.source_app||'?')+' via '+k+prov+'">'+s.t+'</span>';
 }
 
+var ECO_APP_TAG={paceseeker:'PS',lane:'LN',photolynk:'PL'};
+var ECO_APP_COLOR={paceseeker:'var(--accent)',lane:'var(--info)',photolynk:'var(--success)'};
+function ecoAppTag(app){return ECO_APP_TAG[app]||String(app||'?').slice(0,2).toUpperCase()}
+function ecoAppColor(app){return ECO_APP_COLOR[app]||'var(--muted)'}
+
 function renderEcoTable(){
   var tbody=document.getElementById('eco-tbody');
   var empty=document.getElementById('empty');
@@ -902,28 +905,39 @@ function renderEcoTable(){
   empty.style.display='none';
   var html='';
   ecoFiltered.forEach(function(a){
-    var mems=(a.members||[]).map(function(m){
-      var lab=m.app==='paceseeker'?'PS':(m.app==='lane'?'LN':'PL');
-      var vTag=m.wallet_verified?'':' <span style="color:var(--warn)" title="wallet not signature-verified">&#9888;</span>';
-      return'<div style="margin-bottom:2px"><span class="mini-tag" style="color:'+(m.app==='paceseeker'?'var(--accent)':(m.app==='lane'?'var(--info)':'var(--success)'))+'">'+lab+'</span> <span class="uuid-cell" title="'+m.identity+'">'+String(m.identity||'').substring(0,12)+'</span>'+vTag+'</div>';
-    }).join('')||'<span class="date-cell">-</span>';
-    var wals=(a.members||[]).filter(function(m){return m.wallet}).map(function(m){
-      return'<div style="margin-bottom:2px"><span class="uuid-cell" style="cursor:pointer" title="'+m.wallet+' - click to copy" onclick="copyUuid(this,&apos;'+m.wallet+'&apos;)">'+String(m.wallet).substring(0,6)+'&hellip;'+String(m.wallet).slice(-4)+'</span></div>';
-    }).join('')||'<span class="date-cell">-</span>';
+    // Account cell: id + socials inline (no separate column).
     var soc=[];
     if(a.x_handle)soc.push('<span class="mini-tag" title="X">@'+a.x_handle+'</span>');
     if(a.tg_username)soc.push('<span class="mini-tag" title="Telegram">@'+a.tg_username+'</span>');
     if(a.cherry_state==='member')soc.push('<span class="mini-tag" title="Cherry member">cherry</span>');
+    var strict=a.ad_strict?' <span class="mini-tag" style="color:var(--warn)" title="Failed a re-check - future claims must auto-verify">strict</span>':'';
+    var acct='<div class="uuid-cell" title="'+a.account_id+' - click to copy" onclick="copyUuid(this,&apos;'+a.account_id+'&apos;)">'+String(a.account_id).substring(0,12)+'</div>'+(soc.join(' ')||'')+strict;
+
+    // First app the account signed up in (server-derived, earliest link).
+    var first=a.first_app
+      ?'<span class="mini-tag" style="color:'+ecoAppColor(a.first_app)+'">'+ecoAppTag(a.first_app)+'</span>'+(a.first_app_at?'<div class="date-cell">'+fmtDate(new Date(Number(a.first_app_at)).toISOString())+'</div>':'')
+      :'<span class="date-cell">-</span>';
+
+    // Signed up in: one line per member, oldest first; wallet inline.
+    var mems=(a.members||[]).slice().sort(function(x,y){return (Number(x.linked_at)||0)-(Number(y.linked_at)||0)}).map(function(m){
+      var vTag=m.wallet_verified?'':' <span style="color:var(--warn)" title="wallet not signature-verified">&#9888;</span>';
+      var idt=m.app==='photolynk'?('#'+String(m.identity||'').substring(0,12)):String(m.identity||'').substring(0,8)+'&hellip;';
+      var w=m.wallet?' <span class="uuid-cell" style="cursor:pointer" title="'+m.wallet+' - click to copy" onclick="copyUuid(this,&apos;'+m.wallet+'&apos;)">'+String(m.wallet).substring(0,4)+'&hellip;'+String(m.wallet).slice(-4)+'</span>':'';
+      return'<div style="margin-bottom:2px"><span class="mini-tag" style="color:'+ecoAppColor(m.app)+'">'+ecoAppTag(m.app)+'</span> <span class="uuid-cell" title="'+m.app+' '+m.identity+'">'+idt+'</span>'+w+vTag+'</div>';
+    }).join('')||'<span class="date-cell">-</span>';
+
     var claimsTxt=a.claims_total?(a.claims_total+'&nbsp;'+(a.claims_verified?'<span style="color:var(--success)">ok</span>':'<span style="color:var(--warn)">none-ok</span>')):'-';
-    var strict=a.ad_strict?'<span class="mini-tag" style="color:var(--warn)" title="Failed a re-check - future claims must auto-verify">strict</span>':'';
+
+    // Source: what funds the shared floor (paid/ad/admin) + its expiry.
+    var srcCell=ecoSourceBadge(a);
+    if(a.sub_until)srcCell+='<div class="date-cell">'+(a.subscribed?'until ':'ended ')+fmtDate(new Date(Number(a.sub_until)).toISOString())+'</div>';
+
     html+='<tr>';
-    html+='<td class="uuid-cell" title="'+a.account_id+' - click to copy" onclick="copyUuid(this,&apos;'+a.account_id+'&apos;)">'+String(a.account_id).substring(0,12)+'</td>';
+    html+='<td>'+acct+'</td>';
+    html+='<td>'+first+'</td>';
     html+='<td>'+mems+'</td>';
-    html+='<td>'+wals+'</td>';
-    html+='<td>'+(soc.join(' ')||'<span class="date-cell">-</span>')+' '+strict+'</td>';
-    html+='<td>'+ecoSourceBadge(a)+'</td>';
-    html+='<td>'+(a.sub_until?fmtDate(new Date(Number(a.sub_until)).toISOString()):'<span class="date-cell">-</span>')+'</td>';
-    html+='<td style="font-size:11px;min-width:220px">'+ecoEntitlementLines(a)+'</td>';
+    html+='<td style="font-size:11px;min-width:200px">'+ecoGrantLines(a)+'</td>';
+    html+='<td>'+srcCell+'</td>';
     html+='<td><span class="date-cell">'+claimsTxt+'</span></td>';
     html+='<td><button class="btn btn-primary" style="padding:3px 8px;font-size:11px" onclick="ecoSubAction(&apos;'+a.account_id+'&apos;,&apos;extend&apos;)" title="Add 7 days to the shared sub">+7d</button> '
       +'<button class="btn btn-primary" style="padding:3px 8px;font-size:11px" onclick="ecoSubAction(&apos;'+a.account_id+'&apos;,&apos;set-until&apos;)" title="Set the shared sub to an absolute date">Set&hellip;</button> '
@@ -934,52 +948,34 @@ function renderEcoTable(){
   tbody.innerHTML=html;
 }
 
-// One line per member/source of the core snapshot: 'PL #123 · direct 1000GB
-// · until D · payment', 'shared · 399¢ · until D · from PS payment',
-// 'PS a1b2c3… · ad week · until D', 'premium storage 500GB · until D'.
-// Legacy mode has no read model - the column shows the mode, never a guess.
+// Grant lines: one line per app with an ACTIVE entitlement — plan, expiry,
+// paid/ad/admin kind, and the paying app's tag when it differs ('via PS').
+// Not-granted apps are intentionally absent. Legacy mode has no read model -
+// the cell shows the mode, never a guess.
 var ECO_KIND_LABEL={payment:'payment',ad_claim:'ad week',legacy:'legacy',admin:'admin',store:'store',timeline:'shared fold',localplan:'local plan',premium:'premium',grant:'grant'};
 function ecoKindLabel(k){return ECO_KIND_LABEL[k]||k||'?';}
+var ECO_GRANT_KIND={payment:'paid',ad_claim:'ad',admin:'admin',grant:'admin',store:'store',localplan:'direct plan',premium:'premium',timeline:'shared',legacy:'legacy',merge:'merge',link_sync:'link'};
+function ecoGrantKind(k){return ECO_GRANT_KIND[k]||ecoKindLabel(k);}
 function ecoUntil(e){return e==null?'<span title="unbounded">unbounded</span>':(e?fmtDate(new Date(Number(e)).toISOString()):'<span class="date-cell">expired</span>');}
-function ecoEntitlementLines(a){
+function ecoGrantLines(a){
   if(!('entitlements' in a)){
     return '<span class="date-cell" title="Ecosystem core in legacy compatibility mode">legacy mode</span>';
   }
   if(a.entitlementsError||a.entitlements==null){
     return '<span style="color:var(--warn)" title="core snapshot failed">err: '+String(a.entitlementsError||'?')+'</span>';
   }
-  var ent=a.entitlements;var out=[];
-  (ent.members||[]).forEach(function(m){
-    var lab=m.app==='paceseeker'?'PS':(m.app==='lane'?'LN':'PL');
+  var lines=(a.entitlements.members||[]).filter(function(m){return m.active}).map(function(m){
     var idt=m.app==='photolynk'?('#'+m.identity):String(m.identity||'').substring(0,8)+'&hellip;';
     var bits=[];
-    if(m.planGb)bits.push(m.planGb+'GB');
-    if(m.expiresAt!=null)bits.push('until '+ecoUntil(m.expiresAt));
-    if(m.sourceKind)bits.push(ecoKindLabel(m.sourceKind));
-    // Provenance: which concrete source (receipt / promo / admin / PL plan)
-    // is granting this member right now — the source&rarr;app link the admin
-    // needs to answer "which payment activated this app?".
-    if(m.sourceEventId)bits.push('via '+String(m.sourceEventId).substring(0,24));
-    out.push('<div title="'+m.app+' '+m.identity+' &middot; '+(m.sourceKind||'')+'/'+(m.sourceScope||'')+' &middot; '+(m.sourceEventId||'')+(m.sourceValueCents?' &middot; '+m.sourceValueCents+'&cent;':'')+'"><span class="mini-tag" style="color:'+(m.app==='paceseeker'?'var(--accent)':(m.app==='lane'?'var(--info)':'var(--success)'))+'">'+lab+'</span> '+idt+(m.active?'':' <s>expired</s>')+' &middot; '+(bits.join(' &middot; ')||'no grant')+'</div>');
+    bits.push(m.planGb?(m.planGb+'GB'):'sub');
+    bits.push('until '+(m.expiresAt!=null?fmtDate(new Date(Number(m.expiresAt)).toISOString()):'open'));
+    var src=m.sourceKind?ecoGrantKind(m.sourceKind):'';
+    var via=m.sourceApp&&m.sourceApp!==m.app?('via '+ecoAppTag(m.sourceApp)):'';
+    if(src&&via)bits.push(src+' '+via);
+    else if(src||via)bits.push(src||via);
+    return '<div style="margin-bottom:2px" title="'+m.app+' '+m.identity+' &middot; '+(m.sourceKind||'')+'/'+(m.sourceScope||'')+' &middot; '+(m.sourceEventId||'')+(m.sourceValueCents?' &middot; '+m.sourceValueCents+'&cent;':'')+'"><span class="mini-tag" style="color:'+ecoAppColor(m.app)+'">'+ecoAppTag(m.app)+'</span> '+idt+' &middot; '+(bits.join(' &middot; '))+'</div>';
   });
-  (ent.sources||[]).forEach(function(s){
-    if(s.scope!=='shared')return;
-    var kind=s.kind||'shared';
-    var cents=Number(s.monthlyValueCents)||0;
-    var label='shared &middot; '+cents+'&cent; &middot; '+(s.expiresAt!=null?'until '+ecoUntil(s.expiresAt):'open');
-    // Value&rarr;apps matrix: which apps this shared benefit activates.
-    if(s.activates){
-      var act=[];
-      if(s.activates.paceseeker)act.push('PS');
-      if(s.activates.lane)act.push('LN');
-      if(s.activates.photolynkGb>0)act.push('PL '+s.activates.photolynkGb+'GB');
-      if(act.length)label+=' &rarr; '+act.join(' &middot; ');
-    }
-    var from=s.app&&s.app!=='*'?('from '+s.app+' '):'';
-    var rev=s.revoked;
-    out.push('<div title="'+(s.eventId||'')+'" style="'+(rev?'text-decoration:line-through;opacity:.6':'')+'"><span class="mini-tag" style="color:var(--muted)">'+from+ecoKindLabel(kind)+'</span> '+label+(rev?' <span style="color:var(--danger)">revoked</span>':'')+'</div>');
-  });
-  return out.join('')||'<span class="date-cell">-</span>';
+  return lines.join('')||'<span class="date-cell">-</span>';
 }
 
 // Durable verification queue - ECO2 payments waiting for on-chain
@@ -7159,9 +7155,20 @@ app.get('/admin/api/eco-accounts', adminAuth, async (req, res) => {
             accounts: accounts.map(a => {
                 const s = subBy[a.account_id];
                 const ent = entBy[a.account_id];
+                const mems = memBy[a.account_id] || [];
+                // First app the account signed up in — earliest member link.
+                let firstApp = null, firstAppAt = null;
+                for (const m of mems) {
+                    const t = Number(m.linked_at) || 0;
+                    if (t > 0 && (firstAppAt == null || t < firstAppAt)) { firstAppAt = t; firstApp = m.app; }
+                }
+                if (!firstApp) firstApp = s?.source_app || null;
+                if (firstAppAt == null) firstAppAt = a.created_at || null;
                 return {
                     ...a,
-                    members: memBy[a.account_id] || [],
+                    first_app: firstApp,
+                    first_app_at: firstAppAt,
+                    members: mems,
                     claims_total: claimBy[a.account_id]?.n || 0,
                     claims_verified: !!claimBy[a.account_id]?.has_verified,
                     sub_until: s?.sub_until || 0,
