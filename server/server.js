@@ -1783,12 +1783,13 @@ const ADMIN_BASE58_WALLET_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 const normalizeStoredSeekerId = (value) => {
     const raw = String(value || '').trim().toLowerCase();
     if (!raw) return null;
-    // Recover previously corrupted values where the server appended .skr to a .sol domain
-    if (raw.endsWith('.sol.skr')) {
+    // Recover previously corrupted values where the server appended .skr to
+    // an already-suffixed domain (.sol or the migrated .sns registry TLD)
+    if (raw.endsWith('.sol.skr') || raw.endsWith('.sns.skr')) {
         return raw.slice(0, -'.skr'.length);
     }
-    // Preserve registered .skr and .sol domains as-is
-    if (raw.endsWith('.skr') || raw.endsWith('.sol')) return raw;
+    // Preserve registered .skr, .sol and .sns domains as-is
+    if (raw.endsWith('.skr') || raw.endsWith('.sol') || raw.endsWith('.sns')) return raw;
     if (raw.endsWith('@photolynk.local')) {
         const local = raw.slice(0, -'@photolynk.local'.length);
         if (local && !ADMIN_BASE58_WALLET_RE.test(local)) return `${local}.skr`;
@@ -3106,17 +3107,19 @@ db.serialize(() => {
                 });
             });
         }
-        // Fix previously corrupted seeker_ids where .skr was appended to a .sol
-        // domain. Only runs when the column already exists - a fresh ALTER
-        // can't have corrupted values yet, and running this while the ALTER is
-        // still queued fails with "no such column" (async callbacks escape
+        // Fix previously corrupted seeker_ids where .skr was appended to an
+        // already-suffixed domain (.sol or the migrated .sns registry TLD).
+        // Only runs when the column already exists - a fresh ALTER can't have
+        // corrupted values yet, and running this while the ALTER is still
+        // queued fails with "no such column" (async callbacks escape
         // db.serialize ordering).
         if (names.includes('seeker_id')) {
-            db.run(`UPDATE users SET seeker_id = SUBSTR(seeker_id, 1, LENGTH(seeker_id) - ?) WHERE seeker_id LIKE ?`, [
+            db.run(`UPDATE users SET seeker_id = SUBSTR(seeker_id, 1, LENGTH(seeker_id) - ?) WHERE seeker_id LIKE ? OR seeker_id LIKE ?`, [
                 '.skr'.length,
                 '%.sol.skr',
+                '%.sns.skr',
             ], (e2) => {
-                if (e2) console.log('[DB] Failed to repair .sol.skr seeker_ids:', e2.message);
+                if (e2) console.log('[DB] Failed to repair .sol.skr/.sns.skr seeker_ids:', e2.message);
             });
         }
         if (!names.includes('storage_uuid')) {
