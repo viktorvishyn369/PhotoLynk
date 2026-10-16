@@ -1440,6 +1440,7 @@ const runWalletLogin = async (h, body) => {
         JWT_SECRET: 'test-secret',
         ecoEnsureAccount: async () => 'acct',
         ecoSyncMemberEntitlement: async () => { },
+        plUpdateDomain: async () => { }, // lazy SNS fill — out of scope here
         crypto: require('crypto'),
         // Same regex as server.js sanitizeUserKey — the handler gates on it.
         sanitizeUserKey: (v) => String(v || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 128),

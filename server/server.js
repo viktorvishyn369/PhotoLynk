@@ -1824,6 +1824,7 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
                 u.email,
                 u.alias_email,
                 u.seeker_id,
+                u.wallet_address,
                 u.user_uuid,
                 u.storage_uuid,
                 u.created_at AS user_created_at,
@@ -1970,6 +1971,10 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
         // Fetch real-time crypto prices for USD conversion
         const [solPriceUsd, skrPriceUsd] = await Promise.all([fetchSolPriceUsd(), fetchSkrPriceUsd()]);
 
+        // Cap per-request SNS lookups for unnamed wallet accounts — the cache
+        // dedupes, but a fresh server shouldn't burst the sns.id proxy.
+        let adminDomainResolveBudget = 40;
+
         const formattedUsers = await Promise.all(users.map(async user => {
             const nftPayments = nftPaymentsByUser[user.id] || [];
             const premium = nftPremiumByUser[user.id] || {};
@@ -2016,6 +2021,12 @@ app.get('/admin/api/users', adminAuth, async (req, res) => {
             const displayHandle = deriveAdminDisplayHandle(user.seeker_id, user.alias_email, user.email);
             const ecoRow = ecoByUser[String(user.id)] || null;
             const ecoUntil = Number(ecoRow?.eco_sub_until) || 0;
+            // Lazy SNS fill for offline users: wallet present, no handle, and
+            // the fan-out cap keeps a big admin fetch from bursting sns.id.
+            if (!displayHandle && user.wallet_address && adminDomainResolveBudget > 0) {
+                adminDomainResolveBudget--;
+                plUpdateDomain(user.id, user.wallet_address);
+            }
 
             return {
                 id: user.id,
@@ -3517,6 +3528,12 @@ function touchDeviceLastSeen(user, deviceUuid) {
                      )
                  ON CONFLICT(user_id, device_uuid) DO UPDATE SET last_seen = ?`,
             [uid, safeDu, now, uid, safeDu, uid, now], () => { });
+        // Lazy SNS name fill for wallet accounts the app never reported a
+        // domain for — the cheap handle check keeps this to a no-op for
+        // named/none-wallets, and psDomainCache dedupes the actual lookup.
+        if (user.wallet_address && !deriveAdminDisplayHandle(user.seeker_id, user.alias_email, user.email)) {
+            plUpdateDomain(uid, user.wallet_address);
+        }
     } catch (e) { }
 }
 
@@ -5058,26 +5075,51 @@ async function psResolveDomainTld(domainAcctKey) {
     psTldCache.set(parentKey, tld);
     return tld;
 }
+// Shared SNS primary-domain resolver: 'name.tld', '' (verified no domain,
+// cached), or null (transient - uncached so the next call retries).
+async function snsResolveDomain(wallet) {
+    if (!wallet) return '';
+    let domain = psDomainCache.get(wallet);
+    if (domain !== undefined) return domain;
+    domain = '';
+    try {
+        const r = await axios.get(`https://sdk-proxy-v2.sns.id/primary-domain/${wallet}`, { timeout: 5000 });
+        const res = r.data?.result;
+        if (r.data?.s === 'ok' && res && typeof res.reverse === 'string' && typeof res.domain === 'string' && !res.stale) {
+            const label = res.reverse.trim();
+            // The proxy is a third party — a malformed label lands in
+            // wallet_domain/seeker_id and then raw admin HTML. Reject the
+            // markup/injection charset but keep unicode/emoji SNS names.
+            if (!label || label.length > 100 || /[<>&'"`\\/\s]/.test(label)) return '';
+            const tld = await psResolveDomainTld(res.domain);
+            if (tld === null) return null; // transient - keep uncached so next ping retries
+            domain = tld ? `${label}.${tld}` : label;
+        }
+    } catch (e) { }
+    if (psDomainCache.size > 5000) psDomainCache.clear();
+    psDomainCache.set(wallet, domain);
+    return domain;
+}
 async function psUpdateDomain(id, wallet) {
     try {
-        if (!wallet) return;
-        let domain = psDomainCache.get(wallet);
-        if (domain === undefined) {
-            domain = '';
-            try {
-                const r = await axios.get(`https://sdk-proxy-v2.sns.id/primary-domain/${wallet}`, { timeout: 5000 });
-                const res = r.data?.result;
-                if (r.data?.s === 'ok' && res && typeof res.reverse === 'string' && typeof res.domain === 'string' && !res.stale) {
-                    const tld = await psResolveDomainTld(res.domain);
-                    if (tld === null) return; // transient - keep uncached so next ping retries
-                    domain = tld ? `${res.reverse.trim()}.${tld}` : res.reverse.trim();
-                }
-            } catch (e) { }
-            if (psDomainCache.size > 5000) psDomainCache.clear();
-            psDomainCache.set(wallet, domain);
-        }
+        const domain = await snsResolveDomain(wallet);
         if (!domain) return;
         db.run('UPDATE paceseeker_devices SET wallet_domain = ? WHERE device_hash = ?', [domain, id], () => { });
+    } catch (e) { }
+}
+// PhotoLynk users: server-side SNS resolution for accounts whose wallet has a
+// primary domain the app never reported. Only fills a blank seeker_id, and
+// only when no human-readable handle exists anywhere (alias/email), so a
+// user-set name is never overwritten. Rides touchDeviceLastSeen's 5-min
+// throttle, plus the wallet write paths.
+async function plUpdateDomain(userId, wallet) {
+    try {
+        if (!userId || !wallet) return;
+        const domain = await snsResolveDomain(wallet);
+        if (!domain) return;
+        const row = await dbGetAsync(`SELECT seeker_id, alias_email, email FROM users WHERE id = ?`, [userId]);
+        if (!row || deriveAdminDisplayHandle(row.seeker_id, row.alias_email, row.email)) return;
+        db.run(`UPDATE users SET seeker_id = ? WHERE id = ? AND (seeker_id IS NULL OR seeker_id = '')`, [domain, userId], () => { });
     } catch (e) { }
 }
 
@@ -8885,6 +8927,9 @@ app.post('/api/wallet-login', authRateLimiter, async (req, res) => {
                 [walletDomain, user.id]
             );
         }
+        // Wallet proven via SIWS — if the app reported no domain, resolve the
+        // wallet's primary SNS name ourselves (no-op once a handle exists).
+        plUpdateDomain(user.id, walletAddressNorm);
 
         const storageUuid = user.storage_uuid || computeStorageUuidFromEmail(user.email);
         if (storageUuid && !user.storage_uuid) {
@@ -9264,6 +9309,9 @@ app.post('/api/save-wallet', authenticateToken, async (req, res) => {
         params.push(req.user.id);
         await dbRunAsync(`UPDATE users SET ${updates.join(', ')} WHERE id = ?`, params);
         console.log(`[Wallet] Saved wallet profile for user ${req.user.id}: wallet=${rawWalletAddress || '-'} seeker=${normalizedSeekerId || '-'}`);
+        // User just set their wallet — resolve its SNS name lazily (skipped
+        // automatically when the request itself set a seeker_id).
+        if (rawWalletAddress) plUpdateDomain(req.user.id, rawWalletAddress);
         res.json({ success: true });
     } catch (e) {
         console.error('[Wallet] Save error:', e.message);
