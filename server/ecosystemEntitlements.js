@@ -1410,6 +1410,26 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
                 mint: r.mint, paidAt: r.paidAt, verifiedAt: r.verifiedAt,
             });
             if (prior && prior.conflict) return conflictResult(prior.conflict);
+            // Burn the memo-carried promo on any successful apply: a quote
+            // reservation only binds while its quote is live, so an
+            // UNQUOTED promo payment (dropped/legacy quote path) would leave
+            // the code reclaimable after the stale reservation expired.
+            // quote_id 'direct:<sig>' resolves to no quote row, which makes
+            // the code non-reclaimable forever - the correct semantics for
+            // a code that has already hit the chain.
+            const burnMemoPromo = async () => {
+                const pc = r.promo ? String(r.promo).trim().toUpperCase() : null;
+                // App codespace gate: a PS memo can never burn a Lane code.
+                const wantPrefix = app === 'lane' ? 'LN' : 'PS';
+                if (!pc || pc.length !== 14 || !pc.startsWith(wantPrefix)) return;
+                const tbl = await tx.get(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'ecosystem_promo_uses'`);
+                if (!tbl) return;
+                // REPLACE (not IGNORE): an on-chain spend supersedes any live
+                // reservation. The holder's already-issued quote still
+                // consumes fine - promo_uses is only consulted at issue time.
+                await tx.run(`INSERT OR REPLACE INTO ecosystem_promo_uses (code, quote_id, signature) VALUES (?, ?, ?)`,
+                    [pc, `direct:${sig}`, sig]);
+            };
             const canonical = await canonicalAccount(tx, accountId);
             const snapshot = async () => {
                 const snap = await resolveAccountTx(tx, canonical, { at: now(), project: true });
@@ -1438,6 +1458,7 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
                     paidAt: r.paidAt, verifiedAt: r.verifiedAt, quoteId: r.quoteId, evidence: r.evidence,
                     appliedAt: now(), legacyAccounted: true,
                 });
+                await burnMemoPromo();
                 await refoldLocalMember(tx, accountId, app, originIdentity);
                 await refoldEpoch(tx, (await epochForPaidAt(tx, lin, r.paidAt)).timeline_id);
                 return await snapshot();
@@ -1460,6 +1481,7 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
                 payerWallet: wallet, token, mint: r.mint, amountAtomic: r.amountAtomic,
                 paidAt: r.paidAt, verifiedAt: r.verifiedAt, quoteId: r.quoteId, evidence: r.evidence, appliedAt: now(),
             });
+            await burnMemoPromo();
             if (deviceId) await refoldLocalMember(tx, accountId, app, deviceId);
             await refoldEpoch(tx, (await epochForPaidAt(tx, lin, r.paidAt)).timeline_id);
             await bumpGlobal(tx, canonical);
@@ -2600,7 +2622,9 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
         }
         const id = String(identity || '');
         const c = String(code || '').trim().toUpperCase();
-        if (!c) throw codedError('PROMO_INVALID', 'promo code required', { statusCode: 400 });
+        // Shape gate at the ledger too - route validates the codespace, but
+        // the service must never mint a grant for an arbitrary string.
+        if (!/^[A-Z0-9]{14}$/.test(c)) throw codedError('PROMO_INVALID', 'promo code required', { statusCode: 400 });
         return await transaction(async (tx) => {
             const accountId = await ensureAccountTx(tx, appKey, id, {});
             const evtId = `promo:${c}`;

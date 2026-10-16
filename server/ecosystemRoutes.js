@@ -30,6 +30,7 @@ function mountEcosystemRoutes(app, deps = {}) {
         registry = null,
         requestScan = null,
         wakeWorker = null,
+        promoIssued = null,
     } = deps;
 
     const notReady = (res) => res.status(503).json({
@@ -233,6 +234,14 @@ function mountEcosystemRoutes(app, deps = {}) {
             const code = String((req.body || {}).code || '').trim().toUpperCase();
             if (!promoFreeCodeValidFor(who.app, code)) {
                 return res.status(400).json({ success: false, error: 'invalid promo code', code: 'PROMO_INVALID' });
+            }
+            // Shape-valid is not issued: the checksum pepper ships inside
+            // the app bundle, so a mintable-by-anyone code must ALSO exist
+            // in the server-side issued registry (sha256 of each code the
+            // generator emitted). Missing registry/dep => deny, never
+            // silently accept unregistered grants.
+            if (typeof promoIssued !== 'function' || !(await promoIssued(who.app, code))) {
+                return res.status(403).json({ success: false, error: 'promo code not recognized', code: 'PROMO_UNKNOWN' });
             }
             const r = await ecosystem.redeemPromoGrant({ app: who.app, identity: who.identity, code });
             const out = { success: true, accountId: r.accountId, expiresAt: r.expiresAt };

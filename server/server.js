@@ -20007,6 +20007,33 @@ const ecoRequestScan = () => {
     if (timer.unref) timer.unref();
 };
 
+// Free-month promo codes are checksum-shaped on the client, but the pepper
+// lives in the shipped bundle - anyone who extracts it can mint valid-looking
+// codes. A free grant has real cost, so redeem additionally requires the
+// code's sha256 to sit in the server-side issued registry
+// (promo-free-codes.json, written by PaceSeeker/scripts/generate_promo_codes.py
+// -t free). Missing/unparseable registry => nothing was issued => deny all.
+const PROMO_FREE_CODES_FILE = path.join(__dirname, 'promo-free-codes.json');
+let _promoFreeCodesCache = { mtimeMs: -1, map: null };
+const promoFreeIssued = async (app, code) => {
+    try {
+        const st = fs.statSync(PROMO_FREE_CODES_FILE);
+        if (_promoFreeCodesCache.mtimeMs !== st.mtimeMs || !_promoFreeCodesCache.map) {
+            const raw = JSON.parse(fs.readFileSync(PROMO_FREE_CODES_FILE, 'utf8'));
+            _promoFreeCodesCache = { mtimeMs: st.mtimeMs, map: (raw && typeof raw === 'object') ? raw : {} };
+        }
+    } catch (_) {
+        _promoFreeCodesCache = { mtimeMs: -1, map: null };
+        return false;
+    }
+    const key = String(app) === 'lane' ? 'lane' : String(app) === 'paceseeker' ? 'paceseeker' : null;
+    if (!key) return false;
+    const list = _promoFreeCodesCache.map[key];
+    if (!Array.isArray(list) || !list.length) return false;
+    const h = crypto.createHash('sha256').update(String(code || '').trim().toUpperCase()).digest('hex');
+    return list.includes(h);
+};
+
 // ECO2 protocol routes - mounted once after the auth/caller deps above.
 mountEcosystemRoutes(app, {
     auth: ecoMaybeAuth,
@@ -20019,6 +20046,7 @@ mountEcosystemRoutes(app, {
     registry: DEFAULT_REGISTRY,
     requestScan: ecoRequestScan,
     wakeWorker: wakeEcoWorker,
+    promoIssued: promoFreeIssued,
 });
 
 // === ECO_INIT_BEGIN ===

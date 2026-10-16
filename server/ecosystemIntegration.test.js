@@ -742,6 +742,9 @@ test('free-month redeem: single-use globally, local-only grant, stacks, eco bloc
         caller: async (req) => ({ app: String(req.query.app || 'paceseeker'), identity: String(req.query.id || DEV1) }),
         ready: () => true, protocol: () => protocol, ecosystem, signKey: signingKey, registry: DEFAULT_REGISTRY,
         signGrant: (accountId, subUntil) => ({ grant: `ECO1|${accountId}|${subUntil}`, sig: 'testsig' }),
+        // Issued-registry gate: only codes the generator registered may
+        // redeem - checksum shape alone must never suffice for a free grant.
+        promoIssued: async (_app, code) => code === FREE_PROMO || code === FREE_PROMO_2,
     });
     const server = app.listen(0);
     await new Promise((res) => server.once('listening', res));
@@ -757,7 +760,14 @@ test('free-month redeem: single-use globally, local-only grant, stacks, eco bloc
             method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: VALID_PROMO }),
         })).json();
         assert.equal(disc.code, 'PROMO_INVALID', 'PS discount code is not a grant code');
-        // Valid PF code redeems and returns the signed eco block.
+        // Shape-valid but unregistered PF code (e.g. forged with an extracted
+        // pepper): the issued-registry gate denies it.
+        const unregistered = 'PFZZZZZZZZ' + _fnv1a32('PFZZZZZZZZ' + 'PF_PROMO_V1_PEPPER').slice(0, 4).toUpperCase();
+        const unknown = await (await fetch(`http://127.0.0.1:${port}/api/ecosystem/promo/redeem?app=paceseeker&id=${DEV1}`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: unregistered }),
+        })).json();
+        assert.equal(unknown.code, 'PROMO_UNKNOWN', 'unregistered free code denied');
+        // Valid + registered PF code redeems and returns the signed eco block.
         const ok = await (await fetch(`http://127.0.0.1:${port}/api/ecosystem/promo/redeem?app=paceseeker&id=${DEV1}`, {
             method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: FREE_PROMO }),
         })).json();

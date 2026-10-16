@@ -386,21 +386,19 @@ function createEcosystemPaymentService({
         let expectedUsd = (prod.usdCents * months) / 100;
         let flagged = null;
         if (prod.app === 'paceseeker' || prod.app === 'lane') {
-            // Discount only for an actual validated promo: suffix - the
-            // memo's always-present checksum field is not a promo marker
-            // and an unverifiable promo claims no discount. Lane's unquoted
-            // fallback uses the same historical half-price contract.
-            // Discount only for an actual validated promo: suffix - the
-            // memo's always-present checksum field is not a promo marker
-            // and an unverifiable promo claims no discount. The discounted
-            // expectation follows the live promo policy (priceUsd override
-            // or percent); when the policy can't be read it falls back to
-            // the historical half-price contract.
+            // Discount only for an actual validated promo under an ENABLED
+            // policy: the memo checksum alone is not authority (the pepper
+            // lives in the shipped bundle, so a code is forgeable), and a
+            // disabled or unreadable policy must fail closed at full list
+            // price. The checksum field is never a promo marker.
             const policy = await promoPolicy(prod.app).catch(() => null);
-            const promoCents = policy && policy.enabled
+            const policyOn = !!(policy && policy.enabled);
+            const promoCents = policyOn
                 ? promoPriceCents(prod, policy)
                 : Math.round(prod.usdCents * 0.5);
-            if (promo && promoCodeValidFor(prod.app, promo)) expectedUsd = promoCents / 100;
+            const promoOk = promo && promoCodeValidFor(prod.app, promo);
+            if (promoOk && policyOn) expectedUsd = promoCents / 100;
+            else if (promoOk) flagged = 'PROMO_POLICY_DISABLED';
             else if (STABLES.has(token)) {
                 // Ambiguous legacy discount: a ~half-price payment with no
                 // promo marker could not be distinguished from a promo-mode
@@ -507,7 +505,7 @@ function createEcosystemPaymentService({
             const r = await apply({
                 signature: sig, payerWallet: payer, token: insp.transfer.token, mint: insp.transfer.mint,
                 amountAtomic: String(insp.transfer.rawAmount), paidAt: insp.paidAt, verifiedAt: _now(),
-                quoteId,
+                quoteId, promo: insp.promo,
                 evidence: { slot: insp.slot, memo: insp.memo, subjects: subjects || [], flagged: price.flagged || null, ...(quoteEvidence || {}) },
             }, { deviceHash });
             if (r && r.ok === false) {
