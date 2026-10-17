@@ -3790,7 +3790,9 @@ test('admin eco-accounts payload exposes ecosystem init state (real route, VM-ex
 // Compat tables the eco-accounts route reads plus everything
 // createEcosystemService.initialize()/migrateBaseline expects.
 const ECO_ADMIN_DDL = [
-    `CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)`,
+    `CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, seeker_id TEXT, wallet_address TEXT)`,
+    `CREATE TABLE devices (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, device_uuid TEXT, last_seen INTEGER)`,
+    `CREATE TABLE lane_devices (device_hash TEXT PRIMARY KEY, wallet_address TEXT, first_seen INTEGER, last_seen INTEGER, trial_started_at INTEGER, reported_sub_until INTEGER, sub_status TEXT)`,
     `CREATE TABLE user_plans (user_id INTEGER PRIMARY KEY, plan_gb INTEGER, premium_gb INTEGER, premium_expires_at INTEGER, status TEXT, expires_at INTEGER, grace_until INTEGER, trial_until INTEGER, deleted_at INTEGER, payment_type TEXT, payment_at INTEGER, updated_at INTEGER)`,
     `CREATE TABLE files (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, filename TEXT, size INTEGER)`,
     `CREATE TABLE ecosystem_accounts (account_id TEXT PRIMARY KEY, primary_wallet TEXT, created_at INTEGER, ad_strict INTEGER DEFAULT 0, x_handle TEXT, tg_username TEXT, cherry_state TEXT)`,
@@ -3800,7 +3802,7 @@ const ECO_ADMIN_DDL = [
     `CREATE TABLE solana_payments (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, tx_signature TEXT UNIQUE NOT NULL, sol_amount REAL, skr_amount REAL, payment_token TEXT, tier_gb INTEGER, duration TEXT DEFAULT 'monthly', created_at INTEGER, verified_at INTEGER, entitlement_applied_at INTEGER)`,
     `CREATE TABLE solana_subscription_credits (tx_signature TEXT PRIMARY KEY,user_id INTEGER NOT NULL,source TEXT NOT NULL,payment_at INTEGER NOT NULL,expires_before INTEGER,expires_after INTEGER NOT NULL,detail TEXT,created_at INTEGER NOT NULL)`,
     `CREATE TABLE solana_wallet_bindings (wallet TEXT NOT NULL,user_id INTEGER NOT NULL,verified_at INTEGER NOT NULL,PRIMARY KEY(wallet,user_id))`,
-    `CREATE TABLE paceseeker_devices (device_hash TEXT PRIMARY KEY, first_seen INTEGER, last_seen INTEGER, sub_status TEXT, sub_until INTEGER, ad_until INTEGER, sub_signature TEXT, wallet_address TEXT)`,
+    `CREATE TABLE paceseeker_devices (device_hash TEXT PRIMARY KEY, first_seen INTEGER, last_seen INTEGER, trial_expires_at INTEGER, sub_status TEXT, sub_until INTEGER, ad_until INTEGER, sub_signature TEXT, wallet_address TEXT, wallet_domain TEXT)`,
     `CREATE TABLE paceseeker_revenue (signature TEXT PRIMARY KEY, device_hash TEXT, paid_at INTEGER, paid_with TEXT, plan TEXT, usd_at_checkout REAL, amount_atomic INTEGER, reported_at INTEGER, eco_verified INTEGER DEFAULT 0)`,
 ];
 
