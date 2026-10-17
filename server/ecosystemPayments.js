@@ -15,8 +15,8 @@ const USDT_MINT = 'Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB';
 
 // Exact published product prices in USD cents. Yearly = monthly x 12.
 const PLAN_PRICES_CENTS = {
-    'paceseeker.monthly': { app: 'paceseeker', usdCents: 175, tierGb: 0, durations: ['monthly'] },
-    'lane.monthly': { app: 'lane', usdCents: 175, tierGb: 0, durations: ['monthly'] },
+    'paceseeker.monthly': { app: 'paceseeker', usdCents: 399, tierGb: 0, durations: ['monthly'] },
+    'lane.monthly': { app: 'lane', usdCents: 399, tierGb: 0, durations: ['monthly'] },
     'photolynk.storage_100': { app: 'photolynk', usdCents: 175, tierGb: 100, durations: ['monthly', 'yearly'] },
     'photolynk.storage_200': { app: 'photolynk', usdCents: 245, tierGb: 200, durations: ['monthly', 'yearly'] },
     'photolynk.storage_400': { app: 'photolynk', usdCents: 399, tierGb: 400, durations: ['monthly', 'yearly'] },
@@ -84,7 +84,7 @@ function createEcosystemPaymentService({
     ecosystem, signingKey, treasury, tokens, fetchTransaction,
     getPriceBand, evaluatePaymentAmount, resolvePaymentCode, paymentCodeFor,
     treasuryBoundUsers, creditSubscription, creditPremium, resumePremiumPayment,
-    getPremiumPayment, getPromoPolicy, registry, now,
+    getPremiumPayment, getPromoPolicy, getAppRequirementCents, registry, now,
 } = {}) {
     if (!ecosystem || typeof ecosystem.transaction !== 'function') throw codedError('BAD_CONFIG', 'ecosystem service required');
     if (!isNonBlank(treasury)) throw codedError('BAD_CONFIG', 'treasury wallet required');
@@ -173,11 +173,7 @@ function createEcosystemPaymentService({
 
     // Effective monthly charge in cents under a promo policy. priceUsd wins
     // over discountPct and never prices above list or at/under zero.
-    const promoPriceCents = (prod, policy) => {
-        const list = Number(prod.usdCents) || 0;
-        if (policy.priceUsd > 0) return Math.max(1, Math.min(list, Math.round(policy.priceUsd * 100)));
-        return Math.round(list * (100 - policy.discountPct) / 100);
-    };
+    const promoPriceCents = (prod, policy) => promoPriceCentsFor(prod.usdCents, policy);
 
     const tokenPriceUsd = async (token) => {
         if (STABLES.has(token)) return 1;
@@ -397,7 +393,11 @@ function createEcosystemPaymentService({
                 ? promoPriceCents(prod, policy)
                 : Math.round(prod.usdCents * 0.5);
             const promoOk = promo && promoCodeValidFor(prod.app, promo);
-            if (promoOk && policyOn) expectedUsd = promoCents / 100;
+            // 'auto'/'hidden' promo modes are public discounts — no code is
+            // expected or required, so an unquoted payment at the promo price
+            // must still pass. 'code' mode keeps requiring a valid code.
+            if (policyOn && policy.mode !== 'code') expectedUsd = promoCents / 100;
+            else if (promoOk && policyOn) expectedUsd = promoCents / 100;
             else if (promoOk) flagged = 'PROMO_POLICY_DISABLED';
             else if (STABLES.has(token)) {
                 // Ambiguous legacy discount: a ~half-price payment with no
@@ -505,7 +505,7 @@ function createEcosystemPaymentService({
             const r = await apply({
                 signature: sig, payerWallet: payer, token: insp.transfer.token, mint: insp.transfer.mint,
                 amountAtomic: String(insp.transfer.rawAmount), paidAt: insp.paidAt, verifiedAt: _now(),
-                quoteId, promo: insp.promo,
+                quoteId, promo: insp.promo, paidUsdCents: price.usdCents,
                 evidence: { slot: insp.slot, memo: insp.memo, subjects: subjects || [], flagged: price.flagged || null, ...(quoteEvidence || {}) },
             }, { deviceHash });
             if (r && r.ok === false) {
@@ -648,15 +648,34 @@ function createEcosystemPaymentService({
         const subject = String(identity);
         const member = (snapshot.members || []).find((m) => m.app === app && String(m.identity) === subject);
         if (!member) throw codedError('MEMBER_UNKNOWN', 'snapshot has no matching member for this subject');
+        // Cross-app requirement = the app's CURRENT effective price (promo-aware
+        // via the injected getter): a 175¢ stamp opens 175¢-priced apps only —
+        // when promo is off and PS/Lane cost 399¢, a 175¢ stamp no longer
+        // unlocks them. Falls back to the registry floor when unconfigured.
+        const reqCents = typeof getAppRequirementCents === 'function'
+            ? (Number(getAppRequirementCents(String(app))) || Number(appDef.monthlyValueCents))
+            : Number(appDef.monthlyValueCents);
+        // Storage tier from the benefit's VALUE, not the app's base tier: a
+        // 399¢ stamp unlocks PL 400GB, a 175¢ stamp unlocks 100GB.
+        const tierForSharedValue = (cents) => {
+            const v = Number(cents) || 0;
+            let best = 0;
+            for (const p of Object.values((registry && registry.products) || {})) {
+                if (!p || p.app !== app || p.premium || !(Number(p.tierGb) > 0)) continue;
+                const val = Number(p.monthlyValueCents) || 0;
+                if (val > 0 && val <= v) best = Math.max(best, Number(p.tierGb));
+            }
+            return best;
+        };
         const benefits = [];
         for (const s of snapshot.sources || []) {
             const isShared = s.scope === 'shared';
             const isLocal = (s.scope === 'local' || s.scope === 'shared_local')
                 && s.app === app && String(s.identity) === subject;
             if (!isShared && !isLocal) continue;
-            if (isShared && !(Number(s.monthlyValueCents) >= Number(appDef.monthlyValueCents))) continue;
+            if (isShared && !(Number(s.monthlyValueCents) >= reqCents)) continue;
             const planGb = isShared
-                ? (appDef.benefit === 'storage' ? (Number(appDef.tierGb) || 0) : 0)
+                ? (appDef.benefit === 'storage' ? tierForSharedValue(s.monthlyValueCents) : 0)
                 : (Number(s.tierGb) || 0);
             benefits.push({
                 eventId: s.eventId, kind: s.kind || 'payment',
@@ -705,4 +724,14 @@ function createEcosystemPaymentService({
     };
 }
 
-module.exports = { createEcosystemPaymentService, USDC_MINT, USDT_MINT, promoCodeValid, promoCodeValidFor, promoFreeCodeValidFor, BASE58_SIG_RE };
+module.exports = { createEcosystemPaymentService, USDC_MINT, USDT_MINT, promoCodeValid, promoCodeValidFor, promoFreeCodeValidFor, promoPriceCentsFor, PLAN_PRICES_CENTS, BASE58_SIG_RE };
+
+// Module-level twin of the closure inside the service: effective monthly
+// charge in cents under a promo policy — priceUsd wins over discountPct,
+// clamped to (0, list].
+function promoPriceCentsFor(listCents, policy) {
+    const list = Number(listCents) || 0;
+    const p = policy || {};
+    if (Number(p.priceUsd) > 0) return Math.max(1, Math.min(list, Math.round(Number(p.priceUsd) * 100)));
+    return Math.round(list * (100 - (Number(p.discountPct) || 0)) / 100);
+}

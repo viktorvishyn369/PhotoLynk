@@ -15,7 +15,7 @@ const crypto = require('crypto');
 const express = require('express');
 const sqlite3 = require('sqlite3');
 const { createEcosystemService, DEFAULT_REGISTRY } = require('./ecosystemEntitlements');
-const { createEcosystemPaymentService } = require('./ecosystemPayments');
+const { createEcosystemPaymentService, promoPriceCentsFor, PLAN_PRICES_CENTS } = require('./ecosystemPayments');
 const { mountEcosystemRoutes } = require('./ecosystemRoutes');
 
 const createdDirs = [];
@@ -115,7 +115,22 @@ const mkStack = async () => {
     const txMap = new Map();
     const signingKey = crypto.generateKeyPairSync('ed25519').privateKey;
 
-    const ecosystem = createEcosystemService({ sqlite3, dbPath: file, registry: DEFAULT_REGISTRY, now });
+    // Mirrors production ecoGetAppRequirementCents: PS/Lane require their
+    // current effective monthly price (promo-aware via state.promo);
+    // PhotoLynk keeps the registry floor — the stamped value picks the tier.
+    const appRequirementCents = (app) => {
+        if (app === 'paceseeker' || app === 'lane') {
+            const list = PLAN_PRICES_CENTS[`${app}.monthly`].usdCents;
+            return state.promo.enabled ? promoPriceCentsFor(list, state.promo) : list;
+        }
+        const def = DEFAULT_REGISTRY.apps[app];
+        return def ? def.monthlyValueCents : 0;
+    };
+
+    const ecosystem = createEcosystemService({
+        sqlite3, dbPath: file, registry: DEFAULT_REGISTRY, now,
+        getAppRequirementCents: appRequirementCents,
+    });
     await ecosystem.initialize();
 
     const paymentCodeFor = (id) => `c0de${Number(id).toString(16).padStart(4, '0')}`;
@@ -172,6 +187,7 @@ const mkStack = async () => {
             return { applied: true, isPremium: true };
         },
         getPromoPolicy: async () => state.promo,
+        getAppRequirementCents: appRequirementCents,
         registry: DEFAULT_REGISTRY,
         now,
     });
@@ -300,7 +316,7 @@ test('quote reuse requires same payer+promo; PL promo is rejected outright', asy
         'PL premium cannot take a PS promo');
     const q3 = await protocol.issueQuote({ app: 'paceseeker', identity: DEV1, productId: 'paceseeker.monthly', token: 'USDC', payerWallet: P1, promoCode: VALID_PROMO });
     const p3 = JSON.parse(q3.payload);
-    assert.equal(p3.usdCents, 88, 'PS promo applies the 50% discount on the $1.75 list, rounded');
+    assert.equal(p3.usdCents, 200, 'PS promo applies the 50% discount on the $3.99 list, rounded');
     const q4 = await protocol.issueQuote({ app: 'paceseeker', identity: DEV1, productId: 'paceseeker.monthly', token: 'USDC', payerWallet: P1, promoCode: VALID_PROMO });
     assert.equal(q4.quoteId, q3.quoteId, 'same promo request reuses');
     const q5 = await protocol.issueQuote({ app: 'paceseeker', identity: DEV1, productId: 'paceseeker.monthly', token: 'USDC', payerWallet: P1 });
@@ -695,9 +711,9 @@ const DAY = 24 * 60 * 60 * 1000;
 test('fixed final price wins over percentage; disabled promo fails closed', async () => {
     const { conn, ecosystem, protocol, state } = await mkStack();
     await ecosystem.ensureAccount('paceseeker', DEV1, {});
-    // Percentage default: 50% off the $1.75 list -> 88c.
+    // Percentage default: 50% off the $3.99 list -> 200c.
     let q = await protocol.issueQuote({ app: 'paceseeker', identity: DEV1, productId: 'paceseeker.monthly', token: 'USDC', payerWallet: P1, promoCode: VALID_PROMO });
-    assert.equal(JSON.parse(q.payload).usdCents, 88);
+    assert.equal(JSON.parse(q.payload).usdCents, 200);
     // Fixed final price takes precedence and ignores the percentage.
     // (Fresh code — a quote reserves its promo, reusing it throws PROMO_TAKEN.)
     state.promo = { enabled: true, discountPct: 50, priceUsd: 1.19, mode: 'code' };
@@ -714,12 +730,13 @@ test('fixed final price wins over percentage; disabled promo fails closed', asyn
     await closeDb(conn);
 });
 
-test('PS/Lane monthly price is 175c; old 399c overpayment still accepted', async () => {
-    const { conn, clock, txMap, ecosystem, protocol } = await mkStack();
+test('PS/Lane monthly list price is 399c; SOL payment at list applies', async () => {
+    const { conn, clock, txMap, ecosystem, protocol, state } = await mkStack();
+    state.promo = { enabled: false, discountPct: 0, mode: 'auto' };
     await ecosystem.ensureAccount('paceseeker', DEV1, { wallet: P1, proofKind: 'bind', proofRef: 'p1' });
     const q = await protocol.issueQuote({ app: 'paceseeker', identity: DEV1, productId: 'paceseeker.monthly', token: 'USDC', payerWallet: P1 });
-    assert.equal(JSON.parse(q.payload).usdCents, 175, 'PS list price is $1.75');
-    // Legacy $3.99 payment (old client): overpayment above the quote applies.
+    assert.equal(JSON.parse(q.payload).usdCents, 399, 'PS list price is $3.99');
+    // $3.99 SOL payment binds to the quote and applies.
     const lamports = 39_900_000; // $3.99 at the mocked $100 SOL band
     const sig = SIG('old399');
     txMap.set(sig, mkSolTx({
@@ -727,7 +744,7 @@ test('PS/Lane monthly price is 175c; old 399c overpayment still accepted', async
         memos: [`PS1|monthly|${clock.t}|deadbeef`, `SLQ1|${q.quoteId}`],
     }));
     const r = await protocol.processSignature(sig, { subjects: [] });
-    assert.equal(r.status, 'applied', 'old-app $3.99 payment remains valid');
+    assert.equal(r.status, 'applied', 'list-price $3.99 payment applies');
     await closeDb(conn);
 });
 
@@ -811,8 +828,11 @@ test('free-month redeem: single-use globally, local-only grant, stacks, eco bloc
     await closeDb(conn);
 });
 
-test('PhotoLynk 100GB binds the shared floor at 175c and activates PS/Lane; 1TB lifts all', async () => {
-    const { conn, clock, txMap, ecosystem, protocol } = await mkStack();
+test('PhotoLynk 100GB binds the shared floor at 175c and activates PS/Lane while their promo price is 175c', async () => {
+    const { conn, clock, txMap, ecosystem, protocol, state } = await mkStack();
+    // Production auto-promo shape: PS/Lane effectively sell at $1.75, so a
+    // 175c shared stamp (PL 100GB) reaches across to every app.
+    state.promo = { enabled: true, priceUsd: 1.75, mode: 'auto' };
     await runOn(conn, `INSERT INTO users (id,email) VALUES (1,'a@b.c')`);
     const acct = await ecosystem.ensureAccount('photolynk', '1', {});
     await runOn(conn, `INSERT INTO ecosystem_members (account_id,app,identity,linked_at) VALUES (?,?,?,?)`, [acct, 'paceseeker', DEV1, clock.t]);
@@ -837,5 +857,54 @@ test('PhotoLynk 100GB binds the shared floor at 175c and activates PS/Lane; 1TB 
     assert.equal(ln.active, true, '100GB activates Lane');
     assert.equal(pl.planGb, 100, 'PL member keeps its own 100GB tier');
     assert.ok(Number(snap.sharedUntil) >= paidAtMs + 29 * DAY, 'shared floor lifted');
+    await closeDb(conn);
+});
+
+test('full-cost mode: PL 100/200 stamps stay below the $3.99 requirement; a $3.99 payment grants PL 400GB', async () => {
+    const { conn, clock, txMap, ecosystem, protocol, state } = await mkStack();
+    state.promo = { enabled: false, discountPct: 0, mode: 'auto' };
+    await runOn(conn, `INSERT INTO users (id,email) VALUES (1,'a@b.c')`);
+    const acct = await ecosystem.ensureAccount('photolynk', '1', {});
+    const LNDEV = 'ln_' + 'c'.repeat(24);
+    await runOn(conn, `INSERT INTO ecosystem_members (account_id,app,identity,linked_at) VALUES (?,?,?,?)`, [acct, 'paceseeker', DEV1, clock.t]);
+    await runOn(conn, `INSERT INTO ecosystem_members (account_id,app,identity,linked_at) VALUES (?,?,?,?)`, [acct, 'lane', LNDEV, clock.t]);
+    // Wallet proof so the quoted Lane payment attributes to this account.
+    await runOn(conn, `INSERT INTO ecosystem_member_proofs (app,identity,wallet,kind,reference,verified_at) VALUES ('lane',?,?,?,?,?)`, [LNDEV, P1, 'bind', 'test', clock.t]);
+
+    // A $1.75 PL 100GB payment stamps 175c — below the 399c PS/Lane
+    // requirement, so no cross-app unlock while they sell at full price.
+    const q100 = await protocol.issueQuote({ app: 'photolynk', identity: '1', productId: 'photolynk.storage_100', token: 'SOL', payerWallet: P1 });
+    const p100 = JSON.parse(q100.payload);
+    const sig100 = SIG('plx100');
+    txMap.set(sig100, mkSolTx({
+        sig: sig100, payer: P1, lamports: Number(p100.amountAtomic), blockTime: secsNow(clock),
+        memos: ['PhotoLynk:sub:100:monthly', `SLQ1|${q100.quoteId}`],
+    }));
+    const r100 = await protocol.processSignature(sig100, { subjects: [] });
+    assert.equal(r100.status, 'applied', JSON.stringify(r100));
+    let snap = await ecosystem.resolveAccount(acct, { at: secsNow(clock) * 1000 + 1000 });
+    assert.equal(snap.members.find((m) => m.app === 'paceseeker').active, false, 'PL 100GB does not unlock $3.99 PaceSeeker');
+    assert.equal(snap.members.find((m) => m.app === 'lane').active, false, 'PL 100GB does not unlock $3.99 Lane');
+    assert.equal(snap.members.find((m) => m.app === 'photolynk').planGb, 100, 'PL keeps its own 100GB');
+
+    // A full-price $3.99 Lane payment stamps 399c — unlocks everything and
+    // lifts the PL member to the 400GB tier the stamp covers.
+    clock.t += DAY;
+    const qLn = await protocol.issueQuote({ app: 'lane', identity: LNDEV, productId: 'lane.monthly', token: 'SOL', payerWallet: P1 });
+    const pLn = JSON.parse(qLn.payload);
+    assert.equal(pLn.usdCents, 399, 'lane.monthly lists at $3.99');
+    const sigLn = SIG('ln399f');
+    txMap.set(sigLn, mkSolTx({
+        sig: sigLn, payer: P1, lamports: Number(pLn.amountAtomic), blockTime: secsNow(clock),
+        memos: [`LN1|monthly|${clock.t}|deadbeef`, `SLQ1|${qLn.quoteId}`],
+    }));
+    const rLn = await protocol.processSignature(sigLn, { subjects: [] });
+    assert.equal(rLn.status, 'applied', JSON.stringify(rLn));
+    snap = await ecosystem.resolveAccount(acct, { at: secsNow(clock) * 1000 + 1000 });
+    assert.equal(snap.members.find((m) => m.app === 'paceseeker').active, true, '$3.99 Lane payment unlocks PaceSeeker');
+    assert.equal(snap.members.find((m) => m.app === 'lane').active, true, '$3.99 Lane payment keeps Lane active');
+    assert.equal(snap.members.find((m) => m.app === 'photolynk').planGb, 400, '$3.99 stamp lifts PL to 400GB');
+    const rec = await getOn(conn, `SELECT usd_cents FROM ecosystem_receipts WHERE signature = ?`, [sigLn]);
+    assert.equal(Number(rec.usd_cents), 399, 'receipt records the effective paid cents');
     await closeDb(conn);
 });

@@ -101,7 +101,7 @@ const finiteOr = (v, d) => (Number.isFinite(Number(v)) ? Number(v) : d);
 
 const SCHEMA_DDL = [
     `CREATE TABLE IF NOT EXISTS ecosystem_meta (key TEXT PRIMARY KEY,value TEXT NOT NULL)`,
-    `CREATE TABLE IF NOT EXISTS ecosystem_receipts (signature TEXT PRIMARY KEY,account_id TEXT,app TEXT NOT NULL,product_id TEXT NOT NULL,duration TEXT,origin_identity TEXT NOT NULL,payer_wallet TEXT,token TEXT,mint TEXT,amount_atomic TEXT,paid_at INTEGER NOT NULL,verified_at INTEGER,quote_id TEXT,policy_version INTEGER NOT NULL,evidence_json TEXT,applied_at INTEGER,legacy_accounted INTEGER NOT NULL DEFAULT 0)`,
+    `CREATE TABLE IF NOT EXISTS ecosystem_receipts (signature TEXT PRIMARY KEY,account_id TEXT,app TEXT NOT NULL,product_id TEXT NOT NULL,duration TEXT,origin_identity TEXT NOT NULL,payer_wallet TEXT,token TEXT,mint TEXT,amount_atomic TEXT,paid_at INTEGER NOT NULL,verified_at INTEGER,quote_id TEXT,policy_version INTEGER NOT NULL,evidence_json TEXT,applied_at INTEGER,legacy_accounted INTEGER NOT NULL DEFAULT 0,usd_cents INTEGER)`,
     `CREATE TABLE IF NOT EXISTS ecosystem_events (event_id TEXT PRIMARY KEY,account_id TEXT,source_kind TEXT NOT NULL,source_app TEXT,source_ref TEXT,policy_version INTEGER NOT NULL,payload_json TEXT,created_at INTEGER NOT NULL)`,
     `CREATE TABLE IF NOT EXISTS ecosystem_benefits (event_id TEXT NOT NULL,account_id TEXT,app TEXT NOT NULL,identity TEXT NOT NULL,benefit TEXT NOT NULL,starts_at INTEGER NOT NULL,expires_at INTEGER,tier_gb INTEGER NOT NULL DEFAULT 0,monthly_value_cents INTEGER NOT NULL DEFAULT 0,scope TEXT NOT NULL,revoked_at INTEGER,value_json TEXT,PRIMARY KEY(event_id,app,identity,benefit))`,
     `CREATE TABLE IF NOT EXISTS ecosystem_jobs (job_key TEXT PRIMARY KEY,kind TEXT NOT NULL,reference_id TEXT NOT NULL,payload_json TEXT,state TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,next_attempt_at INTEGER NOT NULL,lease_until INTEGER,lease_token TEXT,last_error_code TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL)`,
@@ -122,7 +122,7 @@ const SCHEMA_DDL = [
     `CREATE INDEX IF NOT EXISTS idx_eco_aliases_acct ON ecosystem_aliases(account_id)`,
 ];
 
-function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, now = () => Date.now() } = {}) {
+function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, now = () => Date.now(), getAppRequirementCents = null } = {}) {
     if (!sqlite3) throw codedError('CONFIG_INVALID', 'sqlite3 module required');
     if (!isNonBlank(dbPath)) throw codedError('CONFIG_INVALID', 'dbPath required');
     if (!registry || !registry.apps || !registry.products) throw codedError('REGISTRY_INVALID', 'registry.apps/products required');
@@ -231,6 +231,39 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
         if (!a) return null;
         const v = Number(a.monthlyValueCents);
         return (Number.isInteger(v) && v > 0 && v <= SHARED_VALUE_CENTS) ? a : null;
+    };
+
+    // Cross-app activation requirement: the app's CURRENT effective monthly
+    // price in cents (promo-aware via the injected getter). A shared benefit
+    // only unlocks an app when its stamped value covers that price — a 175¢
+    // stamp opens the apps while they sell at $1.75 promo, not when they
+    // sell at $3.99. Falls back to the registry floor when unconfigured.
+    const requirementCents = (app) => {
+        if (typeof getAppRequirementCents === 'function') {
+            try {
+                const v = Number(getAppRequirementCents(String(app)));
+                if (Number.isFinite(v) && v > 0) return v;
+            } catch (_) { /* fall through to registry */ }
+        }
+        const def = own(registry.apps, app);
+        return def ? (Number(def.monthlyValueCents) || 0) : 0;
+    };
+
+    // Value stamp for a receipt: the largest registry product value the paid
+    // amount covers (5% tolerance absorbs quote→verify price-band drift on
+    // SOL/SKR), never below the product's own declared value. A $1.75 Lane
+    // payment stamps 175 (all apps at promo price); a $3.99 one stamps 399
+    // (all apps + PhotoLynk 400GB). Receipts without a persisted usd_cents
+    // (legacy absorb / heartbeat mirror) stamp the product value as before.
+    const stampForReceipt = (product, paidUsdCents) => {
+        let stamp = Number(product.monthlyValueCents) || 0;
+        const paid = Number(paidUsdCents);
+        if (!Number.isFinite(paid) || paid <= 0) return stamp;
+        for (const p of Object.values(registry.products || {})) {
+            const v = Number(p && p.monthlyValueCents) || 0;
+            if (v > stamp && v <= paid * 1.05) stamp = v;
+        }
+        return stamp;
     };
 
     const validateIdentity = async (tx, app, identity) => {
@@ -475,7 +508,7 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
             return b.app === member.app && String(b.identity) === String(member.identity);
         if (b.scope === 'shared') {
             const appDef = supportedApp(member.app);
-            return !!appDef && Number(b.monthly_value_cents) >= Number(appDef.monthlyValueCents);
+            return !!appDef && Number(b.monthly_value_cents) >= requirementCents(member.app);
         }
         return false;
     };
@@ -573,7 +606,7 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
 
     const sharedFoldEvents = async (tx, lineageId, { w0 = 0, w1 = Number.MAX_SAFE_INTEGER, beforeTs = null } = {}) => {
         const receipts = await tx.all(
-            `SELECT signature, paid_at, product_id, duration FROM ecosystem_receipts
+            `SELECT signature, paid_at, product_id, duration, usd_cents FROM ecosystem_receipts
              WHERE account_id = ? AND COALESCE(legacy_accounted,0) = 0 AND paid_at > ? AND paid_at <= ?
              ORDER BY paid_at, signature`, [String(lineageId), w0, w1]);
         const out = [];
@@ -582,7 +615,7 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
             if (!product || !product.ecosystem) continue;
             let dur = null;
             try { dur = durationFor(product, r.product_id, r.duration || 'monthly'); } catch (_) { continue; }
-            out.push({ ts: Number(r.paid_at), kind: 'receipt', dur, id: r.signature, valueCents: Number(product.monthlyValueCents) || 0 });
+            out.push({ ts: Number(r.paid_at), kind: 'receipt', dur, id: r.signature, valueCents: stampForReceipt(product, r.usd_cents) });
         }
         const actions = await readOverrideList(tx, lineageId);
         for (const a of actions) {
@@ -698,10 +731,10 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
             }
             if (end > 0 && !stampedValue) {
                 const valRows = await tx.all(
-                    `SELECT product_id FROM ecosystem_receipts WHERE account_id = ?`, [e.account_id]);
+                    `SELECT product_id, usd_cents FROM ecosystem_receipts WHERE account_id = ?`, [e.account_id]);
                 for (const rv of valRows) {
                     const prod = own(registry.products, rv.product_id);
-                    if (prod && prod.ecosystem) stampedValue = Math.max(stampedValue, Number(prod.monthlyValueCents) || 0);
+                    if (prod && prod.ecosystem) stampedValue = Math.max(stampedValue, stampForReceipt(prod, rv.usd_cents));
                 }
             }
             if (sawNonReceipt || (end > 0 && !stampedValue)) stampedValue = Math.max(stampedValue, SHARED_VALUE_CENTS);
@@ -961,17 +994,18 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
                 throw e;
             }
         }
-        return tx.run(`INSERT OR IGNORE INTO ecosystem_receipts (signature,account_id,app,product_id,duration,origin_identity,payer_wallet,token,mint,amount_atomic,paid_at,verified_at,quote_id,policy_version,evidence_json,applied_at,legacy_accounted)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+        return tx.run(`INSERT OR IGNORE INTO ecosystem_receipts (signature,account_id,app,product_id,duration,origin_identity,payer_wallet,token,mint,amount_atomic,paid_at,verified_at,quote_id,policy_version,evidence_json,applied_at,legacy_accounted,usd_cents)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
             [r.signature, r.accountId || null, r.app, r.productId, r.duration || null, String(r.originIdentity), r.payerWallet || null,
              r.token || null, r.mint || null, r.amountAtomic || null, r.paidAt, r.verifiedAt == null ? null : r.verifiedAt,
              r.quoteId || null, r.policyVersion || POLICY_VERSION, JSON.stringify(r.evidence == null ? null : r.evidence),
-             r.appliedAt == null ? null : r.appliedAt, r.legacyAccounted ? 1 : 0]);
+             r.appliedAt == null ? null : r.appliedAt, r.legacyAccounted ? 1 : 0,
+             Number.isFinite(Number(r.usdCents)) && Number(r.usdCents) > 0 ? Math.round(Number(r.usdCents)) : null]);
     };
 
     const conflictResult = (conflicting) => ({ ok: false, code: 'PAYMENT_CONFLICT', conflicting });
     const RECEIPT_FIELDS = ['app', 'product_id', 'origin_identity', 'duration', 'token', 'mint', 'payer_wallet', 'amount_atomic', 'quote_id'];
-    const receiptCheck = async (tx, { signature, app, productId, duration, originIdentity, token, mint, payerWallet, amountAtomic, quoteId, paidAt, verifiedAt }) => {
+    const receiptCheck = async (tx, { signature, app, productId, duration, originIdentity, token, mint, payerWallet, amountAtomic, quoteId, paidAt, verifiedAt, usdCents }) => {
         const existing = await tx.get(`SELECT * FROM ecosystem_receipts WHERE signature = ?`, [signature]);
         if (!existing) return null;
         const incoming = {
@@ -996,6 +1030,12 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
         }
         if (existing.verified_at == null && isFiniteMs(verifiedAt)) fills.verified_at = Number(verifiedAt);
         if (existing.applied_at == null && productId !== 'photolynk.premium') fills.applied_at = now();
+        // usd_cents is verification-derived (never a conflict field): backfill
+        // it when a re-check sees the effective paid value the first write
+        // lacked. Refold re-stamps the shared benefit from the new value.
+        if (existing.usd_cents == null && Number.isFinite(Number(usdCents)) && Number(usdCents) > 0) {
+            fills.usd_cents = Math.round(Number(usdCents));
+        }
         if (!identical) {
             await recordConflict(tx, signature, app, originIdentity,
                 `conflicts with ${existing.app}/${existing.product_id}/${existing.origin_identity}/${existing.duration || '-'}/${existing.token || '-'}`);
@@ -1410,7 +1450,7 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
             const prior = await receiptCheck(tx, {
                 signature: sig, app, productId, duration: 'monthly', originIdentity,
                 token, payerWallet: wallet, amountAtomic: r.amountAtomic, quoteId: r.quoteId,
-                mint: r.mint, paidAt: r.paidAt, verifiedAt: r.verifiedAt,
+                mint: r.mint, paidAt: r.paidAt, verifiedAt: r.verifiedAt, usdCents: r.paidUsdCents,
             });
             if (prior && prior.conflict) return conflictResult(prior.conflict);
             // Burn the memo-carried promo on any successful apply: a quote
@@ -1459,7 +1499,7 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
                     signature: sig, accountId: lin, app, productId, duration: 'monthly', originIdentity,
                     payerWallet: wallet, token, mint: r.mint, amountAtomic: r.amountAtomic,
                     paidAt: r.paidAt, verifiedAt: r.verifiedAt, quoteId: r.quoteId, evidence: r.evidence,
-                    appliedAt: now(), legacyAccounted: true,
+                    appliedAt: now(), legacyAccounted: true, usdCents: r.paidUsdCents,
                 });
                 await burnMemoPromo();
                 await refoldLocalMember(tx, accountId, app, originIdentity);
@@ -1483,6 +1523,7 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
                 signature: sig, accountId: lin, app, productId, duration: 'monthly', originIdentity,
                 payerWallet: wallet, token, mint: r.mint, amountAtomic: r.amountAtomic,
                 paidAt: r.paidAt, verifiedAt: r.verifiedAt, quoteId: r.quoteId, evidence: r.evidence, appliedAt: now(),
+                usdCents: r.paidUsdCents,
             });
             await burnMemoPromo();
             if (deviceId) await refoldLocalMember(tx, accountId, app, deviceId);
@@ -2578,6 +2619,9 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
             for (const ddl of SCHEMA_DDL) await tx.run(ddl);
             if (!(await columnExists(tx, 'ecosystem_receipts', 'duration'))) {
                 await tx.run(`ALTER TABLE ecosystem_receipts ADD COLUMN duration TEXT`);
+            }
+            if (!(await columnExists(tx, 'ecosystem_receipts', 'usd_cents'))) {
+                await tx.run(`ALTER TABLE ecosystem_receipts ADD COLUMN usd_cents INTEGER`);
             }
             if (!(await columnExists(tx, 'ecosystem_projection_state', 'source_kind'))) {
                 await tx.run(`ALTER TABLE ecosystem_projection_state ADD COLUMN source_kind TEXT`);

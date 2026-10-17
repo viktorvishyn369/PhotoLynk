@@ -19,7 +19,7 @@ const updater = require('./updater');
 const paymentRecovery = require('./paymentRecovery');
 const { ensurePaceSeekerSchema, ensureLaneSchema, createSubscriptionReadiness } = require('./subscriptionSchema');
 const { createEcosystemService, DEFAULT_REGISTRY, storageTierForValue } = require('./ecosystemEntitlements');
-const { createEcosystemPaymentService, USDC_MINT, USDT_MINT } = require('./ecosystemPayments');
+const { createEcosystemPaymentService, USDC_MINT, USDT_MINT, promoPriceCentsFor, PLAN_PRICES_CENTS } = require('./ecosystemPayments');
 const { mountEcosystemRoutes } = require('./ecosystemRoutes');
 let sharp;
 try { sharp = require('sharp'); console.log('[Server] sharp loaded'); } catch (e) { sharp = null; console.log('[Server] sharp failed to load:', e.message); }
@@ -5401,7 +5401,7 @@ if (!ECO_SIGNING_KEY) console.warn('[Eco] WARNING: no RC signing key — ecosyst
 // rest of the server; initialized in the readiness chain at the bottom of the
 // file. `ecosystemReady` flips true only after schema + baseline migration
 // committed, so no route/worker touches core state before it is durable.
-const ecosystem = createEcosystemService({ sqlite3, dbPath: DB_PATH, registry: DEFAULT_REGISTRY });
+const ecosystem = createEcosystemService({ sqlite3, dbPath: DB_PATH, registry: DEFAULT_REGISTRY, getAppRequirementCents: ecoGetAppRequirementCents });
 let ecosystemReady = false;
 let paymentProtocol = null; // created once treasury helpers exist
 // Admin-visible ecosystem-core startup state: { ok, code, message, at,
@@ -6626,6 +6626,14 @@ app.get('/api/ecosystem/status', ecoRateLimiter, ecoMaybeAuth, async (req, res) 
             // caller's own plan expiry so a claimed week shows as subscribed.
             const plan = await dbGetAsync(`SELECT expires_at FROM user_plans WHERE user_id = ?`, [Number(who.identity)]).catch(() => null);
             localUntil = Math.max(localUntil, Number(plan?.expires_at) || 0);
+        } else if (who.app === 'lane') {
+            // Lane identity is a device hash — local + shared paid time lives
+            // in the entitlement projection (lane_devices has no expiry col).
+            const snap = ecosystemReady
+                ? await ecosystem.resolveAccount(who.accountId, { project: true }).catch(() => null)
+                : null;
+            const m = snap && (snap.members || []).find((x) => x.app === 'lane' && String(x.identity) === String(who.identity));
+            localUntil = Math.max(localUntil, Number(m && m.expiresAt) || 0);
         }
         res.json({
             accountId: who.accountId,
@@ -6979,6 +6987,15 @@ app.post('/api/ecosystem/ad-claim', ecoRateLimiter, ecoMaybeAuth, async (req, re
                 const sharedUntil = (!la || la === 'paceseeker') ? (Number(sub?.sub_until) || 0) : 0;
                 const dev = await dbGetAsync(`SELECT ad_until FROM paceseeker_devices WHERE device_hash = ?`, [String(who.identity)]);
                 return Math.max(sharedUntil, Number(dev?.ad_until) || 0);
+            }
+            if (who.app === 'lane') {
+                // Lane identity is a device hash (non-numeric) — its effective
+                // expiry lives in the entitlement projection, not user_plans.
+                const snap = ecosystemReady
+                    ? await ecosystem.resolveAccount(who.accountId, { project: true }).catch(() => null)
+                    : null;
+                const m = snap && (snap.members || []).find((x) => x.app === 'lane' && String(x.identity) === String(who.identity));
+                return Number(m && m.expiresAt) || 0;
             }
             return Number((await dbGetAsync(`SELECT expires_at FROM user_plans WHERE user_id = ?`, [Number(who.identity)]))?.expires_at) || 0;
         };
@@ -20419,6 +20436,52 @@ const ecoGetPromoPolicy = async (app = 'paceseeker') => {
     }
 };
 
+// Cross-app activation requirement (cents): a shared benefit only unlocks an
+// app when its stamped value covers the app's CURRENT effective monthly
+// price. Promo enabled (any mode — a code-mode payment can still be a legit
+// discount) → the promo price, so a $1.75 payment unlocks all apps. Promo
+// off, or the config unreadable (fail closed — same direction as
+// priceCheck's full-price default) → list price: $3.99 for PS/Lane means a
+// PhotoLynk 100/200GB stamp (175/245¢) no longer reaches across, while a
+// 400GB stamp (399¢) does. PhotoLynk's requirement stays its registry floor:
+// any shared value activates it and the stamped value picks the tier.
+// Function declaration (hoisted) so createEcosystemService at module load
+// can pass it by reference; memoized on the config file's mtime.
+const _ecoAppReqCache = { mtimeMs: -1, cents: {} };
+function ecoGetAppRequirementCents(app) {
+    const key = String(app);
+    if (key !== 'paceseeker' && key !== 'lane') {
+        const def = DEFAULT_REGISTRY.apps[key];
+        return def ? (Number(def.monthlyValueCents) || 0) : 0;
+    }
+    const listCents = Number((PLAN_PRICES_CENTS[`${key}.monthly`] || {}).usdCents)
+        || Number((DEFAULT_REGISTRY.apps[key] || {}).monthlyValueCents) || 0;
+    try {
+        const cfgPath = path.join(__dirname, 'remote-config.json');
+        const mtimeMs = fs.statSync(cfgPath).mtimeMs;
+        if (mtimeMs !== _ecoAppReqCache.mtimeMs) {
+            const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+            const cents = {};
+            for (const a of ['paceseeker', 'lane']) {
+                const section = a === 'lane'
+                    ? (cfg && cfg.lane && typeof cfg.lane.payload === 'string' ? cfg.lane.payload : null)
+                    : (cfg && cfg.payload ? cfg.payload : null);
+                let payload = {};
+                try { payload = section ? JSON.parse(section) : {}; } catch (_) { payload = {}; }
+                const list = Number((PLAN_PRICES_CENTS[`${a}.monthly`] || {}).usdCents) || listCents || 399;
+                cents[a] = payload.subPromoEnabled
+                    ? promoPriceCentsFor(list, { priceUsd: payload.subPromoPriceUsd, discountPct: payload.subPromoDiscountPct })
+                    : list;
+            }
+            _ecoAppReqCache.mtimeMs = mtimeMs;
+            _ecoAppReqCache.cents = cents;
+        }
+        return Number(_ecoAppReqCache.cents[key]) || listCents;
+    } catch (_) {
+        return listCents;
+    }
+}
+
 // Repair for pending ad claims stranded by a crash between the status
 // write and the grant apply. Processes one bounded page per worker pass,
 // advancing a monotonically increasing id cursor so a transient failure on
@@ -20575,6 +20638,7 @@ const ecoTryInitialize = async () => {
             getPremiumPayment: async (signature) =>
                 dbGetAsync(`SELECT * FROM solana_payments WHERE tx_signature = ?`, [String(signature)]),
             getPromoPolicy: ecoGetPromoPolicy,
+            getAppRequirementCents: ecoGetAppRequirementCents,
             registry: DEFAULT_REGISTRY,
             now: () => Date.now(),
         });

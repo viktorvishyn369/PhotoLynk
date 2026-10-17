@@ -3791,7 +3791,7 @@ test('ecoTryInitialize: init failure keeps legacy mode, records state, unref bac
         const getPriceBand = () => null, evaluatePaymentAmount = () => null;
         const treasuryUserByPaymentCode = async () => null, paymentCodeFor = () => '', treasuryBoundUsers = async () => [];
         const creditSolanaSubscription = async () => ({}), recordVerifiedPremiumPayment = async () => ({}), resumePremiumPayment = async () => ({});
-        const dbGetAsync = async () => null, ecoGetPromoPolicy = async () => null;
+        const dbGetAsync = async () => null, ecoGetPromoPolicy = async () => null, ecoGetAppRequirementCents = () => 0;
         const DEFAULT_REGISTRY = {};
         ${extractMarked('ECO_INIT')}
         ;({ ecoTryInitialize, ecosystem,
