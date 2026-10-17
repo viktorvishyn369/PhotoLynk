@@ -1,5 +1,7 @@
 # PhotoLynk — Self‑Hosted. Encrypted Cloud. Android ↔ Desktop.
 
+<img src="server/public/images/logo_photolynk.png" alt="PhotoLynk" width="120">
+
 **A project by <a href="https://stealthlynk.io" target="_blank">StealthLynk LLC</a>** — Building secure, privacy-respecting infrastructure for real-world digital systems.
 
 Back up photos/videos to your own server or StealthCloud, and restore on any phone with the same credentials.
