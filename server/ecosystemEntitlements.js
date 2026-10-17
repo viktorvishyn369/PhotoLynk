@@ -4,6 +4,9 @@ const { withDatabaseWriter } = require('./paymentRecovery');
 
 const DAY_MS = 86400000;
 const WEEK_MS = 7 * DAY_MS;
+// Device free trial length shared by all three apps — used when stacking an
+// ad week on a member's still-running local trial clock.
+const LOCAL_TRIAL_MS = 7 * DAY_MS;
 const AD_MAX_TIER_GB = 200;
 const POLICY_VERSION = 2;
 const PS_IDENTITY_RE = /^[A-Za-z0-9_-]{16,128}$/;
@@ -1741,6 +1744,31 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
         return project ? await transaction(work) : await readTransaction(work);
     };
 
+    // App-local free clocks an ad week must stack on: a still-running device
+    // trial is real entitlement time the member already holds, so the claimed
+    // week extends past it instead of overlapping it (PL parity, where the
+    // trial carryover is already seeded as a benefit).
+    const localFreeEndTx = async (tx, member) => {
+        try {
+            if (member.app === 'paceseeker' && (await tableExists(tx, 'paceseeker_devices'))) {
+                const r = await tx.get(`SELECT trial_expires_at FROM paceseeker_devices WHERE device_hash = ?`, [String(member.identity)]);
+                const v = r && Number(r.trial_expires_at);
+                return Number.isFinite(v) && v > 0 ? v : null;
+            }
+            if (member.app === 'lane' && (await tableExists(tx, 'lane_devices'))) {
+                const r = await tx.get(`SELECT trial_started_at FROM lane_devices WHERE device_hash = ?`, [String(member.identity)]);
+                const v = r && Number(r.trial_started_at);
+                return Number.isFinite(v) && v > 0 ? v + LOCAL_TRIAL_MS : null;
+            }
+            if (member.app === 'photolynk' && (await tableExists(tx, 'user_plans'))) {
+                const r = await tx.get(`SELECT trial_until FROM user_plans WHERE user_id = ?`, [Number(member.identity)]);
+                const v = r && Number(r.trial_until);
+                return Number.isFinite(v) && v > 0 ? v : null;
+            }
+        } catch (_) { /* free clock unreadable — claim still stacks on resolved benefits */ }
+        return null;
+    };
+
     const grantAdClaim = async (claimId, { tierGb = 100 } = {}) =>
         transaction(async (tx) => {
             const claim = await tx.get(`SELECT * FROM ad_claims WHERE id = ?`, [Number(claimId)]);
@@ -1790,7 +1818,8 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
                 const appDef = supportedApp(m.app);
                 if (!appDef) continue;
                 const st = resolveMemberState(m, benefits, actions, now());
-                const base = Math.max(now(), st.active && st.expiresAt != null ? st.expiresAt : 0);
+                const freeEnd = await localFreeEndTx(tx, m);
+                const base = Math.max(now(), st.active && st.expiresAt != null ? st.expiresAt : 0, freeEnd || 0);
                 const tier = appDef.benefit === 'storage' ? Math.min(Math.max(Number(tierGb) || 100, 1), AD_MAX_TIER_GB) : 0;
                 await insertBenefit(tx, {
                     eventId, accountId: m.account_id, app: m.app, identity: String(m.identity),

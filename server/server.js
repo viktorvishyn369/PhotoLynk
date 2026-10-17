@@ -382,7 +382,9 @@ const CLOUD_DIR = process.env.CLOUD_DIR || path.join(AUX_ROOT, 'cloud'); // NVMe
 const CHUNKS_DIR = process.env.CHUNKS_DIR || null; // HDD RAID10: chunks only (if set)
 const CAPACITY_JSON_PATH = process.env.CAPACITY_JSON_PATH || path.join(AUX_ROOT, '.well-known', 'photolynk-capacity.json');
 
-const SUBSCRIPTION_GRACE_DAYS = Number.parseInt(process.env.SUBSCRIPTION_GRACE_DAYS || '7', 10);
+// Uniform 3-day post-expiry access window across PL/PS/Lane: a plan that
+// ended stays usable for GRACE days, then cuts. PL previously ran 7.
+const SUBSCRIPTION_GRACE_DAYS = Number.parseInt(process.env.SUBSCRIPTION_GRACE_DAYS || '3', 10);
 const TRIAL_DAYS = Number.parseInt(process.env.TRIAL_DAYS || '7', 10);
 const TRIAL_COMPLIMENTARY_DAYS = Number.parseInt(process.env.TRIAL_COMPLIMENTARY_DAYS || '3', 10);
 const COMPLIMENTARY_PURGE_INTERVAL_MS = Number.parseInt(process.env.COMPLIMENTARY_PURGE_INTERVAL_MS || String(6 * 60 * 60 * 1000), 10);
@@ -5108,6 +5110,9 @@ app.get('/ai-federation/dashboard', async (req, res) => {
 // ============================================================================
 
 const PS_TRIAL_DAYS = Number.parseInt(process.env.PS_TRIAL_DAYS || '7', 10);
+// PS/Lane sign grants while the resolved expiry is still inside the uniform
+// grace window — the client applies the same +GRACE on its activity check.
+const ECO_GRACE_MS = Math.max(0, SUBSCRIPTION_GRACE_DAYS) * 24 * 60 * 60 * 1000;
 const psTrialBuckets = new Map(); // ip -> {count,reset}
 const psDeviceBuckets = new Map(); // device_hash -> {count,reset}
 // Minute-level presence pings (~60/hr) + trial syncs + NAT headroom.
@@ -7961,7 +7966,14 @@ async function ecoMirrorLanePayment(deviceHash, wallet, sig) {
 // snapshot envelope) when the device's ecosystem account carries an active
 // shared sub — the same signed-grant contract PaceSeeker clients consume.
 async function _laneTrialRespond(res, row, id, wallet) {
-    const out = { ok: true, firstSeen: row.first_seen || null };
+    // Lane uses the same one-time 7-day device trial as PaceSeeker (parity);
+    // trial_started_at was recorded on the device's first ping.
+    const trialStart = Number(row.trial_started_at || row.first_seen || 0) || null;
+    const out = {
+        ok: true, firstSeen: row.first_seen || null,
+        trialStartedAt: trialStart,
+        trialExpiresAt: trialStart ? trialStart + PS_TRIAL_DAYS * 24 * 60 * 60 * 1000 : null,
+    };
     try {
         const accountId = await ecoEnsureAccount('lane', id, wallet || null);
         let snap = null;
@@ -7978,7 +7990,9 @@ async function _laneTrialRespond(res, row, id, wallet) {
             // Lane has no ad weeks — only the shared sub applies.
             subUntil = (!localApp || localApp === 'lane') ? (Number(sub?.sub_until) || 0) : 0;
         }
-        const g = subUntil > Date.now() ? ecoSignGrant(accountId, subUntil) : null;
+        // Keep signing through the grace window: the client applies the same
+        // +GRACE when judging whether a stored grant is still usable.
+        const g = subUntil + ECO_GRACE_MS > Date.now() ? ecoSignGrant(accountId, subUntil) : null;
         out.eco = { account: accountId, subUntil, grant: g ? g.grant : null, sig: g ? g.sig : null };
         if (paymentProtocol && ecosystemReady && snap) {
             try {
@@ -8120,8 +8134,9 @@ async function _psTrialRespond(res, row, id, wallet) {
             subUntil = Math.max(sharedUntil, Number(row.ad_until) || 0);
         }
         // No snapshot, no grant: a failed resolve must never mint a signed
-        // entitlement from empty state.
-        const g = subUntil > Date.now() ? ecoSignGrant(accountId, subUntil) : null;
+        // entitlement from empty state. Grants stay signed through the grace
+        // window so the client's +GRACE activity check keeps working.
+        const g = subUntil + ECO_GRACE_MS > Date.now() ? ecoSignGrant(accountId, subUntil) : null;
         out.eco = { account: accountId, subUntil, grant: g ? g.grant : null, sig: g ? g.sig : null };
         if (paymentProtocol && ecosystemReady && snap) {
             try {
