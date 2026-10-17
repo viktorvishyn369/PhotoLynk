@@ -659,13 +659,14 @@ table{min-width:100%;width:auto}
   <div class="filter-pills" id="app-tabs" style="flex:0 0 auto">
     <button class="pill app-tab active" data-app="photolynk" onclick="switchApp('photolynk')">PhotoLynk</button>
     <button class="pill app-tab" data-app="paceseeker" onclick="switchApp('paceseeker')">PaceSeeker</button>
+    <button class="pill app-tab" data-app="lane" onclick="switchApp('lane')">Lane</button>
     <button class="pill app-tab" data-app="ecosystem" onclick="switchApp('ecosystem')">Ecosystem</button>
   </div>
   <div class="search-box">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
     <input type="text" id="search" placeholder="Search by user, .skr, email, ID, status, plan..." oninput="applyFilters()"/>
   </div>
-  <select id="ps-presence-filter" style="display:none;padding:6px 10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:12px;font-weight:600" onchange="loadPsUsers()">
+  <select id="ps-presence-filter" style="display:none;padding:6px 10px;border-radius:8px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-size:12px;font-weight:600" onchange="onPresenceFilter()">
     <option value="all" selected>All accounts</option>
     <option value="recent">Recently online</option>
   </select>
@@ -708,6 +709,21 @@ table{min-width:100%;width:auto}
       <th data-col="last_ip" onclick="psSortBy('last_ip')">Last IP <span class="sort-arrow">&#9650;</span></th>
     </tr></thead>
     <tbody id="ps-tbody"></tbody>
+  </table>
+  <table id="ln-table" style="display:none">
+    <thead><tr>
+      <th data-col="device_hash" onclick="lnSortBy('device_hash')">ID <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="wallet_address" onclick="lnSortBy('wallet_address')">User <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="last_seen" onclick="lnSortBy('last_seen')">Last Active <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="status" onclick="lnSortBy('status')">Status <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="sub_status" onclick="lnSortBy('sub_status')">Sub <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="usage_days" onclick="lnSortBy('usage_days')">Free Days <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="effective_until" onclick="lnSortBy('effective_until')">Expires <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="first_seen" onclick="lnSortBy('first_seen')">Registered <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="version_code" onclick="lnSortBy('version_code')">App <span class="sort-arrow">&#9650;</span></th>
+      <th data-col="last_ip" onclick="lnSortBy('last_ip')">Last IP <span class="sort-arrow">&#9650;</span></th>
+    </tr></thead>
+    <tbody id="ln-tbody"></tbody>
   </table>
   <div id="eco-core-banner" style="display:none;margin:10px 0;padding:10px 14px;border-radius:8px;font-size:13px"></div>
   <table id="eco-table" style="display:none">
@@ -796,21 +812,23 @@ table{min-width:100%;width:auto}
 <script>
 var allUsers=[];var filteredUsers=[];var sortCol='id';var sortDir='desc';var activeFilter='all';var serverTime='';var adminStats={photolynk_nfts_minted:0,photolynk_paid_nfts_minted:0,photolynk_free_premium_nfts_minted:0,photolynk_premium_users:0};
 var activeApp='photolynk';var psUsers=[];var psFiltered=[];var psLoaded=false;var psSortCol='last_seen';var psSortDir='desc';var psRevenue={count:0,usd:0};
+var lnUsers=[];var lnFiltered=[];var lnLoaded=false;var lnSortCol='last_seen';var lnSortDir='desc';var lnRevenue={count:0,usd:0};
 var ecoAccounts=[];var ecoFiltered=[];var ecoLoaded=false;var ecoOffset=0;var ecoLimit=200;var ecoTotal=0;var ecoCore=null;
 
 function switchApp(app){
   activeApp=app;activeFilter='all';
   document.querySelectorAll('.app-tab').forEach(function(t){t.classList.toggle('active',t.dataset.app===app)});
-  var ps=(app==='paceseeker');var eco=(app==='ecosystem');
+  var ps=(app==='paceseeker');var ln=(app==='lane');var eco=(app==='ecosystem');
   document.getElementById('users-table').style.display='none';
   document.getElementById('ps-table').style.display='none';
+  document.getElementById('ln-table').style.display='none';
   document.getElementById('eco-table').style.display='none';
   document.getElementById('eco-core-banner').style.display='none';
   document.getElementById('eco-pager').style.display='none';
   document.getElementById('eco-jobs-wrap').style.display='none';
   document.getElementById('empty').style.display='none';
-  document.getElementById('ps-presence-filter').style.display=ps?'':'none';
-  document.getElementById('search').placeholder=ps?'Search device hash, IP, wallet or SNS name...':eco?'Search account id, wallet, handle or identity...':'Search by user, .skr, email, ID, status, plan...';
+  document.getElementById('ps-presence-filter').style.display=(ps||ln)?'':'none';
+  document.getElementById('search').placeholder=ps?'Search device hash, IP, wallet or SNS name...':ln?'Search device hash, IP or wallet...':eco?'Search account id, wallet, handle or identity...':'Search by user, .skr, email, ID, status, plan...';
   if(eco){
     if(ecoLoaded){document.getElementById('eco-table').style.display='';document.getElementById('eco-core-banner').style.display='';document.getElementById('eco-pager').style.display='';document.getElementById('eco-jobs-wrap').style.display='';updateStats();buildFilters();applyFilters()}
     else{document.getElementById('loading').style.display='';loadEcoAccounts()}
@@ -819,7 +837,14 @@ function switchApp(app){
   if(ps){
     if(psLoaded){document.getElementById('ps-table').style.display='';updateStats();buildFilters();applyFilters()}
     else{document.getElementById('loading').style.display='';loadPsUsers()}
-  }else{
+    return;
+  }
+  if(ln){
+    if(lnLoaded){document.getElementById('ln-table').style.display='';updateStats();buildFilters();applyFilters()}
+    else{document.getElementById('loading').style.display='';loadLnUsers()}
+    return;
+  }
+  {
     document.getElementById('loading').style.display='none';
     if(allUsers.length)document.getElementById('users-table').style.display='';
     updateStats();buildFilters();applyFilters();
@@ -1084,6 +1109,23 @@ async function loadPsUsers(){
   }catch(e){document.getElementById('loading').textContent='Error: '+e.message}
 }
 
+// Shared presence-dropdown dispatch (PaceSeeker and Lane both heartbeat ~60s).
+function onPresenceFilter(){if(activeApp==='lane')loadLnUsers();else loadPsUsers()}
+
+async function loadLnUsers(){
+  try{
+    var psel=document.getElementById('ps-presence-filter');
+    var url=(psel&&psel.value==='recent')?'/admin/api/lane-users':'/admin/api/lane-users?all=1';
+    var r=await fetch(url);var d=await r.json();
+    if(!r.ok)throw new Error(d.error||'Failed');
+    serverTime=d.server_time||'';
+    lnUsers=d.users||[];lnRevenue=d.revenue||{count:0,usd:0};lnLoaded=true;
+    document.getElementById('loading').style.display='none';
+    document.getElementById('ln-table').style.display='';
+    updateStats();buildFilters();applyFilters();
+  }catch(e){document.getElementById('loading').textContent='Error: '+e.message}
+}
+
 // Ad-claim review buttons render inline inside each account's Links cell.
 async function reviewClaim(id,action){
   try{
@@ -1134,6 +1176,59 @@ function renderPsTable(){
     html+='<td>'+liveDot(u.last_seen)+' '+fmtLogin(u.last_seen_date)+'</td>';
     html+='<td>'+statusBadge(u.status)+'</td>';
     html+='<td>'+subBadge(u.sub_status,u.sub_until_date,u)+'</td>';
+    html+='<td>'+fmtDate(u.effective_until_date)+'</td>';
+    html+='<td>'+fmtDate(u.first_seen_date)+'</td>';
+    html+='<td>'+(u.version_code?'<span class="mini-tag">vc'+u.version_code+'</span>':'<span class="date-cell">-</span>')+'</td>';
+    html+='<td>'+(u.last_ip?'<span class="date-cell">'+flagEmoji(u.last_country_code)+' '+u.last_ip+'</span>':'<span class="date-cell">-</span>')+'</td>';
+    html+='</tr>';
+  });
+  tbody.innerHTML=html;
+}
+
+function lnSortBy(col){
+  if(lnSortCol===col)lnSortDir=lnSortDir==='asc'?'desc':'asc';
+  else{lnSortCol=col;lnSortDir=col==='last_seen'||col==='first_seen'||col==='effective_until'||col==='usage_days'?'desc':'asc'}
+  document.querySelectorAll('#ln-table thead th').forEach(function(th){th.classList.remove('sorted');if(th.dataset.col===col)th.classList.add('sorted')});
+  document.querySelectorAll('#ln-table .sort-arrow').forEach(function(a){a.innerHTML='&#9650;'});
+  var th=document.querySelector('#ln-table th[data-col="'+col+'"]');
+  if(th)th.querySelector('.sort-arrow').innerHTML=lnSortDir==='asc'?'&#9650;':'&#9660;';
+  lnDoSort();renderLnTable();
+}
+
+function lnDoSort(){
+  lnFiltered.sort(function(a,b){
+    var va=a[lnSortCol],vb=b[lnSortCol];
+    if(va==null)va='';if(vb==null)vb='';
+    if(typeof va==='number'&&typeof vb==='number')return lnSortDir==='asc'?va-vb:vb-va;
+    va=String(va).toLowerCase();vb=String(vb).toLowerCase();
+    if(va<vb)return lnSortDir==='asc'?-1:1;
+    if(va>vb)return lnSortDir==='asc'?1:-1;
+    return 0;
+  });
+}
+
+// Lane table — same device-row shape as PaceSeeker. Lane has no wallet SNS
+// domain or ad weeks; instead it reports the free-tier usage ledger
+// (days used this calendar month, client-metered 7-day allowance).
+function renderLnTable(){
+  var tbody=document.getElementById('ln-tbody');
+  var empty=document.getElementById('empty');
+  if(!lnFiltered.length){tbody.innerHTML='';empty.style.display='';return}
+  empty.style.display='none';
+  var html='';
+  lnFiltered.forEach(function(u){
+    html+='<tr>';
+    html+='<td class="uuid-cell" title="'+u.device_hash+'" onclick="copyUuid(this,&apos;'+u.device_hash+'&apos;)">'+(u.device_hash||'').substring(0,13)+'</td>';
+    var userCell='';
+    if(u.wallet_address)userCell='<div class="uuid-cell" style="max-width:none;cursor:pointer" title="'+u.wallet_address+' - click to copy" onclick="copyUuid(this,&apos;'+u.wallet_address+'&apos;)">'+u.wallet_address.substring(0,6)+'&hellip;'+u.wallet_address.slice(-4)+'</div>';
+    else userCell='<span class="date-cell">-</span>';
+    if(u.eco_account)userCell+='<div><span class="mini-tag" style="color:var(--info);cursor:pointer" title="Ecosystem account '+u.eco_account+' - open in Ecosystem tab" onclick="openEcoAccount(&apos;'+u.eco_account+'&apos;)">'+String(u.eco_account).substring(0,12)+'</span></div>';
+    html+='<td>'+userCell+'</td>';
+    html+='<td>'+liveDot(u.last_seen)+' '+fmtLogin(u.last_seen_date)+'</td>';
+    html+='<td>'+statusBadge(u.status)+'</td>';
+    html+='<td>'+subBadge(u.sub_status,u.sub_until_date,u)+'</td>';
+    var ud=Number(u.usage_days)||0;
+    html+='<td>'+(ud>0?'<span class="mini-tag" title="Free-tier days used in '+(u.usage_month||'')+'">'+ud+'d '+(u.usage_month||'')+'</span>':'<span class="date-cell">-</span>')+'</td>';
     html+='<td>'+fmtDate(u.effective_until_date)+'</td>';
     html+='<td>'+fmtDate(u.first_seen_date)+'</td>';
     html+='<td>'+(u.version_code?'<span class="mini-tag">vc'+u.version_code+'</span>':'<span class="date-cell">-</span>')+'</td>';
@@ -1261,6 +1356,20 @@ function updateStats(){
     document.getElementById('header-stats').innerHTML=pst+'<span>Devices: <b>'+ptotal+'</b></span><span>Online: <b>'+ponline+'</b></span><span>In trial: <b>'+ptrials+'</b></span><span>Reported paid/invite: <b>'+psubs+'</b></span><span>Expired: <b>'+pexpired+'</b></span><span>7d active: <b>'+precent+'</b></span><span>Reported checkout USD (unverified): <b>$'+(psRevenue.usd||0).toFixed(2)+'</b></span><span>Reported payments: <b>'+(psRevenue.count||0)+'</b></span><span>Chain-checked: <b>'+pverified+'</b></span><span>Pending reports: <b>'+ppending+'</b></span>';
     return;
   }
+  if(activeApp==='lane'){
+    var ltotal=lnUsers.length;
+    var lactive=lnUsers.filter(function(u){return u.status==='active'}).length;
+    var ltrials=lnUsers.filter(function(u){return u.status==='trial'}).length;
+    var lexpired=lnUsers.filter(function(u){return u.status==='expired'}).length;
+    var lonline=lnUsers.filter(function(u){return u.last_seen&&(Date.now()-u.last_seen)<150000}).length;
+    var lsubs=lnUsers.filter(function(u){return u.sub_status==='paid'}).length;
+    var lusing=lnUsers.filter(function(u){return (Number(u.usage_days)||0)>0}).length;
+    var lverified=lnRevenue.verifiedCount||0;
+    var lpending=lnRevenue.pendingCount||0;
+    var lst=serverTime?'<span>Server: <b>'+new Date(serverTime).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit',second:'2-digit'})+'</b></span>':'';
+    document.getElementById('header-stats').innerHTML=lst+'<span>Devices: <b>'+ltotal+'</b></span><span>Online: <b>'+lonline+'</b></span><span>Entitled: <b>'+lactive+'</b></span><span>In trial: <b>'+ltrials+'</b></span><span>Reported paid: <b>'+lsubs+'</b></span><span>Free-tier active: <b>'+lusing+'</b></span><span>Expired: <b>'+lexpired+'</b></span><span>Reported checkout USD (unverified): <b>$'+(lnRevenue.usd||0).toFixed(2)+'</b></span><span>Reported payments: <b>'+(lnRevenue.count||0)+'</b></span><span>Chain-checked: <b>'+lverified+'</b></span><span>Pending reports: <b>'+lpending+'</b></span>';
+    return;
+  }
   var total=allUsers.length;
   var active=allUsers.filter(function(u){return u.status==='active'}).length;
   var trial=allUsers.filter(function(u){return u.status==='trial'||u.status==='trial_complimentary'}).length;
@@ -1295,10 +1404,11 @@ function buildFilters(){
     document.getElementById('status-filters').innerHTML=ehtml;
     return;
   }
-  if(activeApp==='paceseeker'){
-    var pcounts={};psUsers.forEach(function(u){var s=u.status||'none';pcounts[s]=(pcounts[s]||0)+1});
-    var phtml='<button class="pill active" data-f="all" onclick="setFilter(this,&apos;all&apos;)">All<span class="count">'+psUsers.length+'</span></button>';
-    ['trial','expired'].forEach(function(s){if(pcounts[s])phtml+='<button class="pill" data-f="'+s+'" onclick="setFilter(this,&apos;'+s+'&apos;)">'+s+'<span class="count">'+pcounts[s]+'</span></button>'});
+  if(activeApp==='paceseeker'||activeApp==='lane'){
+    var lsrc=activeApp==='lane'?lnUsers:psUsers;
+    var pcounts={};lsrc.forEach(function(u){var s=u.status||'none';pcounts[s]=(pcounts[s]||0)+1});
+    var phtml='<button class="pill active" data-f="all" onclick="setFilter(this,&apos;all&apos;)">All<span class="count">'+lsrc.length+'</span></button>';
+    ['active','trial','expired'].forEach(function(s){if(pcounts[s])phtml+='<button class="pill" data-f="'+s+'" onclick="setFilter(this,&apos;'+s+'&apos;)">'+s+'<span class="count">'+pcounts[s]+'</span></button>'});
     document.getElementById('status-filters').innerHTML=phtml;
     return;
   }
@@ -1345,8 +1455,17 @@ function applyFilters(){
     renderEcoTable();
     return;
   }
-  if(activeApp==='paceseeker'){
+  if(activeApp==='paceseeker'||activeApp==='lane'){
     var pq=(document.getElementById('search').value||'').toLowerCase().trim();
+    if(activeApp==='lane'){
+      lnFiltered=lnUsers.filter(function(u){
+        if(activeFilter!=='all'&&u.status!==activeFilter)return false;
+        if(!pq)return true;
+        return(u.device_hash||'').toLowerCase().includes(pq)||(u.last_ip||'').toLowerCase().includes(pq)||(u.status||'').toLowerCase().includes(pq)||(u.wallet_address||'').toLowerCase().includes(pq)||(u.eco_account||'').toLowerCase().includes(pq)||(u.usage_month||'').toLowerCase().includes(pq);
+      });
+      lnDoSort();renderLnTable();
+      return;
+    }
     psFiltered=psUsers.filter(function(u){
       if(activeFilter!=='all'&&u.status!==activeFilter)return false;
       if(!pq)return true;
@@ -1525,8 +1644,8 @@ async function confirmDelete(){
 function copyUuid(el,uuid){if(!uuid||uuid==='-')return;navigator.clipboard.writeText(uuid).then(function(){toast('UUID copied','success')}).catch(function(){var t=document.createElement('textarea');t.value=uuid;document.body.appendChild(t);t.select();document.execCommand('copy');document.body.removeChild(t);toast('UUID copied','success')})}
 document.addEventListener('keydown',function(e){if(e.key==='Escape'){closeModal();closeDeleteModal()}});
 loadUsers();
-// Keep PaceSeeker liveness dots moving while the admin watches that tab.
-setInterval(function(){if(activeApp==='paceseeker'&&psLoaded)loadPsUsers()},30000);
+// Keep device-app liveness dots moving while the admin watches those tabs.
+setInterval(function(){if(activeApp==='paceseeker'&&psLoaded)loadPsUsers();else if(activeApp==='lane'&&lnLoaded)loadLnUsers()},30000);
 </script>
 </body>
 </html>`;
@@ -8067,6 +8186,95 @@ app.get('/admin/api/paceseeker-users', adminAuth, (req, res) => {
                 status: (ecoUntil > now || (r.ad_until && r.ad_until > now) || ((r.sub_status === 'paid' || r.sub_status === 'invite') && (!r.sub_until || r.sub_until > now)))
                     ? 'active'
                     : (r.trial_expires_at && r.trial_expires_at > now) ? 'trial' : 'expired',
+            }; }),
+        });
+        });
+        });
+    });
+});
+
+// Admin API: Lane devices — mirrors /admin/api/paceseeker-users. Lane has no
+// ad weeks or expiring trial: free use is a client-metered 7-day/month ledger
+// (usage_month/usage_days). `sub_until` is the server's eco-mirrored value
+// while `reported_sub_until` is the raw client claim — both surface so the
+// Sub column can distinguish them.
+app.get('/admin/api/lane-users', adminAuth, (req, res) => {
+    const now = Date.now();
+    const cutoff = now - 3600000;
+    const showAll = req.query.all === '1';
+    const deviceSql = `SELECT d.*, COALESCE(r.eco_verified,0) AS payment_verified
+        FROM lane_devices d
+        LEFT JOIN lane_revenue r ON r.signature = d.sub_signature AND r.device_hash = d.device_hash`;
+    db.all(showAll ? deviceSql + ' ORDER BY d.last_seen DESC' : deviceSql + ' WHERE d.last_seen >= ? ORDER BY d.last_seen DESC', showAll ? [] : [cutoff], (err, rows) => {
+        if (err) {
+            return res.status(500).json({ error: err.message });
+        }
+        db.get('SELECT COUNT(*) AS cnt, COALESCE(SUM(usd_at_checkout),0) AS usd, COALESCE(SUM(CASE WHEN eco_verified = 1 THEN 1 ELSE 0 END),0) AS verified_count FROM lane_revenue', [], (eR, rev) => {
+        if (eR) {
+            return res.status(500).json({ error: eR.message });
+        }
+        db.all(`SELECT m.identity, m.account_id, s.sub_until AS eco_sub_until, s.source_kind AS eco_source_kind FROM ecosystem_members m LEFT JOIN stealthlynk_subs s ON s.account_id = m.account_id WHERE m.app = 'lane'`, [], (eM, mems) => {
+        if (eM) {
+            return res.status(500).json({ error: eM.message });
+        }
+        const ecoByDevice = {};
+        (mems || []).forEach(m => { ecoByDevice[m.identity] = m; });
+        const revCount = (rev && rev.cnt) || 0;
+        const revVerified = (rev && rev.verified_count) || 0;
+        res.json({
+            server_time: new Date().toISOString(),
+            revenue: { count: revCount, usd: (rev && rev.usd) || 0, verifiedCount: revVerified, pendingCount: revCount - revVerified, usdSource: 'client_reported' },
+            users: (rows || []).map(r => {
+                const eco = ecoByDevice[r.device_hash];
+                const ecoUntil = Number(eco && eco.eco_sub_until) || 0;
+                // Intro window mirrors the eco member_meta rule: a new device
+                // shows 'trial' for PS_TRIAL_DAYS after first contact; past
+                // that an unsubscribed device is 'expired' (free-tier usage
+                // still works client-side — this is the entitlement view).
+                const trialEnd = (Number(r.trial_started_at) || 0) + PS_TRIAL_DAYS * 86400000;
+                const paidActive = r.sub_status === 'paid'
+                    && (Number(r.reported_sub_until) > now || Number(r.sub_until) > now || !r.reported_sub_until);
+                const effUntil = Math.max(
+                    (r.sub_status === 'paid' ? Number(r.reported_sub_until) : 0) || 0,
+                    Number(r.sub_until) || 0,
+                    ecoUntil,
+                    trialEnd) || null;
+                return {
+                device_hash: r.device_hash,
+                first_seen: r.first_seen,
+                last_seen: r.last_seen,
+                trial_started_at: r.trial_started_at,
+                trial_end: trialEnd || null,
+                last_seen_date: r.last_seen ? new Date(r.last_seen).toISOString() : null,
+                first_seen_date: r.first_seen ? new Date(r.first_seen).toISOString() : null,
+                version_code: r.version_code,
+                last_ip: r.last_ip,
+                last_country_code: '',
+                sub_status: r.sub_status || 'none',
+                sub_until: r.sub_until || null,
+                sub_until_date: r.sub_until ? new Date(r.sub_until).toISOString() : null,
+                reported_sub_until: r.reported_sub_until || null,
+                reported_sub_until_date: r.reported_sub_until ? new Date(r.reported_sub_until).toISOString() : null,
+                sub_signature: r.sub_signature || '',
+                payment_verification: !r.sub_signature ? 'none' : (Number(r.payment_verified) === 1 ? 'chain_checked' : 'reported'),
+                sub_paid_at: r.sub_paid_at || null,
+                sub_paid_at_date: r.sub_paid_at ? new Date(r.sub_paid_at).toISOString() : null,
+                sub_paid_with: r.sub_paid_with || '',
+                sub_plan: r.sub_plan || '',
+                sub_usd: r.sub_usd || 0,
+                sub_amount_atomic: r.sub_amount_atomic || null,
+                wallet_address: r.wallet_address || '',
+                usage_month: r.usage_month || '',
+                usage_days: r.usage_days || 0,
+                eco_account: (eco && eco.account_id) || '',
+                eco_sub_until: ecoUntil || null,
+                eco_sub_until_date: ecoUntil ? new Date(ecoUntil).toISOString() : null,
+                eco_source_kind: (eco && eco.eco_source_kind) || '',
+                effective_until: effUntil,
+                effective_until_date: effUntil ? new Date(effUntil).toISOString() : null,
+                status: (ecoUntil > now || paidActive)
+                    ? 'active'
+                    : (trialEnd > now) ? 'trial' : 'expired',
             }; }),
         });
         });

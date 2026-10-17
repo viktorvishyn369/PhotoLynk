@@ -3339,10 +3339,20 @@ test('admin inline script (emitted): presence filter fetches all=1; header verif
 const loadPsUsersRoute = (db) => {
     const captured = {};
     vm.runInNewContext(extractBetween("app.get('/admin/api/paceseeker-users'", 'PaceSeeker invite code tracker'), {
-        app: { get: (p, ...a) => { captured.handler = a[a.length - 1]; } },
+        app: { get: (p, ...a) => { captured[p] = a[a.length - 1]; } },
         adminAuth: () => { }, db, console, Date, JSON, Number, String,
     });
-    return captured.handler;
+    return captured['/admin/api/paceseeker-users'];
+};
+
+const loadLaneUsersRoute = (db) => {
+    const captured = {};
+    vm.runInNewContext(extractBetween("app.get('/admin/api/paceseeker-users'", 'PaceSeeker invite code tracker'), {
+        app: { get: (p, ...a) => { captured[p] = a[a.length - 1]; } },
+        adminAuth: () => { }, db, console, Date, JSON, Number, String, Math,
+        PS_TRIAL_DAYS: 7,
+    });
+    return captured['/admin/api/lane-users'];
 };
 
 const callPsUsers = (handler, query) => new Promise((resolve) => {
@@ -3421,6 +3431,78 @@ test('PS admin route (real handler): aggregate or membership query failure -> 50
     assert.equal(resRev.statusCode, 500);
     const resMem = await callPsUsers(loadPsUsersRoute(errDb('members')), {});
     assert.equal(resMem.statusCode, 500);
+});
+
+async function makeLaneAdminDb() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lnadmin-'));
+    createdDirs.push(dir);
+    const h = await openDb(path.join(dir, 'test.db'));
+    await h.run(`CREATE TABLE lane_devices (
+        device_hash TEXT PRIMARY KEY, first_seen INTEGER, last_seen INTEGER,
+        trial_started_at INTEGER, version_code INTEGER, last_ip TEXT,
+        sub_status TEXT, sub_until INTEGER, reported_sub_until INTEGER,
+        sub_signature TEXT, sub_paid_at INTEGER, sub_paid_with TEXT, sub_plan TEXT,
+        sub_usd REAL, sub_amount_atomic INTEGER, wallet_address TEXT,
+        usage_month TEXT, usage_days INTEGER DEFAULT 0)`);
+    await h.run(`CREATE TABLE lane_revenue (
+        signature TEXT PRIMARY KEY, device_hash TEXT, paid_at INTEGER, paid_with TEXT,
+        plan TEXT, usd_at_checkout REAL, amount_atomic INTEGER, reported_at INTEGER,
+        eco_verified INTEGER DEFAULT 0)`);
+    await h.run(`CREATE TABLE ecosystem_members (
+        account_id TEXT NOT NULL, app TEXT NOT NULL, identity TEXT NOT NULL,
+        wallet TEXT, linked_at INTEGER, wallet_verified INTEGER DEFAULT 0,
+        wallet_changed_at INTEGER, PRIMARY KEY (app, identity))`);
+    await h.run(`CREATE TABLE stealthlynk_subs (
+        account_id TEXT PRIMARY KEY, sub_until INTEGER, source_app TEXT,
+        source_kind TEXT, provenance TEXT, updated_at INTEGER)`);
+    return h;
+}
+
+test('Lane admin route (real handler): eco join, paid/trial/expired status, revenue split', async () => {
+    const h = await makeLaneAdminDb();
+    const now = Date.now();
+    await h.run(`INSERT INTO lane_revenue (signature,device_hash,paid_at,paid_with,plan,usd_at_checkout,amount_atomic,reported_at,eco_verified) VALUES ('sigV','d1',?,'USDC','monthly',3.99,1,?,1)`, [now, now]);
+    await h.run(`INSERT INTO lane_revenue (signature,device_hash,paid_at,paid_with,plan,usd_at_checkout,amount_atomic,reported_at,eco_verified) VALUES ('sigU','d2',?,'USDC','monthly',3.99,1,?,0)`, [now, now]);
+    // d1: paid + verified sig; d2: reported-but-unverified sig; d3: inside the
+    // 7-day intro window; d4: past intro, unpaid -> expired.
+    await h.run(`INSERT INTO lane_devices (device_hash,first_seen,last_seen,trial_started_at,sub_status,sub_signature,reported_sub_until,usage_month,usage_days) VALUES ('d1',?,?,?,'paid','sigV',?,'2026-10',3)`, [now - 9e6, now, now - 9e6, now + 6e5]);
+    await h.run(`INSERT INTO lane_devices (device_hash,first_seen,last_seen,trial_started_at,sub_status,sub_signature,reported_sub_until) VALUES ('d2',?,?,?,'paid','sigU',?)`, [now - 9e6, now, now - 9e6, now + 6e5]);
+    await h.run(`INSERT INTO lane_devices (device_hash,first_seen,last_seen,trial_started_at,sub_status) VALUES ('d3',?,?,?,'none')`, [now - 9e6, now, now - 9e6]);
+    await h.run(`INSERT INTO lane_devices (device_hash,first_seen,last_seen,trial_started_at,sub_status) VALUES ('d4',?,?,?,'none')`, [now - 30e8, now, now - 30e8]);
+    // d4 also holds an ecosystem membership with an active shared sub ->
+    // 'active' status + eco_account populated despite no local payment.
+    await h.run(`INSERT INTO ecosystem_members (account_id,app,identity,wallet,wallet_verified) VALUES ('acctX','lane','d4','wX',1)`);
+    await h.run(`INSERT INTO stealthlynk_subs (account_id,sub_until,source_kind,source_app) VALUES ('acctX',?,'payment','paceseeker')`, [now + 9e6]);
+    const res = await callPsUsers(loadLaneUsersRoute(h.conn), { all: '1' });
+    assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+    assert.equal(res.body.revenue.count, 2);
+    assert.ok(Math.abs(res.body.revenue.usd - 7.98) < 1e-6);
+    assert.equal(res.body.revenue.verifiedCount, 1);
+    assert.equal(res.body.revenue.pendingCount, 1);
+    const byDev = Object.fromEntries(res.body.users.map((u) => [u.device_hash, u]));
+    assert.equal(byDev.d1.payment_verification, 'chain_checked');
+    assert.equal(byDev.d2.payment_verification, 'reported');
+    assert.equal(byDev.d1.status, 'active');
+    assert.equal(byDev.d3.status, 'trial');
+    assert.equal(byDev.d4.status, 'active');
+    assert.equal(byDev.d4.eco_account, 'acctX');
+    assert.equal(byDev.d4.eco_sub_until > now, true);
+    assert.equal(byDev.d1.usage_days, 3);
+    assert.equal(byDev.d1.usage_month, '2026-10');
+    await h.close();
+});
+
+test('Lane admin route (real handler): recent view hides devices silent >1h', async () => {
+    const h = await makeLaneAdminDb();
+    const now = Date.now();
+    await h.run(`INSERT INTO lane_devices (device_hash,first_seen,last_seen,trial_started_at) VALUES ('fresh',?,?,?)`, [now, now, now]);
+    await h.run(`INSERT INTO lane_devices (device_hash,first_seen,last_seen,trial_started_at) VALUES ('stale',?,?,?)`, [now - 9e7, now - 9e7, now - 9e7]);
+    const res = await callPsUsers(loadLaneUsersRoute(h.conn), {});
+    assert.equal(res.statusCode, 200, JSON.stringify(res.body));
+    assert.deepEqual(res.body.users.map((u) => u.device_hash), ['fresh']);
+    const all = await callPsUsers(loadLaneUsersRoute(h.conn), { all: '1' });
+    assert.equal(all.body.users.length, 2);
+    await h.close();
 });
 
 async function makeSchemaFixtureDb() {
