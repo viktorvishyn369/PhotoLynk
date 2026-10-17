@@ -15,12 +15,12 @@ Back up photos/videos to your own server or StealthCloud, and restore on any pho
 
 | Platform | Status | Payment Method |
 |----------|--------|----------------|
-| **Android** | ✅ Live on Google Play | In-App Purchase |
+| **Android** | ✅ Live on Google Play | On-chain wallet payment flow |
 | **Solana Mobile dApp Store** | ✅ Available on Solana Mobile | On-chain wallet payment flow |
 
 The PhotoLynk mobile apps feature end-to-end encryption, self-hosted or cloud backup options, and seamless cross-platform restore.
 
-**Android (Google Play) and Solana Mobile dApp Store are live.**
+**Android (Google Play) and Solana Mobile dApp Store are live.** There is no iOS version — Apple's restrictions on cryptocurrency payments and wallet usage are incompatible with how the app pays, binds wallets, and verifies on-chain.
 
 Store links:
 - Android (Google Play): [Download PhotoLynk](https://play.google.com/store/apps/details?id=com.photosync.app)
@@ -565,7 +565,9 @@ PhotoLynk offers two optional in-app purchases to unlock additional features:
 - Pay with SOL or SKR via Solana wallet
 - One-time payment — no recurring charges, no auto-renewal
 
-All purchases are processed through the Google Play Store. Listed prices are base prices; Google may automatically add applicable taxes, fees, or regional price adjustments at checkout for one-time purchases and subscriptions. PhotoLynk does not directly handle payment card information. Both purchases are final and non-refundable except as required by applicable law.
+All purchases are paid from your Solana wallet in SOL, USDC, or SKR and settled on-chain — no platform billing, no auto-renewal. PhotoLynk does not directly handle payment card information. Both purchases are final and non-refundable except as required by applicable law.
+
+Every new user gets a one-time 7-day free trial, and every entitlement (trial, earned free week, paid plan) carries a 3-day grace tail. Time always stacks: a purchase or earned week starts where your current term ends — remaining trial days are never lost. The 100 GB and 200 GB plans can also be earned free by posting a weekly promo; every paid plan is an ecosystem plan that also unlocks PaceSeeker and Lane on your linked StealthLynk account at equivalent value.
 
 ### Build Requirements (for building from source)
 - Node.js 20 LTS
