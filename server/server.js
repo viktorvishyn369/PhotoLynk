@@ -20590,6 +20590,14 @@ const ecoTryInitialize = async () => {
                 .catch((e) => console.warn('[Eco] legacy absorption pass failed:', e.message));
         }
         await ecoRepairPendingAdClaims().catch(() => { });
+        // One-shot correction for pre-stacking-fix ad weeks: recompute is a
+        // fixed point, so it is safe (and useful for late-merged rows) to run
+        // on every boot.
+        await ecosystem.repairAdTrialStack()
+            .then((r) => {
+                if (r && r.repaired) console.log(`[Eco] ad-trial repair: extended ${r.repaired} benefit(s) on ${r.accounts} account(s)`);
+            })
+            .catch((e) => console.warn('[Eco] ad-trial repair failed:', e.message));
     } catch (err) {
         ecosystemReady = false;
         paymentProtocol = null;

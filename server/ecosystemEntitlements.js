@@ -1834,6 +1834,54 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
             return { granted: true, accountId: canonical, grants: results, revision: snap.revision };
         });
 
+    // Repair for ad-week benefits minted before trial stacking existed: their
+    // expiry was max(now, resolved) + week, so a week claimed while a device
+    // trial still ran overlapped it and added nothing. Recompute each ad
+    // benefit's expiry as max(starts_at, freeEnd, priorRepairedAdEnd) + week,
+    // walked chronologically per member so stacked claims keep their order.
+    // The formula is a fixed point: a second pass finds every target already
+    // met and writes nothing, and post-fix grants already satisfy it.
+    const repairAdTrialStack = async () =>
+        transaction(async (tx) => {
+            if (!(await tableExists(tx, 'ecosystem_benefits'))) return { repaired: 0, accounts: 0 };
+            const rows = await tx.all(
+                `SELECT event_id, account_id, app, identity, benefit, starts_at, expires_at
+                   FROM ecosystem_benefits
+                  WHERE scope = 'local' AND revoked_at IS NULL AND expires_at IS NOT NULL
+                    AND event_id LIKE 'ad:%'
+                  ORDER BY app, identity, starts_at, expires_at`);
+            if (!rows.length) return { repaired: 0, accounts: 0 };
+            let repaired = 0;
+            const touched = new Set();
+            const chains = new Map();
+            for (const r of rows) {
+                const key = `${r.app}|${r.identity}`;
+                const priorEnd = chains.get(key) || 0;
+                const freeEnd = await localFreeEndTx(tx, r);
+                const target = Math.max(Number(r.starts_at) || 0, Number(freeEnd) || 0, priorEnd) + WEEK_MS;
+                const cur = Number(r.expires_at) || 0;
+                const newEnd = Math.max(cur, target);
+                chains.set(key, newEnd);
+                if (newEnd <= cur) continue;
+                await updateBenefitExpiry(tx, {
+                    eventId: r.event_id, app: r.app, identity: r.identity, benefit: r.benefit, expiresAt: newEnd,
+                });
+                await insertEvent(tx, {
+                    eventId: `repair:adtrial:${r.event_id}:${r.app}:${r.identity}`,
+                    accountId: r.account_id, sourceKind: 'repair', sourceApp: r.app,
+                    sourceRef: r.event_id,
+                    payload: { app: r.app, identity: String(r.identity), from: cur, to: newEnd, freeEnd: Number(freeEnd) || null },
+                });
+                touched.add(await canonicalAccount(tx, r.account_id));
+                repaired++;
+            }
+            for (const acct of touched) {
+                await bumpGlobal(tx, acct);
+                await resolveAccountTx(tx, acct, { at: now(), project: true });
+            }
+            return { repaired, accounts: touched.size };
+        });
+
     const adjustShared = async (accountId, { action, until, days, eventId, actor } = {}) =>
         transaction(async (tx) => {
             if (!isNonBlank(eventId)) throw codedError('EVENT_ID_REQUIRED', 'stable eventId required');
@@ -2664,13 +2712,15 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
             if (!ins || !ins.changes) {
                 throw codedError('PROMO_USED', 'promo code already redeemed', { statusCode: 409 });
             }
-            // Renewal semantics: stack on the current live local expiry.
+            // Renewal semantics: stack on the current live local expiry plus
+            // any still-running app-local trial the member holds.
             const baseRow = await tx.get(
                 `SELECT MAX(COALESCE(expires_at,0)) AS m FROM ecosystem_benefits
                  WHERE account_id = ? AND app = ? AND identity = ? AND benefit = 'features'
                    AND scope = 'local' AND revoked_at IS NULL`, [accountId, appKey, id]);
+            const freeEnd = await localFreeEndTx(tx, { app: appKey, identity: id });
             const start = now();
-            const expiresAt = Math.max(start, Number(baseRow && baseRow.m) || 0) + PROMO_GRANT_MS;
+            const expiresAt = Math.max(start, Number(baseRow && baseRow.m) || 0, Number(freeEnd) || 0) + PROMO_GRANT_MS;
             await insertBenefit(tx, {
                 eventId: evtId, accountId, app: appKey, identity: id, benefit: 'features',
                 startsAt: start, expiresAt, tierGb: 0, monthlyValueCents: 0, scope: 'local',
@@ -2700,6 +2750,7 @@ function createEcosystemService({ sqlite3, dbPath, registry = DEFAULT_REGISTRY, 
         resolveAccount,
         grantAdClaim,
         redeemPromoGrant,
+        repairAdTrialStack,
         adjustShared,
         enqueueVerification,
         absorbLegacyLedgerPage,

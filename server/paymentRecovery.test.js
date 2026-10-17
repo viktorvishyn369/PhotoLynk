@@ -3780,6 +3780,7 @@ test('ecoTryInitialize: init failure keeps legacy mode, records state, unref bac
                 return { initialized: true, migrated: false };
             },
             absorbLegacyLedgerPage: async () => { ecosystem.absorbCalls++; return 0; },
+            repairAdTrialStack: async () => ({ repaired: 0, accounts: 0 }),
         };
         const createEcosystemPaymentService = () => ({ initialize: async () => ({ initialized: true }) });
         const startEcoWorker = () => { workerStarts++; };
