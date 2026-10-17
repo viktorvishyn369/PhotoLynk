@@ -8155,7 +8155,13 @@ app.get('/admin/api/paceseeker-users', adminAuth, (req, res) => {
         if (eR) {
             return res.status(500).json({ error: eR.message });
         }
-        db.all(`SELECT m.identity, m.account_id, s.sub_until AS eco_sub_until, s.source_kind AS eco_source_kind FROM ecosystem_members m LEFT JOIN stealthlynk_subs s ON s.account_id = m.account_id WHERE m.app = 'paceseeker'`, [], (eM, mems) => {
+        // ecosystem_projection_state carries the resolved member entitlement
+        // (covers local ad weeks, which stealthlynk_subs - shared scope only -
+        // and the sub_status-gated sub_until column both miss).
+        db.get(`SELECT name FROM sqlite_master WHERE type='table' AND name='ecosystem_projection_state'`, [], (eT, projTbl) => {
+        const projJoin = projTbl ? ` LEFT JOIN ecosystem_projection_state p ON p.app = 'paceseeker' AND p.identity = m.identity` : '';
+        const projCol = projTbl ? `, p.expires_at AS proj_until` : `, NULL AS proj_until`;
+        db.all(`SELECT m.identity, m.account_id, s.sub_until AS eco_sub_until, s.source_kind AS eco_source_kind${projCol} FROM ecosystem_members m LEFT JOIN stealthlynk_subs s ON s.account_id = m.account_id${projJoin} WHERE m.app = 'paceseeker'`, [], (eM, mems) => {
         if (eM) {
             return res.status(500).json({ error: eM.message });
         }
@@ -8168,7 +8174,7 @@ app.get('/admin/api/paceseeker-users', adminAuth, (req, res) => {
             revenue: { count: revCount, usd: (rev && rev.usd) || 0, verifiedCount: revVerified, pendingCount: revCount - revVerified, usdSource: 'client_reported' },
             users: (rows || []).map(r => {
                 const eco = ecoByDevice[r.device_hash];
-                const ecoUntil = Number(eco && eco.eco_sub_until) || 0;
+                const ecoUntil = Math.max(Number(eco && eco.eco_sub_until) || 0, Number(eco && eco.proj_until) || 0);
                 // Effective expiry: the furthest of paid/ad/eco/trial clocks so
                 // the Expires column is the real entitlement end, not just the
                 // trial end (which was meaningless on paid devices).
@@ -8217,6 +8223,7 @@ app.get('/admin/api/paceseeker-users', adminAuth, (req, res) => {
                     ? 'active'
                     : (r.trial_expires_at && r.trial_expires_at > now) ? 'trial' : 'expired',
             }; }),
+        });
         });
         });
         });
