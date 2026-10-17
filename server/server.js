@@ -7735,7 +7735,10 @@ app.get('/api/paceseeker/trial', (req, res) => {
                         `SELECT account_id, wallet, wallet_verified FROM ecosystem_members WHERE app = 'paceseeker' AND identity = ?`, [String(id)]);
                     if (!member?.wallet_verified || !member.wallet || member.wallet !== v.payer) return;
                     const capBase = v.paidAt || Date.now();
-                    const cappedUntil = Math.min(Number(se) || 0, capBase + PS_ECO_PLAN_MS + 12 * 60 * 60 * 1000);
+                    // Client expiry legitimately includes leftover trial time
+                    // now — the cap must not clamp away the carryover.
+                    const carryCap = Math.max(0, Math.min((Number(row.trial_expires_at) || 0) - capBase, PS_TRIAL_DAYS * 24 * 60 * 60 * 1000));
+                    const cappedUntil = Math.min(Number(se) || 0, capBase + PS_ECO_PLAN_MS + carryCap + 12 * 60 * 60 * 1000);
                     await ecoFloorSub(member.account_id, cappedUntil, { sourceApp: 'paceseeker', kind: 'payment', provenance: row.sub_signature });
                 })().catch(() => { });
             }
@@ -7908,12 +7911,13 @@ async function ecoMirrorPsPayment(deviceHash, wallet, sig) {
     // A brand-new verified payment is an affirmative act — it may re-activate
     // an account an admin revoked (they paid again; a ban would be separate).
     // Stack on the fullest current entitlement: shared sub, this device's
-    // earned ad weeks, or the tx blockTime — each new sig buys +1 period.
+    // earned ad weeks, its still-running device trial (carryover parity with
+    // the client + PhotoLynk), or the tx blockTime — each new sig buys +1 period.
     const [sub, dev] = await Promise.all([
         ecoGetSub(member.account_id),
-        dbGetAsync(`SELECT ad_until FROM paceseeker_devices WHERE device_hash = ?`, [String(deviceHash)]),
+        dbGetAsync(`SELECT ad_until, trial_expires_at FROM paceseeker_devices WHERE device_hash = ?`, [String(deviceHash)]),
     ]);
-    const base = Math.max(v.paidAt || Date.now(), Number(sub?.sub_until) || 0, Number(dev?.ad_until) || 0);
+    const base = Math.max(v.paidAt || Date.now(), Number(sub?.sub_until) || 0, Number(dev?.ad_until) || 0, Number(dev?.trial_expires_at) || 0);
     const until = base + PS_ECO_PLAN_MS + 12 * 60 * 60 * 1000;
     await ecoFloorSub(member.account_id, until, { sourceApp: 'paceseeker', kind: 'payment', provenance: sig, allowRevoked: true });
 }
@@ -7956,8 +7960,14 @@ async function ecoMirrorLanePayment(deviceHash, wallet, sig) {
         return;
     }
     db.run(`UPDATE lane_revenue SET eco_verified = 1 WHERE signature = ?`, [sig], () => { });
-    const sub = await ecoGetSub(member.account_id);
-    const base = Math.max(v.paidAt || Date.now(), Number(sub?.sub_until) || 0);
+    // Same carryover parity as PaceSeeker: a still-running device trial
+    // extends the floor's base the way the client's purchase path does.
+    const [sub, dev] = await Promise.all([
+        ecoGetSub(member.account_id),
+        dbGetAsync(`SELECT trial_started_at FROM lane_devices WHERE device_hash = ?`, [String(deviceHash)]),
+    ]);
+    const laneTrialEnd = (Number(dev?.trial_started_at) || 0) + PS_TRIAL_DAYS * 24 * 60 * 60 * 1000;
+    const base = Math.max(v.paidAt || Date.now(), Number(sub?.sub_until) || 0, laneTrialEnd);
     const until = base + PS_ECO_PLAN_MS + 12 * 60 * 60 * 1000;
     await ecoFloorSub(member.account_id, until, { sourceApp: 'lane', kind: 'payment', provenance: sig, allowRevoked: true });
 }
@@ -8096,7 +8106,11 @@ app.get('/api/lane/trial', (req, res) => {
                         `SELECT account_id, wallet, wallet_verified FROM ecosystem_members WHERE app = 'lane' AND identity = ?`, [String(id)]);
                     if (!member?.wallet_verified || !member.wallet || member.wallet !== v.payer) return;
                     const capBase = v.paidAt || Date.now();
-                    const cappedUntil = Math.min(Number(se) || 0, capBase + PS_ECO_PLAN_MS + 12 * 60 * 60 * 1000);
+                    // Same carryover cap as PaceSeeker — Lane's trial clock is
+                    // trial_started_at + PS_TRIAL_DAYS.
+                    const laneTrialEnd = (Number(row.trial_started_at) || 0) + PS_TRIAL_DAYS * 24 * 60 * 60 * 1000;
+                    const carryCap = Math.max(0, Math.min(laneTrialEnd - capBase, PS_TRIAL_DAYS * 24 * 60 * 60 * 1000));
+                    const cappedUntil = Math.min(Number(se) || 0, capBase + PS_ECO_PLAN_MS + carryCap + 12 * 60 * 60 * 1000);
                     await ecoFloorSub(member.account_id, cappedUntil, { sourceApp: 'lane', kind: 'payment', provenance: row.sub_signature });
                 })().catch(() => { });
             }
