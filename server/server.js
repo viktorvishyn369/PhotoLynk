@@ -6366,8 +6366,25 @@ async function ecoTgHandleGroupMessage(msg) {
     const senderId = String(msg?.from?.id || '');
     const senderHandle = msg?.from?.username ? String(msg.from.username) : null;
     if (!senderId || msg?.from?.is_bot) return;
+    // Prefer an account that still has members: user deletes detach members
+    // but keep account socials, so a tg_user_id can outlive its account and
+    // silently route claims/grants to a dead account forever. Tiebreak on the
+    // freshest member link — a re-registered user's account is newer.
     let acct = await dbGetAsync(
-        `SELECT account_id, tg_username, tg_state FROM ecosystem_accounts WHERE tg_user_id = ?`, [senderId]).catch(() => null);
+        `SELECT a.account_id, a.tg_username, a.tg_state FROM ecosystem_accounts a
+         WHERE a.tg_user_id = ?
+         ORDER BY EXISTS(SELECT 1 FROM ecosystem_members m WHERE m.account_id = a.account_id) DESC,
+                  COALESCE((SELECT MAX(m2.linked_at) FROM ecosystem_members m2 WHERE m2.account_id = a.account_id), 0) DESC
+         LIMIT 1`, [senderId]).catch(() => null);
+    // tg_user_id is an identity key — a sender can only ever own ONE account.
+    // Self-heal legacy duplicate bindings: the resolved account keeps it.
+    if (acct) {
+        await dbRunAsync(
+            `UPDATE ecosystem_accounts SET tg_user_id = NULL,
+                tg_state = CASE WHEN tg_username IS NULL OR tg_username = '' THEN NULL ELSE 'declared' END
+             WHERE tg_user_id = ? AND account_id != ?`,
+            [senderId, acct.account_id]).catch(() => { });
+    }
     if (!acct && senderHandle) {
         // Auto-prove a declared handle — only when exactly ONE account declares
         // it, so an ambiguous duplicate can't bind the wrong account.
@@ -6377,6 +6394,11 @@ async function ecoTgHandleGroupMessage(msg) {
             [senderHandle.toLowerCase()]).catch(() => []);
         if (declared.length === 1) {
             acct = declared[0];
+            await dbRunAsync(
+                `UPDATE ecosystem_accounts SET tg_user_id = NULL,
+                    tg_state = CASE WHEN tg_username IS NULL OR tg_username = '' THEN NULL ELSE 'declared' END
+                 WHERE tg_user_id = ? AND account_id != ?`,
+                [senderId, acct.account_id]).catch(() => { });
             await dbRunAsync(
                 `UPDATE ecosystem_accounts SET tg_user_id = ?, tg_username = ?, tg_state = 'verified' WHERE account_id = ?`,
                 [senderId, senderHandle, acct.account_id]).catch(() => { });
@@ -6475,6 +6497,14 @@ async function ecoTgBotLoop() {
                     continue;
                 }
                 await dbRunAsync(`UPDATE ecosystem_link_codes SET used = 1 WHERE code = ?`, [code]);
+                // tg_user_id is an identity key: a Telegram user owns one
+                // account. Clear stale bindings (e.g. left on a deleted
+                // member's old account) so group-post claims route here.
+                await dbRunAsync(
+                    `UPDATE ecosystem_accounts SET tg_user_id = NULL,
+                        tg_state = CASE WHEN tg_username IS NULL OR tg_username = '' THEN NULL ELSE 'declared' END
+                     WHERE tg_user_id = ? AND account_id != ?`,
+                    [String(msg.from.id), row.account_id]);
                 await dbRunAsync(`UPDATE ecosystem_accounts SET tg_user_id = ?, tg_username = ?, tg_state = 'verified' WHERE account_id = ?`,
                     [String(msg.from.id), msg.from.username || null, row.account_id]);
                 ecoTgApi('sendMessage', { chat_id: chatId, text: `Linked! Your Telegram is verified for the StealthLynk ecosystem.` }).catch(() => { });
