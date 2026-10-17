@@ -6049,6 +6049,9 @@ setInterval(ecoRecheckPendingClaims, ECO_CLAIM_RECHECK_MS).unref?.();
 // user taps a deep link once. Without it, TG username is recorded as declared.
 const ECO_X_HANDLE = process.env.ECO_X_HANDLE || 'stealthlynkio';
 const ECO_TG_GROUP = process.env.ECO_TG_GROUP || 'StealthLynk_IO';
+// Numeric chat id for private groups (no username). Get it once via
+// getUpdates or web.telegram.org; optional - public groups match by name.
+const ECO_TG_CHAT_ID = process.env.ECO_TG_CHAT_ID || '';
 const ECO_TG_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const ECO_X_BEARER = process.env.TWITTER_BEARER_TOKEN || '';
 const CHERRY_APP_KEY = process.env.CHERRY_APP_KEY || '';
@@ -6085,7 +6088,9 @@ async function ecoCheckTgMember(tgUserId) {
     if (!ECO_TG_BOT_TOKEN || !tgUserId) return null;
     try {
         const r = await axios.get(`https://api.telegram.org/bot${ECO_TG_BOT_TOKEN}/getChatMember`, {
-            params: { chat_id: `@${ECO_TG_GROUP}`, user_id: tgUserId }, timeout: 8000,
+            // Private groups have no username - the numeric id is the only
+            // addressable chat handle there.
+            params: { chat_id: ECO_TG_CHAT_ID || `@${ECO_TG_GROUP}`, user_id: tgUserId }, timeout: 8000,
         });
         return ['member', 'administrator', 'creator'].includes(r.data?.result?.status);
     } catch (e) {
@@ -6281,6 +6286,14 @@ async function ecoTgHandleGroupMessage(msg) {
 async function ecoTgBotLoop() {
     if (!ECO_TG_BOT_TOKEN) return;
     let offset = 0;
+    try {
+        // getUpdates starves when a webhook is set - detect it loudly instead
+        // of polling into a void (in-app Verify-Telegram links and group-post
+        // witnessing silently die, forcing manual admin approval).
+        const hook = await ecoTgApi('getWebhookInfo');
+        if (hook && hook.url) console.warn(`[Eco] TG bot has a webhook set (${hook.url}) - getUpdates polling will never see messages; run deleteWebhook or unset it for this deployment to receive them`);
+    } catch (e) { console.warn('[Eco] TG getWebhookInfo check failed:', e.message); }
+    let conflictLogged = false;
     // Reuse the same bot for other bots' updates? No — dedicated bot assumed.
     for (;;) {
         try {
@@ -6289,7 +6302,12 @@ async function ecoTgBotLoop() {
                 offset = u.update_id + 1;
                 const msg = u.message;
                 const text = String(msg?.text || '');
-                if (msg?.from?.id && msg.chat?.username && String(msg.chat.username).toLowerCase() === ECO_TG_GROUP.toLowerCase() && !text.startsWith('/')) {
+                // Group posts: match by public username, or by numeric chat id
+                // when the group is private (no username -> chat.username is
+                // unset and a pasted t.me link can't auto-verify either).
+                const isEcoGroup = (msg.chat?.username && String(msg.chat.username).toLowerCase() === ECO_TG_GROUP.toLowerCase())
+                    || (ECO_TG_CHAT_ID && String(msg.chat?.id || '') === String(ECO_TG_CHAT_ID));
+                if (msg?.from?.id && isEcoGroup && !text.startsWith('/')) {
                     ecoTgHandleGroupMessage(msg).catch(() => { });
                     continue;
                 }
@@ -6320,6 +6338,11 @@ async function ecoTgBotLoop() {
                 ecoTgApi('sendMessage', { chat_id: chatId, text: `Linked! Your Telegram is verified for the StealthLynk ecosystem.` }).catch(() => { });
             }
         } catch (e) {
+            // 409 Conflict = webhook still set or another poller owns the bot.
+            if (!conflictLogged && /409/.test(String(e?.response?.status || e?.message || ''))) {
+                conflictLogged = true;
+                console.warn('[Eco] TG getUpdates conflict (409) - a webhook or another poller owns this bot; Verify-Telegram and group claims will not work until resolved');
+            }
             await new Promise(r => setTimeout(r, 5000)); // poll errors - back off
         }
     }
